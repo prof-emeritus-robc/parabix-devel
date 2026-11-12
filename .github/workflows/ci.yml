@@ -5,7 +5,7 @@
 # is the daily schedule (no runs on push or pull request), and a scheduled
 # run is skipped when master has not changed since the last scheduled run.
 # A run can also be started by hand (Actions tab, "Run workflow"), of all
-# jobs or one kind: gh workflow run ci.yml -f jobs=freebsd
+# jobs or one kind: gh workflow run ci.yml -f only=freebsd
 #
 # Jobs (all on GitHub's standard runners, free for public repositories):
 #   linux-x64, linux-arm64, macos   development build (ARTIFACT_MODE=Multiple), all tests
@@ -24,7 +24,7 @@ on:
     - cron: "47 10 * * *"    # 10:47 UTC daily: 03:47 PDT (02:47 PST)
   workflow_dispatch:
     inputs:
-      jobs:
+      only:
         description: "Jobs to run"
         type: choice
         options: [all, linux, macos, install, freebsd]
@@ -70,7 +70,7 @@ jobs:
   linux:
     name: ${{ matrix.name }}
     needs: changes
-    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "linux"]'), inputs.jobs || 'all')
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "linux"]'), inputs.only || 'all')
     strategy:
       fail-fast: false
       matrix:
@@ -113,7 +113,7 @@ jobs:
   macos:
     name: macos
     needs: changes
-    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "macos"]'), inputs.jobs || 'all')
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "macos"]'), inputs.only || 'all')
     runs-on: macos-15
     timeout-minutes: 180
     steps:
@@ -144,7 +144,7 @@ jobs:
   install:
     name: install (linux-x64, single library)
     needs: changes
-    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "install"]'), inputs.jobs || 'all')
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "install"]'), inputs.only || 'all')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -213,7 +213,7 @@ jobs:
   freebsd:
     name: freebsd
     needs: changes
-    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "freebsd"]'), inputs.jobs || 'all')
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "freebsd"]'), inputs.only || 'all')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:

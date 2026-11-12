@@ -28,10 +28,12 @@
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <grep/grep_kernel.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fileselect/file_select.h>
 #include <algorithm>
 #include <fcntl.h>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
@@ -46,6 +48,10 @@ using namespace kernel;
 
 static cl::OptionCategory ucFlags("Command Flags", "ucount options");
 static argv::RegisterFileSelectOptions FileSelectOptions;
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
+// The report, written to the output (toolio::out()) when complete
+static std::ostringstream Report;
 
 static cl::opt<std::string> CC_expr(cl::Positional, cl::desc("<Unicode character class expression>"), cl::Required, cl::cat(ucFlags));
 static cl::opt<bool> CountOnly("c", cl::desc("CountOnly flag for compatibility with greptest"), cl::cat(ucFlags));
@@ -56,7 +62,7 @@ static cl::opt<bool> NoS2P("NoS2P", cl::desc("Don't transpose - use byte data di
 static cl::opt<bool> U21("u21", cl::desc("Use Unicode 21 bits"), cl::cat(ucFlags));
 
 
-typedef uint64_t (*UCountFunctionType)(uint32_t fd);
+typedef uint64_t (*UCountFunctionType)(uint32_t useMMap, uint32_t fd);
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -64,7 +70,7 @@ typedef uint64_t (*UCountFunctionType)(uint32_t fd);
 
 UCountFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"}, Output<uint64_t>{"countResult"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fileDescriptor"}, Output<uint64_t>{"countResult"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
 
@@ -72,7 +78,7 @@ UCountFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
 
     //  Read the file into the ByteStream.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     StreamSet * Source = nullptr;
     if (NoS2P) {
@@ -122,13 +128,16 @@ bool ucount1(UCountFunctionType fn_ptr, const fs::path & path, uint64_t & count)
     if (LLVM_UNLIKELY(fd == -1)) {
         return false;
     }
-    count = fn_ptr(fd);
+    count = fn_ptr(toolio::useMMapFor(fd), fd);
     close(fd);
     return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&ucFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&ucFlags, &argv::File_Select_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    if (!toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("wc");
 
     argv::FileSelectConfig config;
@@ -160,25 +169,29 @@ int main(int argc, char *argv[]) {
     }
     
     if (CountOnly) {
-        std::cout << totalCount << "\n";
+        Report << totalCount << "\n";
     } else {
         const int defaultDisplayColumnWidth = 7;
         int displayColumnWidth = std::to_string(totalCount).size() + 1;
         if (displayColumnWidth < defaultDisplayColumnWidth) displayColumnWidth = defaultDisplayColumnWidth;
         for (unsigned i = 0; i < fileCount; ++i) {
             if (!counted[i]) continue;
-            std::cout << std::setw(displayColumnWidth);
-            std::cout << theCounts[i] << std::setw(displayColumnWidth);
+            Report << std::setw(displayColumnWidth);
+            Report << theCounts[i] << std::setw(displayColumnWidth);
             const auto name = allFiles.displayName(i);
-            if (!name.empty()) std::cout << " " << name;
-            std::cout << std::endl;
+            if (!name.empty()) Report << " " << name;
+            Report << std::endl;
         }
         if (allFiles.showTotal()) {
-            std::cout << std::setw(displayColumnWidth-1);
-            std::cout << totalCount;
-            std::cout << " total" << std::endl;
+            Report << std::setw(displayColumnWidth-1);
+            Report << totalCount;
+            Report << " total" << std::endl;
         }
     }
 
+    toolio::out() << Report.str();
+    if (!toolio::finishOutput()) {
+        return 1;
+    }
     return std::all_of(counted.begin(), counted.end(), [](bool c) {return c;}) ? 0 : 1;
 }

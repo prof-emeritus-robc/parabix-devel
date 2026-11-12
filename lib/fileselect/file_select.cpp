@@ -46,7 +46,6 @@ cl::OptionCategory File_Select_Options("File Selection Options", "These options 
 bool NoMessagesFlag;
 bool RecursiveFlag;
 bool DereferenceRecursiveFlag;
-bool MmapFlag;
 DevDirAction DevicesFlag;
 DevDirAction DirectoriesFlag;
 
@@ -65,7 +64,6 @@ cl::alias RecursiveAlias{"recursive", cl::desc("Alias for -r"), cl::aliasopt(Rec
 cl::opt<bool, true> DereferenceRecursiveOption{"R", cl::location(DereferenceRecursiveFlag), cl::desc("Recursively process files within directories, following symlinks at all levels."), cl::cat(File_Select_Options), cl::Grouping};
 cl::alias DereferenceRecursiveAlias{"dereference-recursive", cl::desc("Alias for -R"), cl::aliasopt(DereferenceRecursiveOption)};
 
-cl::opt<bool, true> MmapOption{"mmap", cl::location(MmapFlag),  cl::init(false), cl::desc("Use mmap for file input."), cl::cat(File_Select_Options)};
 
 cl::list<std::string> ExcludeFiles{"exclude", cl::ZeroOrMore,
                                    cl::desc("Exclude files matching the given filename GLOB pattern."), cl::cat(File_Select_Options)};

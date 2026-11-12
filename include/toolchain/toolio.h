@@ -24,6 +24,7 @@
 //     return toolio::finishOutput() ? 0 : 1;
 
 #include <cstddef>
+#include <iosfwd>
 #include <string>
 
 namespace llvm { class raw_ostream; namespace cl { class OptionCategory; } }
@@ -57,6 +58,12 @@ struct Input {
     bool spooled = false;       // a copy of the standard input (openSeekableInput)
 };
 
+// Whether --mmap was given (for tools opening their input files themselves).
+bool mmapRequested();
+// Whether to map the open file fd: --mmap was given, and fd is a regular file
+// read from its beginning.
+bool useMMapFor(int fd);
+
 // Opens the input file name ("" and "-" are the standard input).  On failure,
 // reports it (tool: file: reason) and returns false.
 bool openInput(const std::string & name, Input & in);
@@ -76,6 +83,9 @@ void closeInput(Input & in);
 // reports it and returns false.  Without --output (or a tool not registering
 // it), the standard output.
 bool openOutput();
+// For a tool parsing its own command line: the output file of its --output
+// (as if given to the --output of RegisterOutputOptions), before openOutput.
+void setOutputFile(const std::string & name);
 // Whether --output was given (for a tool whose output is optional).
 bool outputRequested();
 // The output file descriptor (opened by openOutput; exits on failure if it
@@ -86,6 +96,8 @@ bool outputIsTerminal();
 // For results written by C++ code: buffered, so flushed (by finishOutput, or
 // before a pipeline writes to outputFD() itself).
 llvm::raw_ostream & out();
+// The same output as a std::ostream (for code written with std::cout).
+std::ostream & stream();
 // Completes the output: flushes out(), reports any write error, and renames
 // an output file into place.  Returns false on error, when the output file is
 // removed.  Without it (e.g., on exit after an error), the output file is not

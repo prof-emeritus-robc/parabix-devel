@@ -11,6 +11,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <fileselect/file_select.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <re/parse/parser.h>
 #include <re/adt/re_alt.h>
 #include <re/toolchain/toolchain.h>
@@ -205,9 +206,13 @@ static void icgrep_error_handler(void *UserData, const char * Message, bool GenC
     exit(InternalFailureCode);
 }
 
+// --mmap and --output (toolchain/toolio.h)
+static toolio::RegisterInputOptions InputOutputInputOptions;
+static toolio::RegisterOutputOptions InputOutputOutputOptions;
+
 void InitializeCommandLineInterface(int argc, char *argv[]) {
     llvm::install_fatal_error_handler(&icgrep_error_handler);
-    codegen::ParseCommandLineOptions(argc, argv, {&re::RE_Options, &Input_Options, &argv::File_Select_Options, &Output_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&re::RE_Options, &Input_Options, &argv::File_Select_Options, &toolio::InputOutputOptions, &Output_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     
     if (TextFlag) {
         if (BinaryNonMatchingFlag || (BinaryFilesFlag == WithoutMatch)) {

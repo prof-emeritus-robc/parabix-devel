@@ -12,6 +12,7 @@
 #include <sched.h>
 #include <boost/filesystem.hpp>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <toolchain/fileutil.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
@@ -1032,19 +1033,21 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
     if (fileNames.size() == 1) {
         int32_t fd = openFile(fileNames[0], strm);
         if (fd == -1) return 0;   // File error; skip.
-        struct stat st;
-        const bool statOK = fstat(fd, &st) == 0;
-        // The file is read by AlignedFileBuffer::load, which opens it again.
+        // Only try mmap for file groups consisting of a single file.
+        bool useMMap = mPreferMMap && canMMap(fileNames[0]);
+        // The whole file, or the standard input read to its end (the size of
+        // a pipe is the data in it at the moment, or 0)
+        AlignedFileBuffer buf;
+        const bool loaded = buf.load(fd, useMMap);
         if (fd != STDIN_FILENO) close(fd);
-        if (!statOK || (st.st_size == 0)) return 0;
+        if (!loaded || (buf.getBufSize() == 0)) {
+            buf.release();
+            return 0;
+        }
         accum.mFileNames.push_back(fileNames[0]);
         accum.mFileStartPositions.push_back(static_cast<size_t>(0));
         accum.setFileLabel(accum.mFileNames[0]);
         accum.mFileStartLineNumbers.push_back(~static_cast<size_t>(0));
-        // Only try mmap for file groups consisting of a single file.
-        bool useMMap = mPreferMMap && canMMap(fileNames[0]);
-        AlignedFileBuffer buf;
-        buf.load(fileNames[0], useMMap);
         size_t bytes_read = buf.getBufSize();
         if (bytes_read <= 0) return 0;
         accum.mBatchBuffer = buf.getBuf();
@@ -1260,7 +1263,7 @@ void GrepEngine::DoGrepThreadMethod() {
             while ((mNextFileToPrint < mFileGroups.size()) && (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete)) {
                 const auto output = mResultStrs[mNextFileToPrint].str();
                 if (!output.empty()) {
-                    llvm::outs() << output;
+                    toolio::out() << output;
                 }
                 mFileStatus[mNextFileToPrint] = FileStatus::PrintComplete;
                 mNextFileToPrint++;
@@ -1275,7 +1278,7 @@ void GrepEngine::DoGrepThreadMethod() {
         if (readyToPrint) {
             const auto output = mResultStrs[mNextFileToPrint].str();
             if (!output.empty()) {
-                llvm::outs() << output;
+                toolio::out() << output;
             }
             mFileStatus[mNextFileToPrint] = FileStatus::PrintComplete;
             mNextFileToPrint++;
@@ -1286,7 +1289,7 @@ void GrepEngine::DoGrepThreadMethod() {
     if (mGrepStdIn) {
         std::ostringstream s;
         const auto grepResult = doGrep({"-"}, s);
-        llvm::outs() << s.str();
+        toolio::out() << s.str();
         if (grepResult) grepMatchFound = true;
     }
 }

@@ -355,15 +355,15 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
 
 static void listTransforms(const ldml::TransformRegistry & registry) {
     for (const ldml::TransformEntry & e : registry.entries()) {
-        llvm::outs() << e.canonicalName;
-        for (const std::string & a : e.aliases) llvm::outs() << "  " << a;
+        toolio::out() << e.canonicalName;
+        for (const std::string & a : e.aliases) toolio::out() << "  " << a;
         if (e.isBuiltIn()) {
-            llvm::outs() << "  [built-in]";
+            toolio::out() << "  [built-in]";
         } else {
-            llvm::outs() << "  [" << e.file << (e.direction == ldml::TransformDirection::Backward ? ", backward" : "") << "]";
+            toolio::out() << "  [" << e.file << (e.direction == ldml::TransformDirection::Backward ? ", backward" : "") << "]";
         }
-        if (e.internal) llvm::outs() << "  [internal]";
-        llvm::outs() << "\n";
+        if (e.internal) toolio::out() << "  [internal]";
+        toolio::out() << "\n";
     }
 }
 
@@ -832,7 +832,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step);
 static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearchReplace * sr = nullptr, std::string * reason = nullptr);
 
 static void printPlan(const std::string & label, const TransformAnalysis & a) {
-    llvm::outs() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
+    toolio::out() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
     for (const std::string & p : a.problems) {
         std::string shown = p;
         if (p.size() > 160) {
@@ -841,100 +841,100 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             const size_t reason = p.rfind("  (");
             shown = p.substr(0, cut) + " ... " + (reason == std::string::npos ? "" : p.substr(reason));
         }
-        llvm::outs() << "  problem: " << shown << "\n";
+        toolio::out() << "  problem: " << shown << "\n";
     }
-    if (a.plan.filter) llvm::outs() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
+    if (a.plan.filter) toolio::out() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
-            llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
+            toolio::out() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
                          << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "") << "\n";
             continue;
         }
         if (step.hasFrontLetters) {
             const ldml::FrontLetterRevisits & f = step.frontLetters;
-            llvm::outs() << "  front-letter revisits: mark " << printCodepoints(std::u32string(1, f.mark)) << ", "
+            toolio::out() << "  front-letter revisits: mark " << printCodepoints(std::u32string(1, f.mark)) << ", "
                          << f.upper.size() << " uppercase vowels, letters " << printCodepoints({f.lowerLetter, f.upperLetter})
                          << (f.iotaFirsts.empty() ? "" : ", with the marking of vowels before " + printCodepoints(std::u32string(1, f.iota)))
                          << ", " << f.revisits.size() << " characters revisited as vowels\n";
         }
         if (!step.markRunEditRules.empty()) {
-            llvm::outs() << "  mark run edits: " << step.markRunEditRules.size() << " rules, " << step.markRunKept.size() << " kept\n";
-            for (const ldml::ConversionRule * c : step.markRunEditRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
+            toolio::out() << "  mark run edits: " << step.markRunEditRules.size() << " rules, " << step.markRunKept.size() << " kept\n";
+            for (const ldml::ConversionRule * c : step.markRunEditRules) toolio::out() << "    " << ldml::printRule(c) << "\n";
         }
         if (!step.chainRevisitRules.empty()) {
-            llvm::outs() << "  chain revisits: " << step.chainRevisitRules.size() << " rules\n";
-            for (const ldml::ConversionRule * c : step.chainRevisitRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
+            toolio::out() << "  chain revisits: " << step.chainRevisitRules.size() << " rules\n";
+            for (const ldml::ConversionRule * c : step.chainRevisitRules) toolio::out() << "    " << ldml::printRule(c) << "\n";
         }
         if (!step.prefixRuns.empty()) {
-            llvm::outs() << "  prefix runs: " << step.prefixRuns.size() << " rules\n";
-            for (const ldml::ConversionRule * c : step.prefixRunRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
+            toolio::out() << "  prefix runs: " << step.prefixRuns.size() << " rules\n";
+            for (const ldml::ConversionRule * c : step.prefixRunRules) toolio::out() << "    " << ldml::printRule(c) << "\n";
             continue;
         }
-        llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups, "
+        toolio::out() << "  conversion group: " << step.subgroups.size() << " subgroups, "
                      << step.stringRules.size() << " string rules\n";
         std::string notByEngine;
         if (engineSearchReplace(step, nullptr, &notByEngine)) {
-            llvm::outs() << "    applied by the search and replace of the regular expression engine (where no filter applies)\n";
+            toolio::out() << "    applied by the search and replace of the regular expression engine (where no filter applies)\n";
         } else if (!notByEngine.empty()) {
-            llvm::outs() << "    not applied by the search and replace of the regular expression engine: " << notByEngine << "\n";
+            toolio::out() << "    not applied by the search and replace of the regular expression engine: " << notByEngine << "\n";
         }
         //  The overlaps of the string rules (see ldml::StringRuleOverlaps).
         const ldml::StringRuleOverlaps overlaps = ldml::analyzeStringRuleOverlaps(step);
         if (!overlaps.pairs.empty()) {
-            llvm::outs() << "    string rule overlaps: " << overlaps.pairs.size() << " pairs (" << overlaps.oneWay << " one-way, "
+            toolio::out() << "    string rule overlaps: " << overlaps.pairs.size() << " pairs (" << overlaps.oneWay << " one-way, "
                          << overlaps.twoWay << " two-way, " << overlaps.self << " self); ";
             if (overlaps.singlePass()) {
-                llvm::outs() << "single pass in " << std::max(overlaps.singlePassStages(), 1u) << " stages"
+                toolio::out() << "single pass in " << std::max(overlaps.singlePassStages(), 1u) << " stages"
                              << (overlaps.self ? " (with two-character self-overlaps)" : "") << "\n";
             } else {
                 if (overlaps.twoWay > 0) {
-                    llvm::outs() << "selected sequentially: two-way overlaps";
+                    toolio::out() << "selected sequentially: two-way overlaps";
                 } else if (overlaps.acyclicApartFromSelf) {
-                    llvm::outs() << "selected sequentially: self-overlaps (otherwise single pass in "
+                    toolio::out() << "selected sequentially: self-overlaps (otherwise single pass in "
                                  << std::max(overlaps.stagesApartFromSelf, 1u) << " stages)";
                 } else {
-                    llvm::outs() << "selected sequentially: cycle of " << overlaps.cycle.size() << " rules";
+                    toolio::out() << "selected sequentially: cycle of " << overlaps.cycle.size() << " rules";
                 }
-                llvm::outs() << "; " << overlaps.cyclicComponents << " cyclic components (" << overlaps.pairComponents
+                toolio::out() << "; " << overlaps.cyclicComponents << " cyclic components (" << overlaps.pairComponents
                              << " of 2-character rules, largest " << overlaps.largestComponent << " rules)"
                              << (overlaps.pairSelectable ? ": pair selectable" : "") << "\n";
             }
             for (size_t i = 0; i < overlaps.cycle.size(); i++) {
-                llvm::outs() << "      cycle: " << ldml::printRule(step.stringRules[overlaps.cycle[i]].rule) << "\n";
+                toolio::out() << "      cycle: " << ldml::printRule(step.stringRules[overlaps.cycle[i]].rule) << "\n";
             }
             for (const ldml::StringRuleOverlaps::Pair & pair : overlaps.pairs) {
                 const std::string outer = ldml::printRule(step.stringRules[pair.outer].rule);
                 const std::string inner = ldml::printRule(step.stringRules[pair.inner].rule);
                 switch (pair.kind) {
                     case ldml::StringRuleOverlaps::Kind::OneWay:
-                        llvm::outs() << "      overlap one-way: " << outer << "  →  " << inner << "\n"; break;
+                        toolio::out() << "      overlap one-way: " << outer << "  →  " << inner << "\n"; break;
                     case ldml::StringRuleOverlaps::Kind::TwoWay:
-                        llvm::outs() << "      overlap two-way: " << outer << "  ↔  " << inner << "\n"; break;
+                        toolio::out() << "      overlap two-way: " << outer << "  ↔  " << inner << "\n"; break;
                     case ldml::StringRuleOverlaps::Kind::Self:
-                        llvm::outs() << "      overlap self: " << outer << "\n"; break;
+                        toolio::out() << "      overlap self: " << outer << "\n"; break;
                 }
             }
         }
         printBeforeContextNotes(step);
         for (size_t r = 0; r < step.stringRules.size(); r++) {
-            llvm::outs() << "    string rule: " << ldml::printRule(step.stringRules[r].rule) << "\n";
+            toolio::out() << "    string rule: " << ldml::printRule(step.stringRules[r].rule) << "\n";
             if (r < step.stringPriority.size()) {
                 for (const ldml::ConversionRule * e : step.stringPriority[r]) {
-                    llvm::outs() << "      only where this does not match first: " << ldml::printRule(e) << "\n";
+                    toolio::out() << "      only where this does not match first: " << ldml::printRule(e) << "\n";
                 }
             }
         }
         for (size_t g = 0; g < step.subgroupPriority.size(); g++) {
             for (const ldml::ConversionRule * e : step.subgroupPriority[g]) {
-                llvm::outs() << "    single-character rules [" << step.subgroups[g].contextKey << "] only where this does not match first: "
+                toolio::out() << "    single-character rules [" << step.subgroups[g].contextKey << "] only where this does not match first: "
                              << ldml::printRule(e) << "\n";
             }
         }
         if (step.jointSelection) {
-            llvm::outs() << "    string rules and MultipleCaptureMultipleReplacement rules selected together\n";
+            toolio::out() << "    string rules and MultipleCaptureMultipleReplacement rules selected together\n";
         }
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-            llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
+            toolio::out() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
                          << " rules, matched together (" << set.rules.size() << ", starts by "
                          << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)"
                              : set.walkStarts ? "the engine, selected by the lengths of " + std::to_string(set.walkBranches.size()) + " walk branches"
@@ -945,27 +945,27 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
                          << (set.variants.empty() ? "" : ", " + std::to_string(set.variants.size()) + " variants by the character "
                              + std::to_string(set.selectorOffset) + " from the " + (set.selectorFromEnd ? "end" : "start"))
                          << ":\n";
-            for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
+            for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) toolio::out() << "      " << ldml::printRule(r.rule) << "\n";
         }
         for (const ldml::InsertionRule & ins : step.insertions) {
-            llvm::outs() << "    insertion rule: " << ldml::printRule(ins.rule) << "\n";
+            toolio::out() << "    insertion rule: " << ldml::printRule(ins.rule) << "\n";
         }
         if (!step.deferred.empty()) {
-            llvm::outs() << "    deferred rules (" << step.deferred.size() << ", " << step.copyCaptures.size()
+            toolio::out() << "    deferred rules (" << step.deferred.size() << ", " << step.copyCaptures.size()
                          << " captures copied, triggers " << printRanges(step.deferredTriggers) << "):\n";
             for (const ldml::DeferredRule & d : step.deferred) {
-                llvm::outs() << "      " << (d.selfReproducing ? "self-reproducing copy: " : d.capture >= 0 ? "copy: " : "")
+                toolio::out() << "      " << (d.selfReproducing ? "self-reproducing copy: " : d.capture >= 0 ? "copy: " : "")
                              << ldml::printRule(d.rule) << "\n";
             }
         }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
-            llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
+            toolio::out() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
             unsigned shown = 0;
             for (const ldml::CharMapping & m : s.mappings) {
-                if (shown++ == 3) {llvm::outs() << " ..."; break;}
-                llvm::outs() << (shown == 1 ? ": " : ", ") << printRanges(m.chars) << " -> " << printCodepoints(m.replacement);
+                if (shown++ == 3) {toolio::out() << " ..."; break;}
+                toolio::out() << (shown == 1 ? ": " : ", ") << printRanges(m.chars) << " -> " << printCodepoints(m.replacement);
             }
-            llvm::outs() << "\n";
+            toolio::out() << "\n";
         }
     }
 }
@@ -3119,7 +3119,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         FusedContexts before;
         if (s.engineBefore && fusedContexts(s.engineBefore, true, before, true) && convertedContextMatters(before, outcomes)) {
-            llvm::outs() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
+            toolio::out() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
         }
     }
     bool wholeGroup = false;
@@ -3131,15 +3131,15 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
                 && (step.captureReplacements.empty() || (!step.jointSelection && !step.sequentialSelection && needCoverage));
             wholeGroup |= (!step.stringOrder.empty() || needCoverage) && wholeGroupFits;
             if ((step.stringOrder.empty() && !needCoverage) || wholeGroupFits) {
-                llvm::outs() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
+                toolio::out() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
             } else {
-                llvm::outs() << "    warning: the before context of " << ldml::printRule(sr.rule)
+                toolio::out() << "    warning: the before context of " << ldml::printRule(sr.rule)
                              << " may match differently in the converted text\n";
             }
         }
     }
     if (wholeGroup && step.sequentialSelection) {
-        llvm::outs() << "    string matches selected sequentially between the " << ConvertedContextRounds + 1
+        toolio::out() << "    string matches selected sequentially between the " << ConvertedContextRounds + 1
                      << " rounds of matching before contexts against the converted text\n";
     }
     //  The contexts that are not fused (with unbounded repetitions) are matched
@@ -3198,7 +3198,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         }
         for (const ldml::PatternItem & item : items) changes |= !(item.chars & stringRuleChars).empty();
         if (changes) {
-            llvm::outs() << "    warning: the before context of [" << s.contextKey
+            toolio::out() << "    warning: the before context of [" << s.contextKey
                          << "] may match differently in the converted text\n";
         }
     }
@@ -9647,12 +9647,12 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
             rules += groupRules(step);
         }
     }
-    llvm::outs() << "kernel counts: " << entry->canonicalName << "\n";
+    toolio::out() << "kernel counts: " << entry->canonicalName << "\n";
     if (!a.implementable) {
-        llvm::outs() << "total: " << groups << " groups, " << rules << " rules\n";
+        toolio::out() << "total: " << groups << " groups, " << rules << " rules\n";
         return 2;
     }
-    llvm::outs().flush();   // (not to be written again by a process the driver forks)
+    toolio::out().flush();   // (not to be written again by a process the driver forks)
     CPUDriver driver("tconv");
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
@@ -9665,7 +9665,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     if (entry->canonicalName == "Any-CaseFold") {
         const size_t kernels = P.getNumOfKernelCalls();
         directPipeline(P, Transform::CaseFold, ByteStream);
-        llvm::outs() << "total: 0 groups, 0 rules, 0 group kernels, " << (P.getNumOfKernelCalls() - kernels)
+        toolio::out() << "total: 0 groups, 0 rules, 0 group kernels, " << (P.getNumOfKernelCalls() - kernels)
                      << " kernels (direct pipeline)\n";
         return 0;
     }
@@ -9674,10 +9674,10 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     size_t groupKernels = 0;
     for (size_t i = 0; i < builder.groupCounts().size(); i++) {
         const RulePipelineBuilder::GroupCount & g = builder.groupCounts()[i];
-        llvm::outs() << "group " << (i + 1) << ": " << g.rules << " rules, " << g.kernels << " kernels\n";
+        toolio::out() << "group " << (i + 1) << ": " << g.rules << " rules, " << g.kernels << " kernels\n";
         groupKernels += g.kernels;
     }
-    llvm::outs() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
+    toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                  << total << " kernels\n";
     return 0;
 }
@@ -10026,7 +10026,17 @@ static bool invokesICUBuiltIn(const ldml::TransformRegistry & registry, Transfor
     return false;
 }
 
+static int run(int argc, char *argv[]);
+
+//  The reports (--list-transforms, --plan, --kernel-counts, --revisit-report)
+//  and the transformed text go to the output: the standard output, or the
+//  file of --output.
 int main(int argc, char *argv[]) {
+    const int status = run(argc, argv);
+    return toolio::finishOutput() ? status : 1;
+}
+
+static int run(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     ldml::TransformRegistry registry;
@@ -10142,7 +10152,7 @@ int main(int argc, char *argv[]) {
         for (const std::string & p : a.problems) {
             if (p.compare(0, 18, "rules not loaded: ") == 0) llvm::errs() << entry->canonicalName << ": " << p << "\n";
         }
-        for (const std::string & line : a.revisitReport) llvm::outs() << line << "\n";
+        for (const std::string & line : a.revisitReport) toolio::out() << line << "\n";
         return 0;
     }
     if (ShowPlan) {

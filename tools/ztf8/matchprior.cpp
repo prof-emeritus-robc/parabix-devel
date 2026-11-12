@@ -16,9 +16,11 @@
 #include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fileselect/file_select.h>
 #include <fcntl.h>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
@@ -30,6 +32,10 @@ using namespace codegen;
 
 static cl::OptionCategory matchpriorFlags("Command Flags", "matchprior options");
 static argv::RegisterFileSelectOptions FileSelectOptions;
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
+// The report, written to the output (toolio::out()) when complete
+static std::ostringstream Report;
 
 static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(matchpriorFlags));
 
@@ -70,25 +76,24 @@ void MatchPriorKernel::generatePabloMethod() {
     pb.createAssign(matchCount, pb.createCount(matchesprior));
 }
 
-typedef uint64_t (*MatchPriorFunctionType)(uint32_t fd);
+typedef uint64_t (*MatchPriorFunctionType)(uint32_t useMMap, uint32_t fd);
+
+// The size of the input read (fstat gives none for a pipe)
+static uint64_t InputSize = 0;
+extern "C" void record_input_size(uint64_t size) {
+    InputSize = size;
+}
 
 MatchPriorFunctionType mpPipelineGen(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"}, Output<uint64_t>{"countResult"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Output<uint64_t>{"countResult"});
     Scalar * const fileDescriptor = P.getInputScalar("fd");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    Kernel * const sourceK = P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     P.CreateKernelCall<MatchPriorKernel>(BasisBits, P.getOutputScalar("countResult"));
+    P.CreateCall("record_input_size", record_input_size, {sourceK->getOutputScalarAt(0)});
     return P.compile();
-}
-
-size_t file_size(const int fd) {
-    struct stat st;
-    if (LLVM_UNLIKELY(fstat(fd, &st) != 0)) {
-        st.st_size = 0;
-    }
-    return st.st_size;
 }
 
 // Reports a file, returning false (after reporting the error) if it cannot be read.
@@ -97,18 +102,21 @@ bool mp(MatchPriorFunctionType fn_ptr, const fs::path & path, const std::string 
     if (LLVM_UNLIKELY(fd == -1)) {
         return false;
     }
-    uint64_t countResult = fn_ptr(fd);
-    std::cout << std::setw(defaultDisplayColumnWidth);
-    std::cout << countResult << std::setw(defaultDisplayColumnWidth);
-    std::cout << file_size(fd);
-    if (!name.empty()) std::cout << " " << name;
-    std::cout << std::endl;
+    uint64_t countResult = fn_ptr(toolio::useMMapFor(fd), fd);
+    Report << std::setw(defaultDisplayColumnWidth);
+    Report << countResult << std::setw(defaultDisplayColumnWidth);
+    Report << InputSize;
+    if (!name.empty()) Report << " " << name;
+    Report << std::endl;
     close(fd);
     return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &argv::File_Select_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    if (!toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("mp");
     argv::FileSelectConfig config;
     config.stdinAsPath = true;
@@ -120,6 +128,10 @@ int main(int argc, char *argv[]) {
     bool allRead = true;
     for (unsigned i = 0; i < fileCount; ++i) {
         allRead &= mp(matchPriorFunctionPtr, allFiles[i], allFiles.displayName(i));
+    }
+    toolio::out() << Report.str();
+    if (!toolio::finishOutput()) {
+        return 1;
     }
     return allRead ? 0 : 1;
 }

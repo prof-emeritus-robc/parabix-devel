@@ -40,7 +40,6 @@ extern DevDirAction DirectoriesFlag;
 extern bool RecursiveFlag; 
 extern bool DereferenceRecursiveFlag; // -R
 
-extern bool MmapFlag; // -mmap
 
 // How a tool selects its files.
 struct FileSelectConfig {

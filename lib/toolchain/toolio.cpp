@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <ostream>
+#include <streambuf>
 #include <vector>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -88,6 +90,15 @@ const char * programName() {
     }
     const char * const slash = std::strrchr(name, '/');
     return slash ? slash + 1 : name;
+}
+
+bool mmapRequested() {
+    return MMapFlag;
+}
+
+bool useMMapFor(const int fd) {
+    struct stat st;
+    return MMapFlag && ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && ::lseek(fd, 0, SEEK_CUR) == 0;
 }
 
 bool openInput(const std::string & name, Input & in) {
@@ -276,6 +287,10 @@ bool openOutput() {
     return true;
 }
 
+void setOutputFile(const std::string & name) {
+    OutputFileName = name;
+}
+
 bool outputRequested() {
     return !OutputFileName.empty();
 }
@@ -301,6 +316,35 @@ raw_ostream & out() {
         o.stream = std::make_unique<raw_fd_ostream>(outputFD(), /*shouldClose*/ false);
     }
     return *o.stream;
+}
+
+namespace {
+
+// A std::streambuf writing to out() (which buffers).
+class OutStreamBuf final : public std::streambuf {
+protected:
+    int_type overflow(int_type c) override {
+        if (!traits_type::eq_int_type(c, traits_type::eof())) {
+            out() << traits_type::to_char_type(c);
+        }
+        return traits_type::not_eof(c);
+    }
+    std::streamsize xsputn(const char * s, std::streamsize n) override {
+        out().write(s, static_cast<size_t>(n));
+        return n;
+    }
+    int sync() override {
+        out().flush();
+        return 0;
+    }
+};
+
+} // anonymous namespace
+
+std::ostream & stream() {
+    static OutStreamBuf buffer;
+    static std::ostream os(&buffer);
+    return os;
 }
 
 bool finishOutput() {

@@ -94,28 +94,33 @@ void MMapSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     const auto pageSize = CBuilder::PageSize;
     ConstantInt * const CODE_UNIT_BYTES = b.getSize(codeUnitWidth / 8);
 
+    // The pages before that of the first unconsumed item (in bytes, from the
+    // start of the mapping)
     Value * const consumedItems = b.getConsumedItemCount("sourceBuffer");
     Value * const consumedBytes = b.CreateMul(consumedItems, CODE_UNIT_BYTES);
     Value * const consumedPageOffset = b.CreateRoundDownRational(consumedBytes, pageSize);
-    Value * const consumedBuffer = b.getRawOutputPointer("sourceBuffer", consumedPageOffset);
+    Value * const consumedBuffer = b.CreateGEP(b.getInt8Ty(), b.getBaseAddress("sourceBuffer"), consumedPageOffset);
+    // "buffer": the first page not yet released
     Value * const readableBuffer = b.getScalarField("buffer");
-    Value * const unnecessaryBytes = b.CreateSub(consumedPageOffset, b.CreatePtrToInt(readableBuffer, b.getSizeTy()));
+    Value * const unnecessaryBytes = b.CreateSub(b.CreatePtrToInt(consumedBuffer, b.getSizeTy()),
+                                                 b.CreatePtrToInt(readableBuffer, b.getSizeTy()));
 
     Module * const m = b.getModule();
     Function * MAdviseFunc = m->getFunction("madvise");
     assert (MAdviseFunc);
     FixedArray<Value *, 3> args;
 
-    // avoid calling madvise unless an actual page table change could occur
-    b.CreateLikelyCondBr(b.CreateIsNotNull(unnecessaryBytes), dropPages, checkRemaining);
+    // avoid calling madvise unless pages were consumed since the last call
+    b.CreateUnlikelyCondBr(b.CreateIsNotNull(unnecessaryBytes), dropPages, checkRemaining);
     b.SetInsertPoint(dropPages);
-    // instruct the OS that it can safely drop any fully consumed pages
+    // instruct the OS that it can safely drop the pages consumed since
     #ifndef __APPLE__
     args[0] = readableBuffer;
-    args[1] = consumedPageOffset;
+    args[1] = unnecessaryBytes;
     args[2] = b.getInt32(MADV_DONTNEED);
     b.CreateCall(MAdviseFunc, args);
     #endif
+    b.setScalarField("buffer", consumedBuffer);
     b.CreateBr(checkRemaining);
 
     // determine whether or not we've exhausted the "safe" region of the file buffer

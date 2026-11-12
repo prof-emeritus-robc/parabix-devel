@@ -43,6 +43,7 @@ set(TOOLS_normalization_test nfc nfd nfkd)
 set(TOOLS_editd_test editd)
 set(TOOLS_objcache_test base64 icgrep hexlines)
 set(TOOLS_option_registration_test "")
+set(TOOLS_tool_io_test "")         # those installed
 
 # The tests whose tools are installed, on the links
 file(READ "@PROJECT_BINARY_DIR@/CTestTestfile.cmake" TESTFILE)

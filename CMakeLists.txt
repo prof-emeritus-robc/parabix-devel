@@ -1118,6 +1118,13 @@ add_test(
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
   COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
 
+# The input and output conventions (stdin, "-", --mmap, --output, colors) of
+# the tools built
+add_test(
+  NAME tool_io_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tool_io_test.py "${BIN_DIR}")
+
 
 SET_PROPERTY(TEST proptest PROPERTY TIMEOUT 1500)
 SET_PROPERTY(TEST abc_test PROPERTY TIMEOUT 100)

@@ -7,6 +7,24 @@ For more information about Parabix, please check our [wiki](https://cs-git-resea
 ### Tools
 Parabix includes a set of built-in [tools](https://cs-git-research.cs.sfu.ca/cameron/parabix-devel/-/tree/master/tools), such as [`icgrep`](README-icgrep.md), which is a very fast regular expression search program.
 
+The tools follow the usual conventions for input and output:
+
+- An input file named `-`, or none, is the standard input.  Tools that take several files
+  (`icgrep`, `wc`, `base64`, `ucount`, `matchprior`) accept `-` among them.
+- The results go to the standard output, or to a file with `--output=<file>`.  The file is
+  written under a temporary name and put in place only when the tool succeeds, so a failed
+  run leaves an existing file as it was (`/dev/null` and other files that are not regular
+  are written in place).
+- Messages (errors, warnings, timings, traces) go to the standard error.  An input that cannot
+  be read is reported as `tool: file: reason`, with a nonzero exit status.
+- `icgrep` colors its output (`--colors=auto`, the default) only on a terminal, and not when
+  `NO_COLOR` is set or `TERM=dumb`; `--colors=always` and `--colors=never` override this.
+- `--mmap` maps input files into memory instead of reading them.
+- A tool compiles its kernels when it starts, so an input from a pipe or a terminal is read
+  by a separate thread meanwhile (at most 64 MiB ahead), and `icgrep` asks the system to read
+  its files into the cache (the first 256 MB); `-read-ahead=false` turns this off.  `icgrep -q`
+  does not read the standard input ahead, as it may stop before needing it.
+
 ### Requirements
 
 To build Parabix, you need a development environment that meets a few requirements.

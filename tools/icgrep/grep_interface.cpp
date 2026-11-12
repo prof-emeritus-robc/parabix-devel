@@ -184,7 +184,7 @@ ColoringType ColorFlag;
 
 static cl::opt<ColoringType, true> Color("colors", cl::desc("Set colorization of the output"), cl::location(ColorFlag), cl::cat(Output_Options), cl::init(autoColor),
                                  cl::values(clEnumValN(alwaysColor, "always", "Enable colorization"),
-                                            clEnumValN(autoColor,   "auto", "Colorize output to stdout"),
+                                            clEnumValN(autoColor,   "auto", "Colorize output to a terminal (not with NO_COLOR or TERM=dumb)"),
                                             clEnumValN(neverColor,  "never", "Disable colorization")));
 static cl::alias ColorAlias("colours", cl::desc("Alias for -color"), cl::aliasopt(Color));
 

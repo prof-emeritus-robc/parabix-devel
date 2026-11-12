@@ -31,6 +31,7 @@
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/CodeGen/TargetRegisterInfo.h>
 #include <llvm/CodeGen/MachineFrameInfo.h>
+#include <llvm/IR/LegacyPassManagers.h>
 #include <llvm/Support/CommandLine.h>
 #include <toolchain/toolchain.h>
 #include <idisa/passes/pass_measurements.h>
@@ -70,75 +71,80 @@ using BasicBlockIterator = std::vector<MachineBasicBlock *>::iterator;
 
 using InstrIterator = MachineBasicBlock::instr_iterator;
 
-class FunctionSnippetTokenReplacerPass : public MachineFunctionPass {
+
+class FunctionSnippetTokenReplacerPass : public llvm::MachineFunctionPass {
 public:
+
+    using BasicBlockIterator = std::vector<llvm::MachineBasicBlock *>::iterator;
+
+    using InstrIterator = llvm::MachineBasicBlock::instr_iterator;
 
     static inline char ID = 0;
 
     FunctionSnippetTokenReplacerPass()
-    : MachineFunctionPass(ID) {
+    : llvm::MachineFunctionPass(ID) {
 
     }
 
-    StringRef getPassName() const override {
-        return StringRef{"FunctionSnippetReplacement"};
+    llvm::StringRef getPassName() const override {
+        return llvm::StringRef{"FunctionSnippetReplacement"};
     }
 
-    bool doInitialization(Module & M) override;
+    bool doInitialization(llvm::Module & M) override;
 
-    bool runOnMachineFunction(MachineFunction & MF) override;
+    bool runOnMachineFunction(llvm::MachineFunction & MF) override;
 
-    bool doFinalization(Module & M) override;
+    bool doFinalization(llvm::Module & M) override;
 
-    void getAnalysisUsage(AnalysisUsage & AU) const override;
+    void getAnalysisUsage(llvm::AnalysisUsage & AU) const override;
 
 private:
 
     struct CodeFragment {
-        std::vector<Register> LiveIn;
-        std::vector<Register> LiveOut;
-        std::vector<Register> VRegDefs;
-        std::vector<MachineBasicBlock *> BasicBlocks;
-        MachineBasicBlock::instr_iterator Begin;
-        MachineBasicBlock::instr_iterator End;
+        std::vector<llvm::Register> LiveIn;
+        std::vector<llvm::Register> LiveOut;
+        std::vector<llvm::Register> VRegDefs;
+        std::vector<llvm::MachineBasicBlock *> BasicBlocks;
+        llvm::MachineBasicBlock::instr_iterator Begin;
+        llvm::MachineBasicBlock::instr_iterator End;
         bool FullyResolved = false;
     };
 
-    using CodeFragmentMap = DenseMap<const Function *, CodeFragment, DenseMapInfo<Function *>>;
+    using CodeFragmentMap = llvm::DenseMap<const llvm::Function *, CodeFragment, llvm::DenseMapInfo<llvm::Function *>>;
 
-    using OrderingMap = DenseMap<MachineBasicBlock *, size_t, DenseMapInfo <MachineBasicBlock *>>;
+    using OrderingMap = llvm::DenseMap<llvm::MachineBasicBlock *, size_t, llvm::DenseMapInfo<llvm::MachineBasicBlock *>>;
 
-    using GlobalSet = DenseSet<const GlobalValue *, DenseMapInfo<GlobalValue *>>;
+    using GlobalSet = llvm::DenseSet<const llvm::GlobalValue *, llvm::DenseMapInfo<llvm::GlobalValue *>>;
 
-    bool checkForFencedCodeFragment(Module * M,
-                                    MachineFunction & MF,
+    bool checkForFencedCodeFragment(llvm::Module * M,
+                                    llvm::MachineFunction & MF,
                                     BasicBlockIterator & MBBIterator,
                                     InstrIterator & instrIterator,
                                     CodeFragmentMap & codeFragments,
                                     GlobalSet & discoveredGlobals) const;
 
-    bool subsituteCodeFragment(const Function * F,
-                               MachineFunction & MF,
+    bool subsituteCodeFragment(const llvm::Function * F,
+                               llvm::MachineFunction & MF,
                                BasicBlockIterator & MBBIterator,
                                InstrIterator & instrIterator,
                                const CodeFragmentMap & codeFragments,
                                GlobalSet & discoveredGlobals) const;
 
 
-    using RegisterVector = SmallVector<Register, 16>;
-    using ToDeleteVector = SmallVector<MachineInstr *, 32>;
+    using RegisterVector = llvm::SmallVector<llvm::Register, 16>;
+    using ToDeleteVector = llvm::SmallVector<llvm::MachineInstr *, 32>;
 
-    static void getCallsiteVirtualRegisters(MachineFunction & MF, InstrIterator &callsite,
+    static void getCallsiteVirtualRegisters(llvm::MachineFunction & MF, InstrIterator &callsite,
                                      RegisterVector &uses, RegisterVector & defs, GlobalSet & discoveredGlobals);
 
-    static void eraseCallsite(MachineRegisterInfo & MRI, InstrIterator & callsite);
+    static void eraseCallsite(llvm::MachineRegisterInfo & MRI, InstrIterator & callsite);
 
     template <typename ArrayA, typename ArrayB>
-    static void rerouteLiveSets(const TargetRegisterInfo * const TRI, MachineRegisterInfo & MRI, const TargetInstrInfo * const TII,
+    static void rerouteLiveSets(const llvm::TargetRegisterInfo * const TRI, llvm::MachineRegisterInfo & MRI, const llvm::TargetInstrInfo * const TII,
                                 InstrIterator ip,
                                 const ArrayA & srcArray, ArrayB & dstArray);
 
-    const Function * getCalleeFunction(Module * M, MachineFunction & MF, MachineInstr & call) const;
+    const llvm::Function * getCalleeFunction(llvm::Module * M, llvm::MachineFunction & MF, llvm::MachineInstr & call) const;
 
 };
 
@@ -1312,9 +1318,7 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
 
 FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llvm::PassManagerBase & pm, PassMeasurements * PICObj)
 : BasePM(pm)
-, PICObj(PICObj)
-, AlreadyInsertedFunctionSnippetPass(false)
-, ValidPhaseForInstrumentation(false) {
+, PICObj(PICObj) {
     // TODO: we need to scan through the function declarations in M to see if any snippets are single use ones.
     // We can add a LLVM AlwaysInline attribute to those to let LLVM deal with them completely. Only if we have a
     // multi-use snippet do we need to run the snippet inliner pass on M. This has the added benefit of the pass
@@ -1333,122 +1337,121 @@ FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llv
 
 }
 
-class PassInstrumentationStartCallback : public llvm::MachineFunctionPass {
-public:
-
-    static inline char ID = 0;
-
-    PassInstrumentationStartCallback(PassMeasurements & obj, StringRef name)
-    : MachineFunctionPass(ID)
-    , CallBackObj(obj)
-    , Name(name) {
-
-    }
-
-    bool runOnMachineFunction(MachineFunction & MF) override {
-        CallBackObj.startTimerCallback(Name, &MF);
-        return false;
-    }
-
-protected:
-
-    void getAnalysisUsage(AnalysisUsage &AU) const override {
-        AU.setPreservesAll();
-        MachineFunctionPass::getAnalysisUsage(AU);
-    }
-
-private:
-    PassMeasurements & CallBackObj;
-    StringRef Name;
-};
-
-class PassInstrumentationEndCallback : public llvm::MachineFunctionPass {
-public:
-
-    static inline char ID = 0;
-
-    PassInstrumentationEndCallback(PassMeasurements & obj, bool isAnalysis, StringRef name)
-    : MachineFunctionPass(ID)
-    , CallBackObj(obj)
-    , IsAnalysisPass(isAnalysis)
-    , Name(name) {
-
-    }
-
-    bool runOnMachineFunction(MachineFunction & MF) override {
-        CallBackObj.endTimerCallback(Name, &MF, !IsAnalysisPass);
-        return false;
-    }
-
-protected:
-
-    void getAnalysisUsage(AnalysisUsage & AU) const override {
-        AU.setPreservesAll();
-        MachineFunctionPass::getAnalysisUsage(AU);
-    }
-
-private:
-    PassMeasurements & CallBackObj;
-    bool IsAnalysisPass;
-    StringRef Name;
-};
-
-inline bool isAnalysisPass(const Pass * P) {
-    auto info = PassRegistry::getPassRegistry()->getPassInfo(P->getPassID());
-    if (info) {
-        return info->isAnalysis();
-    } else {
-        return false;
-    }
+inline LLVM_READNONE bool isAnalysisPass(const Pass * P) {
+    llvm::AnalysisUsage AU;
+    P->getAnalysisUsage(AU);
+    return AU.getPreservesAll();
 }
 
+class PassInstrumentationStartTimer : public llvm::MachineFunctionPass {
+public:
+
+    PassInstrumentationStartTimer(PassMeasurements & obj, StringRef passName)
+    : MachineFunctionPass(ID)
+    , PI("start-timer", passName, &ID, nullptr, false, false)
+    , CallBackObj(obj)
+    , CallbackName(passName) {
+        //llvm::PassRegistry::getPassRegistry()->registerPass(PI, false);
+    }
+
+    llvm::StringRef getPassName() const override {
+         return CallbackName;
+    }
+
+    bool runOnFunction(Function & F) override {
+        CallBackObj.startTimerCallback(CallbackName, &F);
+        return false;
+    }
+
+protected:
+
+    bool runOnMachineFunction(MachineFunction & MF) override {
+        llvm_unreachable("Should not be possible to call this function.");
+        return false;
+    }
+
+    void getAnalysisUsage(llvm::AnalysisUsage &AU) const override {
+        AU.setPreservesAll();
+    }
+
+private:
+    llvm::PassInfo PI;
+    PassMeasurements & CallBackObj;
+    const StringRef CallbackName;
+    char ID = 0;
+};
+
+class PassInstrumentationEndTimer : public llvm::MachineFunctionPass {
+public:
+
+    PassInstrumentationEndTimer(PassMeasurements & obj, StringRef passName, const bool nonAnalysis)
+    : MachineFunctionPass(ID)
+    , PI("end-timer", passName, &ID, nullptr, false, false)
+    , CallBackObj(obj)
+    , CallbackName(passName)
+    , NonAnalysisPass(nonAnalysis) {
+        //llvm::PassRegistry::getPassRegistry()->registerPass(PI, false);
+    }
+
+    llvm::StringRef getPassName() const override {
+         return CallbackName;
+    }
+
+    bool runOnFunction(Function & F) override {
+        CallBackObj.endTimerCallback(CallbackName, &F, NonAnalysisPass);
+        return false;
+    }
+
+protected:
+
+    bool runOnMachineFunction(MachineFunction & MF) override {
+        llvm_unreachable("Should not be possible to call this function.");
+        return false;
+    }
+
+    void getAnalysisUsage(llvm::AnalysisUsage &AU) const override {
+        AU.setPreservesAll();
+    }
+
+private:
+    llvm::PassInfo PI;
+    PassMeasurements & CallBackObj;
+    const StringRef CallbackName;
+    const bool NonAnalysisPass;
+    char ID = 0;
+
+};
 
 void FunctionSnippetPassManagerProxy::add(Pass * P) {
-//    if (AlreadyInsertedFunctionSnippetPass) {
-//        BasePM.add(P);
-//    } else {
-        const auto PassId = P->getPassID();
-        if (PassId == &TargetPassConfig::ID) {
-            auto * TPC = static_cast<TargetPassConfig *>(P);
-            TPC->setRequiresCodeGenSCCOrder();
-        }
-        const auto passName = P->getPassName();
-
-        if (LLVM_UNLIKELY(PICObj && !ValidPhaseForInstrumentation)) {
-            AnalysisUsage AU;
-            P->getAnalysisUsage(AU);
-            for (const llvm::AnalysisID ID : AU.getRequiredSet()) {
-                if (ID == &llvm::MachineModuleInfoWrapperPass::ID) {
-                    ValidPhaseForInstrumentation = true;
-                    break;
-                }
-            }
-        }
-
-
-        auto *  const PIC = (ValidPhaseForInstrumentation && P->getAsImmutablePass() != nullptr) ? PICObj : nullptr;
-
+    PassMeasurements * PIC = nullptr;
+    if (P->getPotentialPassManagerType() == llvm::PMT_FunctionPassManager) {
+        PIC = PICObj;
+    }
+    const auto PassId = P->getPassID();
+    if (PassId == &TargetPassConfig::ID) {
+        auto * TPC = static_cast<TargetPassConfig *>(P);
+        TPC->setRequiresCodeGenSCCOrder();
+    } else if (PassId == &FinalizeISelID) {
+        Pass * const snippetPass = createFunctionSnippetTokenReplacerPass();
+        StringRef snippetPassName;
         if (PIC) {
-            BasePM.add(new PassInstrumentationStartCallback(*PIC, passName));
+            snippetPassName = PIC->intern(snippetPass->getPassName());
+            BasePM.add(new PassInstrumentationStartTimer(*PIC, snippetPassName));
         }
-        BasePM.add(P);
+        BasePM.add(snippetPass);
         if (PIC) {
-            BasePM.add(new PassInstrumentationEndCallback(*PIC, isAnalysisPass(P), passName));
+            BasePM.add(new PassInstrumentationEndTimer(*PIC, snippetPassName, true));
         }
-        if (PassId == &FinalizeISelID) {
-            Pass * snippetPass = createFunctionSnippetTokenReplacerPass();
-            auto callbackName = snippetPass->getPassName();
-            if (PICObj) {
-                BasePM.add(new PassInstrumentationStartCallback(*PICObj, callbackName));
-            }
-            BasePM.add(snippetPass);
-            if (PICObj) {
-                BasePM.add(new PassInstrumentationEndCallback(*PICObj, false, callbackName));
-            }
-            AlreadyInsertedFunctionSnippetPass = true;
-        }
-
-//    }
+    }
+    StringRef passName;
+    if (PIC) {
+        passName = PIC->intern(P->getPassName());
+        BasePM.add(new PassInstrumentationStartTimer(*PIC, passName));
+    }
+    BasePM.add(P);
+    if (PIC) {
+        BasePM.add(new PassInstrumentationEndTimer(*PIC, passName, true));
+    }
 }
 
 

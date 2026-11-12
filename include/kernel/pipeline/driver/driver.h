@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
+#include <llvm/Support/raw_ostream.h>
 
 namespace llvm { class Function; }
 namespace kernel { class KernelBuilder; }
@@ -66,6 +68,20 @@ public:
     const llvm::LLVMContext & getContext() const {
         return *mContext;
     }
+
+    enum class EmittedOutputOption {
+        ObjectCode
+        , ASM
+    };
+
+    static llvm::Error compile(kernel::KernelBuilder & b,
+                               kernel::Kernel::SelectedOptimizationPasses & passes,
+                               llvm::TargetMachine * const TM,
+                               llvm::PassInstrumentationCallbacks * const PIC,
+                               llvm::raw_pwrite_stream & emittedOutput,
+                               const EmittedOutputOption emittedOutputOption,
+                               std::unique_ptr<llvm::raw_svector_ostream> &UnoptimizedIROutput,
+                               std::unique_ptr<llvm::raw_svector_ostream> &OptimizedIROutput);
 
     static void runAllOptimizationPasses(kernel::KernelBuilder & b,
                                          kernel::Kernel::SelectedOptimizationPasses & passes,

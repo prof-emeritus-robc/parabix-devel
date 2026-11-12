@@ -51,14 +51,17 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/PromoteMemToReg.h>
-
+#include <llvm/CodeGen/CodeGenPassBuilder.h>
 #include <llvm/IRPrinter/IRPrintingPasses.h>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(19, 0, 0)
 #include <llvm/IR/PassInstrumentation.h>
 #endif
-
+#include <llvm/CodeGen/MachinePassManager.h>
+//#include <llvm/CodeGen/MachineFunctionAnalysis.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/FileSystem.h>
+#include <idisa/passes/function_snippet.h>
+#include <llvm/MC/MCStreamer.h>
 
 using namespace kernel;
 using namespace llvm;
@@ -210,8 +213,7 @@ private:
  ** ------------------------------------------------------------------------------------------------------------- */
 class FilteredPrintFunctionPass : public PrintFunctionPass {
 public:
-    FilteredPrintFunctionPass(raw_ostream & OS,
-                  const std::string & Banner = "")
+    FilteredPrintFunctionPass(raw_ostream & OS, const std::string & Banner = "")
     : PrintFunctionPass(OS, Banner)
     , RegexFilter(codegen::ShowIRFilter) {
 
@@ -230,6 +232,243 @@ private:
     const boost::regex RegexFilter;
 };
 
+
+template <typename DerivedT>
+class JITMachinePipelineBuilder : public llvm::CodeGenPassBuilder<DerivedT> {
+public:
+    using Base = llvm::CodeGenPassBuilder<DerivedT>;
+    JITMachinePipelineBuilder(llvm::TargetMachine &TM,
+                              const llvm::CGPassBuilderOption & Opts,
+                              llvm::PassInstrumentationCallbacks *PIC)
+    : Base(reinterpret_cast<LLVMTargetMachine &>(TM), Opts, PIC) {
+
+    }
+
+    void addPreISel(typename JITMachinePipelineBuilder::AddIRPass &) const {
+
+    }
+
+    void addPreRegAlloc(typename JITMachinePipelineBuilder::AddMachinePass & MFPM) const {
+        if (getFunctionSnippetMode() == FunctionSnippetMode::MIR) {
+           // MFPM.addPass(createFunctionSnippetTokenReplacerPass());
+        }
+        Base::addPreRegAlloc(MFPM);
+    }
+
+};
+
+class JITBackendRunner : public JITMachinePipelineBuilder<JITBackendRunner> {
+public:
+    using JITMachinePipelineBuilder<JITBackendRunner>::JITMachinePipelineBuilder;
+};
+
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief runAllOptimizationPasses
+ ** ------------------------------------------------------------------------------------------------------------- */
+llvm::Error BaseDriver::compile(kernel::KernelBuilder & b,
+                                kernel::Kernel::SelectedOptimizationPasses & passes,
+                                llvm::TargetMachine * const TM,
+                                llvm::PassInstrumentationCallbacks * const PIC,
+                                llvm::raw_pwrite_stream & emittedOutput,
+                                const EmittedOutputOption emittedOutputOption,
+                                std::unique_ptr<raw_svector_ostream> & UnoptimizedIROutput,
+                                std::unique_ptr<raw_svector_ostream> & OptimizedIROutput) {
+
+    LoopAnalysisManager LAM;
+    CGSCCAnalysisManager CGAM;
+    FunctionAnalysisManager FAM;
+    ModuleAnalysisManager MAM;
+    MachineFunctionAnalysisManager MFAM;
+
+    if (LLVM_UNLIKELY(PIC)) {
+        LAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        CGAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        MAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        FAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        MFAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+    }
+
+    CGAM.registerPass([&] { return FunctionAnalysisManagerCGSCCProxy(); });
+    CGAM.registerPass([&] { return ModuleAnalysisManagerCGSCCProxy(MAM); });
+
+    MAM.registerPass([&] { return FunctionAnalysisManagerModuleProxy(FAM); });
+    MAM.registerPass([&] { return CGSCCAnalysisManagerModuleProxy(CGAM); });
+
+    FAM.registerPass([&] { return ModuleAnalysisManagerFunctionProxy(MAM); });
+    FAM.registerPass([&] { return CGSCCAnalysisManagerFunctionProxy(CGAM); });
+
+    #ifndef NDEBUG
+    #define ADD_VERIFY_IR_PASS true
+    #else
+    const auto __verifyIR = codegen::DebugOptionIsSet(codegen::VerifyIR);
+    #define ADD_VERIFY_IR_PASS  LLVM_UNLIKELY(__verifyIR)
+    #endif
+
+    if (ADD_VERIFY_IR_PASS) {
+        MAM.registerPass([&] { return VerifierAnalysis(); });
+    }
+//    MAM.registerPass([&] { return ProfileSummaryAnalysis(); });
+
+//    MAM.registerPass([&] { return InlineAdvisorAnalysis(); });
+//    MAM.registerPass([&] { return LazyCallGraphAnalysis(); });
+
+//    FAM.registerPass([&] { return TargetIRAnalysis(); });
+
+//    FAM.registerPass([&] { return AssumptionAnalysis(); });
+//    FAM.registerPass([&] { return DominatorTreeAnalysis(); });
+//    FAM.registerPass([&] { return PostDominatorTreeAnalysis(); });
+//    FAM.registerPass([&] { return TargetLibraryAnalysis(); });
+//    FAM.registerPass([&] { return AAManager(); });
+
+//    FAM.registerPass([&] { return LoopAnalysis(); });
+//    FAM.registerPass([&] { return PhiValuesAnalysis(); });
+//    FAM.registerPass([&] { return MemoryDependenceAnalysis(); });
+//    FAM.registerPass([&] { return MemorySSAAnalysis(); });
+//    FAM.registerPass([&] { return OptimizationRemarkEmitterAnalysis(); });
+
+//    FAM.registerPass([&] { return BranchProbabilityAnalysis(); });
+//    FAM.registerPass([&] { return BlockFrequencyAnalysis(); });
+
+
+    // The passes above (in particular ModuleInlinerPass, added below) can depend on
+    // additional analyses that vary by LLVM version and are otherwise easy to miss
+    // registering by hand; a stale/missing registration corrupts silently in a
+    // Release build since AnalysisManager::lookUpPass only asserts in debug builds.
+    // PassBuilder::register*Analyses only fills in analyses that aren't already
+    // registered above, so our explicit choices (e.g. PassInstrumentationAnalysis
+    // bound to our own PIC) are preserved.
+
+    PassBuilder PB(TM, PipelineTuningOptions(), std::nullopt, PIC);
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    FunctionPassManager FPM;
+
+    Module & M = *b.getModule();
+
+    // PrintFunctionPass/FilteredPrintFunctionPass only store a raw_ostream&, and the
+    // passes aren't actually run until MPM.run() at the end of this function, so the
+    // backing raw_svector_ostream must outlive that call -- it cannot be scoped to
+    // just the "if" block that constructs it.
+
+    if (LLVM_UNLIKELY(UnoptimizedIROutput)) {
+        if (codegen::ShowIRFilter.empty()) {
+            FPM.addPass(PrintFunctionPass(*UnoptimizedIROutput));
+        } else {
+            FPM.addPass(FilteredPrintFunctionPass(*UnoptimizedIROutput));
+        }
+    }
+
+    ModulePassManager MPM;
+    if (ADD_VERIFY_IR_PASS) {
+        MPM.addPass(VerifierPass());
+    }
+    if (LLVM_UNLIKELY(!codegen::TraceOption.empty())) {
+        FPM.addPass(TracePass(b));
+    }
+    if (codegen::EnableModuleInliner) {
+        MPM.addPass(ModuleInlinerPass());
+    }
+
+    FPM.addPass(RemoveRedundantAllocaAndGEPInstructions());
+    FPM.addPass(SimplifyCFGPass());
+    FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+    // A kernel can opt out of InstCombine by adding the NoInstCombinePass marker.
+    const bool kernelSkipsInstCombine =
+        std::find(passes.begin(), passes.end(), Kernel::OptimizationPass::NoInstCombinePass) != passes.end();
+    if (!kernelSkipsInstCombine) {
+    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
+        FPM.addPass(llvm::InstCombinePass());
+    #else
+        llvm::InstCombineOptions Opts;
+        //Opts.VerifyFixpoint = false;
+        FPM.addPass(llvm::InstCombinePass(Opts));
+    #endif
+    }
+    FPM.addPass(DCEPass());
+    FPM.addPass(ReassociatePass());
+    FPM.addPass(GVNPass());
+
+    using P = Kernel::OptimizationPass;
+
+    for (const P pass : passes) {
+        switch (pass) {
+             case P::AggressiveInstCombinePass:
+                FPM.addPass(AggressiveInstCombinePass());
+                break;
+            case P::DCEPass:
+                FPM.addPass(DCEPass());
+                break;
+            case P::EarlyCSEPass:
+                FPM.addPass(EarlyCSEPass());
+                break;
+            case P::MemCpyOptPass:
+                FPM.addPass(MemCpyOptPass());
+                break;
+            case P::NewGVNPass:
+                FPM.addPass(NewGVNPass());
+                break;
+            case P::SimplifyCFGPass:
+                FPM.addPass(SimplifyCFGPass());
+                break;
+            case P::PHICanonicalizerPass:
+                FPM.addPass(PHICanonicalizerPass());
+                break;
+            case P::NoInstCombinePass:   // marker only, handled above
+                break;
+        }
+    }
+
+    // ShowIRFilter
+    if (LLVM_UNLIKELY(OptimizedIROutput)) {
+        if (codegen::ShowIRFilter.empty()) {
+            FPM.addPass(PrintFunctionPass(*OptimizedIROutput));
+        } else {
+            FPM.addPass(FilteredPrintFunctionPass(*OptimizedIROutput));
+        }
+    }
+
+    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+
+    if (ADD_VERIFY_IR_PASS) {
+        MPM.addPass(VerifierPass());
+    }
+
+    #undef ADD_VERIFY_IR_PASS
+
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
+    constexpr auto ObjFile = CodeGenFileType::ObjectFile;
+    constexpr auto ASMFile = CodeGenFileType::AssemblyFile;
+    #else
+    constexpr auto ObjFile = CGFT_ObjectFile;
+    constexpr auto ASMFile = CGFT_AssemblyFile;
+    #endif
+
+    const auto outputOpt = (emittedOutputOption == EmittedOutputOption::ASM) ? ASMFile : ObjFile;
+
+
+    // 3. Build the backend code generation pipeline using pure NewPM layout tools
+    llvm::CGPassBuilderOption Opts;
+    JITBackendRunner Builder(*TM, Opts, PIC);
+
+    #if LLVM_VERSION_MAJOR >= 18
+    Error Err = Builder.buildPipeline(MPM, FAM, emittedOutput, nullptr, outputOpt);
+    #else
+    llvm::MachineFunctionPassManager MFPM;
+    Error Err = Builder.buildPipeline(MPM, MFPM, emittedOutput, nullptr, outputOpt);
+    #endif
+    if (Err) {
+        return Err;
+    }
+
+    MPM.run(M, MAM);
+
+    return Error::success();
+}
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief runAllOptimizationPasses
@@ -293,8 +532,6 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
 
 //    FAM.registerPass([&] { return BranchProbabilityAnalysis(); });
 //    FAM.registerPass([&] { return BlockFrequencyAnalysis(); });
-
-
 
 
     // The passes above (in particular ModuleInlinerPass, added below) can depend on

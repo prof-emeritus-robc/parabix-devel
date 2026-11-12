@@ -55,25 +55,6 @@ using namespace kernel;
 
 using AttrId = kernel::Attribute::KindId;
 
-#if (defined(__has_builtin) && __has_builtin(__builtin_readcyclecounter)) || defined(__GNUC__)
-#elif defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#include <x86intrin.h>
-#else
-#include <chrono>
-#endif
-
-inline uint64_t getCycleCount() {
-    #if (defined(__has_builtin) && __has_builtin(__builtin_readcyclecounter)) || defined(__GNUC__)
-    return __builtin_readcyclecounter();
-    #elif defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    return __rdtsc();
-    #else
-    return static_cast<uint64_t>(std::chrono::steady_clock::now().count());
-    #endif
-}
-
 // Module::setTargetTriple took a StringRef prior to LLVM 21 and takes a Triple from LLVM 21 onward.
 template <typename ModulePtr>
 inline void setModuleTargetTriple(ModulePtr && M, const Triple & T) {
@@ -169,66 +150,11 @@ void printPassMeasurementStatistics(std::vector<CPUDriverContext *> & contexts) 
     const auto n = contexts.size();
     assert (n > 0);
     auto & M0 = contexts[0]->Measurements; assert (M0);
-
     for (size_t i = 1; i < n; ++i) {
         auto & MI = contexts[i]->Measurements; assert (MI);
         M0->update(*MI.get());
     }
-
-    const auto & measurements = M0->Measurements;
-
-    double sumMean = 0;
-    size_t maxNameLength = 0;
-    for (const auto & M : measurements) {
-        sumMean += M.Mean;
-        maxNameLength = std::max(maxNameLength, M.Name.size());
-    }
-    maxNameLength += 8;
-
-    struct Node {
-        const PassMeasurement * Metric = nullptr;
-        SmallVector<Node *, 1> Children;
-    };
-
-    const auto m = measurements.size();
-
-    std::function<void(size_t, unsigned)> postOrderPrint = [&](const size_t measurementIndex, const unsigned indent) {
-
-        auto & M = measurements[measurementIndex];
-        const auto normMean = (M.Mean * 100.0 / sumMean);
-        const auto normStdDev = (M.getStdDev() * 100.0 / M.Mean);
-        const auto modPerc = (double)M.ModifiedCount / (double)M.Count;
-
-        const auto & nm = M.Name;
-
-        errs().indent(indent);
-        errs() << nm;
-        errs().indent(maxNameLength - indent - nm.size());
-
-        errs() << ", " << llvm::formatv("{0,6}", M.Count);
-        errs() << ", " << llvm::formatv("{0,6:f2}", normMean);
-        errs() << ", " << llvm::formatv("{0,6:f2}", normStdDev);
-        errs() << ", " << llvm::formatv("{0,6:f2}", modPerc);
-        errs() << '\n';
-
-        // TODO: this is very inefficient but m is not expected to be large
-        for (size_t i = 0; i < m; ++i) {
-            auto & measure = measurements[i];
-            if (measure.Parent == measurementIndex) {
-                postOrderPrint(i, indent + 2);
-            }
-        }
-    };
-
-    for (size_t i = 0; i < m; ++i) {
-        auto & measure = measurements[i];
-        if (measure.Parent == PassMeasurements::MAX_INT) {
-            postOrderPrint(i, 0);
-        }
-
-    }
-
-
+    M0->print(errs());
 }
 
 enum class CPUDriverTaskType : size_t {
@@ -1079,8 +1005,16 @@ record_decl:
         M->setDataLayout(C.DataLayout);
         Target->linkExternalMethods(builder);
 
+        SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
+
+        PassInstrumentationCallbacks * PICObj = nullptr;
+        auto & measurements = C.Measurements;
+        if (LLVM_UNLIKELY(measurements.get())) {
+            PassInstrumentationCallbacks & PIC = measurements->PIC;
+            PICObj = &PIC;
+        }
 
         BEGIN_SCOPED_REGION
         NamedRegionTimer T(Target->getSignature(), Target->getName(),
@@ -1111,26 +1045,20 @@ record_decl:
             ParabixObjectCache::recordIRHash(*M);
         }
 
-        END_SCOPED_REGION
 
-        PassInstrumentationCallbacks * PICObj = nullptr;
-        auto & measurements = C.Measurements;
-        if (LLVM_UNLIKELY(measurements.get())) {
-            PassInstrumentationCallbacks & PIC = measurements->PIC;
-            PICObj = &PIC;
-        }
+
 
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);
-        TM->setOptLevel(codegen::BackEndOptLevel);
         BaseDriver::runAllOptimizationPasses(builder, passes, TM, PICObj, IROutput, OptIROutput);
 
-        legacy::PassManager PM;
 
-        SmallVector<char, 0> ASMOutput;
+        END_SCOPED_REGION
+
         SmallVector<char, 0> objBuffer;
-
         std::unique_ptr<SmallVectorMemoryBuffer> objCode;
+
+
 
         BEGIN_SCOPED_REGION
 
@@ -1151,6 +1079,7 @@ record_decl:
             #else
             constexpr auto ASMFile = CGFT_AssemblyFile;
             #endif
+
             // Use a separate PassManager (and a separate run()) for ASM emission.
             // TargetMachine::addPassesToEmitFile installs a full codegen pipeline
             // (isel, regalloc, AsmPrinter); appending a second one for the object
@@ -1178,6 +1107,7 @@ record_decl:
         constexpr auto ObjFile = CGFT_ObjectFile;
         #endif
 
+        legacy::PassManager PM;
         FunctionSnippetPassManagerProxy FPM(*M, PM, measurements.get());
         if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ObjFile))) {
             report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
@@ -1188,12 +1118,6 @@ record_decl:
         objCode = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
 
         END_SCOPED_REGION
-
-        assert (objCode.get());
-
-        if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
-            ObjectCache->saveCachedObjectFile(*M, objCode->getMemBufferRef());
-        }
 
         delete M;
 

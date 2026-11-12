@@ -344,7 +344,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             b.CreateCondBr(needsRealloc, allocateNewBuffer, allocateNewBufferExit);
 
             b.SetInsertPoint(allocateNewBuffer);
-            Value * const allocedBytes = b.CreateRoundUpRational(mallocBytes, CBuilder::PAGE_SIZE);
+            Value * const allocedBytes = b.CreateRoundUpRational(mallocBytes, CBuilder::PageSize);
             b.CreateFree(existingBuffer);
             Value * const newBuffer = b.CreateAlignedMalloc(allocedBytes, blockSize);
             b.CreateAlignedStore(newBuffer, mallocedPtr, PtrTyABIAlignment);
@@ -438,7 +438,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
                 FixedArray<Value *, 2> fields;
                 fields[0] = retAddress;
                 fields[1] = mallocBytes;
-                b.CreateAggregateRet(fields.data(), 2);
+                b.CreateAggregateRet(fields);
             } else {
                 b.CreateRet(retAddress);
             }
@@ -462,7 +462,13 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
         } else {
             processedItems = mCurrentProcessedItemCountPhi[inputPort];
         }
-        args[2] = processedItems;
+        // A LookBehind input reads items before the processed position: copy from the
+        // block holding the first of them, so that they are in the masked buffer too.
+        Value * copyStart = processedItems;
+        if (LLVM_UNLIKELY(port.LookBehind > 0)) {
+            copyStart = b.CreateUnsignedSaturatingSub(processedItems, b.getSize(port.LookBehind));
+        }
+        args[2] = copyStart;
         Value * const maxItems = b.CreateAdd(mCurrentProcessedItemCountPhi[inputPort], accessibleItems[inputPort.Number]);
         args[3] = maxItems;
         assert (port.RequiredOverflowSpace >= 0);
@@ -486,7 +492,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             const auto & DL = m->getDataLayout();
             const auto ts = b.getTypeSize(DL, buffer->getType(b));
             maskedCapacity = b.CreateMulRational(maskedBytes, Rational{b.getBitBlockWidth(), ts});
-            maskedCapacity = b.CreateAdd(processedItems, maskedCapacity);
+            maskedCapacity = b.CreateAdd(copyStart, maskedCapacity);
         }
         assert (maskedAddress->getType()->isPointerTy());
 

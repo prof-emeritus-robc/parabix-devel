@@ -32,6 +32,20 @@
 using namespace llvm;
 using namespace re;
 
+namespace {
+//  The blocking marks of a set (see ldml::DeletedRunBlockMark), which are not
+//  characters of the text: the automata do not see them, and the sets keep
+//  them.
+const UCD::UnicodeSet BlockingMarks(ldml::DeletedRunBlockMark, ldml::DeletedRunBlockMark + 1);
+//  The characters of a set, without its blocking marks if it has them (a
+//  complement, as [^c], has the noncharacters as characters, as before).
+UCD::UnicodeSet withoutMarks(const UCD::UnicodeSet & chars) {
+    return ldml::marksDeletedRunBlock(chars) || ldml::marksDeletedRunAllow(chars) ? chars - BlockingMarks : chars;
+}
+//  The failure of an earlier rule whose blocking marks L does not have.
+const std::string BlockedEarlier = "E: an earlier rule with blocking marks";
+}
+
 namespace ldml {
 
 namespace {
@@ -656,6 +670,9 @@ public:
     // Whether rule L is replaced (by the pieces, possibly none if L is
     // masked by its earlier rules), given its earlier overlapping rules.
     bool disambiguate(ConversionRule * L, const std::vector<ConversionRule *> & earlier, std::vector<Rule *> & pieces);
+    //  The earlier rules of the last disambiguate left to priority (see
+    //  DisambiguationStats::prioritized).
+    const std::vector<const ConversionRule *> & prioritized() const {return mPrioritized;}
 
     // Whether an earlier rule e may match where r matches under ICU's
     // matching, given that they overlap as regular expressions.
@@ -803,6 +820,7 @@ private:
     bool exploreSides(const std::vector<Earlier> & rules, std::vector<std::pair<Found, Found>> & sides);
 
     DisambiguationStats & mStats;
+    std::vector<const ConversionRule *> mPrioritized;
     CharSetAnalysis mAnalysis;
     RuleOverlapAnalysis mOverlaps;
     std::vector<LItem> mAfter;      // the items of L following its position: its key, then its after context
@@ -868,7 +886,7 @@ bool Disambiguator::parseL(RE * re, std::vector<LItem> & items, bool segments, s
             }
             std::vector<std::vector<codepoint_t>> strings;
             collectSetStrings(set, strings);
-            const UCD::UnicodeSet chars = mAnalysis.setOf(set, false);
+            const UCD::UnicodeSet chars = withoutMarks(mAnalysis.setOf(set, false));
             bool stringsOK = true;
             for (const auto & x : strings) {
                 stringsOK &= x.size() > 1 && chars.contains(x[0]);
@@ -894,7 +912,7 @@ bool Disambiguator::parseL(RE * re, std::vector<LItem> & items, bool segments, s
             reason = itemReason(e);
             return false;
         }
-        items.push_back(LItem{e, mAnalysis.setOf(e, false), 1, 1, false});
+        items.push_back(LItem{e, withoutMarks(mAnalysis.setOf(e, false)), 1, 1, false});
     }
     return true;
 }
@@ -1107,7 +1125,7 @@ bool Disambiguator::setElement(RE * re, bool reversed, Element & e) {
     }
     if (!CharSetAnalysis::isSet(re)) return false;
     e.set = re;
-    e.charSet = mAnalysis.setOf(re, false);
+    e.charSet = withoutMarks(mAnalysis.setOf(re, false));
     e.chars = e.charSet.empty() ? nullptr : charPart(re, e.charSet);
     e.strings.clear();
     collectSetStrings(re, e.strings);
@@ -1306,9 +1324,11 @@ bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::str
 }
 
 // The set x without the characters k, preserving the structure of unions.
-RE * Disambiguator::subtract(RE * x, const UCD::UnicodeSet & k) {
-    // (Of the characters of x only: not its strings or the text boundary.)
+RE * Disambiguator::subtract(RE * x, const UCD::UnicodeSet & removed) {
+    // (Of the characters of x only: not its strings or the text boundary.  The
+    // blocking marks of x are kept: see DeletedRunBlockMark.)
     const UCD::UnicodeSet xs = mAnalysis.setOf(x, false);
+    const UCD::UnicodeSet k = withoutMarks(xs) == xs ? removed : removed - BlockingMarks;
     x = charPart(x, xs);
     if ((xs - k).empty()) return nullptr;
     if (!xs.intersects(k)) return x;
@@ -1554,6 +1574,7 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
     std::vector<Step> steps;
     std::vector<std::set<State>> nexts;
     std::vector<LState> lNexts;
+
     for (const UCD::UnicodeSet & part : parts) {
         int item = -1;
         const LState lNext = lStep(part, item);
@@ -1563,13 +1584,29 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         }
         if (cls == nullptr && item >= 0 && lItems[item].chars == part) cls = lItems[item].set;
         if (cls == nullptr) cls = makeCC(part);
+        //  With blocking marks (see DeletedRunBlockMark): an earlier rule blocked
+        //  after a deleted run where L is not leaves L to apply there, which the
+        //  classes do not express (the pair is then prioritized: see
+        //  DisambiguationStats::prioritized); where L is blocked, so is its class.
+        auto marks = [&](RE * set) {
+            const UCD::UnicodeSet chars = mAnalysis.setOf(set, false);
+            return std::make_pair(marksDeletedRunBlock(chars), marksDeletedRunAllow(chars));
+        };
+        const auto lMarks = item >= 0 ? marks(lItems[item].set) : std::make_pair(false, false);
         std::set<State> next;
         for (const State & s : active) {
             for (const NFA::Edge & e : automaton(rules[s.first], after).out[s.second]) {
-                if (e.kind == NFA::Kind::Chars && e.chars.intersects(part)) next.insert(State{s.first, e.to});
+                if (e.kind != NFA::Kind::Chars || !e.chars.intersects(part)) continue;
+                next.insert(State{s.first, e.to});
+                const auto eMarks = marks(e.set);
+                if (lMarks.second || eMarks.second || (item >= 0 && eMarks.first && !lMarks.first)) {
+                    mFailure = BlockedEarlier;
+                    return false;
+                }
             }
         }
         closure(rules, after, next);
+        if (lMarks.first && !marks(cls).first) cls = makeCC(withDeletedRunBlock(part));
         steps.push_back(Step{cls, item});
         nexts.push_back(next);
         lNexts.push_back(lNext);
@@ -1643,6 +1680,33 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
     if (canEnd && (boundaryFails || !(excludedChars == UCD::UnicodeSet(0, UCD::UNICODE_MAX)))) {
         std::vector<RE *> excluded = edgeSets;
         excluded.insert(excluded.end(), candidateSets.begin(), candidateSets.end());
+        //  With blocking marks (see DeletedRunBlockMark): the negated set of
+        //  marked sets M, with other sets U, is that of U alone if M is within
+        //  U; otherwise (it would also match after a deleted run, which the
+        //  analyses of the sets, as characters, do not see) it is left to
+        //  priority.
+        UCD::UnicodeSet markedChars, plainChars;
+        std::vector<RE *> plain;
+        for (RE * set : excluded) {
+            const UCD::UnicodeSet chars = mAnalysis.setOf(set, false);
+            if (marksDeletedRunAllow(chars)) {
+                mFailure = BlockedEarlier;
+                return false;
+            }
+            if (marksDeletedRunBlock(chars)) {
+                markedChars = markedChars + withoutMarks(chars);
+            } else {
+                plainChars = plainChars + chars;
+                plain.push_back(set);
+            }
+        }
+        if (!markedChars.empty()) {
+            if (plain.empty() || !markedChars.subset(plainChars)) {
+                mFailure = BlockedEarlier;
+                return false;
+            }
+            excluded = plain;
+        }
         std::vector<Step> p = path;
         RE * const boundary = after ? static_cast<RE *>(makeEnd()) : static_cast<RE *>(makeStart());
         p.push_back(Step{negated(excluded, boundaryFails ? boundary : nullptr), -1});
@@ -1693,6 +1757,7 @@ bool Disambiguator::exploreSides(const std::vector<Earlier> & rules, std::vector
 }
 
 bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<ConversionRule *> & earlier, std::vector<Rule *> & pieces) {
+    mPrioritized.clear();
     const RuleSide * src = L->getLeftSide();
     if (L->getDirection() != Direction::Forward) {
         unresolved("L: not a forward rule", earlier.size());
@@ -1811,7 +1876,11 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         // The rules that cannot be explored alone remain unresolved; the
         // others may still be resolved together.
         if (rules.size() == 1) {
-            unresolved(failure());
+            if (mFailure == BlockedEarlier) {
+                mPrioritized.push_back(rules[0].rule);
+            } else {
+                unresolved(failure());
+            }
             return false;
         }
         const std::string joint = failure();
@@ -1821,6 +1890,8 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
             std::vector<std::pair<Found, Found>> s;
             if (exploreSides(one, s)) {
                 alone.push_back(std::move(e));
+            } else if (mFailure == BlockedEarlier) {
+                mPrioritized.push_back(e.rule);
             } else {
                 unresolved(failure());
             }
@@ -2222,6 +2293,13 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
     RuleOverlapAnalysis analysis;
     std::vector<Rule *> result;
     std::vector<size_t> origin;     // the index of the rule each result rule replaces
+    std::vector<std::pair<const Rule *, const Rule *>> prioritized;    // (see DisambiguationStats)
+    //  The pairs of the earlier rules left to priority with the rules replacing L.
+    auto prioritize = [&](const std::vector<Rule *> & by, std::vector<std::pair<const Rule *, const Rule *>> & pairs) {
+        for (const ConversionRule * e : d.prioritized()) {
+            for (const Rule * r : by) pairs.emplace_back(e, r);
+        }
+    };
     for (size_t i = 0; i < rules.size(); i++) {
         auto f = earlierOf.find(i);
         if (f == earlierOf.end()) {
@@ -2233,6 +2311,8 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
         const DisambiguationStats initial = s;
         std::vector<Rule *> pieces;
         bool replaced = d.disambiguate(L, f->second, pieces);
+        std::vector<std::pair<const Rule *, const Rule *>> pairs;
+        prioritize(replaced ? pieces : std::vector<Rule *>{L}, pairs);
         if (!replaced || s.pairsUnresolved != initial.pairsUnresolved) {
             // Not completely resolved: try splitting the sets of L with
             // strings or the text boundary into rules for their alternatives,
@@ -2244,6 +2324,7 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
                 const DisambiguationStats first = s;
                 s = initial;
                 std::vector<Rule *> altPieces;
+                std::vector<std::pair<const Rule *, const Rule *>> altPairs;
                 bool ok = true;
                 for (size_t k = 0; k < alternatives.size() && ok; k++) {
                     ConversionRule * A = cast<ConversionRule>(alternatives[k]);
@@ -2269,12 +2350,20 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
                     }
                     const size_t unresolved = s.pairsUnresolved;
                     std::vector<Rule *> p;
-                    ok = d.disambiguate(A, earlier, p) && s.pairsUnresolved == unresolved;
+                    ok = d.disambiguate(A, earlier, p);
+                    if (!ok && !d.prioritized().empty()) {
+                        //  (A, left to priority.)
+                        ok = true;
+                        p = {A};
+                    }
+                    ok = ok && s.pairsUnresolved == unresolved;
+                    prioritize(p, altPairs);
                     if (ok) s.pairsResolved -= blocking;
                     altPieces.insert(altPieces.end(), p.begin(), p.end());
                 }
                 if (ok) {
                     pieces = altPieces;
+                    pairs = altPairs;
                     replaced = true;
                     s.rulesReplaced = initial.rulesReplaced + 1;
                     s.rulesAdded = initial.rulesAdded + pieces.size();
@@ -2293,19 +2382,38 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
             result.push_back(L);
             origin.push_back(i);
         }
+        prioritized.insert(prioritized.end(), pairs.begin(), pairs.end());
     }
+    //  (An earlier rule E as given, replaced by the rules of the result
+    //  replacing it.)
+    std::map<const Rule *, std::vector<const Rule *>> replacing;
+    for (size_t k = 0; k < result.size(); k++) replacing[rules[origin[k]]].push_back(result[k]);
+    s.prioritized.clear();
+    for (const auto & pr : prioritized) {
+        for (const Rule * e : replacing[pr.first]) s.prioritized.emplace_back(e, pr.second);
+    }
+    const std::set<std::pair<const Rule *, const Rule *>> byPriority(s.prioritized.begin(), s.prioritized.end());
     // The remaining overlaps, under ICU's matching (pieces may be disjoint
     // from an earlier rule only under its longest-match or possessive
     // matching), counted as pairs of the original rules.
     std::set<std::pair<size_t, size_t>> remaining;
     for (const RuleOverlap & o : findRuleOverlaps(result)) {
         const std::pair<size_t, size_t> pair(origin[o.earlier], origin[o.later]);
+        if (byPriority.count({result[o.earlier], result[o.later]})) continue;
         if (remaining.count(pair) == 0 && d.mayOverlapUnderICU(cast<ConversionRule>(result[o.earlier]), cast<ConversionRule>(result[o.later]))) {
             remaining.insert(pair);
         }
     }
     s.overlapsAfter = remaining.size();
+    const std::vector<Rule *> unclosed = result;
     result = closeDeletionContexts(result, s);
+    //  (The pairs left to priority, of the rules as closed, in place.)
+    std::map<const Rule *, const Rule *> closed;
+    for (size_t k = 0; k < result.size() && result.size() == unclosed.size(); k++) closed[unclosed[k]] = result[k];
+    for (auto & pr : s.prioritized) {
+        if (closed.count(pr.first)) pr.first = closed[pr.first];
+        if (closed.count(pr.second)) pr.second = closed[pr.second];
+    }
     return result;
 }
 

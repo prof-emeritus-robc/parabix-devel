@@ -8,6 +8,9 @@
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/core/streamset.h>
 #include <string>
+#include <vector>
+
+namespace re { class CC; }
 
 using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
@@ -73,7 +76,18 @@ PreTokenizerResult buildPreTokenizerBoundaries(
 // (bytelevel, no normalizer), straight from the UTF-8 BasisBits. The nine classes are computed
 // on the decoded codepoints in place and only they are compressed to one slot per codepoint,
 // instead of all 21 codepoint bits. Returns U21tokenBoundaries' byte-domain equivalent.
-StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits);
+// classCode (--pretok-class-code): compress the 4-bit code of the nine classes instead.
+// byteDomain (--pretok-byte-domain, with classCode): no compression at all; the boundary rules
+// run on the bytes (GPT2ByteBoundaryLAKernel, on the classes at each codepoint's first byte).
+// utf8Classes (--pretok-utf8-classes, with byteDomain): compile the classes on the UTF-8 bytes
+// instead of on UTF8_Decoder's codepoints.
+// BPE_DUMP (debug): the source byte stream, for dumping the class streams.
+extern StreamSet * gPretokDumpSource;
+// extraCCs (with utf8Classes): more classes compiled in the same kernel, after the pretokenizer's
+// own; *classesOut, if given, is then set to the whole class set.
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode = false,
+                                    bool byteDomain = false, bool utf8Classes = false,
+                                    const std::vector<re::CC *> & extraCCs = {}, StreamSet ** classesOut = nullptr);
 
 // Stage 2b: spread codepoints, insert LF separators, filter whitespace.
 // Takes the PreTokenizerResult and returns the final U21 codepoint stream

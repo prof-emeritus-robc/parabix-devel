@@ -22,11 +22,12 @@
 #define WIN32_LEAN_AND_MEAN
 #define VC_EXTRALEAN
 #include <Windows.h>
-#elif defined(__linux__) || defined(__APPLE__)
+#else
 #include <sys/ioctl.h>
+#include <unistd.h>
 #include <stdio.h>
-#include <toolchain/toolchain.h>
 #endif
+#include <toolchain/toolchain.h>
 
 using namespace boost;
 using namespace boost::container;
@@ -58,7 +59,7 @@ inline size_t get_terminal_width(const size_t fileDefault) {
     }
     GetConsoleScreenBufferInfo(h, &csbi);
     return = csbi.srWindow.Right-csbi.srWindow.Left+1;
-#elif defined(__linux__) || defined(__APPLE__)
+#else
     if (isatty(STDERR_FILENO)) {
         struct winsize w;
         ioctl(STDERR_FILENO, TIOCGWINSZ, &w);
@@ -67,7 +68,7 @@ inline size_t get_terminal_width(const size_t fileDefault) {
     } else {
         return fileDefault;
     }
-#endif // Windows/Linux
+#endif // Windows/POSIX
 }
 
 #define BEGIN_SCOPED_REGION {

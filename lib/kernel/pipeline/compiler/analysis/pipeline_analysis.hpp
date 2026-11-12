@@ -226,7 +226,6 @@ private:
 
     void calculateRelativeToInputDataTransferIORates();
 
-    void simpleEstimateInterPartitionDataflow(PartitionGraph & P, pipeline_random_engine & rng);
 
     // princpal rate analysis functions
 

@@ -11,3 +11,7 @@ add_executable(cachejanitord
     object_cache_daemon.cpp)
 
 target_link_libraries(cachejanitord ${Boost_LIBRARIES})
+
+# Where the object cache finds it, as in an installation (see the top-level
+# CMakeLists.txt): <build>/libexec/parabix by default.
+set_target_properties(cachejanitord PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PARABIX_BUILD_LIBEXECDIR})

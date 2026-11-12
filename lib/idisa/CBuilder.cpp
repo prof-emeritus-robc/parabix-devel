@@ -17,11 +17,15 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Format.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <cstdarg>
 #include <cstdlib>
 #include <sys/mman.h>
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0     // (FreeBSD: memory is not reserved for mappings in any case)
+#endif
 #include <unistd.h>
 #include <stdio.h>
 #include <boost/filesystem.hpp>
@@ -92,7 +96,7 @@ using namespace llvm;
 
 static int accumulatedFreeCalls = 0;
 
-const size_t CBuilder::PAGE_SIZE = sys::Process::getPageSizeEstimate();
+const size_t CBuilder::PageSize = sys::Process::getPageSizeEstimate();
 
 extern "C" void free_debug_wrapper(void * ptr) {
     if (accumulatedFreeCalls < codegen::FreeCallBisectLimit) {
@@ -267,7 +271,7 @@ Value * CBuilder::CreateUnlinkCall(Value * path) {
 Value * CBuilder::CreatePosixFAllocate(Value * fileDescriptor, Value * offset, Value * len) {
 #if defined(__APPLE__) || defined(_WIN32)
     return nullptr;
-#elif defined(__linux__)
+#else
     Module * const m = getModule();
     IntegerType * sizeTy = getSizeTy();
     FunctionType * fty = FunctionType::get(sizeTy, {getInt32Ty(), sizeTy, sizeTy}, false);
@@ -750,7 +754,7 @@ Value * CBuilder::CreateMRemap(Value * addr, Value * oldSize, Value * newSize) {
         }
     } else { // no OS mremap support
         ptr = CreateAnonymousMMap(newSize);
-        CreateMemCpy(ptr, addr, oldSize, CBuilder::PAGE_SIZE);
+        CreateMemCpy(ptr, addr, oldSize, CBuilder::PageSize);
         CreateMUnmap(addr, oldSize);
     }
     return ptr;
@@ -771,7 +775,7 @@ Value * CBuilder::CreateMUnmap(Value * addr, Value * len) {
         IntegerType * const intPtrTy = getIntPtrTy(DL);
         CreateAssert(len, "CreateMUnmap: length cannot be 0");
         Value * const addrValue = CreatePtrToInt(addr, intPtrTy);
-        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE));
+        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, CBuilder::PageSize));
         CreateAssertZero(pageOffset, "CreateMUnmap: addr must be a multiple of the page size");
         Value * const boundCheck = CreateICmpULT(addrValue, CreateSub(ConstantInt::getAllOnesValue(intPtrTy), CreateZExtOrTrunc(len, intPtrTy)));
         CreateAssert(boundCheck, "CreateMUnmap: addresses in [addr, addr+len) are outside the valid address space range");
@@ -796,7 +800,7 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
 
         auto & DL = getModule()->getDataLayout();
         IntegerType * const intPtrTy = getIntPtrTy(DL);
-        Constant * const pageSize = ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE);
+        Constant * const pageSize = ConstantInt::get(intPtrTy, CBuilder::PageSize);
         CreateAssertZero(CreateURem(CreatePtrToInt(addr, intPtrTy), pageSize), "CreateMProtect: addr must be aligned to page boundary");
     }
 
@@ -952,8 +956,9 @@ struct __backtrace_data {
 extern "C"
 BOOST_NOINLINE
 void __report_failure_v(const char * name, const char * fmt, const __backtrace_data * const trace[], const uint32_t traceLength, va_list & args) {
-    // colourize the output if and only if stderr is piped to the terminal
-    const auto colourize = isatty(STDERR_FILENO) == 1;
+    // colourize the output if and only if stderr is a terminal (and not with
+    // NO_COLOR or TERM=dumb)
+    const auto colourize = toolio::useColor(toolio::ColorMode::Auto, STDERR_FILENO);
     raw_fd_ostream out(STDERR_FILENO, false);
     out << "Assertion Failure: ";
     if (trace) {
@@ -1328,7 +1333,12 @@ bool CBuilder::supportsIndirectBr() const {
     return !codegen::DebugOptionIsSet(codegen::DisableIndirectBranch);
 }
 
-BranchInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, BasicBlock * False, const int probability) {
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+CondBrInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, BasicBlock * False, const int probability)
+#else
+BranchInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, BasicBlock * False, const int probability)
+#endif
+{
     MDBuilder mdb(getContext());
     if (probability < 0 || probability > 100) {
         report_fatal_error("branch weight probability must be in [0,100]");
@@ -2244,7 +2254,11 @@ bool RemoveRedundantAssertionsPass::runOnModule(Module & M) {
             auto next = ci->eraseFromParent();
             // note: split automatically inserts an unconditional branch to the new block
             BasicBlock * const assertFinally = bb->splitBasicBlock(next, "__assert_ok");
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+            assert(dyn_cast_or_null<UncondBrInst>(bb->getTerminator()));
+#else
             assert(dyn_cast_or_null<BranchInst>(bb->getTerminator()));
+#endif
             bb->getTerminator()->eraseFromParent();
             builder.SetInsertPoint(bb);
             builder.CreateInvoke(assertFunc, assertFinally, rethrow, args);

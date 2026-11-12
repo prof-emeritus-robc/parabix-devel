@@ -8,6 +8,8 @@
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/ADT/SmallVector.h>
 #include <map>
+#include <llvm/Support/raw_ostream.h>
+#include <toolchain/toolio.h>
 
 /*
  * <Json2CSV> ::= <Array>
@@ -71,24 +73,25 @@ static void json2csv_resetAll() {
 }
 
 static void json2csv_printCSV() {
+    llvm::raw_ostream & out = toolio::out();
     std::map<std::string, std::map<int, std::string>>::iterator it;
     std::map<std::string, std::map<int, std::string>>::iterator nextIt;
     for (it = info.begin(); it != info.end(); it++) {
         nextIt = it;
         const char * sep = ++nextIt == info.end() ? "" : ",";
-	printf("%s%s", it->first.c_str(), sep);
+        out << it->first << sep;
     }
     for (uint64_t idx = 0; idx < currentIndex + 1; idx++) {
-        printf("\n");
+        out << "\n";
         for (it = info.begin(); it != info.end(); it++) {
             nextIt = it;
             const char * sep = ++nextIt == info.end() ? "" : ",";
             std::map<int, std::string> innerMap = it->second;
             std::map<int, std::string>::const_iterator pos = innerMap.find(idx);
             if (pos != innerMap.end()) {
-                printf("%s", pos->second.c_str());
+                out << pos->second;
             }
-            printf("%s", sep);
+            out << sep;
         }
     }
 }

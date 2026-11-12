@@ -12,6 +12,7 @@
 #include <sched.h>
 #include <boost/filesystem.hpp>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <toolchain/fileutil.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
@@ -95,7 +96,7 @@ MaxLimitTerminationMode("maxlimit-termination-mode",
                              clEnumValN(UntilNMode::ZeroAfterN, "zero", "fully process the file")));
 
 
-static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl::init(false));
+static cl::opt<bool> UseLayers("GrepUseLayers", cl::desc("Use pipeline layers"), cl::init(false));
 
 const auto ENCODING_BITS = 8;
 
@@ -203,7 +204,7 @@ void GrepEngine::setRecordBreak(GrepRecordBreakKind b) {
 
 namespace fs = boost::filesystem;
 
-std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths, size_t max_batch_size) {
+std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths, size_t max_batch_size, bool skipEmptyFiles) {
     const unsigned maxFilesPerGroup = 32;
     std::vector<std::vector<std::string>> groups;
     // The total size of files in the current group, or 0 if the
@@ -212,6 +213,7 @@ std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths
     for (auto p : paths) {
         boost::system::error_code errc;
         auto s = fs::file_size(p, errc);
+        if (skipEmptyFiles && !errc && (s == 0)) continue;
         if ((s > 0) && (s + 1 + groupTotalSize < max_batch_size)) {
             s += 1;  // +1 for an extra "\n"
             if (groupTotalSize == 0) {
@@ -241,7 +243,7 @@ void GrepEngine::initFileResult(const std::vector<boost::filesystem::path> & pat
     mResultStrs.resize(n);
     mFileStatus.resize(n, FileStatus::Pending);
     mInputPaths = paths;
-    mFileGroups = formFileGroups(paths, mBatchSize);
+    mFileGroups = formFileGroups(paths, mBatchSize, !reportsEmptyFiles());
     const unsigned numOfThreads = std::min(static_cast<unsigned>(codegen::TaskThreads),
                                            std::max(static_cast<unsigned>(mFileGroups.size()), 1u));
     codegen::setTaskThreads(numOfThreads);
@@ -1031,17 +1033,21 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
     if (fileNames.size() == 1) {
         int32_t fd = openFile(fileNames[0], strm);
         if (fd == -1) return 0;   // File error; skip.
-        struct stat st;
-        if (fstat(fd, &st) != 0)  return 0;
-        if (st.st_size == 0) return 0;
+        // Only try mmap for file groups consisting of a single file.
+        bool useMMap = mPreferMMap && canMMap(fileNames[0]);
+        // The whole file, or the standard input read to its end (the size of
+        // a pipe is the data in it at the moment, or 0)
+        AlignedFileBuffer buf;
+        const bool loaded = buf.load(fd, useMMap);
+        if (fd != STDIN_FILENO) close(fd);
+        if (!loaded || (buf.getBufSize() == 0)) {
+            buf.release();
+            return 0;
+        }
         accum.mFileNames.push_back(fileNames[0]);
         accum.mFileStartPositions.push_back(static_cast<size_t>(0));
         accum.setFileLabel(accum.mFileNames[0]);
         accum.mFileStartLineNumbers.push_back(~static_cast<size_t>(0));
-        // Only try mmap for file groups consisting of a single file.
-        bool useMMap = mPreferMMap && canMMap(fileNames[0]);
-        AlignedFileBuffer buf;
-        buf.load(fileNames[0], useMMap);
         size_t bytes_read = buf.getBufSize();
         if (bytes_read <= 0) return 0;
         accum.mBatchBuffer = buf.getBuf();
@@ -1183,6 +1189,7 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
         #endif
         int32_t fileDescriptor = open(fileName.c_str(), flags);
         if (LLVM_UNLIKELY(fileDescriptor == -1)) {
+            mFileErrorFound = true;
             if (!mSuppressFileMessages) {
                 msgstrm << "icgrep: \"" << fileName << "\": ";
                 if (errno == EACCES) {
@@ -1198,6 +1205,7 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
             return fileDescriptor;
         }
         if (stat(fileName.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
+            mFileErrorFound = true;
             if (!mSuppressFileMessages) {
                 msgstrm << "icgrep: " << fileName << ": Is a directory.\n";
             }
@@ -1255,7 +1263,7 @@ void GrepEngine::DoGrepThreadMethod() {
             while ((mNextFileToPrint < mFileGroups.size()) && (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete)) {
                 const auto output = mResultStrs[mNextFileToPrint].str();
                 if (!output.empty()) {
-                    llvm::outs() << output;
+                    toolio::out() << output;
                 }
                 mFileStatus[mNextFileToPrint] = FileStatus::PrintComplete;
                 mNextFileToPrint++;
@@ -1270,7 +1278,7 @@ void GrepEngine::DoGrepThreadMethod() {
         if (readyToPrint) {
             const auto output = mResultStrs[mNextFileToPrint].str();
             if (!output.empty()) {
-                llvm::outs() << output;
+                toolio::out() << output;
             }
             mFileStatus[mNextFileToPrint] = FileStatus::PrintComplete;
             mNextFileToPrint++;
@@ -1281,7 +1289,7 @@ void GrepEngine::DoGrepThreadMethod() {
     if (mGrepStdIn) {
         std::ostringstream s;
         const auto grepResult = doGrep({"-"}, s);
-        llvm::outs() << s.str();
+        toolio::out() << s.str();
         if (grepResult) grepMatchFound = true;
     }
 }

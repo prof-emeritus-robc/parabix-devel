@@ -35,6 +35,25 @@ inline void setLowestPriority() {
     assert (nicesetting != -1);
 }
 
+// How often a sleeping janitor checks that its cache directory still exists.
+#define CACHE_DIRECTORY_CHECK_SECONDS (60)
+
+// Sleeps until the given time, or returns false as soon as the cache directory
+// is gone (e.g., a temporary one of a test), so that no janitor outlives it.
+inline bool sleepWhileCacheExists(const fs::path & cachePath, const time_t until) {
+    for (;;) {
+        const auto now = currentTime();
+        if (now >= until) {
+            return true;
+        }
+        std::this_thread::sleep_for(seconds(std::min<time_t>(until - now, CACHE_DIRECTORY_CHECK_SECONDS)));
+        system::error_code ec;
+        if (BOOST_UNLIKELY(!fs::is_directory(cachePath, ec))) {
+            return false;
+        }
+    }
+}
+
 inline int runCacheCleanUp(const fs::path cachePath) noexcept {
 
     // Iteratively delete any files in "cachePath" that haven't been touched in
@@ -110,7 +129,10 @@ inline int runCacheCleanUp(const fs::path cachePath) noexcept {
                 ctime_r(&nextCleanUpTime, writtenTime);
                 writtenTime[24] = '\0';  // Removes the newline that is added
                 syslog(LOG_NOTICE | LOG_USER, "sleeping until %s...", writtenTime);
-                std::this_thread::sleep_until(system_clock::from_time_t(nextCleanUpTime));
+                if (BOOST_UNLIKELY(!sleepWhileCacheExists(cachePath, nextCleanUpTime))) {
+                    syslog(LOG_NOTICE | LOG_USER, "cache directory is gone; stopping...");
+                    return 0;
+                }
                 syslog(LOG_INFO | LOG_USER, "waking...");
                 createPidFile = false;
             }

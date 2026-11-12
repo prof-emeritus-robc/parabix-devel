@@ -8,6 +8,7 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/util/hex_convert.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 
 #include "idisa_operations.h"
 
@@ -24,8 +25,8 @@ cl::list<string> OperationArgs(cl::ConsumeAfter, cl::desc("[operation args..]"))
 
 cl::OptionCategory ExerciserFlags("C. Command Flags");
 
-cl::opt<string> OperationOutputFile("output", cl::value_desc("output"),
-                                    cl::desc("Write the output of the operation to a file."), cl::cat(ExerciserFlags));
+// --output: write the output of the operation to a file (- for the standard output)
+static toolio::RegisterOutputOptions OutputOptions;
 cl::opt<bool> OperationOutputHex("x", cl::desc("Write the output as a hex dump."), cl::cat(ExerciserFlags));
 
 cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(ExerciserFlags));
@@ -58,7 +59,7 @@ int main(int argc, char *argv[]) {
 
     string overview =
         "Exercise an IDISA operation implementation, by comparing to a scalar reference or by timing runs.";
-    codegen::ParseCommandLineOptions(argc, argv, {&ExerciserFlags, codegen::codegen_flags()}, overview);
+    codegen::ParseCommandLineOptions(argc, argv, {&ExerciserFlags, &toolio::InputOutputOptions, codegen::codegen_flags()}, overview);
 
     // Disable caching, if we're doing testing it's almost certainly a hazard -- also, it breaks our method for figuring
     // out which builder was used for compilation
@@ -76,11 +77,11 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     // I don't have a better dummy sink than file output right now, so I guess we permit this
-    // if (!OperationOutputFile.empty() && (WarmupCount != 0)) {
+    // if (toolio::outputRequested() && (WarmupCount != 0)) {
     //     WarmupCount.error("Output can only be recorded if repeat count is 1, with no warmup.");
     //     return 2;
     // }
-    // if (!OperationOutputFile.empty() && (RepeatCount != 1)) {
+    // if (toolio::outputRequested() && (RepeatCount != 1)) {
     //     RepeatCount.error("Output can only be recorded if repeat count is 1, with no warmup.");
     //     return 2;
     // }
@@ -90,7 +91,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (ReportTiming && !DisableChecks) {
-        outs() << "timing: warning: checks are enabled, parallelization of the test and check kernels can result in "
+        errs() << "timing: warning: checks are enabled, parallelization of the test and check kernels can result in "
                   "timing which only depends on the slowest kernel\n";
     }
     CPUDriver driver("idisa_exerciser");
@@ -98,7 +99,10 @@ int main(int argc, char *argv[]) {
     if (operationConfig->configurePipelineFromArgs(OperationArgs, !DisableChecks)) {
         return 2;
     }
-    if (!OperationOutputFile.empty()) {
+    if (toolio::outputRequested()) {
+        if (!toolio::openOutput()) {
+            return 2;
+        }
         StreamSet *convertedOutput = operationConfig->getOutputStream();
         PipelineBuilder &p = operationConfig->getPipelineBuilder();
         if (OperationOutputHex) {
@@ -106,9 +110,8 @@ int main(int argc, char *argv[]) {
             p.CreateKernelCall<BinaryToHex>(convertedOutput, outputAsHex);
             convertedOutput = outputAsHex;
         }
-        Scalar *outputFilename = p.getInputScalar(OperationConfig::outputFilenameIdent);
-        p.CreateKernelCall<FileSink>(outputFilename, convertedOutput);
-        operationConfig->setOutputFilename(OperationOutputFile);
+        p.CreateKernelCall<FDSinkKernel>(p.getInputScalar(OperationConfig::outputFDIdent), convertedOutput);
+        operationConfig->setOutputFD(toolio::outputFD());
     }
 
     chrono::steady_clock::time_point compileStart;
@@ -118,7 +121,7 @@ int main(int argc, char *argv[]) {
     operationConfig->compilePipeline();
     if (ReportTiming) {
         auto compileTimeUs = chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now() - compileStart);
-        outs() << "timing: compile: " << operationConfig->getKernelBuilderID() << " took " << compileTimeUs.count()
+        errs() << "timing: compile: " << operationConfig->getKernelBuilderID() << " took " << compileTimeUs.count()
                << " us\n";
     }
     if (!QuietMode && !DisableChecks) {
@@ -134,7 +137,7 @@ int main(int argc, char *argv[]) {
                        << " incorrect blocks during warmup #" << i << "\n";
             }
             if (ReportTiming) {
-                outs() << "timing: aborting due to test failure during warmup #" << i << "\n";
+                errs() << "timing: aborting due to test failure during warmup #" << i << "\n";
             }
             return 1;
         }
@@ -155,7 +158,7 @@ int main(int argc, char *argv[]) {
                        << " incorrect blocks during run #" << i << "\n";
             }
             if (ReportTiming) {
-                outs() << "timing: aborting due to test failure during run #" << i << "\n";
+                errs() << "timing: aborting due to test failure during run #" << i << "\n";
             }
             return 1;
         }
@@ -172,24 +175,24 @@ int main(int argc, char *argv[]) {
     if (ReportTiming) {
         assert(execTimesUs.size() > 0);
         if (execTimesUs.size() == 0) {
-            outs() << "timing: kernel execution: no data!\n";
+            errs() << "timing: kernel execution: no data!\n";
         } else if (execTimesUs.size() == 1) {
-            outs() << "timing: kernel execution: " << execTimesUs[0].count() << " us\n";
+            errs() << "timing: kernel execution: " << execTimesUs[0].count() << " us\n";
         } else {
             if (!QuietMode) {
-                outs() << "timing: kernel execution: raw data us (including dropped elements): ";
+                errs() << "timing: kernel execution: raw data us (including dropped elements): ";
                 unsigned i = 0;
                 for (auto const &t : execTimesUs) {
                     if ((i >= 1000) && (execTimesUs.size() > 1000)) {
-                        outs() << " // Data table too large, truncating to 1000 elements";
+                        errs() << " // Data table too large, truncating to 1000 elements";
                         break;
                     }
                     if (i > 0)
-                        outs() << ", ";
-                    outs() << t.count();
+                        errs() << ", ";
+                    errs() << t.count();
                     ++i;
                 }
-                outs() << "\n";
+                errs() << "\n";
             }
             std::sort(execTimesUs.begin(), execTimesUs.end());
             execTimesUs.erase(execTimesUs.end() - DropWorstCount, execTimesUs.end());
@@ -206,24 +209,24 @@ int main(int argc, char *argv[]) {
             }
             // -1 from size for sample deviation
             double stdevExecUs = sqrt(devExecUs2 / (execTimesUs.size() - 1));
-            outs() << "timing: kernel execution: " << static_cast<int64_t>(round(meanExecUs)) << " us mean, "
+            errs() << "timing: kernel execution: " << static_cast<int64_t>(round(meanExecUs)) << " us mean, "
                    << static_cast<int64_t>(round(stdevExecUs)) << " us sample dev, " << execTimesUs.size()
                    << " runs counted";
             if (DropWorstCount || DropBestCount) {
-                outs() << "; ";
+                errs() << "; ";
                 if (DropWorstCount) {
-                    outs() << DropWorstCount << " worst";
+                    errs() << DropWorstCount << " worst";
                     if (DropBestCount) {
-                        outs() << ", ";
+                        errs() << ", ";
                     }
                 }
                 if (DropBestCount) {
-                    outs() << DropWorstCount << " best";
+                    errs() << DropBestCount << " best";
                 }
-                outs() << " not counted";
+                errs() << " not counted";
             }
-            outs() << "\n";
+            errs() << "\n";
         }
     }
-    return 0;
+    return toolio::finishOutput() ? 0 : 2;
 }

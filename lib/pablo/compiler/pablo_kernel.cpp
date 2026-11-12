@@ -200,6 +200,15 @@ Ones * PabloKernel::getAllOnesValue(Type * type) {
 }
 
 void PabloKernel::addInternalProperties(KernelBuilder & b) {
+    // A Pablo kernel is driven by its input streams: without any, it has no
+    // number of items to process, and its final block (where the EOF marks
+    // are set) cannot be compiled.  (A kernel of a stream computed from
+    // nothing, such as the positions of the text, takes the text as an input.)
+    // (Checked here, when the kernel is compiled: some kernels bind their
+    // inputs after the PabloKernel is constructed.)
+    if (LLVM_UNLIKELY(getNumOfStreamInputs() == 0)) {
+        report_fatal_error(llvm::StringRef("PabloKernel ") + getName() + ": a Pablo kernel must have an input stream set");
+    }
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
     auto & C = b.getContext();
     mContext = &C;

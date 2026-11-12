@@ -2439,8 +2439,17 @@ Value * PipelineCompiler::calculateNumOfLinearItems(KernelBuilder & b, const Buf
         const auto refInput = getInput(mKernelId, refPort);
         const BufferPort & ref = mBufferGraph[refInput];
         return calculateNumOfLinearItems(b, ref, linearStrides, location);
+    } else if (rate.isUnknown()) {
+        // An unknown input reads whatever is accessible; an unknown output (a managed buffer)
+        // is guaranteed only its lower bound.
+        if (port.Port.Type == PortType::Input) {
+            return getAccessibleInputItems(b, port);
+        }
+        return b.CreateMulRational(linearStrides, rate.getLowerBound() * mKernel->getStride());
     }
-    llvm_unreachable("unexpected rate type");
+    // Not llvm_unreachable: in a release build that lets an unhandled rate fall into the relative
+    // case above and look up a reference that does not exist.
+    report_fatal_error(StringRef(mKernel->getName()) + "." + binding.getName() + ": unhandled processing rate in calculateNumOfLinearItems");
 }
 
 }

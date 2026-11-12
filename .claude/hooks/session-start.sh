@@ -3,7 +3,7 @@
 #  SPDX-License-Identifier: OSL-3.0
 #
 #  SessionStart hook for Claude Code cloud sessions: installs the build
-#  dependencies of Parabix (LLVM >= 16 development files, Boost, Z3),
+#  dependencies of Parabix (LLVM >= 16 development files, Boost),
 #  configures a Release build in build/ and builds the LDML tools
 #  (ldml_trules, tconv).  Idempotent: packages already installed are not
 #  reinstalled, and make rebuilds only what changed.
@@ -16,7 +16,7 @@ fi
 cd "$CLAUDE_PROJECT_DIR"
 
 packages=(cmake g++ python3 llvm-18-dev libboost-filesystem-dev libboost-iostreams-dev
-          libboost-regex-dev libz3-dev zlib1g-dev libzstd-dev)
+          libboost-regex-dev zlib1g-dev libzstd-dev)
 missing=()
 for p in "${packages[@]}"; do
   dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")

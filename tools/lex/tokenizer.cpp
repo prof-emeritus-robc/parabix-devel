@@ -20,6 +20,8 @@
 #include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
+#include <toolchain/fileutil.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/streamutils/deletion.h>
@@ -148,16 +150,16 @@ static void emitToken(uint16_t id, const std::string & tokStr) {
             offsetAdvanceTo(eByte);
         }
         if (gOutputStrings)
-            llvm::outs() << id << '\t' << s << '\t' << e << '\t' << tokStr << "\n";
+            toolio::out() << id << '\t' << s << '\t' << e << '\t' << tokStr << "\n";
         else
-            llvm::outs() << id << '\t' << s << '\t' << e << "\n";
+            toolio::out() << id << '\t' << s << '\t' << e << "\n";
         return;
     }
 
     if (gOutputStrings && gBPE)
-        llvm::outs() << id << '\t' << tokStr << "\n";
+        toolio::out() << id << '\t' << tokStr << "\n";
     else
-        llvm::outs() << id << "\n";
+        toolio::out() << id << "\n";
 }
 
 // bpe_emit_token
@@ -194,7 +196,7 @@ static void bpe_emit_id(uint16_t id) {
         unsigned v = id;
         do { *--p = char('0' + v % 10); v /= 10; } while (v);
         std::lock_guard<std::mutex> lock(gEmitMutex);
-        llvm::outs().write(p, end - p);
+        toolio::out().write(p, end - p);
         return;
     }
     const std::string tokStr = gBPE ? gBPE->decodeToken(static_cast<int>(id)) : std::string();
@@ -244,8 +246,10 @@ static void runBPEWithSpecialTokens(BPEFnPtr bpeFn, const char * buf, size_t nby
 }
 
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required,
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"),
                                       cl::cat(wordBreakerFlags));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 
 static cl::list<NormalizationMode> Normalization(
     "normalize",
@@ -393,6 +397,36 @@ static cl::opt<bool> PretokCompressClasses(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+// --pretok-class-code (with --pretok-compress-classes): the nine classes fall into 10
+// disjoint categories, so compress their 4-bit code (4 streams, each one Unicode set)
+// instead of the 9 class streams; the boundary kernels decode it.
+static cl::opt<bool> PretokClassCode(
+    "pretok-class-code",
+    cl::desc("With --pretok-compress-classes: compress a 4-bit code of the classes instead of "
+             "the 9 class streams."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+// --pretok-byte-domain (with --pretok-class-code): find the GPT-2 pretoken starts on the bytes
+// themselves (each class at its codepoint's first byte, and advanced to its last byte by the
+// UTF-8 lead byte), with no compression to one slot per codepoint and no spreading back:
+// drops FilterByMask, SpreadByMask and UTF8_index.
+static cl::opt<bool> PretokByteDomain(
+    "pretok-byte-domain",
+    cl::desc("With --pretok-class-code: compute the pretoken boundaries in the byte domain, "
+             "without compressing the classes to codepoints."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+// --pretok-utf8-classes (with --pretok-byte-domain): compile the 4 class-code sets on the UTF-8
+// bytes (marked at each sequence's first byte) instead of decoding codepoints first.
+static cl::opt<bool> PretokUTF8Classes(
+    "pretok-utf8-classes",
+    cl::desc("With --pretok-byte-domain: compute the classes from the UTF-8 bytes, without "
+             "decoding codepoints."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
 static cl::opt<unsigned> BenchLoop(
     "bench-loop",
     cl::desc("BPE mode: tokenize the input N times inside one process (excludes OS "
@@ -401,7 +435,47 @@ static cl::opt<unsigned> BenchLoop(
     cl::init(0),
     cl::cat(wordBreakerFlags));
 
-using WordBreakerFunctionType = void (*)(uint32_t fd);
+// --bench-cold-cache: empty the --bpe-tail segment caches before every --bench-loop run, so
+// each timed run starts cold like a one-shot run instead of reusing the words the previous
+// run cached from the same input. The caches are cleared, not freed, so the run still skips
+// the page faults a one-shot run pays.
+static cl::opt<bool> BenchColdCache(
+    "bench-cold-cache",
+    cl::desc("With --bench-loop and --bpe-tail: start every run with empty segment caches."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+// --auto-segment-size: choose --segment-size from the input's size and --thread-num, unless
+// --segment-size is given. The pipeline bakes the segment length in when it is built, so this
+// runs before the build. Bigger segments save per-segment work (sync, kernel calls, edge
+// words): 4 threads, 50 MB / 256 MB inputs -7% at 128K-256K. Too few segments per thread
+// leave threads idle on uneven text (4 MB multi-language at 64K, 16 per thread: +4%), so the
+// size grows (powers of two from the default 16K, at most 256K) only while every thread
+// still gets at least kAutoSegPerThread segments. A 4 MB input at 4 threads keeps 16K.
+static cl::opt<bool> AutoSegmentSize(
+    "auto-segment-size",
+    cl::desc("BPE mode: pick --segment-size from the input size and --thread-num "
+             "(16K..256K, >= 64 segments per thread) unless --segment-size is given (default off)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+static constexpr uint64_t kAutoSegPerThread = 64;
+static constexpr unsigned kAutoSegMin = 16384, kAutoSegMax = 262144;
+
+static void applyAutoSegmentSize(const std::string & path) {
+    if (!AutoSegmentSize) return;
+    auto & opts = cl::getRegisteredOptions();
+    auto it = opts.find("segment-size");
+    if (it != opts.end() && it->second->getNumOccurrences() != 0) return;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || st.st_size <= 0) return;
+    const uint64_t perSeg = uint64_t(st.st_size) / (uint64_t(std::max(1u, codegen::SegmentThreads)) * kAutoSegPerThread);
+    unsigned seg = kAutoSegMin;
+    while (seg < kAutoSegMax && uint64_t(seg) * 2 <= perSeg) seg *= 2;
+    codegen::SegmentSize = std::max(codegen::SegmentSize, seg);
+    std::cerr << "[BPE] --auto-segment-size: " << codegen::SegmentSize << "\n";
+}
+
+using WordBreakerFunctionType = void (*)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 // writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
 // to stdout.  Extracted to avoid repeating the P2SKernel + StdOutKernel pair
@@ -409,7 +483,7 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
     StreamSet * output = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(basis, output);
-    P.CreateKernelCall<StdOutKernel>(output);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), output);
 }
 
 //  bpePipeline
@@ -435,21 +509,33 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
 // HuggingFace's benchmark, which tokenizes an already-loaded in-memory string.
 using BPEPipelineFunctionType = void (*)(const char * buffer, size_t length);
 
-static BPEPipelineFunctionType buildBPEPipeline(
-        CPUDriver & driver,
-        const BPETokenizer & bpe) {
+// --memsource-in-place: main loads the input once into a buffer laid out like
+// MemorySourceKernel's own copy (page aligned, zeros through one page past the data), and
+// the source kernel reads that buffer in place instead of copying it on every pipeline call
+// (a serial malloc + memcpy + page faults before the workers start). Any other buffer (the
+// pieces around a <|endoftext|>) is still copied: the pipeline gets inPlace = 0 for it.
+static cl::opt<bool> MemSourceInPlace(
+    "memsource-in-place",
+    cl::desc("BPE mode: let the in-memory source read the padded input buffer in place "
+             "instead of copying it on every pipeline call (default off)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+using BPEPipelineInPlaceType = void (*)(const char * buffer, size_t length, size_t inPlace);
+static BPEPipelineInPlaceType gBPEInPlaceFn = nullptr;
+static const char * gPaddedBuf = nullptr;   // the padded whole-input buffer, if any
+static size_t gPaddedLen = 0;
+static void bpeInPlaceCall(const char * buffer, size_t length) {
+    gBPEInPlaceFn(buffer, length, buffer == gPaddedBuf && length == gPaddedLen && length > 0 ? 1 : 0);
+}
 
-    auto __tBuild0 = std::chrono::steady_clock::now();
-    bpeSetFrameworkHooks();
-    auto P = CreatePipeline(driver,
-                            Input<const char*>{"buffer"}, Input<size_t>{"length"});
-    Scalar * const buffer = P.getInputScalar("buffer");
-    Scalar * const length = P.getInputScalar("length");
-
+static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const BPETokenizer & bpe,
+                                   Scalar * buffer, Scalar * length, Scalar * inPlace,
+                                   std::chrono::steady_clock::time_point __tBuild0) {
     // Stage 0: in-memory source — no fd, no per-call read(). The caller loads the
     // file once (see main) and passes the resident pointer + length each call.
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
+    if (inPlace) P.CreateKernelCall<MemorySourceKernel>(buffer, length, inPlace, ByteStream);
+    else P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
@@ -486,6 +572,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
     //        compare_bpe.py step 1; 0x0A bytes mark separators).
     StreamSet * bpeBasis;
     StreamSet * bpeBoundary = nullptr;   // pretoken-start mask fed to BPE (gates merges)
+    StreamSet * cutClassSet = nullptr;   // the pretokenizer's classes with the cut classes (--pair-cuts=3)
     if (PreTokenizer.getNumOccurrences() == 0) {
         // No pretokenizer. By default treat '\n' as real content — it seeds to
         // id 198 (GPT-2 'Ċ') and flows through the merges, matching HuggingFace
@@ -495,10 +582,15 @@ static BPEPipelineFunctionType buildBPEPipeline(
                                  : normalizedBasis;
     } else if (compressClasses) {
         bpeBasis    = normalizedBasis;
-        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits);
+        gPretokDumpSource = ByteStream;
+        // --pair-cuts=3: the BPE cut classes compiled with the pretokenizer's classes
+        const std::vector<re::CC *> cutCCs = PretokClassCode && PretokByteDomain && PretokUTF8Classes
+                                           ? bpeCutClassCCs(bpe) : std::vector<re::CC *>{};
+        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes,
+                                              cutCCs, &cutClassSet);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
-        // mark pretoken STARTS. Feed BPE the RAW bytes (BPERangeSeed does bytes_to_unicode
+        // mark pretoken STARTS. Feed BPE the RAW bytes (BPEBaseIdKernel does bytes_to_unicode
         // ONCE — using ptResult's Ġ-remapped bytes would double-encode) plus the
         // byte-domain boundary mask (ptResult.U21tokenBoundaries, already 1-per-byte for
         // bytelevel) so merges can't cross a pretoken boundary .
@@ -567,7 +659,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
                     p += table.second[ids[i]];
                 }
                 std::lock_guard<std::mutex> lock(gEmitMutex);
-                llvm::outs().write(buf.data(), p - buf.data());
+                toolio::out().write(buf.data(), p - buf.data());
                 return;
             }
             if (gFastEmit && !gEmitDbg) {
@@ -583,7 +675,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
                     text.append(p, end - p);
                 }
                 std::lock_guard<std::mutex> lock(gEmitMutex);
-                llvm::outs().write(text.data(), text.size());
+                toolio::out().write(text.data(), text.size());
                 return;
             }
             for (size_t i = 0; i < n; i++) bpe_emit_id(ids[i]);
@@ -594,7 +686,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
                 bpeBytes = P.CreateStreamSet(1, 8);
                 P.CreateKernelCall<P2SKernel>(bpeBasis, bpeBytes);
             }
-            buildBPEByteTailEmitter(P, bpeBytes, tr.segStarts);
+            buildBPEByteTailEmitter(P, bpeBytes, bpeBasis, tr.segStarts, cutClassSet);
         } else {
             buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
         }
@@ -610,7 +702,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
     }
 
     auto __tBuild1 = std::chrono::steady_clock::now();
-    auto fn = reinterpret_cast<BPEPipelineFunctionType>(P.compile());
+    void * const fn = P.ProgramBuilder::compile();
     auto __tCompile1 = std::chrono::steady_clock::now();
 
     std::cerr << "[BPE] pipeline graph build: "
@@ -622,14 +714,34 @@ static BPEPipelineFunctionType buildBPEPipeline(
     return fn;
 }
 
+static BPEPipelineFunctionType buildBPEPipeline(
+        CPUDriver & driver,
+        const BPETokenizer & bpe) {
+
+    auto __tBuild0 = std::chrono::steady_clock::now();
+    bpeSetFrameworkHooks();
+    if (MemSourceInPlace) {
+        auto P = CreatePipeline(driver, Input<const char*>{"buffer"}, Input<size_t>{"length"},
+                                Input<size_t>{"inPlace"});
+        gBPEInPlaceFn = reinterpret_cast<BPEPipelineInPlaceType>(buildBPEPipelineBody(
+            P, driver, bpe, P.getInputScalar("buffer"), P.getInputScalar("length"),
+            P.getInputScalar("inPlace"), __tBuild0));
+        return bpeInPlaceCall;
+    }
+    auto P = CreatePipeline(driver,
+                            Input<const char*>{"buffer"}, Input<size_t>{"length"});
+    return reinterpret_cast<BPEPipelineFunctionType>(buildBPEPipelineBody(
+        P, driver, bpe, P.getInputScalar("buffer"), P.getInputScalar("length"), nullptr, __tBuild0));
+}
+
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fileDescriptor"}, Input<uint32_t>{"outputFD"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
 
     //  Stage 0: I/O — read file, convert to parallel bit streams 
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
@@ -670,7 +782,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, 
-        {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+        {&wordBreakerFlags, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     // BPE pipeline mode — enabled when --vocab OR --merges is supplied. merges.txt
     // is self-sufficient (it generates the 256 base tokens internally), so
@@ -710,32 +822,51 @@ int main(int argc, char *argv[]) {
                                 "NORMALIZED text, which may not align with the input file.\n";
         }
 
+        // (Opened before compiling: a pipe is read ahead meanwhile.)
+        toolio::Input in;
+        if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+            return 1;
+        }
+        // The output of the tokens (written under gEmitMutex), created before
+        // the pipeline's threads write to it
+        (void)toolio::out();
+
+        applyAutoSegmentSize(inputFile);
         CPUDriver driver("bpe_tokenizer");
         BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
 
-        const int fd = open(inputFile.c_str(), O_RDONLY);
-        if (LLVM_UNLIKELY(fd == -1)) {
-            llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
+        // Load the whole input ONCE into memory (before any timing). A file is
+        // mapped: a page-aligned pointer, which satisfies MemorySourceKernel's
+        // alignment requirement, and zero-copy; the standard input (a pipe) is
+        // read into a page-aligned buffer. Every pipeline call reads these
+        // resident bytes with no fd access — so --bench-loop times pure
+        // tokenization, and file I/O is excluded from the timed region exactly
+        // as HuggingFace does.
+        AlignedFileBuffer input;
+        if (!input.load(in.fd, in.mappable)) {
+            llvm::errs() << toolio::programName() << ": " << in.name << ": " << std::strerror(errno) << "\n";
             return 1;
         }
-
-        // Load the whole file ONCE into memory (before any timing). mmap gives a
-        // page-aligned pointer, which satisfies MemorySourceKernel's alignment
-        // requirement and is zero-copy. Every pipeline call reads these resident
-        // bytes with no fd access — so --bench-loop times pure tokenization, and
-        // file I/O is excluded from the timed region exactly as HuggingFace does.
-        struct stat st;
-        const size_t nbytes = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
-        void * mapping = MAP_FAILED;
-        const char * buf = nullptr;
-        if (nbytes > 0) {
-            mapping = mmap(nullptr, nbytes, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (mapping == MAP_FAILED) {
-                llvm::errs() << "Error: cannot mmap " << inputFile << ".\n";
-                close(fd);
+        const size_t nbytes = input.getBufSize();
+        const char * buf = (nbytes > 0) ? input.getBuf() : nullptr;
+        // --memsource-in-place: one copy here, laid out like MemorySourceKernel's own (page
+        // aligned, zeroed from the end of the data through one more page), instead of the
+        // kernel's copy on every pipeline call.
+        std::unique_ptr<char, void (*)(void *)> padded(nullptr, std::free);
+        if (MemSourceInPlace && nbytes > 0) {
+            const size_t page = size_t(getpagesize());
+            const size_t size = (nbytes + page - 1) / page * page + page;
+            void * p = nullptr;
+            if (posix_memalign(&p, page, size) != 0) {
+                llvm::errs() << "Error: cannot allocate the input buffer.\n";
                 return 1;
             }
-            buf = static_cast<const char *>(mapping);
+            std::memcpy(p, buf, nbytes);
+            std::memset(static_cast<char *>(p) + nbytes, 0, size - nbytes);
+            padded.reset(static_cast<char *>(p));
+            buf = padded.get();
+            gPaddedBuf = buf;
+            gPaddedLen = nbytes;
         }
         // Empty-file / degenerate case: MemorySourceKernel asserts the buffer is
         // 64-byte aligned even when length == 0, so hand it an aligned dummy.
@@ -758,19 +889,21 @@ int main(int argc, char *argv[]) {
 
             // One discarded warm-up run (first pass pays page-fault / cache-fill cost).
             resetOffsetState();
+            if (BenchColdCache) bpeDropTailCaches();
             bpeFn(buf, nbytes);
 
             std::vector<double> ms;   // per-iteration wall time, milliseconds
             ms.reserve(N);
             for (unsigned i = 0; i < N; ++i) {
                 resetOffsetState();   // spans are cumulative — rewind per iteration
+                if (BenchColdCache) bpeDropTailCaches();
                 auto t0 = std::chrono::steady_clock::now();
                 bpeFn(buf, nbytes);
                 auto t1 = std::chrono::steady_clock::now();
                 ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
             }
-            if (mapping != MAP_FAILED) munmap(mapping, nbytes);
-            close(fd);
+            input.release();
+            toolio::closeInput(in);
 
             std::sort(ms.begin(), ms.end());
             const double minv    = ms.front();
@@ -788,7 +921,7 @@ int main(int argc, char *argv[]) {
                          "BENCH_RESULT bytes=%zu iters=%u min_ms=%.6f median_ms=%.6f "
                          "mean_ms=%.6f mbps=%.4f\n",
                          nbytes, N, minv, median, mean, mbps);
-            return 0;
+            return toolio::finishOutput() ? 0 : 1;
         }
 
         auto __tRun0 = std::chrono::steady_clock::now();
@@ -799,21 +932,19 @@ int main(int argc, char *argv[]) {
                   << std::chrono::duration<double, std::milli>(__tRun1 - __tRun0).count()
                   << " ms\n";
         reportBPEStatistics();
-        if (mapping != MAP_FAILED) munmap(mapping, nbytes);
-        close(fd);
-        return 0;
+        input.release();
+        toolio::closeInput(in);
+        return toolio::finishOutput() ? 0 : 1;
     }
 
     // Pre-tokenizer pipeline mode (existing behaviour) 
-    CPUDriver driver("unicode_word_tokenizer");
-    WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);
-
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
         return 1;
     }
-    wordBreakerFn(fd);
-    close(fd);
-    return 0;
+    CPUDriver driver("unicode_word_tokenizer");
+    WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);
+    wordBreakerFn(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

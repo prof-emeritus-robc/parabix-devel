@@ -826,6 +826,68 @@ bool parseStringClass(RE * r, std::vector<std::vector<CC *>> & strings) {
     return multi;
 }
 
+bool parseGuardedStringClass(RE * r, std::vector<std::vector<CC *>> & strings,
+                             std::vector<std::vector<std::vector<CC *>>> & guards) {
+    std::vector<RE *> alternatives;
+    std::vector<RE *> pending{r};
+    while (!pending.empty()) {
+        RE * a = pending.back();
+        pending.pop_back();
+        if (const Name * n = dyn_cast<Name>(a)) {
+            if (n->getDefinition() == nullptr) return false;
+            pending.push_back(n->getDefinition());
+        } else if (const Alt * alt = dyn_cast<Alt>(a)) {
+            for (RE * e : *alt) pending.push_back(e);
+        } else {
+            alternatives.push_back(a);
+        }
+    }
+    // A sequence of character classes.
+    auto literal = [](RE * e, std::vector<CC *> & str) {
+        std::vector<RE *> items;
+        flattenSeq(e, items);
+        for (RE * item : items) {
+            CC * const cc = resolveCharClass(item);
+            if ((cc == nullptr) || cc->empty()) return false;
+            str.push_back(cc);
+        }
+        return !str.empty();
+    };
+    bool multi = false;
+    for (RE * a : alternatives) {
+        std::vector<RE *> items;
+        flattenSeq(a, items);
+        std::vector<std::vector<CC *>> g;
+        if (!items.empty()) {
+            RE * last = items.back();
+            while (const Name * n = dyn_cast<Name>(last)) {
+                if (n->getDefinition() == nullptr) break;
+                last = n->getDefinition();
+            }
+            const Assertion * const la = dyn_cast<Assertion>(last);
+            if (la && (la->getKind() == Assertion::Kind::LookAhead) && (la->getSense() == Assertion::Sense::Negative)) {
+                std::vector<RE *> gs;
+                if (const Alt * alt = dyn_cast<Alt>(la->getAsserted())) {
+                    gs.assign(alt->begin(), alt->end());
+                } else {
+                    gs.push_back(la->getAsserted());
+                }
+                for (RE * e : gs) {
+                    g.emplace_back();
+                    if (!literal(e, g.back())) return false;
+                }
+                items.pop_back();
+            }
+        }
+        std::vector<CC *> str;
+        if (!literal(makeSeq(items.begin(), items.end()), str)) return false;
+        multi |= (str.size() > 1) || !g.empty();
+        strings.push_back(std::move(str));
+        guards.push_back(std::move(g));
+    }
+    return multi;
+}
+
 // Can the strings s (at offset i) and t (at offset 0) match the same text
 // over the k positions starting at offset i of s and 0 of t?
 static bool overlaps(const std::vector<CC *> & s, size_t i, const std::vector<CC *> & t, size_t k) {
@@ -852,11 +914,53 @@ bool isRepeatableStringClass(const std::vector<std::vector<CC *>> & strings) {
     return true;
 }
 
+bool isEndLookahead(RE * r) {
+    while (const Name * n = dyn_cast<Name>(r)) {
+        if (n->getDefinition() == nullptr) return false;
+        r = n->getDefinition();
+    }
+    const Assertion * const a = dyn_cast<Assertion>(r);
+    return a && (a->getKind() == Assertion::Kind::LookAhead) && (a->getSense() == Assertion::Sense::Positive)
+           && isa<End>(a->getAsserted());
+}
+
+// Does the zero-width assertion r (through names, alternations and sequences
+// of assertions) hold at the end of the text?  A negative lookahead of an RE
+// that matches at least one character does.
+static bool holdsAtEnd(RE * r) {
+    if (const Name * n = dyn_cast<Name>(r)) {
+        return n->getDefinition() && holdsAtEnd(n->getDefinition());
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        for (RE * a : *alt) {
+            if (holdsAtEnd(a)) return true;
+        }
+        return false;
+    } else if (const Seq * seq = dyn_cast<Seq>(r)) {
+        for (RE * a : *seq) {
+            if (!holdsAtEnd(a)) return false;
+        }
+        return true;
+    } else if (const Assertion * a = dyn_cast<Assertion>(r)) {
+        return (a->getKind() == Assertion::Kind::LookAhead) && (a->getSense() == Assertion::Sense::Negative)
+               && (getLengthRange(a->getAsserted(), &cc::Unicode).first > 0);
+    }
+    return false;
+}
+
 bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments,
                          bool requireStar) {
     segments.clear();
     std::vector<RE *> elems;
     flattenSeq(body, elems);
+    // A final lookahead of the end of the text, (?=$), is the end of the text.
+    if (!elems.empty() && isEndLookahead(elems.back())) elems.back() = makeEnd();
+    // Assertions just before the end of the text that hold there (as after a
+    // possessive repetition X{lb,}+ (?!X) $) are dropped.
+    if (!elems.empty() && isa<End>(elems.back())) {
+        size_t n = elems.size() - 1;
+        while ((n > 0) && holdsAtEnd(elems[n - 1])) n--;
+        elems.erase(elems.begin() + n, elems.end() - 1);
+    }
     // Group the elements into star segments and maximal fixed segments.
     std::vector<RE *> fixed;
     auto closeFixed = [&]() -> bool {
@@ -875,9 +979,16 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
             if (rep->getUB() == Rep::UNBOUNDED_REP) {
                 CC * const X = resolveCharClass(rep->getRE());
                 std::vector<std::vector<CC *>> strings;
-                if (X == nullptr && rep->getLB() <= 1 && parseStringClass(rep->getRE(), strings)) {
-                    // A string class (see isRepeatableStringClass).
+                std::vector<std::vector<std::vector<CC *>>> guards;
+                if (X == nullptr && rep->getLB() <= 1 && parseGuardedStringClass(rep->getRE(), strings, guards)) {
+                    // A string class (see isRepeatableStringClass), possibly with guards:
+                    // the occurrences of its guarded strings, where no guard follows,
+                    // are those of the alternatives (the guards do not change where
+                    // occurrences may overlap).
                     if (!isRepeatableStringClass(strings) || !closeFixed()) return false;
+                    bool guarded = false;
+                    for (const auto & g : guards) guarded |= !g.empty();
+                    if (!guarded) guards.clear();
                     CC * first = makeCC();
                     CC * later = makeCC();
                     for (const auto & str : strings) {
@@ -886,6 +997,7 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
                     }
                     LookaheadSegment seg{true, false, makeCC(first, later), rep->getRE(), rep->getLB(), 0};
                     seg.strings = std::move(strings);
+                    seg.guards = std::move(guards);
                     seg.first = first;
                     segments.push_back(std::move(seg));
                     hasStar = true;

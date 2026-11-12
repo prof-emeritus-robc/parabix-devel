@@ -21,6 +21,7 @@
 #include <kernel/streamutils/zeroextend.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <llvm/Support/raw_ostream.h>
@@ -37,8 +38,9 @@ using namespace re;
 
 
 static cl::OptionCategory x8u16Options("x8u16 Options", "Transcoding control options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(x8u16Options));
-static cl::opt<std::string> outputFile(cl::Positional, cl::desc("<output file>"), cl::cat(x8u16Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(x8u16Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 
 
 /*  transcoderClasses(sourceCharSet) determines character classes for bitwise
@@ -159,15 +161,15 @@ void TranscoderKernelBuilder::generatePabloMethod() {
     }
 }
 
-typedef void (*x8u16FunctionType)(uint32_t fd, const char *);
+typedef void (*x8u16FunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 x8u16FunctionType generatePipeline(CPUDriver & driver) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"), Input<const char *>("outputFileName"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"), Input<uint32_t>("outputFD"));
 
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     // Transposed bits from s2p
     StreamSet * BasisBits = P.CreateStreamSet(8);
@@ -181,8 +183,7 @@ x8u16FunctionType generatePipeline(CPUDriver & driver) {
 
     P.CreateKernelCall<P2S16Kernel>(u16bits, UTF16_out);
 
-    Scalar * outputFileName = P.getInputScalar("outputFileName");
-    P.CreateKernelCall<FileSink>(outputFileName, UTF16_out);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), UTF16_out);
 
     return P.compile();
 }
@@ -196,15 +197,14 @@ size_t file_size(const int fd) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&x8u16Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&x8u16Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("x8u16");
     x8u16FunctionType x8u16Function = generatePipeline(driver);
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        std::cerr << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        x8u16Function(fd, outputFile.c_str());
-        close(fd);
-    }
-    return 0;
+    x8u16Function(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

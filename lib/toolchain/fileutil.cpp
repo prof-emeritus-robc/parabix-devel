@@ -4,10 +4,13 @@
  */
 
 #include <toolchain/fileutil.h>
+#include <toolchain/toolio.h>
 #include <string>
 #include <boost/filesystem.hpp>
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -100,6 +103,63 @@ void AlignedFileBuffer::load(const std::string & fileName, bool preferMMap) {
         mBufSize = total;
     }
     close(fd);
+}
+
+bool AlignedFileBuffer::load(const int fd, const bool useMMap) {
+    mDidMMap = false;
+    mBuffer = nullptr;
+    mBufSize = 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return false;
+    }
+    if (useMMap && st.st_size > 0) {
+        auto mmap_ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (LLVM_LIKELY(mmap_ptr != MAP_FAILED)) {
+            mBuffer = reinterpret_cast<char *>(mmap_ptr);
+            mBufSize = st.st_size;
+            mDidMMap = true;
+            return true;
+        }
+    }
+    // Read to the end, growing the buffer (the size of a regular file is the
+    // first guess; a pipe has none)
+    size_t capacity = std::max<size_t>(S_ISREG(st.st_mode) ? st.st_size + 1 : 0, 1 << 16);
+    capacity = (capacity + mAlignment - 1) & -size_t{mAlignment};
+    mBuffer = mAlloc.allocate(capacity, 0);
+    if (mBuffer == nullptr) {
+        report_fatal_error("Unable to allocate aligned file buffer");
+    }
+    constexpr size_t MaximumReadSize = 1UL << 30;
+    for (;;) {
+        if (mBufSize == capacity) {
+            const size_t newCapacity = capacity * 2;
+            char * const newBuffer = mAlloc.allocate(newCapacity, 0);
+            if (newBuffer == nullptr) {
+                report_fatal_error("Unable to allocate aligned file buffer");
+            }
+            std::memcpy(newBuffer, mBuffer, mBufSize);
+            mAlloc.deallocate(mBuffer, 0);
+            mBuffer = newBuffer;
+            capacity = newCapacity;
+        }
+        // (toolio_read: the data read ahead of a pipe, then read())
+        const auto n = toolio_read(fd, mBuffer + mBufSize, std::min(capacity - mBufSize, MaximumReadSize));
+        if (n > 0) {
+            mBufSize += n;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            const int error = errno;
+            mAlloc.deallocate(mBuffer, 0);
+            mBuffer = nullptr;
+            mBufSize = 0;
+            errno = error;
+            return false;
+        }
+    }
+    mAlignedSize = capacity;
+    return true;
 }
 
 size_t AlignedFileBuffer::getBufSize() {

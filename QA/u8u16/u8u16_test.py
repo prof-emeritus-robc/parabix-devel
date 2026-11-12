@@ -61,7 +61,7 @@ def main():
         in_path = os.path.join(args.input_dir, fbase)
         out_path = os.path.join(args.output_dir, 'Files', fbase)
         msg_path = os.path.join(args.output_dir, 'Messages', fbase)
-        cmd = [args.program] + extra_flags + [in_path, out_path]
+        cmd = [args.program] + extra_flags + [in_path, '--output=' + out_path]
         if args.verbose:
             print('Running: %s' % ' '.join(shlex.quote(c) for c in cmd))
         with open(msg_path, 'wb') as msg_f:

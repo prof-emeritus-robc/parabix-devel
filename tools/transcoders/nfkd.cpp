@@ -15,6 +15,7 @@
 #include <kernel/streamutils/focused_transform.h>
 #include <kernel/unicode/normalization/normalization.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 
 using namespace kernel;
@@ -23,20 +24,22 @@ using namespace llvm;
 //  These declarations are for command line processing.
 //  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory NFKD_Options("Decomposition Options", "Decomposition Options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFKD_Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(NFKD_Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
     P.SetStageLabel("source");
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     Selected_S2P(P, ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
 }
 
-typedef void (*XfrmFunctionType)(uint32_t fd);
+typedef void (*XfrmFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 XfrmFunctionType generate_NFKD_pipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"), Input<uint32_t>("outputFD"));
     NFD_PipelineBuilder NFD_builder(P);
     const auto NFKD = NFKD_FocusedTransform(NFD_builder, FocusOptions::fromCommandLine());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
@@ -46,20 +49,19 @@ XfrmFunctionType generate_NFKD_pipeline(CPUDriver & driver) {
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
     StreamSet * const OutputBytes = NFKD.build(P, ByteStream, BasisBits);
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&NFKD_Options, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
-        exit(-1);
+    codegen::ParseCommandLineOptions(argc, argv, {&NFKD_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
     CPUDriver driver("NFKD_function");
     XfrmFunctionType fn = generate_NFKD_pipeline(driver);
-    fn(fd);
-    close(fd);
-    return 0;
+    fn(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

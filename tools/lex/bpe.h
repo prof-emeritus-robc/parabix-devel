@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+namespace re { class CC; }
+
 namespace kernel {
     class PipelineBuilder;
     class StreamSet;
@@ -114,7 +116,7 @@ private:
 // buildBPEPassPipeline
 //   Builds the merge-kernel BPE pipeline:
 //     - buildMergeRuleRanges() groups merges into id-ranges (rank order).
-//     - BPERangeSeed seeds source = base id of each raw byte (active=1s, end=0s).
+//     - BPEBaseIdKernel seeds source = base id of each raw byte (active=1s).
 //     - One BPEMergeKernel per range (lowest first) glues adjacent ids into
 //       `source`, threaded kernel→kernel (the Ġthe→Ġthey cascade).
 //   Returns (matchEnd=active, vocabID=source). Emission is Stage-B debug
@@ -128,7 +130,7 @@ struct BPEPassResult {
 // --bpe-tail emitter: finishes BPE per segment over the tokens at `starts` (ids = 16×1 BixNum,
 // segs = segment starts) in order, and hands the finished ids to the sink, in order, a batch
 // per pipeline call.
-// The opt-in framework hooks of the BPE flags (--vm-ring-buffers, --memsource-block-capacity).
+// The opt-in framework hooks of the BPE flags (--memsource-block-capacity).
 // Call before building the pipeline: the source kernel reads its hook when constructed.
 void bpeSetFrameworkHooks();
 
@@ -137,9 +139,23 @@ void bpeTailSetSink(BPETailSink sink);
 void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
                          kernel::StreamSet * starts, kernel::StreamSet * segs);
 // --tail-from-bytes (buildBPEPassPipeline returned vocabID == nullptr): the same emitter, run
-// on the BPE input as a byte stream (1x8) and the pretoken starts.
+// on the BPE input as a byte stream (1x8), its basis bits (8x1, for --tail-unit-cuts) and the
+// pretoken starts.
+// BPE_DUMP=<prefix> (debug): the byte offsets of the marks of `marks`, written to <prefix>.<name>.
+void bpeDumpStream(kernel::PipelineBuilder & P, kernel::StreamSet * bytes, kernel::StreamSet * marks,
+                   const std::string & name);
+// cutClassSet (optional): the pretokenizer's class streams, ending with the cut classes of
+// bpeCutClassCCs (--pair-cuts=3).
 void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
-                             kernel::StreamSet * segs);
+                             kernel::StreamSet * basis, kernel::StreamSet * segs,
+                             kernel::StreamSet * cutClassSet = nullptr);
+// --pair-cuts=3: the codepoint classes of the cuts (kCutBefore .. kCutAfterLead in bpe.cpp), to be compiled
+// with the pretokenizer's classes on the UTF-8 bytes; empty when the cuts do not use them. Builds
+// the table of the byte pairs inside tokens from the merge rules.
+std::vector<re::CC *> bpeCutClassCCs(const BPETokenizer & bpe);
+// --bench-cold-cache: every thread's tail segment cache starts empty on the next pipeline
+// run, as in a one-shot run (the caches survive across --bench-loop runs otherwise).
+void bpeDropTailCaches();
 
 // `boundary` (optional, may be null): a 1-bit per-byte mask marking pretoken
 // STARTS (GPT-2 regex boundaries). When present, merges are blocked from crossing

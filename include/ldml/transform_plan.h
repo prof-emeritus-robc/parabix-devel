@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <set>
 #include <map>
 #include <string>
 #include <vector>
@@ -60,6 +61,7 @@ struct CharMapSubgroup {
     // are not changed, but take precedence over later rules for them.
     UCD::UnicodeSet kept;
     unsigned rules = 0;         // the number of rules
+    std::vector<const ConversionRule *> sourceRules;    // the rules, in order
     // All the characters of the mappings and kept.
     const UCD::UnicodeSet & characters() const {return all;}
     // The characters of the rules added to the mappings or kept (by
@@ -88,10 +90,32 @@ struct StringRule {
     bool selfOverlapping = false;
     // A run: the text is followed by the longest run of characters of this set
     // (possibly none), which is deleted (S+ → x ; has the text S and the run S).
-    // The rule then has no after context, and its group is selected
-    // sequentially (TransformStep::sequentialSelection).
+    // An after context then follows the run (after: S* A, for a run of single
+    // characters), and the group is selected sequentially
+    // (TransformStep::sequentialSelection).
     UCD::UnicodeSet run;
+    // A run of a set with strings (of two or more characters), [{i̯} i ɪ]+ :
+    // run has all the characters of the set, runSingles those of one
+    // character (including the first of each string), and runStrings the
+    // strings.  The run is then the longest run of positions each of a
+    // character of runSingles or within an occurrence of a string: ICU's run,
+    // taking the longest string at each step, as no string ends with the
+    // beginning of another (a proper suffix of one is no proper prefix of
+    // another), so that no occurrence begins within one ICU takes and extends
+    // past it.
+    UCD::UnicodeSet runSingles;
+    std::vector<std::u32string> runStrings;
+    // Whether the replacement keeps characters of the text: StringRuleKept at
+    // a position of the replacement (one for each position of the text but
+    // the last, which has the rest) keeps the character of the text there,
+    // and StringRuleDeleted deletes it.  As planned for a rule whose captures
+    // are of single characters (see planTransform), as
+    //     $LO $W? { ꪿ ($F) → $1 ˧˥ ;   (text ꪿ $F, replacement deleted, kept, ˧˥)
+    bool kept = false;
 };
+
+constexpr UCD::codepoint_t StringRuleKept = 0xFDD1;     // (a noncharacter)
+constexpr UCD::codepoint_t StringRuleDeleted = 0xD800;  // (the deletion mark of tconv)
 
 // A MultipleCaptureMultipleReplacement rule: a conversion rule
 //      before { T0 (B1) T1 (B2) ... (Bk) Tk } after → R0 $1 R1 $2 ... $k Rk ;
@@ -150,6 +174,28 @@ struct BoundaryReplacement {
 //     first characters of the after context) may occur nowhere else in a match.
 // As information flows forward only, from the start of a match to its end,
 // only T0 and R0 may differ between the rules of a set.
+//  A branch of the possessive walk of the matches of a set from their starts
+//  (see MultipleCaptureMultipleReplacementSet::walkStarts): where the
+//  characters at the offsets of in are in their sets, and those at the
+//  offsets of out are not (the sets, the optional items taken or not, the
+//  strings), a match has
+//  length positions, then (if run) a run of the characters of runSet, then
+//  the characters of suffix.
+struct WalkBranch {
+    std::vector<std::pair<unsigned, UCD::UnicodeSet>> in, out;
+    unsigned length = 0;
+    bool run = false;
+    UCD::UnicodeSet runSet;
+    std::vector<UCD::UnicodeSet> suffix;
+    //  Further runs after the suffix, each followed by a number of characters
+    //  (of sets, not tested: the walk of a start found by the engine holds).
+    std::vector<std::pair<UCD::UnicodeSet, unsigned>> moreRuns;
+};
+
+//  Whether planTransform merges rules as the variants of a set (see
+//  MultipleCaptureMultipleReplacementSet::variants); tconv --capture-variants.
+extern bool MergeCaptureVariants;
+
 struct MultipleCaptureMultipleReplacementSet {
     std::vector<re::RE *> captures;                      // B1 ... Bk
     std::vector<std::vector<UCD::UnicodeSet>> texts;     // T1 ... Tk
@@ -157,6 +203,10 @@ struct MultipleCaptureMultipleReplacementSet {
     re::RE * after = nullptr;
     re::RE * engineBefore = nullptr;
     re::RE * engineAfter = nullptr;
+    //  Whether engineBefore, matched against the text itself, is a before
+    //  context on the converted text translated to the text (see
+    //  sourceBeforeContext in tconv).
+    bool sourceBefore = false;
     bool startsByFirst = false;
     //  If startsByFirst: the characters at which the matches begin (those of
     //  T0[0] or, with T0 empty, of the set with which B1 begins).
@@ -175,9 +225,52 @@ struct MultipleCaptureMultipleReplacementSet {
     //  with strings there): the same matches, if what follows each repetition
     //  cannot begin with a character it repeats.
     bool greedyStarts = false;
+    //  With exactStarts, whether the captures (repeating sets with strings or
+    //  sequences, not matched greedily) are matched possessively in the
+    //  lookahead, in a form that tconv checks the engine supports (see
+    //  lookaheadContextProblems in tconv).
+    bool engineStarts = false;
+    //  Where a match may end within another of the set (and the starts are not
+    //  known by the first characters): the starts found by the engine (as with
+    //  exactStarts, greedyStarts as there), of which those that apply are
+    //  selected from the left by the lengths of the matches, in the branches
+    //  of their possessive walk (no run before a later optional item).
+    bool walkStarts = false;
+    std::vector<WalkBranch> walkBranches;
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
     std::vector<std::u32string> results;                 // R1 ... Rk (as planned, in the order of the captures)
     std::vector<MultipleCaptureMultipleReplacement> rules;
+    //  Variants: rules of the same conversion group that would otherwise be sets
+    //  of their own, differing from the first rule of the set only in the
+    //  characters at one position of a text (the selector,
+    //  texts[selectorText][selectorPos], whose characters occur in no other
+    //  item of a match) and in their results (as rules expanded from a function
+    //  call on a capture of single characters, as NumericPinyin-Latin's
+    //  &NumericPinyin-Pinyin($3)), where no rule of the group between the first
+    //  rule of the set and the variant may match where the variant does (so
+    //  that the set applies it where ICU would).  The group's own rules alone
+    //  decide this: the replacements are made within the group, as ICU makes
+    //  them, so that its before contexts see the converted text ICU's do.  One
+    //  for each rule of the set, in order: its characters at the selector, and
+    //  its replacements and results.  The set is matched once, with the union of
+    //  their characters at the selector (texts); replacements holds the union of
+    //  their replacements, one for each position (with the characters of all and
+    //  the first one's replacement), which the kernels apply for each variant at
+    //  the matches whose selector holds its characters.  The selector is at
+    //  selectorOffset from the start, or from the end (the last position) if
+    //  selectorFromEnd.
+    struct Variant {
+        UCD::UnicodeSet chars;
+        std::vector<BoundaryReplacement> replacements;
+        std::vector<std::u32string> results;
+    };
+    std::vector<Variant> variants;
+    unsigned selectorText = 0;
+    unsigned selectorPos = 0;
+    bool selectorFromEnd = false;
+    unsigned selectorOffset = 0;
+    //  The least length of a match.
+    unsigned minLength = 0;
     //  A rule whose result refers to its two captures in reverse order,
     //  T0 (B1) T1 (B2) T2 → R0 $2 R1 $1 R2, with B1 and B2 of fixed lengths, is
     //  planned as T0 (B1) T1 (B2) T2 → R0 R1 $1 $2 R2, and the region R1 B1 B2 of
@@ -299,6 +392,14 @@ struct TransformStep {
     // the rule applies only if it does not begin within an applied match of
     // these.  Empty otherwise.
     std::vector<size_t> stringOrder;
+    // For each string rule, the earlier rules of the group (string rules or
+    // single-character rules) that it yields to at the same position: it
+    // applies only where none of them matches at its first position (see
+    // DisambiguationStats::prioritized; set by the client after planning).
+    std::vector<std::vector<const ConversionRule *>> stringPriority;
+    // Likewise for each subgroup, the earlier rules that a rule of it yields
+    // to (the subgroup applies only where none of them matches).
+    std::vector<std::vector<const ConversionRule *>> subgroupPriority;
     std::vector<std::vector<size_t>> stringPredecessors;
     // Otherwise (cyclic, two-way or longer self-overlaps), the matches are
     // selected sequentially, from the left: a match applies if it does not
@@ -332,6 +433,29 @@ struct TransformStep {
     UCD::UnicodeSet deferredTriggers;
     std::vector<UCD::UnicodeSet> deferredTails;
     UCD::UnicodeSet deferredReach;
+    // The prefix runs (see ComposeRevisits), in a group of their own, and their
+    // rules.  At each run P S^n of the characters of a prefix run (with all of
+    // them within the filters), the characters become A^n P.
+    std::vector<PrefixRun> prefixRuns;
+    std::vector<const ConversionRule *> prefixRunRules;
+    // The chain revisits (see ComposeRevisits), in a group of their own (with
+    // the same E, M, A and Y; X the union of theirs), and their rules.
+    ChainRevisit chainRevisit;
+    std::vector<const ConversionRule *> chainRevisitRules;
+    // The mark run edits (see ComposeRevisits), in a group of their own, in
+    // order, their rules, and the items of the rules kept before them, which
+    // apply instead where they match.
+    std::vector<MarkRunEdit> markRunEdits;
+    std::vector<const ConversionRule *> markRunEditRules;
+    std::vector<std::vector<UCD::UnicodeSet>> markRunKept;
+    std::vector<unsigned> markRunKeptBefore;    // the edits before each kept rule
+    // The front-letter revisits of the group (see FrontLetterRevisits),
+    // applied before its other rules, if any; and whether this is the last
+    // step of the group (the group may be planned as several steps, joined by
+    // :: Null ;), after which the letters are placed.
+    bool hasFrontLetters = false;
+    FrontLetterRevisits frontLetters;
+    bool frontLettersEnd = false;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;
@@ -349,8 +473,14 @@ struct TransformPlan {
 };
 
 // The plan for the forward rules of a transform (as given by
-// ExtractForwardRules or ExtractReverseBackwardRules).
-TransformPlan planTransform(const std::vector<Rule *> & rules);
+// ExtractForwardRules or ExtractReverseBackwardRules).  The rules of
+// keptCaptures whose texts are of single characters and whose results refer
+// to their captures in order, with no text inserted but after the last
+// position, are planned as string rules keeping the characters of their
+// captures (StringRule::kept), rather than MultipleCaptureMultipleReplacement
+// rules, so that their before contexts may be matched against the converted
+// text.
+TransformPlan planTransform(const std::vector<Rule *> & rules, const std::set<const Rule *> * keptCaptures = nullptr);
 
 //  The overlaps of the string rules of a conversion group.
 //
@@ -430,6 +560,17 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step);
 // text (including U+0000).
 re::RE * expandedContext(re::RE * context, const std::map<unsigned, UCD::UnicodeSet> & insertions,
                          UCD::codepoint_t filler);
+
+// Whether a pattern (an after context, or a capture), matched by the regular
+// expression engine within a lookahead, has an unbounded repetition of
+// something other than a set of single characters (such as a set with
+// strings, [{m̥}m]*).  The engine supports such variable-length lookaheads
+// only in some forms (with a unique prefix, or as chains of repeated sets),
+// after resolving the repetitions possessively, as ICU matches them
+// (re::resolvePossessiveQuantifiers): the lookaheads of the starts of
+// MultipleCaptureMultipleReplacement rules are not among them; the others are
+// checked with the engine's preconditions (tconv).
+bool repeatsStringsOrSequences(const re::RE * re);
 
 // The characters that the set items of a pattern (e.g. a context) may match,
 // including those of the variables it uses.

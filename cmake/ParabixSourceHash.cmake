@@ -182,7 +182,6 @@ function(parabix_srchash_write_config FILE)
     string(APPEND CONTENT "flags=${FLAGS}\n")
     string(APPEND CONTENT "artifacts=${ARTIFACT_MODE} ${ARTIFACT_TYPE}\n")
     string(APPEND CONTENT "papi=${ENABLE_PAPI}\n")
-    string(APPEND CONTENT "z3=${Z3_FOUND}\n")
     parabix_srchash_write_if_different(${FILE} "${CONTENT}")
 endfunction(parabix_srchash_write_config)
 
@@ -197,8 +196,8 @@ function(parabix_srchash_finalize)
     get_property(CODEGEN_LABELS GLOBAL PROPERTY PARABIX_SRCHASH_CODEGEN_LABELS)
     foreach(TGT ${TARGETS})
         if(TGT STREQUAL PARABIX_MONO_TARGET)
-            # The single artifact holds every module.
-            set(DEPS ${NAMES})
+            # The single artifact holds every module but those built apart.
+            get_property(DEPS GLOBAL PROPERTY PARABIX_SINGLE_MODULES)
         else()
             parabix_srchash_codegen_deps(DEPS ${TGT})
         endif()

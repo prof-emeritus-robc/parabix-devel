@@ -63,9 +63,9 @@ static const std::vector<BuiltIn> builtInTransforms = {
     {"Any-Null", {}}, {"Any-Remove", {}},
     {"Any-Name", {}}, {"Name-Any", {}},
     {"Any-Hex/Java", {"Any-Hex"}}, {"Any-Hex/C", {}}, {"Any-Hex/Perl", {}},
-    {"Any-Hex/Unicode", {}}, {"Any-Hex/XML", {}}, {"Any-Hex/XML10", {}}, {"Any-Hex/Plain", {}},
+    {"Any-Hex/Unicode", {}}, {"Any-Hex/XML", {}}, {"Any-Hex/XML10", {}},
     {"Hex-Any", {}}, {"Hex-Any/Java", {}}, {"Hex-Any/C", {}}, {"Hex-Any/Perl", {}},
-    {"Hex-Any/Unicode", {}}, {"Hex-Any/XML", {}}, {"Hex-Any/XML10", {}}, {"Hex-Any/Plain", {}},
+    {"Hex-Any/Unicode", {}}, {"Hex-Any/XML", {}}, {"Hex-Any/XML10", {}},
     {"Any-BreakInternal", {}},
 };
 

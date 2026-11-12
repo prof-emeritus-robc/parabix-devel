@@ -27,6 +27,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <kernel/streamutils/streams_merge.h>
@@ -54,7 +55,9 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory jsonOptions("json Options", "json options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(jsonOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(jsonOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 bool ToCSVFlag;
 static cl::opt<bool, true> ToCSVOption("to-csv", cl::location(ToCSVFlag), cl::desc("Print equivalent CSV"), cl::cat(jsonOptions));
 bool ShowLinesFlag;
@@ -64,7 +67,7 @@ static cl::opt<unsigned, true> MaxDepthOption("max-depth", cl::location(MaxDepth
 int OnlyDepth;
 static cl::opt<int, true> OnlyDepthOption("only-depth", cl::location(OnlyDepth), cl::desc("Only generate code for depth n of JSON."), cl::cat(jsonOptions), cl::init(-1));
 
-typedef void (*jsonFunctionType)(uint32_t fd);
+typedef void (*jsonFunctionType)(uint32_t useMMap, uint32_t fd);
 
 jsonFunctionType json_parsing_gen(
     CPUDriver & driver,
@@ -73,13 +76,13 @@ jsonFunctionType json_parsing_gen(
 
     const auto ParallelProcess = !ToCSVFlag && !ShowLinesFlag;
 
-    auto P = CreatePipeline(driver, Input<uint32_t>("fd"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("fd"));
 
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const codeUnitStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, codeUnitStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, codeUnitStream);
     StreamSet * const u8basis = P.CreateStreamSet(8);
     Selected_S2P(P, codeUnitStream, u8basis);
 
@@ -265,7 +268,7 @@ jsonFunctionType json_parsing_gen(
 }
 
 int main(int argc, char ** argv) {
-    codegen::ParseCommandLineOptions(argc, argv, {&jsonOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&jsonOptions, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     CPUDriver driver("json");
     auto em = ErrorManager::Create();
@@ -274,13 +277,12 @@ int main(int argc, char ** argv) {
     if (jsonSource == nullptr) {
         report_fatal_error("pablo-parser: error loading pablo source file: json.pablo");
     }
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        auto jsonParsingFunction = json_parsing_gen(driver, parser, jsonSource);
-        jsonParsingFunction(fd);
-        close(fd);
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
-    return 0;
+    auto jsonParsingFunction = json_parsing_gen(driver, parser, jsonSource);
+    jsonParsingFunction(in.useMMap, in.fd);
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

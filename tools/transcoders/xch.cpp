@@ -37,6 +37,7 @@
 #include <re/cc/cc_compiler_target.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
@@ -61,7 +62,9 @@ static cl::opt<std::string> TgtChars("tgt", cl::desc("target characters to be ge
 static cl::opt<std::string> XfrmProperty("prop", cl::desc("transformation kind (Unicode property)"), cl::cat(Xch_Options), cl::init(""));
 static cl::opt<bool> U21("U21", cl::desc("perform character translation via 21-bit Unicode"),  cl::cat(Xch_Options));
 static cl::opt<bool> Buffering("buf", cl::desc("buffer pipeline output"),  cl::cat(Xch_Options));
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(Xch_Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(Xch_Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -444,22 +447,22 @@ void UTF8_CharacterTranslator::generatePabloMethod() {
     writeOutputStreamSet("output_basis", basis);
 }
 
-typedef void (*XfrmFunctionType)(StreamSetPtr & ss_buf, uint32_t fd);
+typedef void (*XfrmFunctionType)(StreamSetPtr & ss_buf, uint32_t useMMap, uint32_t fd);
 
 
 XfrmFunctionType generateU21_pipeline(CPUDriver & driver,
                                       std::vector<unicode::BitTranslationSets> tr,
                                       unicode::BitTranslationSets ins_bixnum) {
 
-    auto P = CreatePipeline(driver, Output<streamset_t>("OutputBytes",  1, 8, ReturnedBuffer(1)), Input<uint32_t>("inputFileDecriptor"));
+    auto P = CreatePipeline(driver, Output<streamset_t>("OutputBytes",  1, 8, ReturnedBuffer(1)), Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"));
 
     //  The program will use a file descriptor as an input.
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     // File data from mmap
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    //  ReadSourceKernel is a Parabix Kernel that produces a stream of bytes
-    //  from a file descriptor.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    //  FDSourceKernel is a Parabix Kernel that produces a stream of bytes
+    //  from a file descriptor, mapping the file into memory or reading it.
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     //  The Parabix basis bits representation is created by the Parabix S2P kernel.
@@ -492,15 +495,15 @@ XfrmFunctionType generateU21_pipeline(CPUDriver & driver,
 XfrmFunctionType generateU21_pipeline(CPUDriver & driver,
                                       unicode::BitTranslationSets tr) {
 
-    auto P = CreatePipeline(driver, Output<streamset_t>("OutputBytes",  1, 8, ReturnedBuffer(1)), Input<uint32_t>("inputFileDecriptor"));
+    auto P = CreatePipeline(driver, Output<streamset_t>("OutputBytes",  1, 8, ReturnedBuffer(1)), Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"));
 
     //  The program will use a file descriptor as an input.
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     // File data from mmap
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    //  ReadSourceKernel is a Parabix Kernel that produces a stream of bytes
-    //  from a file descriptor.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    //  FDSourceKernel is a Parabix Kernel that produces a stream of bytes
+    //  from a file descriptor, mapping the file into memory or reading it.
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     //  The Parabix basis bits representation is created by the Parabix S2P kernel.
@@ -545,15 +548,15 @@ XfrmFunctionType generateUTF8_pipeline(CPUDriver & driver,
                                        unicode::BitTranslationSets ins_bixnum,
                                        unicode::BitTranslationSets del_bixnum) {
 
-    auto P = CreatePipeline(driver, Output<streamset_t>("OutputBytes", 1, 8, ReturnedBuffer(1)), Input<uint32_t>("inputFileDecriptor"));
+    auto P = CreatePipeline(driver, Output<streamset_t>("OutputBytes", 1, 8, ReturnedBuffer(1)), Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"));
 
     //  The program will use a file descriptor as an input.
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     // File data from mmap
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    //  ReadSourceKernel is a Parabix Kernel that produces a stream of bytes
-    //  from a file descriptor.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    //  FDSourceKernel is a Parabix Kernel that produces a stream of bytes
+    //  from a file descriptor, mapping the file into memory or reading it.
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     //  The Parabix basis bits representation is created by the Parabix S2P kernel.
@@ -637,7 +640,7 @@ XfrmFunctionType generateUTF8_pipeline(CPUDriver & driver,
 int main(int argc, char *argv[]) {
     //  ParseCommandLineOptions uses the LLVM CommandLine processor, but we also add
     //  standard Parabix command line options such as -help, -ShowPablo and many others.
-    codegen::ParseCommandLineOptions(argc, argv, {&Xch_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&Xch_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     std::vector<unicode::BitTranslationSets> xfrms;
     unicode::BitTranslationSets insertion_bixnum;
@@ -685,6 +688,10 @@ int main(int argc, char *argv[]) {
     } else {
         llvm::report_fatal_error("Need either a codepoint property (prop=...) or a source-target (src=..., tgt=...) mapping.");
     }
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("xfrm_function");
     //  Build and compile the Parabix pipeline by calling the Pipeline function above.
     XfrmFunctionType fn;
@@ -694,13 +701,8 @@ int main(int argc, char *argv[]) {
     } else {
         fn = generateUTF8_pipeline(driver, xfrms[0], insertion_bixnum, deletion_bixnum);
     }
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        fn(xlated, fd);
-        close(fd);
-        std::ignore = write(STDOUT_FILENO, xlated.data(), xlated.length());
-    }
-    return 0;
+    fn(xlated, in.useMMap, in.fd);
+    toolio::closeInput(in);
+    toolio_write(toolio::outputFD(), xlated.data(), xlated.length());
+    return toolio::finishOutput() ? 0 : 1;
 }

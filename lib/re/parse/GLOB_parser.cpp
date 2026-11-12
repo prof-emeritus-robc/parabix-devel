@@ -88,8 +88,12 @@ RE * FileGLOB_Parser::parse_next_item() {
         // Check for pattern beginning **/, containing /**/, or ending /**, and
         // process according to GIT special GLOB rules if required.
         if ((mGLOB_kind == GLOB_kind::GIT) && mPathComponentStartContext && accept('*')) {
-            if (mCursor.noMore() || at(PATTERN_PATH_SEPARATOR))
+            if (mCursor.noMore())
                 return Rep::Create(makeAnyPathCC(), 0, Rep::UNBOUNDED_REP);
+            // **/ matches zero or more path components.
+            if (accept(PATTERN_PATH_SEPARATOR))
+                return Rep::Create(Seq::Create({Rep::Create(makeAnyPathCC(), 0, Rep::UNBOUNDED_REP),
+                                                CC::Create(FILE_PATH_SEPARATOR)}), 0, 1);
         }
         // Otherwise fall through and ignore redundant * characters (normal GLOB rule).
         // Then check for a ? character.
@@ -193,11 +197,28 @@ RE * FileGLOB_Parser::range_extend(RE * char_expr1) {
 // Parsing a file using .gitignore conventions, returning a vector of REs.
 //
 // Lines beginning "!" are ignore overrides, these are returned as negative lookbehind assertions.
-// Lines beginning "/" are anchored to the given directory path.
+// Lines beginning "/" or containing "/" other than at the end are anchored
+//    to the given directory path.
 // Lines ending "/" match directories only (directory entries in the search buffer
 //    must include a trailing slash.)
 //
 namespace fs = boost::filesystem;
+
+// The directory path as a GLOB matching the path names of its entries
+// literally, ending with a "/".
+static std::string directoryPrefixGLOB(const fs::path & dirpath) {
+    std::string prefix;
+    for (const char c : dirpath.string()) {
+        if ((c == '\\') || (c == '*') || (c == '?') || (c == '[')) {
+            prefix.push_back('\\');
+        }
+        prefix.push_back(c);
+    }
+    if (prefix.empty() || (prefix.back() != '/')) {
+        prefix.push_back('/');
+    }
+    return prefix;
+}
 
 PatternVector parseGitIgnoreFile(fs::path dirpath, std::string ignoreFileName) {
     PatternVector ignoreREs;
@@ -223,7 +244,7 @@ PatternVector parseGitIgnoreFile(fs::path dirpath, std::string ignoreFileName) {
                 while ((escape_pos > 0) && (line[escape_pos-1] == '\\')) {
                     escape_pos--;
                 }
-                if (((line_end - escape_pos) & 1) == 1) {
+                if ((((line_end - escape_pos) & 1) == 1) && (line_end + 1 < line.size())) {
                     // Odd number of escapes - the final space is escaped, not trimmed.
                     line_end++;
                 }
@@ -235,17 +256,25 @@ PatternVector parseGitIgnoreFile(fs::path dirpath, std::string ignoreFileName) {
                 is_include_override = true;
                 line_start++;
             }
-            // Convert any local patterns to full path patterns.
-            if (line[0] == '/') {
+            if (line[line_start] == '/') {
                 is_local_pattern = true;
                 line_start++;
+            }
+            if (line_start > line_end) continue;  // no pattern ("!" or "/")
+            // A separator before the end also makes a pattern local.
+            if (line.find('/', line_start) < line_end) {
+                is_local_pattern = true;
             }
             if ((line_start != 0) || (line_end != line.size() - 1)) {
                 line = line.substr(line_start, line_end - line_start + 1);
             }
+            if (is_local_pattern) {
+                // Local patterns are relative to the directory: the full path
+                // of the entry, which begins with the directory path, must be matched.
+                line = directoryPrefixGLOB(dirpath) + line;
+            }
             RE * lineRE = RE_Parser::parse(line, DEFAULT_MODE, RE_Syntax::GitGLOB);
             if (is_local_pattern) {
-                // The full path must be matched.
                 lineRE = Seq::Create({Start::Create(), lineRE});
             }
             else {

@@ -5,6 +5,7 @@
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <boost/container/flat_map.hpp>
+#include <queue>
 
 #if (defined(__has_builtin) && __has_builtin(__builtin_readcyclecounter)) || defined(__GNUC__)
 #elif defined(_MSC_VER)
@@ -42,6 +43,7 @@ void PassMeasurements::endTimerCallback(llvm::StringRef PassId, llvm::Any IR, co
     if (LLVM_LIKELY(cc > td.StartTime)) {
         total = cc - td.StartTime;
     }
+    assert (td.MeasurementIndex < Measurements.size());
     PassMeasurement & CM = Measurements[td.MeasurementIndex];
     assert (PassId.equals(CM.Name));
     uint64_t mean = 0;
@@ -73,40 +75,47 @@ void PassMeasurements::update(PassMeasurements & other) {
 
     boost::container::flat_map<uint64_t, uint64_t> M;
     M.reserve(m);
-    M.emplace(MAX_INT, MAX_INT);
 
-    boost::container::flat_map<uint64_t, uint64_t> N;
-    N.reserve(m);
-
-    for (;;) {
-
-        for (size_t i = 0; i < m; ++i) {
-            auto & Bi = B[i];
-            const auto f = M.find(Bi.Parent);
-            if (f != M.end()) {
-                const auto parent = f->second;
-                auto key = MeasurementMapKey(Bi.Name, parent);
-                auto g = MeasurementMap.find(key);
-                if (g != MeasurementMap.end()) {
-                    const uint64_t passIdx = g->second;
-                    PassMeasurement & PM = Measurements[passIdx];
-                    PM.update(Bi);
-                    N.emplace(Bi.Index, passIdx);
-                } else {
-                    const uint64_t idx = Measurements.size();
-                    Measurements.emplace_back(Bi, idx, parent);
-                    MeasurementMap.insert(std::make_pair(key, idx));
-                    N.emplace(Bi.Index, idx);
-                }
-            }
-            M.clear();
-            if (N.empty()) {
-                return;
-            }
-            M.swap(N);
+    auto addOrUpdateMeasurement = [&](const PassMeasurement & measurement, const uint64_t Parent) {
+        auto key = MeasurementMapKey(measurement.Name, Parent);
+        auto g = MeasurementMap.find(key);
+        uint64_t passIdx;
+        if (g != MeasurementMap.end()) {
+            passIdx = g->second;
+            Measurements[passIdx].update(measurement);
+        } else {
+            passIdx = Measurements.size();
+            Measurements.emplace_back(measurement, passIdx, Parent);
+            MeasurementMap.insert(std::make_pair(key, passIdx));
         }
+        auto h = M.emplace(measurement.Index, passIdx);
+        assert (h.second);
+    };
 
+    std::queue<size_t> Q;
+
+    for (size_t i = 0; i < m; ++i) {
+        const auto & measurement = B[i];
+        if (measurement.Parent == MAX_INT) {
+            addOrUpdateMeasurement(measurement, MAX_INT);
+        } else {
+            Q.push(i);
+        }
     }
+
+    while (!Q.empty()) {
+        const auto k = Q.front();
+        Q.pop();
+        const auto & measurement = B[k];
+        auto p = M.find(measurement.Parent);
+        if (p == M.end()) {
+            Q.push(k);
+        } else {
+            addOrUpdateMeasurement(measurement, p->second);
+        }
+    }
+
+
 
 }
 
@@ -154,6 +163,8 @@ void PassMeasurements::print(llvm::raw_ostream & out) const {
             }
         }
     };
+
+    out << "PASS NAME,MEAN,STDEV,MODIFIED\n\n";
 
     for (size_t i = 0; i < m; ++i) {
         auto & measure = Measurements[i];

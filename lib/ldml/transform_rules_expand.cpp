@@ -12,6 +12,7 @@
 #include <set>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include <ldml/transform_plan.h>
 #include "charset_analysis.h"
 
 using namespace llvm;
@@ -329,6 +330,354 @@ bool referencesCaptures(const RE * re) {
 
 }
 
+//  The members of a set other than the end of the text (End), through its
+//  alternations, differences, intersections and variables, with end set if it
+//  has the end (a negated set [^X] is the difference of a set with it and X);
+//  nullptr if it has no other member.
+static RE * withoutEnd(RE * re, bool & end) {
+    if (isa<End>(re)) {
+        end = true;
+        return nullptr;
+    } else if (Name * n = dyn_cast<Name>(re); n && !isFunctionCall(n) && n->getDefinition()) {
+        bool e = false;
+        RE * const rest = withoutEnd(n->getDefinition(), e);
+        if (!e) return re;
+        end = true;
+        return rest;
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> rest;
+        bool e = false;
+        for (RE * a : *alt) {
+            RE * const x = withoutEnd(a, e);
+            if (x && !(isa<CC>(x) && cast<CC>(x)->empty())) rest.push_back(x);
+        }
+        if (!e) return re;
+        end = true;
+        return rest.empty() ? nullptr : makeAlt(rest.begin(), rest.end());
+    } else if (Diff * d = dyn_cast<Diff>(re)) {
+        bool l = false, r = false;
+        RE * const lh = withoutEnd(d->getLH(), l);
+        RE * const rh = withoutEnd(d->getRH(), r);
+        if (!l || r) return re;
+        end = true;
+        if (lh == nullptr) return nullptr;
+        return rh ? makeDiff(lh, rh) : lh;
+    } else if (Intersect * x = dyn_cast<Intersect>(re)) {
+        bool l = false, r = false;
+        RE * const lh = withoutEnd(x->getLH(), l);
+        RE * const rh = withoutEnd(x->getRH(), r);
+        if (!l || !r) return re;
+        end = true;
+        if (lh == nullptr || rh == nullptr) return nullptr;
+        return makeIntersect(lh, rh);
+    }
+    return re;
+}
+
+//  Whether a pattern (of a result) refers to a capture, anywhere in it
+//  (including the arguments of function calls).
+static bool refersTo(const RE * re, const Capture * capture) {
+    if (const Reference * r = dyn_cast<Reference>(re)) {
+        return r->getCapture() == capture;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (refersTo(e, capture)) return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (refersTo(e, capture)) return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return refersTo(rep->getRE(), capture);
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() && refersTo(n->getDefinition(), capture);
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return refersTo(c->getCapturedRE(), capture);
+    }
+    return false;
+}
+
+//  A part of a result with the references to a capture (items of the part)
+//  referring to another (by), or, with by nullptr, removed; false if a
+//  reference to it is not such an item (within a function call).
+static bool rebind(RE * part, const Capture * capture, Capture * by, RE *& out) {
+    if (part == nullptr) {
+        out = nullptr;
+        return true;
+    }
+    std::vector<RE *> items;
+    if (Seq * seq = dyn_cast<Seq>(part)) items.assign(seq->begin(), seq->end()); else items.push_back(part);
+    std::vector<RE *> rebound;
+    for (RE * item : items) {
+        if (const Reference * r = dyn_cast<Reference>(item); r && r->getCapture() == capture) {
+            if (by) rebound.push_back(Reference::Create(r->getName(), by, r->getInstance(), r->getReferencedProperty()));
+        } else if (refersTo(item, capture)) {
+            return false;
+        } else {
+            rebound.push_back(item);
+        }
+    }
+    out = makeSeq(rebound.begin(), rebound.end());
+    return true;
+}
+
+//  The result side of a rule with the references to a capture rebound (see
+//  rebind), or nullptr.
+static RuleSide * rebindResult(const RuleSide * result, const Capture * capture, Capture * by) {
+    RE * completed = nullptr, * revisit = nullptr;
+    if (!rebind(result->getCompletedResult(), capture, by, completed) || !rebind(result->getResultToRevisit(), capture, by, revisit)) {
+        return nullptr;
+    }
+    return RuleSide::Create(result->getBeforeContext(), completed, result->hasCursor(), revisit, result->getCursorOffset(),
+                            result->getAfterContext());
+}
+
+std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
+    //  With a global filter and transform rules, ICU applies each rule set to
+    //  each run of the characters of the filter (in the text given, which the
+    //  rule sets before change): a set of the text that includes the text
+    //  boundary also matches at the end of a run, which the text of a step does
+    //  not tell (the characters a step before inserts are within the run of the
+    //  character they follow), but the filter's mask does: the end of the text
+    //  is then also a position outside the filter (FilterRunEndMark).
+    //  (The characters of the set are then those of the filter, as the text of
+    //  a rule matches within a run.)
+    const FilterRule * filter = nullptr;
+    bool transforms = false;
+    for (const Rule * r : rules) {
+        if (const FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse() && filter == nullptr) filter = f;
+        transforms |= isa<TransformRule>(r);
+    }
+    const bool runs = filter && transforms;
+    RE * const end = runs ? static_cast<RE *>(Alt::Create({makeCC(FilterRunEndMark), makeEnd()})) : makeEnd();
+    CharSetAnalysis sets;
+    static const UCD::UnicodeSet nonCharacters = UCD::UnicodeSet(0xFDD0, 0xFDEF);
+    const UCD::UnicodeSet filterChars = runs ? sets.setOf(filter->getFilterSet(), false) - nonCharacters : UCD::UnicodeSet();
+    auto withinFilter = [&](RE * set) -> RE * {
+        if (!runs || set == nullptr) return set;
+        const UCD::UnicodeSet chars = sets.setOf(set, false) & filterChars;
+        return chars.empty() ? nullptr : makeCC(chars);
+    };
+    std::vector<Rule *> out;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        const RuleSide * source = c ? c->getSourceSide(Direction::Forward) : nullptr;
+        if (source == nullptr || source->getText() == nullptr) {
+            out.push_back(r);
+            continue;
+        }
+        RE * const text = source->getText();
+        std::vector<RE *> items;
+        if (Seq * seq = dyn_cast<Seq>(text)) items.assign(seq->begin(), seq->end()); else items.push_back(text);
+        RE * before = source->getBeforeContext();
+        RE * const after = source->getAfterContext();
+        RuleSide * const result = c->getResultSide(Direction::Forward);
+        auto rule = [&](RE * b, const std::vector<RE *> & t, RE * a, RuleSide * r = nullptr) {
+            return makeConversionRule(makeRuleSide(b, makeSeq(t.begin(), t.end()), a), Direction::Forward, r ? r : result);
+        };
+        bool changed = false;
+        //  ^ at the start of the text: its before context.
+        if (before == nullptr && items.size() > 1 && isa<Start>(items.front())) {
+            before = makeStart();
+            items.erase(items.begin());
+            changed = true;
+        }
+        if (after == nullptr && items.size() > 1) {
+            //  $ at the end of the text: its after context.
+            if (isa<End>(items.back())) {
+                items.pop_back();
+                out.push_back(rule(before, items, makeEnd()));
+                continue;
+            }
+            //  A last capture of such a set: of a character of the set, or
+            //  (empty, its references removed) the end of the text.  Revisited
+            //  unchanged (the last of the text to revisit, its only reference),
+            //  it is its after context, the text then revisited from the same
+            //  position (^ 4 ($nd) → | X $1 as ^ 4 } $nd → | X).
+            if (Capture * const capture = dyn_cast<Capture>(items.back())) {
+                bool boundary = false;
+                RE * const chars = withinFilter(withoutEnd(capture->getCapturedRE(), boundary));
+                RE * const revisit = result->getResultToRevisit();
+                std::vector<RE *> revisited;
+                if (revisit) {
+                    if (Seq * seq = dyn_cast<Seq>(revisit)) revisited.assign(seq->begin(), seq->end()); else revisited.push_back(revisit);
+                }
+                const Reference * const last = revisited.empty() ? nullptr : dyn_cast<Reference>(revisited.back());
+                if (boundary && result->hasCursor() && result->getCursorOffset() == 0 && last && last->getCapture() == capture
+                        && !(result->getCompletedResult() && refersTo(result->getCompletedResult(), capture))) {
+                    revisited.pop_back();
+                    bool once = true;
+                    for (const RE * e : revisited) once &= !refersTo(e, capture);
+                    if (once) {
+                        RuleSide * const context = RuleSide::Create(result->getBeforeContext(), result->getCompletedResult(), true,
+                                                                    makeSeq(revisited.begin(), revisited.end()), 0,
+                                                                    result->getAfterContext());
+                        items.pop_back();
+                        //  (Its end of the text also the end of a run, see FilterRunEndMark.)
+                        RE * after = capture->getCapturedRE();
+                        if (end != nullptr && !isa<End>(end)) {
+                            std::vector<RE *> alts;
+                            if (chars) alts.push_back(chars);
+                            alts.push_back(end);
+                            after = makeAlt(alts.begin(), alts.end());
+                        }
+                        out.push_back(rule(before, items, after, context));
+                        continue;
+                    }
+                }
+                if (boundary) {
+                    Capture * const withChar = chars ? makeCapture(capture->getName(), chars) : nullptr;
+                    RuleSide * const charResult = withChar ? rebindResult(result, capture, withChar) : nullptr;
+                    RuleSide * const endResult = rebindResult(result, capture, nullptr);
+                    if ((withChar == nullptr || charResult) && endResult) {
+                        if (withChar) {
+                            std::vector<RE *> text(items);
+                            text.back() = withChar;
+                            out.push_back(rule(before, text, nullptr, charResult));
+                        }
+                        items.pop_back();
+                        out.push_back(rule(before, items, end, endResult));
+                        continue;
+                    }
+                }
+            }
+            //  A last set including the end of the text: a character of the
+            //  set, or (matching nothing) the end of the text.
+            bool boundary = false;
+            RE * const chars = withinFilter(withoutEnd(items.back(), boundary));
+            if (boundary) {
+                if (chars) {
+                    std::vector<RE *> withChar(items);
+                    withChar.back() = chars;
+                    out.push_back(rule(before, withChar, nullptr));
+                }
+                items.pop_back();
+                out.push_back(rule(before, items, end));
+                continue;
+            }
+        }
+        out.push_back(changed ? rule(before, items, after) : r);
+    }
+    return out;
+}
+
+//  Whether a set has only characters (no strings), through its alternations,
+//  differences, intersections and variables.
+static bool charactersOnly(const RE * re) {
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && charactersOnly(n->getDefinition());
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * a : *alt) if (!charactersOnly(a)) return false;
+        return true;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        return seq->size() == 1 && charactersOnly(seq->front());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        return charactersOnly(d->getLH());
+    } else if (const Intersect * x = dyn_cast<Intersect>(re)) {
+        return charactersOnly(x->getLH()) || charactersOnly(x->getRH());
+    }
+    return !isBoundary(re);
+}
+
+//  The references to a capture in a pattern of a result (anywhere), counted;
+//  false where one is not an item of the pattern (within a function call).
+static bool countReferences(const RE * re, const Capture * capture, unsigned & count, bool top = true) {
+    if (const Reference * r = dyn_cast<Reference>(re)) {
+        if (r->getCapture() == capture) {
+            if (!top) return false;
+            count++;
+        }
+        return true;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (!countReferences(e, capture, count, top)) return false;
+        return true;
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() == nullptr || countReferences(n->getDefinition(), capture, count, false);
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (!countReferences(e, capture, count, false)) return false;
+        return true;
+    }
+    return true;
+}
+
+//  A part of a result with the references to the captures given replaced by
+//  their characters.
+static RE * replaceReferences(RE * part, const std::map<const Capture *, UCD::codepoint_t> & chars) {
+    if (part == nullptr) return nullptr;
+    std::vector<RE *> items;
+    if (Seq * seq = dyn_cast<Seq>(part)) items.assign(seq->begin(), seq->end()); else items.push_back(part);
+    for (RE *& item : items) {
+        if (const Reference * r = dyn_cast<Reference>(item)) {
+            const auto f = chars.find(r->getCapture());
+            if (f != chars.end()) item = makeCC(f->second);
+        }
+    }
+    return makeSeq(items.begin(), items.end());
+}
+
+std::vector<Rule *> EnumerateRepeatedCaptures(const std::vector<Rule *> & rules) {
+    constexpr size_t MaxRules = 64;
+    std::vector<Rule *> out;
+    CharSetAnalysis sets;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        const RuleSide * source = c ? c->getSourceSide(Direction::Forward) : nullptr;
+        if (source == nullptr || source->getText() == nullptr) {
+            out.push_back(r);
+            continue;
+        }
+        const RuleSide * result = c->getResultSide(Direction::Forward);
+        std::vector<RE *> items;
+        if (Seq * seq = dyn_cast<Seq>(source->getText())) items.assign(seq->begin(), seq->end()); else items.push_back(source->getText());
+        //  The captures of single characters of the text referred to more than
+        //  once (the references items of the result).
+        std::vector<std::pair<size_t, UCD::UnicodeSet>> enumerated;
+        bool repeated = false, ok = true;
+        size_t combinations = 1;
+        for (size_t i = 0; i < items.size() && ok; ++i) {
+            const Capture * cap = dyn_cast<Capture>(items[i]);
+            if (cap == nullptr || !CharSetAnalysis::isSet(cap->getCapturedRE()) || !charactersOnly(cap->getCapturedRE())) continue;
+            unsigned count = 0;
+            ok = countReferences(result->getCompletedResult() ? result->getCompletedResult() : makeSeq(), cap, count)
+                 && (result->getResultToRevisit() == nullptr || countReferences(result->getResultToRevisit(), cap, count));
+            if (!ok || count == 0) continue;
+            const UCD::UnicodeSet chars = sets.setOf(cap->getCapturedRE(), false);
+            if (chars.empty()) {
+                ok = false;
+                break;
+            }
+            combinations *= chars.count();
+            repeated |= count > 1;
+            enumerated.emplace_back(i, chars);
+        }
+        if (!ok || !repeated || combinations > MaxRules) {
+            out.push_back(r);
+            continue;
+        }
+        //  Each combination of the characters of the captures, in order.
+        std::vector<std::map<const Capture *, UCD::codepoint_t>> combos(1);
+        for (const auto & e : enumerated) {
+            std::vector<std::map<const Capture *, UCD::codepoint_t>> next;
+            for (const auto & m : combos) {
+                for (const auto & range : e.second) {
+                    for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ++ch) {
+                        auto n = m;
+                        n[cast<Capture>(items[e.first])] = ch;
+                        next.push_back(std::move(n));
+                    }
+                }
+            }
+            combos = std::move(next);
+        }
+        for (const auto & m : combos) {
+            std::vector<RE *> text(items);
+            for (const auto & e : enumerated) text[e.first] = makeCC(m.at(cast<Capture>(items[e.first])));
+            RuleSide * const side = makeRuleSide(source->getBeforeContext(), makeSeq(text.begin(), text.end()), source->getAfterContext());
+            RuleSide * const res = RuleSide::Create(result->getBeforeContext(), replaceReferences(result->getCompletedResult(), m),
+                                                    result->hasCursor(), replaceReferences(result->getResultToRevisit(), m),
+                                                    result->getCursorOffset(), result->getAfterContext());
+            out.push_back(makeConversionRule(side, Direction::Forward, res));
+        }
+    }
+    return out;
+}
+
 std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats) {
     std::vector<Rule *> out;
     Expander expander;
@@ -392,6 +741,608 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
             if (stats) stats->notExpanded.emplace_back(c, e.reason);
             out.push_back(r);
         }
+    }
+    return out;
+}
+
+
+namespace {
+
+//  The characters with which a match of re may begin, and whether it may be
+//  empty (as Composer::firstChars), or false.
+bool textFirsts(RE * re, CharSetAnalysis & sets, UCD::UnicodeSet & first, bool & nullable) {
+    if (CharSetAnalysis::isSet(re)) {
+        first = first + sets.setOf(re, true);
+        nullable = false;
+        return true;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        nullable = true;
+        for (RE * e : *seq) {
+            bool n = false;
+            if (!textFirsts(e, sets, first, n)) return false;
+            if (!n) {
+                nullable = false;
+                break;
+            }
+        }
+        return true;
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        nullable = false;
+        for (RE * e : *alt) {
+            bool n = false;
+            if (!textFirsts(e, sets, first, n)) return false;
+            nullable |= n;
+        }
+        return true;
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        if (!textFirsts(rep->getRE(), sets, first, nullable)) return false;
+        nullable |= rep->getLB() == 0;
+        return true;
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        return textFirsts(c->getCapturedRE(), sets, first, nullable);
+    } else if (Name * name = dyn_cast<Name>(re)) {
+        return !isFunctionCall(name) && name->getDefinition() && textFirsts(name->getDefinition(), sets, first, nullable);
+    } else if (isBoundary(re) || isa<Start>(re) || isa<End>(re)) {
+        nullable = true;
+        return true;
+    }
+    return false;
+}
+
+}
+
+//  A rule's text beginning with a run of at least n characters of a set R,
+//  R{k} R{lb,} T (n = k + lb), T not empty (see SplitLeadingRuns).
+struct LeadingRun {
+    RE * R = nullptr;
+    UCD::UnicodeSet chars;
+    int n = 0;
+    RE * rest = nullptr;
+    UCD::UnicodeSet restFirst;
+};
+
+static bool leadingRun(const ConversionRule * c, Expander & expander, CharSetAnalysis & sets, LeadingRun & run) {
+    const RuleSide * const source = c->getSourceSide(Direction::Forward);
+    if (source->hasBeforeContext() || c->getResultSide(Direction::Forward)->hasCursor()) return false;
+    RE * const text = source->getText();
+    const Seq * const seq = text ? dyn_cast<Seq>(text) : nullptr;
+    if (seq == nullptr || seq->size() < 2) return false;
+    std::vector<RE *> items(seq->begin(), seq->end());
+    size_t at = 0;
+    while (at < items.size() && !isa<Rep>(items[at])) at++;
+    if (at + 1 >= items.size()) return false;
+    const Rep * const rep = cast<Rep>(items[at]);
+    if (rep->getUB() != Rep::UNBOUNDED_REP || !CharSetAnalysis::isSet(rep->getRE())) return false;
+    std::set<std::u32string> strings;
+    if (!expander.alternatives(rep->getRE(), run.chars, strings) || !strings.empty() || run.chars.empty()) return false;
+    for (size_t j = 0; j < at; j++) {
+        UCD::UnicodeSet chars;
+        std::set<std::u32string> st;
+        if (!CharSetAnalysis::isSet(items[j]) || !expander.alternatives(items[j], chars, st) || !st.empty() || !(chars == run.chars)) {
+            return false;
+        }
+    }
+    run.R = rep->getRE();
+    run.n = static_cast<int>(at) + rep->getLB();
+    run.rest = makeSeq(items.begin() + at + 1, items.end());
+    bool nullable = false;
+    return textFirsts(run.rest, sets, run.restFirst, nullable) && !nullable && !run.restFirst.intersects(run.chars);
+}
+
+//  The RE without its captures (as a context).
+static RE * withoutCaptures(RE * re) {
+    if (Capture * c = dyn_cast<Capture>(re)) return withoutCaptures(c->getCapturedRE());
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items;
+        for (RE * e : *seq) items.push_back(withoutCaptures(e));
+        return makeSeq(items.begin(), items.end());
+    }
+    if (Alt * alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> items;
+        for (RE * e : *alt) items.push_back(withoutCaptures(e));
+        return makeAlt(items.begin(), items.end());
+    }
+    if (Rep * rep = dyn_cast<Rep>(re)) return makeRep(withoutCaptures(rep->getRE()), rep->getLB(), rep->getUB());
+    return re;
+}
+
+std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned * split) {
+    std::vector<Rule *> out;
+    Expander expander;
+    CharSetAnalysis sets;
+    //  The conversion rules of the group so far.
+    std::vector<const ConversionRule *> earlier;
+    //  Where an earlier rule may match within a run of R followed by a text
+    //  beginning with a character of next (its first item then a set meeting
+    //  R): at a character of the run followed by another (Within), or by the
+    //  text (AtLast: a character after it may be of next); or, with n = 0, at a
+    //  character of next (Within).
+    enum class Match {None, AtLast, Within};
+    auto mayMatch = [&](const ConversionRule * e, const UCD::UnicodeSet & R, const UCD::UnicodeSet & next, bool atNext) {
+        const RuleSide * const s = e->getSourceSide(Direction::Forward);
+        RE * const text = s->getText() ? withoutCaptures(s->getText()) : nullptr;
+        UCD::UnicodeSet first;
+        bool nullable = false;
+        if (text == nullptr || !textFirsts(text, sets, first, nullable) || nullable) return Match::Within;
+        if (atNext && first.intersects(next)) return Match::Within;
+        if (!first.intersects(R)) return Match::None;
+        std::vector<RE *> items;
+        if (const Seq * seq = dyn_cast<Seq>(text)) items.assign(seq->begin(), seq->end()); else items.push_back(text);
+        if (!CharSetAnalysis::isSet(items.front())) return Match::Within;
+        items.erase(items.begin());
+        if (s->hasAfterContext()) items.push_back(s->getAfterContext());
+        UCD::UnicodeSet second;
+        nullable = false;
+        if (!textFirsts(makeSeq(items.begin(), items.end()), sets, second, nullable) || nullable) return Match::Within;
+        if (second.intersects(R)) return Match::Within;
+        return second.intersects(next) ? Match::AtLast : Match::None;
+    };
+    //  The position in out of each earlier rule (as written there).
+    std::map<const ConversionRule *, size_t> outAt;
+    for (size_t i = 0; i < rules.size(); i++) {
+        Rule * const r = rules[i];
+        ConversionRule * const c = dyn_cast<ConversionRule>(r);
+        if (c == nullptr) {
+            if (!isa<VariableDefinitionRule>(r)) {
+                earlier.clear();
+                outAt.clear();
+            }
+            out.push_back(r);
+            continue;
+        }
+        LeadingRun run;
+        if (!leadingRun(c, expander, sets, run)) {
+            earlier.push_back(c);
+            outAt[c] = out.size();
+            out.push_back(r);
+            continue;
+        }
+        //  The block of the rules beginning with the same run (variable
+        //  definitions between them kept in place).
+        std::vector<std::pair<size_t, LeadingRun>> block{{i, run}};
+        size_t j = i + 1;
+        for (; j < rules.size(); j++) {
+            if (isa<VariableDefinitionRule>(rules[j])) continue;
+            const ConversionRule * const d = dyn_cast<ConversionRule>(rules[j]);
+            LeadingRun next;
+            if (d == nullptr || !leadingRun(d, expander, sets, next) || !(next.chars == run.chars) || next.n != run.n) break;
+            block.emplace_back(j, next);
+        }
+        UCD::UnicodeSet next;
+        for (const auto & b : block) next = next + b.second.restFirst;
+        //  An earlier rule that may match at the last character of the run
+        //  (before Ti), and not within it, does not where the run has at least
+        //  two characters, ICU's rule then applying at its first: the rules
+        //  R{k} Ti → Ci (k = max(n, 2)), placed before the first such earlier
+        //  rule (which they then precede where the run has exactly k), take
+        //  the last k characters of the run (and the deletion the others).
+        bool blocked = false;
+        size_t moveTo = SIZE_MAX;
+        for (const ConversionRule * e : earlier) {
+            const Match m = mayMatch(e, run.chars, next, run.n == 0);
+            if (m == Match::Within) blocked = true;
+            if (m == Match::AtLast && run.n > 0) {
+                //  (Not before a rule split here.)
+                const size_t at = outAt.count(e) ? outAt.at(e) : SIZE_MAX;
+                if (at == SIZE_MAX) blocked = true; else moveTo = std::min(moveTo, at);
+            }
+            if (m == Match::AtLast && run.n == 0) blocked = true;
+        }
+        if (blocked) {
+            earlier.push_back(c);
+            outAt[c] = out.size();
+            out.push_back(r);
+            continue;
+        }
+        const int k = moveTo == SIZE_MAX ? run.n : std::max(run.n, 2);
+        //  R } R{n,} (T1 | T2 | ...) → ; then R{n} Ti → Ci in order.
+        std::vector<RE *> alternatives;
+        for (const auto & b : block) {
+            const RuleSide * const s = cast<ConversionRule>(rules[b.first])->getSourceSide(Direction::Forward);
+            std::vector<RE *> items{withoutCaptures(b.second.rest)};
+            if (s->hasAfterContext()) items.push_back(s->getAfterContext());
+            alternatives.push_back(makeSeq(items.begin(), items.end()));
+        }
+        RE * const after = makeSeq({makeRep(run.R, k, Rep::UNBOUNDED_REP), makeAlt(alternatives.begin(), alternatives.end())});
+        out.push_back(makeConversionRule(makeRuleSide(nullptr, run.R, after), Direction::Forward, makeRuleSide(makeSeq())));
+        std::vector<Rule *> fixed;
+        size_t b = 0;
+        for (size_t x = i; x < j; x++) {
+            if (b < block.size() && block[b].first == x) {
+                ConversionRule * const d = cast<ConversionRule>(rules[x]);
+                const RuleSide * const s = d->getSourceSide(Direction::Forward);
+                std::vector<RE *> last(static_cast<size_t>(k), run.R);
+                last.push_back(block[b].second.rest);
+                fixed.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq(last.begin(), last.end()), s->getAfterContext()),
+                                                   Direction::Forward, d->getResultSide(Direction::Forward)));
+                //  (With the rules moved, those of the shorter runs, R{j} Ti → Ci for
+                //  n <= j < k, stay in place, after the earlier rule.)
+                for (int len = run.n; moveTo != SIZE_MAX && len < k; len++) {
+                    std::vector<RE *> shorter(static_cast<size_t>(len), run.R);
+                    shorter.push_back(block[b].second.rest);
+                    out.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq(shorter.begin(), shorter.end()), s->getAfterContext()),
+                                                     Direction::Forward, d->getResultSide(Direction::Forward)));
+                }
+                earlier.push_back(d);
+                b++;
+            } else if (moveTo == SIZE_MAX) {
+                out.insert(out.end(), fixed.begin(), fixed.end());
+                fixed.clear();
+                out.push_back(rules[x]);
+            } else {
+                out.push_back(rules[x]);
+            }
+        }
+        if (moveTo == SIZE_MAX) {
+            out.insert(out.end(), fixed.begin(), fixed.end());
+        } else {
+            out.insert(out.begin() + moveTo, fixed.begin(), fixed.end());
+            for (auto & at : outAt) if (at.second >= moveTo) at.second += fixed.size();
+        }
+        for (size_t x = i; x < j; x++) {
+            if (const ConversionRule * d = dyn_cast<ConversionRule>(rules[x])) outAt[d] = SIZE_MAX;
+        }
+        if (split) *split += block.size();
+        i = j - 1;
+    }
+    return out;
+}
+
+//  The marker of a rule split by SplitMiddleRuns (counting down from U+FDEF,
+//  as the markers of the revisits count up from U+FDE0).
+static constexpr UCD::codepoint_t MiddleRunMarkLast = 0xFDEF;
+
+std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned * split) {
+    //  (Not with a global filter, which the markers would have to pass.)
+    for (const Rule * r : rules) {
+        if (isa<FilterRule>(r)) return rules;
+    }
+    Expander expander;
+    CharSetAnalysis sets;
+    std::vector<Rule *> out;
+    unsigned markers = 0;
+    size_t start = 0;
+    while (start < rules.size()) {
+        //  A group: the conversion rules and variable definitions up to the next
+        //  other rule.
+        size_t end = start;
+        while (end < rules.size() && (isa<ConversionRule>(rules[end]) || isa<VariableDefinitionRule>(rules[end]))) end++;
+        if (end == start) {
+            out.push_back(rules[start++]);
+            continue;
+        }
+        bool contexts = false;
+        for (size_t i = start; i < end; i++) {
+            if (const ConversionRule * c = dyn_cast<ConversionRule>(rules[i])) contexts |= c->getSourceSide(Direction::Forward)->hasBeforeContext();
+        }
+        std::vector<Rule *> first, body, after;
+        for (size_t i = start; i < end; i++) {
+            ConversionRule * const c = dyn_cast<ConversionRule>(rules[i]);
+            std::vector<Rule *> replaced;
+            [&] {
+                if (c == nullptr || contexts || markers > 15) return;
+                const RuleSide * const source = c->getSourceSide(Direction::Forward);
+                const RuleSide * const result = c->getResultSide(Direction::Forward);
+                if (result->hasCursor()) return;
+                RE * const text = source->getText();
+                const Seq * const seq = text ? dyn_cast<Seq>(text) : nullptr;
+                if (seq == nullptr) return;
+                std::vector<RE *> items(seq->begin(), seq->end());
+                size_t at = 0;
+                while (at < items.size() && !isa<Rep>(items[at])) at++;
+                if (at == 0 || at + 1 >= items.size()) return;
+                const Rep * const rep = cast<Rep>(items[at]);
+                if (rep->getLB() < 1 || rep->getUB() != Rep::UNBOUNDED_REP || !CharSetAnalysis::isSet(rep->getRE())) return;
+                UCD::UnicodeSet chars;
+                std::set<std::u32string> strings;
+                if (!expander.alternatives(rep->getRE(), chars, strings) || !strings.empty()) return;
+                RE * const X = makeSeq(items.begin(), items.begin() + at);
+                RE * const T = makeSeq(items.begin() + at + 1, items.end());
+                if (!expander.isFixed(X) || !expander.isFixed(T) || referencesCaptures(X)) return;
+                //  (The result may refer to the captures of T only.)
+                for (size_t j = 0; j < at; j++) {
+                    if (isa<Capture>(items[j])) return;
+                }
+                UCD::UnicodeSet tFirst, xLast;
+                bool nullable = false;
+                if (!textFirsts(T, sets, tFirst, nullable) || nullable || tFirst.intersects(chars)) return;
+                RE * const R = rep->getRE();
+                RE * const mark = makeCC(MiddleRunMarkLast - markers);
+                std::vector<RE *> ahead{makeRep(R, rep->getLB(), Rep::UNBOUNDED_REP), withoutCaptures(T)};
+                if (source->hasAfterContext()) ahead.push_back(source->getAfterContext());
+                //  X } R{lb,} T → M, in place.
+                replaced.push_back(makeConversionRule(makeRuleSide(nullptr, X, makeSeq(ahead.begin(), ahead.end())),
+                                                      Direction::Forward, makeRuleSide(mark)));
+                //  M { R → ; and M { T → C, first in the group (M is followed by the
+                //  run and T).  A T of one captured set, with a result of literals
+                //  and the capture, as rules of single characters (whose before
+                //  contexts are matched against the converted text).
+                first.push_back(makeConversionRule(makeRuleSide(mark, R, nullptr), Direction::Forward, makeRuleSide(makeSeq())));
+                const Capture * const capture = (at + 2 == items.size()) ? dyn_cast<Capture>(items[at + 1]) : nullptr;
+                UCD::UnicodeSet tChars;
+                std::set<std::u32string> tStrings;
+                if (capture && CharSetAnalysis::isSet(capture->getCapturedRE())
+                        && expander.alternatives(capture->getCapturedRE(), tChars, tStrings) && tStrings.empty() && tChars.count() <= 128) {
+                    for (const auto & range : tChars) {
+                        for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ch++) {
+                            RE * const out = replaceReferences(result->getText(), {{capture, ch}});
+                            first.push_back(makeConversionRule(makeRuleSide(mark, makeCC(ch), source->getAfterContext()),
+                                                               Direction::Forward, makeRuleSide(out)));
+                        }
+                    }
+                } else {
+                    first.push_back(makeConversionRule(makeRuleSide(mark, T, source->getAfterContext()),
+                                                       Direction::Forward, c->getResultSide(Direction::Forward)));
+                }
+                //  M → ; in a group after.
+                after.push_back(makeConversionRule(makeRuleSide(mark), Direction::Forward, makeRuleSide(makeSeq())));
+                markers++;
+            }();
+            if (replaced.empty()) {
+                body.push_back(rules[i]);
+            } else {
+                if (split) (*split)++;
+                body.insert(body.end(), replaced.begin(), replaced.end());
+            }
+        }
+        //  (Variable definitions before the rules that may refer to them.)
+        size_t defs = 0;
+        while (defs < body.size() && isa<VariableDefinitionRule>(body[defs])) defs++;
+        out.insert(out.end(), body.begin(), body.begin() + defs);
+        out.insert(out.end(), first.begin(), first.end());
+        out.insert(out.end(), body.begin() + defs, body.end());
+        if (!after.empty()) {
+            out.push_back(makeTransformRule(TransformID("Null")));
+            out.insert(out.end(), after.begin(), after.end());
+            out.push_back(makeTransformRule(TransformID("Null")));
+        }
+        start = end;
+    }
+    return out;
+}
+
+std::vector<Rule *> ExpandContextCaptureStrings(const std::vector<Rule *> & rules, unsigned * expanded) {
+    std::vector<Rule *> out;
+    Expander expander;
+    for (Rule * r : rules) {
+        ConversionRule * const c = dyn_cast<ConversionRule>(r);
+        std::vector<Rule *> replaced;
+        [&] {
+            if (c == nullptr) return;
+            const RuleSide * const source = c->getSourceSide(Direction::Forward);
+            const Capture * const capture = source->getBeforeContext() ? dyn_cast<Capture>(source->getBeforeContext()) : nullptr;
+            if (capture == nullptr || !CharSetAnalysis::isSet(capture->getCapturedRE())) return;
+            UCD::UnicodeSet chars;
+            std::set<std::u32string> strings;
+            if (!expander.alternatives(capture->getCapturedRE(), chars, strings) || strings.empty()) return;
+            //  The strings, longest first (ICU takes the longest that ends there).
+            std::vector<std::u32string> order(strings.begin(), strings.end());
+            std::stable_sort(order.begin(), order.end(), [](const std::u32string & a, const std::u32string & b) {
+                return a.size() > b.size();
+            });
+            auto variant = [&](RE * captured) -> Rule * {
+                Capture * const by = makeCapture(capture->getName(), captured);
+                RuleSide * const result = rebindResult(c->getResultSide(Direction::Forward), capture, by);
+                if (result == nullptr) return nullptr;
+                return makeConversionRule(makeRuleSide(by, source->getText(), source->getAfterContext()), Direction::Forward, result);
+            };
+            for (const std::u32string & str : order) {
+                std::vector<RE *> items;
+                for (char32_t ch : str) items.push_back(makeCC(static_cast<UCD::codepoint_t>(ch)));
+                Rule * const v = variant(makeSeq(items.begin(), items.end()));
+                if (v == nullptr) {
+                    replaced.clear();
+                    return;
+                }
+                replaced.push_back(v);
+            }
+            if (!chars.empty()) {
+                Rule * const v = variant(makeCC(chars));
+                if (v == nullptr) {
+                    replaced.clear();
+                    return;
+                }
+                replaced.push_back(v);
+            }
+        }();
+        if (replaced.empty()) {
+            out.push_back(r);
+        } else {
+            if (expanded) (*expanded)++;
+            out.insert(out.end(), replaced.begin(), replaced.end());
+        }
+    }
+    return out;
+}
+
+std::vector<Rule *> MarkRunMoves(const std::vector<Rule *> & rules, unsigned * moved) {
+    //  (Not with a global filter, which the marks would have to pass.)
+    for (const Rule * r : rules) {
+        if (isa<FilterRule>(r)) return rules;
+    }
+    Expander expander;
+    CharSetAnalysis sets;
+    auto itemsOf = [](RE * re) {
+        std::vector<RE *> items;
+        if (Seq * seq = dyn_cast<Seq>(re)) items.assign(seq->begin(), seq->end()); else if (re) items.push_back(re);
+        return items;
+    };
+    //  The characters of a set (or false).
+    auto setChars = [&](RE * re, UCD::UnicodeSet & chars) {
+        std::set<std::u32string> strings;
+        return CharSetAnalysis::isSet(re) && expander.alternatives(re, chars, strings) && strings.empty() && !chars.empty();
+    };
+    //  The rule (P) S → S | $1: P and S, or false.
+    auto runMove = [&](const ConversionRule * c, UCD::UnicodeSet & P, UCD::codepoint_t & s) {
+        const RuleSide * const source = c->getSourceSide(Direction::Forward);
+        const RuleSide * const result = c->getResultSide(Direction::Forward);
+        if (source->hasBeforeContext() || source->hasAfterContext() || !result->hasCursor() || result->getCursorOffset() != 0) return false;
+        const std::vector<RE *> text = itemsOf(source->getText());
+        if (text.size() != 2) return false;
+        const Capture * const capture = dyn_cast<Capture>(text[0]);
+        UCD::UnicodeSet S;
+        if (capture == nullptr || !setChars(capture->getCapturedRE(), P) || !setChars(text[1], S) || S.count() != 1) return false;
+        s = lo_codepoint(*S.begin());
+        std::u32string completed;
+        const std::vector<RE *> revisit = itemsOf(result->getResultToRevisit());
+        return literalString(result->getCompletedResult(), completed) && completed == std::u32string(1, static_cast<char32_t>(s))
+               && revisit.size() == 1 && isa<Reference>(revisit[0]) && cast<Reference>(revisit[0])->getCapture() == capture
+               && !P.contains(s);
+    };
+    std::vector<Rule *> out;
+    unsigned marks = 0;
+    size_t start = 0;
+    while (start < rules.size()) {
+        size_t end = start;
+        while (end < rules.size() && (isa<ConversionRule>(rules[end]) || isa<VariableDefinitionRule>(rules[end]))) end++;
+        if (end == start) {
+            out.push_back(rules[start++]);
+            continue;
+        }
+        std::vector<Rule *> group(rules.begin() + start, rules.begin() + end);
+        start = end;
+        //  The rule (one per group), and the first characters of the others.
+        size_t ci = group.size();
+        UCD::UnicodeSet P;
+        UCD::codepoint_t s = 0;
+        for (size_t i = 0; i < group.size() && ci == group.size(); i++) {
+            const ConversionRule * const c = dyn_cast<ConversionRule>(group[i]);
+            if (c && runMove(c, P, s)) ci = i;
+        }
+        if (ci == group.size()) {
+            out.insert(out.end(), group.begin(), group.end());
+            continue;
+        }
+        struct Move {
+            RE * head;                  // P' & P
+            RE * rest;                  // T (nullptr: empty)
+            RE * after;                 // E's after context
+            std::u32string result;      // R
+        };
+        std::vector<Move> moves;
+        UCD::UnicodeSet converted;      // the characters of P that a rule E always converts
+        std::vector<RE *> befores;      // the before contexts of the group
+        bool ok = true;
+        for (size_t k = 0; k < group.size() && ok; k++) {
+            const ConversionRule * const e = dyn_cast<ConversionRule>(group[k]);
+            if (e == nullptr || k == ci) continue;
+            const RuleSide * const es = e->getSourceSide(Direction::Forward);
+            const RuleSide * const er = e->getResultSide(Direction::Forward);
+            if (es->hasBeforeContext()) befores.push_back(es->getBeforeContext());
+            UCD::UnicodeSet first;
+            bool nullable = false;
+            if (es->getText() == nullptr || !textFirsts(es->getText(), sets, first, nullable) || nullable || first.contains(s) || er->hasCursor()) {
+                ok = false;
+                break;
+            }
+            if (!first.intersects(P)) continue;
+            //  A rule E (after the rule).
+            std::u32string fixed;
+            const std::vector<RE *> etext = itemsOf(withoutCaptures(es->getText()));
+            UCD::UnicodeSet head;
+            if (k < ci || es->hasBeforeContext() || !literalString(er->getText(), fixed) || fixed.empty() || etext.empty()
+                    || !setChars(etext[0], head)) {
+                ok = false;
+                break;
+            }
+            RE * rest = nullptr;
+            if (etext.size() > 1) {
+                rest = makeSeq(etext.begin() + 1, etext.end());
+                UCD::UnicodeSet restFirst;
+                bool restNullable = false;
+                if (!textFirsts(rest, sets, restFirst, restNullable) || restNullable || restFirst.contains(s)) {
+                    ok = false;
+                    break;
+                }
+            } else if (!es->hasAfterContext()) {
+                converted = converted + (head & P);
+            }
+            moves.push_back(Move{makeCC(head & P), rest, es->getAfterContext(), fixed});
+        }
+        //  P } S+ → M with the result P, for the characters no rule E always converts.
+        const UCD::UnicodeSet unconverted = P - converted;
+        if (ok && unconverted.count() > 4) ok = false;
+        for (const auto & range : unconverted) {
+            for (UCD::codepoint_t p = lo_codepoint(range); ok && p <= hi_codepoint(range); p++) {
+                moves.push_back(Move{makeCC(p), nullptr, nullptr, std::u32string(1, static_cast<char32_t>(p))});
+            }
+        }
+        //  No before context may see S followed by the first character of a
+        //  result (an item with S, then one with the character, or with S
+        //  again, repeated).
+        for (RE * before : befores) {
+            const std::vector<PatternItem> items = patternItems(before);
+            for (size_t i = 0; i < items.size() && ok; i++) {
+                if (!items[i].chars.contains(s)) continue;
+                if (i + 1 == items.size()) continue;
+                for (const Move & m : moves) {
+                    if (items[i + 1].chars.contains(m.result[0]) || (items[i].repeated && items[i + 1].chars.contains(s))) ok = false;
+                }
+            }
+        }
+        //  The marks, one for each T and R.
+        auto keyOf = [](const Move & m) {
+            std::string key = m.rest ? printPattern(m.rest) : std::string();
+            for (char32_t ch : m.result) key += "/" + std::to_string(static_cast<unsigned>(ch));
+            return key;
+        };
+        std::map<std::string, UCD::codepoint_t> markOf;
+        for (const Move & m : moves) {
+            const std::string key = keyOf(m);
+            if (markOf.count(key) == 0) {
+                if (marks + markOf.size() >= RunMoveMarks) ok = false; else markOf.emplace(key, RunMoveMark(marks + markOf.size()));
+            }
+        }
+        if (!ok) {
+            out.insert(out.end(), group.begin(), group.end());
+            continue;
+        }
+        RE * const run = makeRep(makeCC(s), 1, Rep::UNBOUNDED_REP);
+        RE * const anyRun = makeRep(makeCC(s), 0, Rep::UNBOUNDED_REP);
+        auto literal = [](const std::u32string & str) {
+            std::vector<RE *> items;
+            for (char32_t ch : str) items.push_back(makeCC(static_cast<UCD::codepoint_t>(ch)));
+            return makeSeq(items.begin(), items.end());
+        };
+        std::vector<Rule *> first, replaced;
+        std::set<UCD::codepoint_t> written;
+        UCD::UnicodeSet used;
+        for (const Move & m : moves) {
+            const std::string key = keyOf(m);
+            const UCD::codepoint_t mark = markOf.at(key);
+            used.insert(mark);
+            //  P' } S+ T C → M, in place.
+            std::vector<RE *> ahead{run};
+            if (m.rest) ahead.push_back(m.rest);
+            if (m.after) ahead.push_back(m.after);
+            replaced.push_back(makeConversionRule(makeRuleSide(nullptr, m.head, makeSeq(ahead.begin(), ahead.end())),
+                                                  Direction::Forward, makeRuleSide(makeCC(mark))));
+            if (!written.insert(mark).second) continue;
+            if (m.rest) {
+                //  M S+ { T → R.
+                first.push_back(makeConversionRule(makeRuleSide(makeSeq({makeCC(mark), run}), m.rest, nullptr),
+                                                   Direction::Forward, makeRuleSide(literal(m.result))));
+            } else {
+                //  M S* { S } S → S, M S* { S → S R.
+                first.push_back(makeConversionRule(makeRuleSide(makeSeq({makeCC(mark), anyRun}), makeCC(s), makeCC(s)),
+                                                   Direction::Forward, makeRuleSide(makeCC(s))));
+                first.push_back(makeConversionRule(makeRuleSide(makeSeq({makeCC(mark), anyRun}), makeCC(s), nullptr),
+                                                   Direction::Forward, makeRuleSide(literal(std::u32string(1, static_cast<char32_t>(s)) + m.result))));
+            }
+        }
+        marks += markOf.size();
+        if (moved) (*moved)++;
+        group.erase(group.begin() + ci);
+        group.insert(group.begin() + ci, replaced.begin(), replaced.end());
+        //  (Variable definitions before the rules that may refer to them.)
+        size_t defs = 0;
+        while (defs < group.size() && isa<VariableDefinitionRule>(group[defs])) defs++;
+        out.insert(out.end(), group.begin(), group.begin() + defs);
+        out.insert(out.end(), first.begin(), first.end());
+        out.insert(out.end(), group.begin() + defs, group.end());
+        out.push_back(makeTransformRule(TransformID("Null")));
+        out.push_back(makeConversionRule(makeRuleSide(makeCC(used)), Direction::Forward, makeRuleSide(makeSeq())));
+        out.push_back(makeTransformRule(TransformID("Null")));
     }
     return out;
 }

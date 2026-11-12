@@ -35,6 +35,7 @@
 #include <llvm/IR/PassTimingInfo.h>
 #include <llvm/CodeGen/TargetPassConfig.h>
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
+#include <llvm/Support/thread.h>
 #include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
@@ -123,7 +124,15 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
             single.insert(std::make_pair(mangled, def));
             auto err = MainJD.define(orc::absoluteSymbols(std::move(single)));
             if (err) {
-                handleAllErrors(std::move(err), [](const DuplicateDefinition &) { /* already visible; fine */ });
+                // Already visible: fine if it is the same function. A name linked to another
+                // function is an error, since every kernel calling it would get the first one.
+                handleAllErrors(std::move(err), [&](const DuplicateDefinition &) {
+                    auto prior = ES.lookup(makeJITDylibSearchOrder({&MainJD}), mangled);
+                    if (prior && prior->getAddress() != addr) {
+                        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
+                    }
+                    if (!prior) consumeError(prior.takeError());
+                });
             }
         }
         return f;
@@ -402,7 +411,7 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
         SlabNode(const size_t size, const Block * near = nullptr)
         : Slab([size, near](){
             std::error_code EC;
-            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PAGE_SIZE);
+            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PageSize);
             auto slab = Mem::allocateMappedMemory(alignedSize, near, Mem::MF_READ | Mem::MF_WRITE, EC);
             if (EC) {
                 SmallVector<char, 256> tmp;
@@ -557,7 +566,7 @@ public:
             const auto used = n->AllocatedOffset.load(std::memory_order_relaxed);
             const auto alreadyProtected = n->ProtectedOffset;
             if (LLVM_LIKELY(used > alreadyProtected)) {
-                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PAGE_SIZE), slabEnd);
+                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PageSize), slabEnd);
                 const Block toProtect(reinterpret_cast<void*>(alreadyProtected), protectEnd - alreadyProtected);
                 const auto ec = Mem::protectMappedMemory(toProtect, Mem::MF_READ | Mem::MF_EXEC);
                 if (ec) {
@@ -620,7 +629,7 @@ private:
                     SlabNode * nextSlab = CurrentSlab.load(std::memory_order_acquire);
                     if (nextSlab == currentSlab) {
                         const auto minSize = std::max<uintptr_t>(currentSlab->Slab.allocatedSize(), totalSize * 4);
-                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PAGE_SIZE);
+                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PageSize);
                         // Hint near the original exec slab (rather than currentSlab) so growth keeps
                         // accumulating close to the anchor point instead of drifting slab by slab.
                         nextSlab = new SlabNode(allocSize, &ExecSlab.Slab);
@@ -673,7 +682,7 @@ public:
 
         for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
             CPUDriverContext & ctx = *(Contexts[i]);
-            Threads.emplace_back([this, &ctx]() {
+            Threads.emplace_back(std::optional<unsigned>(CompileThreadStackSize), [this, &ctx]() {
                 // NOTE: the ThreadSafeSlabAllocator itself is not passed into any class but is used invisibly
                 // behind the scenes. Do not remove this!
 
@@ -1154,7 +1163,10 @@ record_decl:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        C.TargetMachine->setOptLevel(codegen::BackEndOptLevel);
+        // "main" only sets up and calls the kernels, which are compiled
+        // separately at codegen::BackEndOptLevel: optimizing its code would
+        // cost far more (several msec per program) than it could ever save.
+        C.TargetMachine->setOptLevel(CodeGenOptLevel::None);
 
         SmallVector<char, 0> objBuffer;
         objBuffer.reserve(4096 + M->getInstructionCount() * 16);
@@ -1280,7 +1292,11 @@ private:
 
     std::mutex                                      PrecompiledStateObjectMutex;
 
-    std::vector<std::thread>                        Threads;
+    //  The worker threads, with stacks of their own size: LLVM's analyses recurse
+    //  deeply on large kernels (ScalarEvolution, in the loop passes, overflows
+    //  the 512 KB of a std::thread on macOS for am_Ethi-am_Ethi/Geminate).
+    static constexpr unsigned                       CompileThreadStackSize = 8u << 20;
+    std::vector<llvm::thread>                       Threads;
 
     std::mutex                                      DebugPrintMutex;
     SmallVector<DebugPrintingResult, 0>             DebugPrintResults;
@@ -1303,11 +1319,12 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
     const StringMap<bool> features = sys::getHostCPUFeatures();
     #endif
 
+    // The features the host lacks are disabled as well: a CPU name implies
+    // features of its own, which a virtual machine may not provide (e.g.,
+    // AVX-512 masked by the hypervisor, giving SIGILL)
     std::vector<std::string> attrs;
     for (auto & flag : features) {
-        if (flag.second) {
-            attrs.push_back("+" + flag.first().str());
-        }
+        attrs.push_back((flag.second ? "+" : "-") + flag.first().str());
     }
 
     auto TripleStr = Triple{sys::getProcessTriple()}.normalize();
@@ -1321,7 +1338,7 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
         .setCodeModel(CodeModel::Large)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
-    const size_t numOfThreads = 1U; // std::max(codegen::CompileThreads, 1U);
+    const auto numOfThreads = codegen::CompileThreads ? codegen::CompileThreads : 1U;
 
     mAllLinkedSymbols = std::make_unique<SymbolMap>();
 
@@ -1342,7 +1359,16 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
     // InProcessMemoryManager, which allocates a small dedicated region per object rather
     // than long-lived shared pools, does not hit it). --use-custom-jit-memory-manager
     // controls which is used; see toolchain.cpp for its LLVM-version-dependent default.
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    // (From LLVM 23, ORC passes the creator a default memory manager, which is not used.)
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, jitlink::JITLinkMemoryManager &) {
+        auto objLinker = codegen::UseCustomJITMemoryManager
+            ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())
+            : std::make_unique<ObjectLinkingLayer>(ES, cantFail(jitlink::InProcessMemoryManager::Create()));
+        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
+        return objLinker;
+    });
+    #elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
     Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES) {
         auto objLinker = codegen::UseCustomJITMemoryManager
             ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())
@@ -1463,12 +1489,18 @@ void * OrcJITBackend::finalizeObject(kernel::Kernel * const pk) {
 
 llvm::Function * OrcJITBackend::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
     assert (&functionType->getContext() == &mDriver.mMainModule->getContext());
+    MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
+    auto symbol = M(unmangledName);
+    auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
+    // A linked name resolves to one address for the whole program: linking it again to another
+    // function would silently give every caller the first one.
+    const auto linked = mAllLinkedSymbols->find(symbol);
+    if (LLVM_UNLIKELY(linked != mAllLinkedSymbols->end() && linked->second.getAddress() != addr)) {
+        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
+    }
     Function * f = mDriver.mMainModule->getFunction(unmangledName);
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mDriver.mMainModule);
-        MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
-        auto symbol = M(unmangledName);
-        auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
         mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
     }
     return f;

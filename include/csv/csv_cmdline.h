@@ -10,12 +10,13 @@
 #include <string>
 #include <vector>
 namespace llvm { namespace cl { class OptionCategory; } }
+namespace toolio { struct Input; }
 
 namespace csv {
 
 extern llvm::cl::OptionCategory CSV_Options;
 
-// input file parameter
+// input file parameter (the standard input if none, or -)
 extern std::string inputFile;
 
 // header information
@@ -26,7 +27,10 @@ extern std::string HeaderSpec;
 extern char32_t FieldDelimiter;
 extern char32_t QuoteChar;
 
-std::vector<std::string> get_CSV_headers();
+// The column headers: of the --headers options, or the first line of the
+// input (read with pread from in.start: in is an input of
+// toolio::openSeekableInput, its position unchanged).
+std::vector<std::string> get_CSV_headers(const toolio::Input & in);
 
 std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers);
 

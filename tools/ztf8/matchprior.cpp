@@ -16,9 +16,11 @@
 #include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fileselect/file_select.h>
 #include <fcntl.h>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
@@ -29,14 +31,18 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory matchpriorFlags("Command Flags", "matchprior options");
+static argv::RegisterFileSelectOptions FileSelectOptions;
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
+// The report, written to the output (toolio::out()) when complete
+static std::ostringstream Report;
 
-static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::OneOrMore, cl::cat(matchpriorFlags));
+static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(matchpriorFlags));
 
 static cl::opt<unsigned> priorDistance("distance", cl::desc("distance for prior match (default 2)"), cl::init(2),  cl::cat(matchpriorFlags));
 
 static int defaultDisplayColumnWidth = 10;  // default field width
 
-std::vector<fs::path> allFiles;
 
 using namespace kernel;
 
@@ -70,68 +76,62 @@ void MatchPriorKernel::generatePabloMethod() {
     pb.createAssign(matchCount, pb.createCount(matchesprior));
 }
 
-typedef uint64_t (*MatchPriorFunctionType)(uint32_t fd);
+typedef uint64_t (*MatchPriorFunctionType)(uint32_t useMMap, uint32_t fd);
+
+// The size of the input read (fstat gives none for a pipe)
+static uint64_t InputSize = 0;
+extern "C" void record_input_size(uint64_t size) {
+    InputSize = size;
+}
 
 MatchPriorFunctionType mpPipelineGen(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"}, Output<uint64_t>{"countResult"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Output<uint64_t>{"countResult"});
     Scalar * const fileDescriptor = P.getInputScalar("fd");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    Kernel * const sourceK = P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     P.CreateKernelCall<MatchPriorKernel>(BasisBits, P.getOutputScalar("countResult"));
+    P.CreateCall("record_input_size", record_input_size, {sourceK->getOutputScalarAt(0)});
     return P.compile();
 }
 
-size_t file_size(const int fd) {
-    struct stat st;
-    if (LLVM_UNLIKELY(fstat(fd, &st) != 0)) {
-        st.st_size = 0;
-    }
-    return st.st_size;
-}
-
-void mp(MatchPriorFunctionType fn_ptr, const uint32_t fileIdx) {
-    std::string fileName = allFiles[fileIdx].string();
-    struct stat sb;
-    const int fd = open(fileName.c_str(), O_RDONLY);
+// Reports a file, returning false (after reporting the error) if it cannot be read.
+bool mp(MatchPriorFunctionType fn_ptr, const fs::path & path, const std::string & name) {
+    const int fd = argv::openInputFile(path);
     if (LLVM_UNLIKELY(fd == -1)) {
-        if (errno == EACCES) {
-            std::cerr << "matchprior: " << fileName << ": Permission denied.\n";
-        }
-        else if (errno == ENOENT) {
-            std::cerr << "matchprior: " << fileName << ": No such file.\n";
-        }
-        else {
-            std::cerr << "matchprior: " << fileName << ": Failed.\n";
-        }
-        return;
+        return false;
     }
-    if (stat(fileName.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::cerr << "matchprior: " << fileName << ": Is a directory.\n";
-        close(fd);
-        return;
-    }
-    uint64_t countResult = fn_ptr(fd);
-    std::cout << std::setw(defaultDisplayColumnWidth);
-    std::cout << countResult << std::setw(defaultDisplayColumnWidth);
-    std::cout << file_size(fd);
-    std::cout << " " << fileName << std::endl;
+    uint64_t countResult = fn_ptr(toolio::useMMapFor(fd), fd);
+    Report << std::setw(defaultDisplayColumnWidth);
+    Report << countResult << std::setw(defaultDisplayColumnWidth);
+    Report << InputSize;
+    if (!name.empty()) Report << " " << name;
+    Report << std::endl;
     close(fd);
+    return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
-        argv::DirectoriesFlag = argv::Recurse;
+    codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &argv::File_Select_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    if (!toolio::openOutput()) {
+        return 1;
     }
     CPUDriver driver("mp");
-    allFiles = argv::getFullFileList(driver, inputFiles);
+    argv::FileSelectConfig config;
+    config.stdinAsPath = true;
+    config.useIgnoreFiles = false;
+    const argv::FileSelection allFiles(driver, inputFiles, config);
     const auto fileCount = allFiles.size();
 
     auto matchPriorFunctionPtr = mpPipelineGen(driver);
+    bool allRead = true;
     for (unsigned i = 0; i < fileCount; ++i) {
-        mp(matchPriorFunctionPtr, i);
+        allRead &= mp(matchPriorFunctionPtr, allFiles[i], allFiles.displayName(i));
     }
-    return 0;
+    toolio::out() << Report.str();
+    if (!toolio::finishOutput()) {
+        return 1;
+    }
+    return allRead ? 0 : 1;
 }

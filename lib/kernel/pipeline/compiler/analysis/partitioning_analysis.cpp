@@ -192,7 +192,7 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
 
     // wcan through the graph and determine where every non-Fixed relationship exists
     // so that we can construct our initial set of partitions. The goal here is to act
-    // as a naive first pass to simplify the problem before using Z3.
+    // as a naive first pass to simplify the problem for the later stages.
 
     // NOTE: any decisions made during this pass *must* be provably correct for any
     // situation because the choices will *not* be verified.
@@ -1921,10 +1921,12 @@ void PipelineAnalysis::determinePartitionJumpIndices() {
         }
 
         for (auto partitionId = firstPartition; partitionId < oneAfterLastPartition; ++partitionId) {
-            const BitSet & prior =  rateDomSet[partitionId - 1];
             const BitSet & current =  rateDomSet[partitionId];
+            // (In a pipeline of no kernels, the first phase starts at partition 0,
+            // which has no prior partition.)
+            const bool differsFromPrior = (partitionId == 0) || (rateDomSet[partitionId - 1] != current);
             auto j = partitionId + 1U;
-            if (prior != current && in_degree(partitionId, J) > 0) {
+            if (differsFromPrior && in_degree(partitionId, J) > 0) {
                 assert (current.any());
                 for (; j < oneAfterLastPartition; ++j) {
                     const BitSet & next =  rateDomSet[j];
@@ -1983,6 +1985,9 @@ void PipelineAnalysis::identifyProvisionalStrideKernels() {
         if (active) {
             ProvisionalStrideKernel.set(kernel);
             ProvisionalChainLookAhead[kernel] = chain;
+            // A provisional stride writes a stride past the full strides, into the output of the
+            // next segment: the kernel must not run segments concurrently (isKernelStateFree).
+            mBufferGraph[kernel].Type |= HasProvisionalStride;
         } else if (!isRoot) {
             // A kernel that looks ahead into data produced within its own partition depends on
             // the provisional strides of its producers.

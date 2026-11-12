@@ -25,14 +25,14 @@ class SourceFile {
 public:
 
     /**
-     * Creates a source file instance by opening the file at a path relative to
-     * some static base path.
-     * 
-     * The base path is: $HOME/.cache/parabix
-     * 
-     * @param path  The path to the source file relative to the base path. For
+     * Creates a source file instance by opening a pablo source file installed
+     * with Parabix, in the pablo directory of its data directory
+     * (<prefix>/share/parabix/pablo, or <build>/share/parabix/pablo in the
+     * build tree, where parabix_add_pablo_src copies it).
+     *
+     * @param path  The path to the source file relative to that directory. For
      *              example, path = "src.pablo" will get the file:
-     *              '$HOME/.cache/parabix/src.pablo'.
+     *              '<prefix>/share/parabix/pablo/src.pablo'.
      * @return A pointer to the newly created source file or nullptr if unable
      *  to open the file.
      */

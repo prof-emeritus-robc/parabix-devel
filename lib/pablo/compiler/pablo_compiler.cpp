@@ -195,7 +195,6 @@ Value * PabloCompiler::getCarryRebuildScratchPtr(KernelBuilder & b, const Var * 
     const auto shape = StreamSetBuffer::resolveType(var->getType(), 0);
     auto vecTy = FixedVectorType::get(b.getIntNTy(shape.FieldWidth), b.getBitBlockWidth() / shape.FieldWidth);
     auto scratchTy = ArrayType::get(vecTy, shape.ElementCount);
-
     Value * scratch = nullptr;
     const auto f = mCarryRebuildScratch.find(var);
     if (f == mCarryRebuildScratch.end()) {
@@ -306,8 +305,8 @@ void PabloCompiler::addBranchCounter(KernelBuilder & b) {
         std::tie(ptr, ty) = b.getScalarFieldPtr("profile");
         assert (mBasicBlock.size() < ty->getArrayNumElements());
         ptr = b.CreateGEP(ty, ptr, {b.getInt32(0), b.getInt32(mBasicBlock.size())});
-        const auto alignment = getAlignment(ty);
-        Value * value = b.CreateAlignedLoad(ty, ptr, alignment, false, "branchCounter");
+        const auto alignment = getAlignment(ty->getArrayElementType());
+        Value * value = b.CreateAlignedLoad(ty->getArrayElementType(), ptr, alignment, false, "branchCounter");
         value = b.CreateAdd(value, ConstantInt::get(cast<IntegerType>(value->getType()), 1));
         b.CreateAlignedStore(value, ptr, alignment);
         mBasicBlock.push_back(b.GetInsertBlock());

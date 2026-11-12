@@ -24,6 +24,7 @@
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <llvm/Support/CommandLine.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -39,8 +40,9 @@ using namespace codegen;
 using namespace re;
 
 static cl::OptionCategory u8u16Options("u8u16 Options", "Transcoding control options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(u8u16Options));
-static cl::opt<std::string> outputFile(cl::Positional, cl::desc("<output file>"), cl::cat(u8u16Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(u8u16Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<std::string> OutputEncoding("encoding", cl::desc("Output encoding (default: UTF-16BE)"), cl::init("UTF-16BE"), cl::cat(u8u16Options));
 
 static cl::opt<bool> BranchingMode("branch", cl::desc("Use Experimental branching pipeline mode"), cl::cat(u8u16Options));
@@ -254,17 +256,17 @@ void U8U16Kernel::generatePabloMethod() {
     main.createAssign(main.createExtract(getOutputStreamVar("selectors"), main.getInteger(0)), selectors);
 }
 
-typedef void (*u8u16FunctionType)(uint32_t fd, const char *);
+typedef void (*u8u16FunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 // ------------------------------------------------------
 
 u8u16FunctionType generatePipeline(CPUDriver & driver, cc::ByteNumbering byteNumbering) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"), Input<const char *>("outputFileName"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"), Input<uint32_t>("outputFD"));
 
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     // Transposed bits from s2p
     StreamSet * BasisBits = P.CreateStreamSet(8);
@@ -283,8 +285,7 @@ u8u16FunctionType generatePipeline(CPUDriver & driver, cc::ByteNumbering byteNum
                                              fieldWidth);
     P.CreateKernelCall<P2S16KernelWithCompressedOutput>(u16bits, selectors, u16bytes, byteNumbering);
 
-    Scalar * outputFileName = P.getInputScalar("outputFileName");
-    P.CreateKernelCall<FileSink>(outputFileName, u16bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u16bytes);
 
     return P.compile();
 }
@@ -322,12 +323,12 @@ void makeAllAsciiBranch(PipelineBuilder & P, StreamSet * const ByteStream, Strea
 
 u8u16FunctionType generatePipeline2(CPUDriver & driver, cc::ByteNumbering byteNumbering) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"), Input<const char *>("outputFileName"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"), Input<uint32_t>("outputFD"));
 
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     StreamSet * const u16bytes = P.CreateStreamSet(1, 16);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     StreamSet * const nonAscii =  P.CreateStreamSet();
 
@@ -343,8 +344,7 @@ u8u16FunctionType generatePipeline2(CPUDriver & driver, cc::ByteNumbering byteNu
 
     makeNonAsciiBranch(driver, *B->getNonZeroBranch().get(), ByteStream, u16bytes, byteNumbering);
 
-    Scalar * outputFileName = P.getInputScalar("outputFileName");
-    P.CreateKernelCall<FileSink>(outputFileName, u16bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u16bytes);
 
     return reinterpret_cast<u8u16FunctionType>(P.compile());
 }
@@ -359,7 +359,7 @@ size_t file_size(const int fd) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&u8u16Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&u8u16Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     cc::ByteNumbering byteNumbering;
     if ((OutputEncoding == "UTF16LE") || (OutputEncoding == "UTF-16LE")) {
         byteNumbering = cc::ByteNumbering::LittleEndian;
@@ -369,6 +369,10 @@ int main(int argc, char *argv[]) {
         byteNumbering = cc::ByteNumbering::BigEndian;
     } else {
         llvm::report_fatal_error("Unrecognized encoding.");
+    }
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
     CPUDriver driver("u8u16");
     u8u16FunctionType u8u16Function = nullptr;
@@ -380,20 +384,15 @@ int main(int argc, char *argv[]) {
     {
         u8u16Function = generatePipeline(driver, byteNumbering);
     }
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        std::cerr << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        #ifdef REPORT_PAPI_TESTS
-        papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
-        jitExecution.start();
-        #endif
-        u8u16Function(fd, outputFile.c_str());
-        #ifdef REPORT_PAPI_TESTS
-        jitExecution.stop();
-        jitExecution.write(std::cerr);
-        #endif
-        close(fd);
-    }
-    return 0;
+    #ifdef REPORT_PAPI_TESTS
+    papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
+    jitExecution.start();
+    #endif
+    u8u16Function(in.useMMap, in.fd, toolio::outputFD());
+    #ifdef REPORT_PAPI_TESTS
+    jitExecution.stop();
+    jitExecution.write(std::cerr);
+    #endif
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

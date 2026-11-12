@@ -67,6 +67,11 @@ struct RE_context {
     kernel::StreamSet * source;
     kernel::StreamSet * matchStarts = nullptr;
     kernel::StreamSet * matchFollows = nullptr;
+    //  Externals of the client, by name (a name of the RE with that full name
+    //  is compiled as the external, rather than by its definition), as streams
+    //  of the positions of the source; for a source of Unicode (or of the codes
+    //  of a multiplexed alphabet of it) only.
+    std::vector<std::pair<std::string, ExternalStream>> externals = {};
 };
 
 struct RE_ModeOptions {
@@ -230,6 +235,7 @@ public:
     std::string makeSignature(RE_CompilerContext & ctxt, re::RE * r);
     kernel::Bindings makeInputBindings(RE_CompilerContext & ctxt, re::RE * r);
     kernel::Bindings makeOutputBindings(RE_CompilerContext & ctxt, re::RE * r, kernel::StreamSet * results);
+    static bool needsTextInput(RE_CompilerContext & ctxt, re::RE * r);
 
 private:
     // The RE as compiled: with a multiplexed context, its CCs translated to codes.
@@ -342,15 +348,20 @@ class StringClassKernel : public pablo::PabloKernel {
 public:
     // With the region follows (the position after each match region),
     // occurrences that include a region follow are excluded.
+    // With guards (see re::parseGuardedStringClass), an occurrence of
+    // strings[i] counts only where none of guards[i] follows it (within the
+    // region).
     StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
                       kernel::StreamSet * basis, kernel::StreamSet * fillStartsEnds,
-                      kernel::StreamSet * follows = nullptr);
+                      kernel::StreamSet * follows = nullptr,
+                      std::vector<std::vector<std::vector<re::CC *>>> guards = {});
     bool hasSignature() const override { return true; }
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
     void generatePabloMethod() override;
 private:
     const std::vector<std::vector<re::CC *>> mStrings;
+    const std::vector<std::vector<std::vector<re::CC *>>> mGuards;
     const bool mHasFollows;
     const std::string mSignature;
 };

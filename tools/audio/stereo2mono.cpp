@@ -15,6 +15,7 @@
 #include <kernel/scan/scanmatchgen.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fcntl.h>
 #include <iostream>
 #include <kernel/pipeline/driver/cpudriver.h>
@@ -37,8 +38,9 @@ using namespace audio;
     P.captureByteData(#name, name)
 
 static cl::OptionCategory DemoOptions("Demo Options", "Demo control options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(DemoOptions));
-static cl::opt<std::string> outputFile("o", cl::desc("Specify a file to save the modified .wav file."), cl::cat(DemoOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(DemoOptions));
+// The modified .wav file goes to the standard output, or the file of --output.
+static toolio::RegisterOutputOptions OutputOptions;
 
 typedef void (*PipelineFunctionType)(StreamSetPtr & ss_buf, int32_t fd);
 
@@ -79,42 +81,42 @@ PipelineFunctionType generatePipeline(CPUDriver & pxDriver, const unsigned int& 
 
 int main(int argc, char *argv[])
 {
-    codegen::ParseCommandLineOptions(argc, argv, {&DemoOptions, codegen::codegen_flags()});
+    codegen::ParseCommandLineOptions(argc, argv, {&DemoOptions, &toolio::InputOutputOptions, codegen::codegen_flags()});
 
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
+    const int fd = in.fd;
     CPUDriver driver("demo");
-    const int fd = open(inputFile.c_str(), O_RDONLY);
     unsigned int sampleRate = 0, numChannels = 2, bitsPerSample = 16, numSamples = 0;
     bool isWav = true;
     try
     {
         readWAVHeader(fd, numChannels, sampleRate, bitsPerSample, numSamples);
-        std::cout << "numChannels: " << numChannels << ", sampleRate: " << sampleRate << ", bitsPerSample: " << bitsPerSample << ", numSamples: " << numSamples << "\n";
+        llvm::errs() << "numChannels: " << numChannels << ", sampleRate: " << sampleRate << ", bitsPerSample: " << bitsPerSample << ", numSamples: " << numSamples << "\n";
         lseek(fd, 44, SEEK_SET);
     }
     catch (const std::exception &e)
     {
-        llvm::errs() << "Warning: cannot parse " << inputFile << " WAV header for processing. Processing file as text.\n";
-        lseek(fd, 0, SEEK_SET);
+        llvm::errs() << "Warning: cannot parse " << in.name << " WAV header for processing. Processing file as text.\n";
+        if (lseek(fd, 0, SEEK_SET) == -1) {
+            llvm::errs() << toolio::programName() << ": " << in.name << ": cannot be read again as text (a pipe)\n";
+            return 1;
+        }
         isWav = false;
     }
 
     auto fn = generatePipeline(driver, numChannels, bitsPerSample);
     StreamSetPtr wavStream;
     fn(wavStream, fd);
-    if (outputFile.getNumOccurrences() != 0) {
-        const int fd_out = open(outputFile.c_str(), O_WRONLY | O_CREAT, 0666);
-        if (LLVM_UNLIKELY(fd_out == -1)) {
-            llvm::errs() << "Error: cannot write to " << outputFile << ".\n";
-        } else {
-            if (isWav) {
-                auto header = createWAVHeader(1, sampleRate, bitsPerSample, numSamples);
-                std::ignore = write(fd_out, header.c_str(), header.size());
-            }
-            // NOTE: Despite a sample can be 8, 16, 32, etc. we treat the stream as bytestream (8-bit) to make it consistent with existing kernels.
-            std::ignore = write(fd_out, wavStream.data<8>(), wavStream.length() * (bitsPerSample / 8));
-            close(fd_out);
-        }
+    toolio::closeInput(in);
+    const int fd_out = toolio::outputFD();
+    if (isWav) {
+        auto header = createWAVHeader(1, sampleRate, bitsPerSample, numSamples);
+        toolio_write(fd_out, header.c_str(), header.size());
     }
-    close(fd);
-    return 0;
+    // NOTE: Despite a sample can be 8, 16, 32, etc. we treat the stream as bytestream (8-bit) to make it consistent with existing kernels.
+    toolio_write(fd_out, wavStream.data<8>(), wavStream.length() * (bitsPerSample / 8));
+    return toolio::finishOutput() ? 0 : 1;
 }

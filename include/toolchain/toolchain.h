@@ -194,11 +194,11 @@ extern unsigned CompileThreads;
 extern bool UseMCJIT;
 extern bool EnableDynamicMultithreading;
 extern bool TraceObjectCache;
+extern bool PrewarmSystemObjectCache;  // set from command line: --prewarm-system-object-cache
 extern unsigned GroupNum;
 extern const char * ProgramName;
 extern llvm::TargetOptions target_Options;
 extern bool TimeKernelsIsEnabled;
-extern unsigned Z3_Timeout;
 extern bool EnableIllustrator;
 extern int IllustratorDisplay;
 extern float DynamicMultithreadingAddThreshold;

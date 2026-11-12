@@ -56,11 +56,14 @@ struct PassMeasurement {
     void update(const PassMeasurement & other) {
         assert (other.Count > 0 && Count > 0);
         assert (other.Name == Name);
-        const auto newCount = other.Count + Count;
+        const auto newCount = Count + other.Count;
+        const double dblCount = (double)newCount;
+        const auto newMean = (Mean * Count + other.Mean * other.Count) / dblCount;
         const auto delta = other.Mean - Mean;
-        Mean += delta * ((double)(other.Count) / newCount);
-        M2 += other.M2 * ((delta * delta * (double)Count * (double)other.Count) / (double)newCount);
+        const auto newM2 = (M2 + other.M2) + (delta * Count * delta * other.Count) / dblCount;
         Count = newCount;
+        Mean = newMean;
+        M2 = newM2;
         ModifiedCount += other.ModifiedCount;
     }
 
@@ -130,39 +133,22 @@ struct PassMeasurements {
     , MeasurementMap{} {
 
         PIC.registerBeforeNonSkippedPassCallback([this](llvm::StringRef PassId, llvm::Any IR) {
-            return startTimerCallback(PassId, IR);
+            return startTimerCallback(intern(PassId), IR);
         });
 
         PIC.registerBeforeAnalysisCallback([this](llvm::StringRef PassId, llvm::Any IR) {
-            return startTimerCallback(PassId, IR);
+            return startTimerCallback(intern(PassId), IR);
         });
 
         PIC.registerAfterPassCallback([this](llvm::StringRef PassId, llvm::Any IR, const llvm::PreservedAnalyses & PA){
-            return endTimerCallback(PassId, IR, !PA.areAllPreserved());
+            return endTimerCallback(intern(PassId), IR, !PA.areAllPreserved());
         });
 
         PIC.registerAfterAnalysisCallback([this](llvm::StringRef PassId, llvm::Any IR) {
-            return endTimerCallback(PassId, IR, false);
+            return endTimerCallback(intern(PassId), IR, false);
         });
 
 //        registerCodeGenCallback(PIC, static_cast<LLVMTargetMachine &>(*TM));
-    }
-
-
-    static llvm::StringRef resolvePassName(llvm::StringRef PassId, llvm::Any IR) {
-        assert (!PassId.empty());
-        /*
-        if (PassId.empty() || PassId == "Machine Optimization Pass") {
-            auto pass = llvm::any_cast<llvm::Pass *>(IR);
-            if (pass) {
-                auto registry = llvm::PassRegistry::getPassRegistry();
-                auto info = registry->getPassInfo(pass);
-                if (info) {
-                    return info->getPassArgument();
-                }
-            }
-        }*/
-        return PassId;
     }
 
     static size_t getLinesOfCode(const llvm::Any & IR) {

@@ -328,7 +328,14 @@ static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::loca
                                                    cl::desc("Trace object cache retrieval."), cl::cat(JIT_InfoOptions));
 
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
-                                                 cl::desc("Path to the object cache directory"), cl::cat(CodeGenOptions));
+                                                 cl::desc("Path to the object cache directory (the only one used: "
+                                                          "not the system-wide one)"), cl::cat(CodeGenOptions));
+
+bool PrewarmSystemObjectCache = false;
+static cl::opt<bool, true> PrewarmSystemObjectCacheOption("prewarm-system-object-cache", cl::location(PrewarmSystemObjectCache), cl::init(false),
+                                                          cl::desc("Compile into the system-wide object cache, read by all users "
+                                                                   "(done when installing, by share/parabix/prewarm.sh)."),
+                                                          cl::cat(CodeGenOptions), cl::Hidden);
 
 std::string ObjectCacheSalt;
 static cl::opt<std::string, true> ObjectCacheSaltOption("object-cache-salt", cl::location(ObjectCacheSalt), cl::init(""),
@@ -405,10 +412,6 @@ static cl::opt<unsigned, true> PhaseClaimSegmentsOption("phase-claim-segments", 
                                                         "another segment of the later phase (at most --phase-segment-limit)"),
                                                cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
 
-
-unsigned Z3_Timeout;
-static cl::opt<unsigned, true> Z3_TimeoutOption("Z3-timeout", cl::location(Z3_Timeout), cl::init(3000),
-                                               cl::desc("Z3 timeout"), cl::value_desc("positive integer"));
 
 static cl::opt<unsigned, true>
 MaxTaskThreadsOption("max-task-threads", cl::location(TaskThreads),

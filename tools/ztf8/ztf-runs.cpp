@@ -23,6 +23,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <kernel/streamutils/run_index.h>
@@ -42,7 +43,9 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory ztfRunsOptions("ztfRuns Options", "ZTF-runs options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(ztfRunsOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(ztfRunsOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> Decompression("d", cl::desc("Decompress from ZTF-Runs to UTF-8."), cl::cat(ztfRunsOptions), cl::init(false));
 static cl::alias DecompressionAlias("decompress", cl::desc("Alias for -d"), cl::aliasopt(Decompression));
 
@@ -153,17 +156,17 @@ void ZTF_Run_Decompression::generatePabloMethod() {
     }
 }
 
-typedef void (*ztfRunsFunctionType)(uint32_t fd);
+typedef void (*ztfRunsFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 ztfRunsFunctionType ztfRuns_compression_gen (CPUDriver & driver) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"outputFD"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const codeUnitStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, codeUnitStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, codeUnitStream);
 
     StreamSet * const u8basis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(codeUnitStream, u8basis);
@@ -187,17 +190,17 @@ ztfRunsFunctionType ztfRuns_compression_gen (CPUDriver & driver) {
     FilterByMask(P, toExtract, replacedBasis, ztf_basis);
     StreamSet * const ZTF_bytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(ztf_basis, ZTF_bytes);
-    P.CreateKernelCall<StdOutKernel>(ZTF_bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), ZTF_bytes);
     return P.compile();
 }
 
 ztfRunsFunctionType ztfRuns_decompression_gen (CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"outputFD"});
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const source = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, source);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, source);
     StreamSet * const ztfRunsBasis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(source, ztfRunsBasis);
     StreamSet * const ztfRunLengths = P.CreateStreamSet(3);
@@ -213,26 +216,25 @@ ztfRunsFunctionType ztfRuns_decompression_gen (CPUDriver & driver) {
     P.CreateKernelCall<ZTF_Run_Decompression>(ztfRunCodes, ztfRunSpreadMask, ztfRuns_u8_Basis, u8basis);
     StreamSet * const u8bytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(u8basis, u8bytes);
-    P.CreateKernelCall<StdOutKernel>(u8bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u8bytes);
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&ztfRunsOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&ztfRunsOptions, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     
     CPUDriver driver("ztfRuns");
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        if (Decompression) {
-            auto ztfRunsDecompressionFunction = ztfRuns_decompression_gen(driver);
-            ztfRunsDecompressionFunction(fd);
-        } else {
-            auto ztfRunsCompressionFunction = ztfRuns_compression_gen(driver);
-            ztfRunsCompressionFunction(fd);
-        }
-        close(fd);
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
-    return 0;
+    if (Decompression) {
+        auto ztfRunsDecompressionFunction = ztfRuns_decompression_gen(driver);
+        ztfRunsDecompressionFunction(in.useMMap, in.fd, toolio::outputFD());
+    } else {
+        auto ztfRunsCompressionFunction = ztfRuns_compression_gen(driver);
+        ztfRunsCompressionFunction(in.useMMap, in.fd, toolio::outputFD());
+    }
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

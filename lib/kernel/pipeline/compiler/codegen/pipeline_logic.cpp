@@ -476,6 +476,9 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
         }
         if (bufferScaling) {
             expectedSourceOutputSize = b.CreateCeilUDivRational(bufferScaling, b.getBitBlockWidth());
+            // A source with no estimate (e.g., a pipe with no data waiting yet) expects 0
+            Value * const noEstimate = b.CreateIsNull(expectedSourceOutputSize);
+            expectedSourceOutputSize = b.CreateSelect(noEstimate, segmentSize, expectedSourceOutputSize);
         } else {
             expectedSourceOutputSize = segmentSize;
         }

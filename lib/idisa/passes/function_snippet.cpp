@@ -87,7 +87,7 @@ public:
     }
 
     llvm::StringRef getPassName() const override {
-        return llvm::StringRef{"FunctionSnippetReplacement"};
+        return llvm::StringRef{"Function Snippet Replacement"};
     }
 
     bool doInitialization(llvm::Module & M) override;
@@ -1431,7 +1431,17 @@ void FunctionSnippetPassManagerProxy::add(Pass * P) {
     if (PassId == &TargetPassConfig::ID) {
         auto * TPC = static_cast<TargetPassConfig *>(P);
         TPC->setRequiresCodeGenSCCOrder();
-    } else if (PassId == &FinalizeISelID) {
+    }
+    StringRef passName;
+    if (PIC) {
+        passName = PIC->intern(P->getPassName());
+        BasePM.add(new PassInstrumentationStartTimer(*PIC, passName));
+    }
+    BasePM.add(P);
+    if (PIC) {
+        BasePM.add(new PassInstrumentationEndTimer(*PIC, passName, true));
+    }
+    if (PassId == &FinalizeISelID) {
         Pass * const snippetPass = createFunctionSnippetTokenReplacerPass();
         StringRef snippetPassName;
         if (PIC) {
@@ -1442,15 +1452,6 @@ void FunctionSnippetPassManagerProxy::add(Pass * P) {
         if (PIC) {
             BasePM.add(new PassInstrumentationEndTimer(*PIC, snippetPassName, true));
         }
-    }
-    StringRef passName;
-    if (PIC) {
-        passName = PIC->intern(P->getPassName());
-        BasePM.add(new PassInstrumentationStartTimer(*PIC, passName));
-    }
-    BasePM.add(P);
-    if (PIC) {
-        BasePM.add(new PassInstrumentationEndTimer(*PIC, passName, true));
     }
 }
 

@@ -92,11 +92,12 @@ MCJITBackend::MCJITBackend(CPUDriver & driver)
     const StringMap<bool> features = sys::getHostCPUFeatures();
     #endif
 
+    // The features the host lacks are disabled as well: a CPU name implies
+    // features of its own, which a virtual machine may not provide (e.g.,
+    // AVX-512 masked by the hypervisor, giving SIGILL)
     std::vector<std::string> attrs;
     for (auto & flag : features) {
-        if (flag.second) {
-            attrs.push_back("+" + flag.first().str());
-        }
+        attrs.push_back((flag.second ? "+" : "-") + flag.first().str());
     }
 
     std::string errMessage;
@@ -331,6 +332,11 @@ llvm::Function * MCJITBackend::LinkFunction(llvm::StringRef unmangledName, llvm:
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mod);
         mEngine->updateGlobalMapping(f, functionPointer);
+    } else if (void * const prior = mEngine->getPointerToGlobalIfAvailable(f);
+               LLVM_UNLIKELY(prior != nullptr && prior != functionPointer)) {
+        // A linked name resolves to one address: linking it again to another function would
+        // silently give every caller the first one.
+        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
     }
     return f;
 }

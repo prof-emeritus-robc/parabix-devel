@@ -2,6 +2,8 @@
 #include <re/transforms/re_transformer.h>
 #include <re/adt/adt.h>
 #include <re/analysis/re_analysis.h>
+#include <re/alphabet/alphabet.h>
+#include <functional>
 
 using namespace llvm;
 
@@ -31,9 +33,23 @@ namespace re {
 //  there, a possessive repetition determines the match end or must reach the
 //  position of the lookbehind.
 //
+//  The engine accepts a text where any choice of the alternatives of the
+//  repeated item matches; a possessive repetition chooses one at each
+//  repetition (the longest that matches, as ICU does, or the first, as PCRE
+//  does; see PossessiveChoice).  A repeated item that is a class of literal
+//  strings (with sets of single characters) is therefore first made
+//  unambiguous (see unambiguousStrings): at each position, at most one of its
+//  alternatives matches, the one the possessive repetition chooses, so that
+//  the repetitions reach the same positions whatever the engine chooses, and
+//  the forms above are exact (e{n}+ as e{n}, before $ or at the end of a
+//  lookahead as e{lb,ub}, before items that cannot begin with a first character
+//  of e as e{lb,ub}, and otherwise with the assertion).  Other repeated items,
+//  of several characters, are resolved as before, which is exact only where
+//  they match unambiguously.
+//
 class ResolvePossessive final : public RE_Transformer {
 public:
-    ResolvePossessive() : RE_Transformer("ResolvePossessive") {}
+    ResolvePossessive(PossessiveChoice choice) : RE_Transformer("ResolvePossessive"), mChoice(choice) {}
 protected:
     RE * transformRep(Rep * rep) override;
     RE * transformSeq(Seq * seq) override;
@@ -42,7 +58,168 @@ private:
     RE * resolve(Rep * rep, const std::vector<RE *> & rest, bool atLookaheadEnd);
     // Is the RE being transformed at the end of a lookahead body?
     bool mAtLookaheadEnd = false;
+    const PossessiveChoice mChoice;
 };
+
+//  The alternatives of a class of strings, in order (through alternations and
+//  names), each a sequence of character classes, or false.
+static bool orderedStrings(RE * r, std::vector<std::vector<CC *>> & strings) {
+    if (Name * n = dyn_cast<Name>(r)) {
+        return n->getDefinition() && orderedStrings(n->getDefinition(), strings);
+    } else if (Alt * alt = dyn_cast<Alt>(r)) {
+        for (RE * a : *alt) {
+            if (!orderedStrings(a, strings)) return false;
+        }
+        return true;
+    }
+    std::vector<RE *> items;
+    //  (A sequence of character classes, strings or names of them.)
+    std::function<bool (RE *)> flatten = [&](RE * e) -> bool {
+        if (Seq * seq = dyn_cast<Seq>(e)) {
+            for (RE * x : *seq) {
+                if (!flatten(x)) return false;
+            }
+            return true;
+        } else if (String * str = dyn_cast<String>(e)) {
+            for (const char32_t c : *str) items.push_back(makeCC(c));
+            return true;
+        }
+        items.push_back(e);
+        return true;
+    };
+    flatten(r);
+    std::vector<CC *> str;
+    for (RE * item : items) {
+        CC * const cc = resolveCharClass(item);
+        if (cc == nullptr || cc->empty()) return false;
+        str.push_back(cc);
+    }
+    if (str.empty()) return false;
+    strings.push_back(std::move(str));
+    return true;
+}
+
+//  A class of strings made unambiguous for a possessive repetition, or nullptr
+//  (with firsts, the characters with which its matches begin).  The strings
+//  of several characters must be literal; the alternatives of one character
+//  may be sets.  The alternative chosen where several match (the preferred:
+//  the longer one, or the earlier one) is the only one left to match there:
+//    - a string w with a preferred string t as a proper prefix is never chosen,
+//      and is dropped (with First, as (a|ab): ab is never taken);
+//    - a string w that is a proper prefix of preferred strings w t' is taken
+//      only where none of them matches: w (?!t'...);
+//    - the characters of a set of one character that begin longer strings are
+//      such strings w (the others have no conflict).
+//  At each position, at most one alternative then matches.  Backward (matched
+//  from the right, as the repetitions of an ICU before context; see
+//  unambiguousAlternatives), the same with the ends of the strings: a string
+//  w that is a proper suffix of preferred strings t' w is taken only where none
+//  of them matches, (?<!t'...) w, and with firsts the characters with which
+//  the matches end; at each end position, at most one alternative matches.
+static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bool backward = false,
+                               CC ** singles = nullptr) {
+    std::vector<std::vector<CC *>> alternatives;
+    if (!orderedStrings(e, alternatives)) return nullptr;
+    const cc::Alphabet * alphabet = nullptr;
+    bool multi = false;
+    UCD::UnicodeSet starts;                     // the first (backward: last) characters of the strings of several characters
+    for (const auto & a : alternatives) {
+        for (CC * cc : a) {
+            if (alphabet && cc->getAlphabet() != alphabet) return nullptr;
+            alphabet = cc->getAlphabet();
+        }
+        if (a.size() > 1) {
+            multi = true;
+            for (CC * cc : a) {
+                if (cc->count() != 1) return nullptr;
+            }
+            starts.insert(lo_codepoint((backward ? a.back() : a.front())->front()));
+        }
+    }
+    if (!multi) return nullptr;
+    struct Literal {
+        std::u32string text;
+        size_t order;
+    };
+    std::vector<Literal> literals;
+    UCD::UnicodeSet others;                     // the characters of sets of one character, without conflicts
+    for (size_t i = 0; i < alternatives.size(); i++) {
+        const auto & a = alternatives[i];
+        if (a.size() == 1) {
+            const UCD::UnicodeSet chars = *a.front();
+            others = others + (chars - starts);
+            const UCD::UnicodeSet involved = chars & starts;
+            if (involved.count() > 64) return nullptr;
+            for (const auto & range : involved) {
+                for (UCD::codepoint_t c = lo_codepoint(range); c <= hi_codepoint(range); c++) {
+                    literals.push_back(Literal{std::u32string(1, static_cast<char32_t>(c)), i});
+                }
+            }
+        } else {
+            std::u32string text;
+            for (CC * cc : a) text.push_back(static_cast<char32_t>(lo_codepoint(cc->front())));
+            literals.push_back(Literal{text, i});
+        }
+    }
+    //  (The same string twice: the earlier.)
+    std::vector<Literal> distinct;
+    for (const Literal & l : literals) {
+        bool seen = false;
+        for (const Literal & d : distinct) seen |= d.text == l.text;
+        if (!seen) distinct.push_back(l);
+    }
+    auto preferred = [&](const Literal & t, const Literal & w) {
+        return choice == PossessiveChoice::Longest ? t.text.size() > w.text.size() : t.order < w.order;
+    };
+    std::vector<RE *> alts;
+    UCD::UnicodeSet first = others;
+    if (!others.empty()) alts.push_back(makeCC(std::move(others), alphabet));
+    //  Whether t begins (backward: ends) with w.
+    auto extends = [&](const std::u32string & t, const std::u32string & w) {
+        return backward ? t.compare(t.size() - w.size(), w.size(), w) == 0 : t.compare(0, w.size(), w) == 0;
+    };
+    auto literal = [&](const std::u32string & text) {
+        std::vector<RE *> items;
+        for (char32_t c : text) items.push_back(makeCC(static_cast<UCD::codepoint_t>(c), alphabet));
+        return makeSeq(items.begin(), items.end());
+    };
+    for (const Literal & w : distinct) {
+        bool dropped = false;
+        std::vector<RE *> guards;
+        for (const Literal & t : distinct) {
+            if (&t == &w || !preferred(t, w)) continue;
+            if (t.text.size() < w.text.size() && extends(w.text, t.text)) {
+                dropped = true;
+            } else if (t.text.size() > w.text.size() && extends(t.text, w.text)) {
+                //  The rest of t, beyond w.
+                const size_t n = t.text.size() - w.text.size();
+                guards.push_back(literal(backward ? t.text.substr(0, n) : t.text.substr(w.text.size())));
+            }
+        }
+        if (dropped) continue;
+        RE * const text = literal(w.text);
+        if (guards.empty()) {
+            alts.push_back(text);
+        } else if (backward) {
+            alts.push_back(makeSeq({makeNegativeLookBehindAssertion(makeAlt(guards.begin(), guards.end())), text}));
+        } else {
+            alts.push_back(makeSeq({text, makeNegativeLookAheadAssertion(makeAlt(guards.begin(), guards.end()))}));
+        }
+        first.insert(static_cast<UCD::codepoint_t>(backward ? w.text.back() : w.text.front()));
+    }
+    //  The first characters that are alternatives of their own (guarded only by
+    //  the rest of the longer alternatives they begin, which are alternatives
+    //  too): at such a character, an alternative always matches.
+    if (singles) {
+        UCD::UnicodeSet alone = others;
+        for (const Literal & w : distinct) {
+            if (w.text.size() == 1) alone.insert(static_cast<UCD::codepoint_t>(w.text.front()));
+        }
+        *singles = makeCC(std::move(alone), alphabet);
+    }
+    firsts = makeCC(std::move(first), alphabet);
+    return makeAlt(alts.begin(), alts.end());
+}
 
 //  The general resolution of e{lb,ub}+.
 static RE * withAssertion(RE * e, const int lb, const int ub) {
@@ -109,10 +286,35 @@ RE * ResolvePossessive::resolve(Rep * rep, const std::vector<RE *> & rest, bool 
     RE * const e = rep->getRE();
     const int lb = rep->getLB();
     const int ub = rep->getUB();
+    CC * const S = resolveCharClass(e);
+    //  A class of strings, made unambiguous: its repetitions reach the same
+    //  positions however they are matched.
+    CC * firsts = nullptr;
+    CC * singles = nullptr;
+    if (RE * const d = S ? nullptr : unambiguousStrings(e, mChoice, firsts, false, &singles)) {
+        RE * const following = makeSeq(rest.begin(), rest.end());
+        if (lb == ub || (rest.empty() && atLookaheadEnd) || (!rest.empty() && isa<End>(rest.front()))) {
+            return makeSeq({makeRep(d, lb, ub), following});
+        }
+        if (!rest.empty()) {
+            CC * const first = firstCharClassOfItems(rest);
+            if (first && first->getAlphabet() == firsts->getAlphabet() && intersectCC(first, firsts)->empty()) {
+                return makeSeq({makeRep(d, lb, ub), following});
+            }
+        }
+        //  Where every first character is an alternative of its own, (?!d) holds
+        //  exactly where the next character is not a first character: a
+        //  one-character lookahead (as a lookahead chain allows).
+        if (singles && firsts->getAlphabet() == singles->getAlphabet() && subtractCC(firsts, singles)->empty()) {
+            RE * const notFirst = makeNegativeLookAheadAssertion(firsts);
+            if (ub == Rep::UNBOUNDED_REP) return makeSeq({makeRep(d, lb, ub), notFirst, following});
+            return makeSeq({makeAlt({makeSeq({makeRep(d, lb, ub - 1), notFirst}), makeRep(d, ub, ub)}), following});
+        }
+        return makeSeq({withAssertion(d, lb, ub), following});
+    }
     if (lb == ub) {
         return makeSeq({makeRep(e, lb, ub), makeSeq(rest.begin(), rest.end())});
     }
-    CC * const S = resolveCharClass(e);
     if (S) {
         if (rest.empty()) {
             if (atLookaheadEnd) return makeRep(e, lb, ub);
@@ -219,8 +421,13 @@ RE * ResolvePossessive::transformAssertion(Assertion * a) {
     return makeAssertion(asserted, a->getKind(), a->getSense());
 }
 
-RE * resolvePossessiveQuantifiers(RE * re) {
-    return ResolvePossessive().transformRE(re);
+RE * resolvePossessiveQuantifiers(RE * re, PossessiveChoice choice) {
+    return ResolvePossessive(choice).transformRE(re);
+}
+
+RE * unambiguousAlternatives(RE * e, PossessiveChoice choice, bool backward) {
+    CC * ends = nullptr;
+    return unambiguousStrings(e, choice, ends, backward);
 }
 
 }

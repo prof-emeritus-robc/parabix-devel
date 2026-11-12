@@ -30,6 +30,7 @@
 #include <pablo/parse/rd_parser.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fcntl.h>
 #include <iostream>
 #include <iomanip>
@@ -48,18 +49,20 @@ using namespace pablo::parse;
 static cl::OptionCategory xmlFlags("Command Flags", "xml options");
 
 std::string inputFile;
-static cl::opt<std::string, true> inputFileOption(cl::Positional, cl::location(inputFile), cl::desc("<input file>"), cl::Required, cl::cat(xmlFlags));
+static cl::opt<std::string, true> inputFileOption(cl::Positional, cl::location(inputFile), cl::desc("<input file>"), cl::cat(xmlFlags));
+// (The errors found are the only output, on the standard error.)
+static toolio::RegisterInputOptions InputOptions;
 
-typedef void(*XMLProcessFunctionType)(uint32_t fd);
+typedef void(*XMLProcessFunctionType)(uint32_t useMMap, uint32_t fd);
 
 XMLProcessFunctionType xmlPipelineGen(CPUDriver & driver, std::shared_ptr<PabloParser> parser, std::shared_ptr<SourceFile> xmlPabloSrc) {
     const size_t ERROR_STREAM_COUNT = 9;
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"});
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
@@ -305,26 +308,11 @@ XMLProcessFunctionType xmlPipelineGen(CPUDriver & driver, std::shared_ptr<PabloP
 
 
 int main(int argc, char ** argv) {
-    codegen::ParseCommandLineOptions(argc, argv, {&xmlFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&xmlFlags, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
-    struct stat sb;
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        if (errno == EACCES) {
-            std::cerr << "xml: " << inputFile << ": Permission denied.\n";
-        }
-        else if (errno == ENOENT) {
-            std::cerr << "xml: " << inputFile << ": No such file.\n";
-        }
-        else {
-            std::cerr << "xml: " << inputFile << ": Failed.\n";
-        }
-        return errno;
-    }
-    if (stat(inputFile.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::cerr << "xml: " << inputFile << ": Is a directory.\n";
-        close(fd);
-        return -1;
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in)) {
+        return 1;
     }
 
     CPUDriver driver("xml-pablo");
@@ -336,7 +324,8 @@ int main(int argc, char ** argv) {
     }
     auto xmlProcessFuncPtr = xmlPipelineGen(driver, parser, xmlSource);
 
-    xmlProcessFuncPtr(fd);
+    xmlProcessFuncPtr(in.useMMap, in.fd);
     ShowError();
-    close(fd);
+    toolio::closeInput(in);
+    return 0;
 }

@@ -127,11 +127,13 @@ protected:
 // Abstract class for two-level scanning
 class TwoLevelScanKernel : public MultiStrideKernel {
 public:
+    // scanStreamIndex: scan that stream of the scan stream set; -1 (the default): the union of all.
     TwoLevelScanKernel(LLVMTypeSystemInterface & ts,
                        std::string && name,
                        unsigned scanWordWidth,
                        std::string scanStreamName,
-                       std::vector<LoopVar> loopVars);
+                       std::vector<LoopVar> loopVars,
+                       int scanStreamIndex = -1);
     virtual ~TwoLevelScanKernel() {}
 protected:
     void generateIndexComputation(KernelBuilder & b,
@@ -150,8 +152,12 @@ protected:
                                          llvm::Value * absItemPos,
                                          std::vector<llvm::Value *> & loopVars) = 0;
 private:
+    // The scanned streams of the scan stream set: [first, first + count).
+    unsigned scanFirst() const { return mScanStreamIndex < 0 ? 0 : unsigned(mScanStreamIndex); }
+    unsigned scanCount(KernelBuilder & b) const;
     unsigned mScanWordWidth;
     std::string mScanStreamName;
+    int mScanStreamIndex;
 };
 
 }

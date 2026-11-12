@@ -8,6 +8,7 @@
 #include <llvm/IR/Module.h>
 #include <kernel/core/kernel_builder.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/core/streamset.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -51,6 +52,44 @@ StdOutKernel::StdOutKernel(LLVMTypeSystemInterface & ts, StreamSet *codeUnitBuff
 {Binding{"codeUnitBuffer", codeUnitBuffer}}
 // output & scalars
 , {}, {}, {}, {})
+, mCodeUnitWidth(codeUnitBuffer->getFieldWidth()) {
+    setStride((8 * BUFSIZ) / mCodeUnitWidth);
+    addAttribute(SideEffecting());
+}
+
+void FDSinkKernel::linkExternalMethods(KernelBuilder & b) {
+    b.LinkFunction("toolio_write", toolio_write);
+}
+
+void FDSinkKernel::generateDoSegmentMethod(KernelBuilder & b) {
+    Value * const itemsDone = b.getProcessedItemCount("codeUnitBuffer");
+    Value * const codeUnitBuffer = b.getRawInputPointer("codeUnitBuffer", itemsDone);
+    Value * bytesToDo = b.getAccessibleItemCount("codeUnitBuffer");
+    if (LLVM_UNLIKELY(mCodeUnitWidth > 8)) {
+        bytesToDo = b.CreateMul(bytesToDo, b.getSize(mCodeUnitWidth / 8));
+    } else if (LLVM_UNLIKELY(mCodeUnitWidth < 8)) {
+        bytesToDo = b.CreateUDiv(bytesToDo, b.getSize(8 / mCodeUnitWidth));
+    }
+    Function * const writeFunc = b.getModule()->getFunction("toolio_write");
+    FixedArray<Value *, 3> args;
+    args[0] = b.getScalarField("fileDescriptor");
+    args[1] = codeUnitBuffer;
+    args[2] = bytesToDo;
+    b.CreateCall(writeFunc->getFunctionType(), writeFunc, args);
+}
+
+FDSinkKernel::FDSinkKernel(LLVMTypeSystemInterface & ts, Scalar * fd, StreamSet * codeUnitBuffer)
+: SegmentOrientedKernel(ts, "fd_sink" + std::to_string(codeUnitBuffer->getFieldWidth()),
+// input
+{Binding{"codeUnitBuffer", codeUnitBuffer}},
+// output
+{},
+// input scalars
+{Binding{"fileDescriptor", fd}},
+// output scalars
+{},
+// internal scalars
+{})
 , mCodeUnitWidth(codeUnitBuffer->getFieldWidth()) {
     setStride((8 * BUFSIZ) / mCodeUnitWidth);
     addAttribute(SideEffecting());

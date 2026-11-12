@@ -127,6 +127,12 @@ add_test(NAME circular_buffer_test
     WORKING_DIRECTORY ${TEST_BIN_DIR}
     COMMAND ${TEST_BIN_DIR}/test_circular_buffer)
 
+# The input and output conventions of the tools (toolchain/toolio.h), on a cat
+# program of them
+parabix_add_executable(NAME toolio_cat SRC toolio_cat.cpp DEPS kernel.io)
+add_test(NAME toolio_test
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/QA
+    COMMAND python3 toolio_test.py ${TEST_BIN_DIR}/toolio_cat)
 
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests

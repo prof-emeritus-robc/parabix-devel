@@ -18,8 +18,8 @@
  *      Mirrors merge_analysis.py::clean_range_analysis.
  *
  *  Runtime pipeline (one BPEMergeKernel per clean range, lowest range first):
- *      BPERangeSeed   — source = base id of each RAW byte (8-bit), active = 1s,
- *                       end = 0s (end is legacy/unused).
+ *      BPEBaseIdKernel — source = base id of each RAW byte (8-bit, BixNum arithmetic),
+ *                       active = 1s (kernel name BPE_BaseIds+active).
  *      BPEMergeKernel — START-anchored, per rule (rank order):
  *                         Astart    = EQ(source, idA)                  // A starts here
  *                         BstartAtA = EQ(LookAhead(source, lenA), idB) // B lenA ahead
@@ -40,7 +40,7 @@
  *  ──────────
  *  BPEMergeKernel name encodes hashRuleSet(the group's rule list), so two merges
  *  files producing the same range shape but different rules still get distinct
- *  cache entries. BPERangeSeed is shape-only (constant name).
+ *  cache entries. BPEBaseIdKernel is data-independent (constant name).
  */
 
 #include "bpe.h"
@@ -51,6 +51,7 @@
 #include <iostream>
 #include <map>
 #include <atomic>
+#include <mutex>
 #include <memory>
 #include <queue>
 #include <array>
@@ -77,11 +78,17 @@
 #include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
-#include <kernel/core/streamset.h>               // CircularBufferAllocator (--vm-ring-buffers)
 #include <kernel/io/source_kernel.h>              // MemorySourceBlockCapacity (--memsource-block-capacity)
-#ifdef __APPLE__
-#include <mach/mach.h>
-#endif
+#include <kernel/scan/base.h>                     // TwoLevelScanKernel (--tail-scan-kernel)
+#include <kernel/scan/reader.h>                   // BPE_DUMP
+#include <kernel/scan/index_generator.h>          // BPE_DUMP
+#include <chrono>                                 // --tail-vocab-table build time
+#include <thread>                                 // --tail-vocab-table builder
+#include <cstdio>                                 // --tail-vocab-file
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
@@ -529,11 +536,6 @@ static cl::opt<unsigned> BPETail(
              "segment in the emitter (0 = off, the default)."),
     cl::init(0));
 
-// --vm-ring-buffers (macOS): build the pipeline's circular buffers with mach vm_remap
-// (kernel::CircularBufferAllocator) instead of the framework's memfd mapping, which on macOS
-// is a temp file in /tmp: mkstemp + unlink + ftruncate per buffer on every pipeline run,
-// ~9% of a 1-thread run, all of it before the worker threads start. Runtime only (the
-// kernels' code is the same), so no cache tag. No effect elsewhere.
 // --tail-direct-input (with --bpe-tail, when no retirement point comes before the cut): hand
 // the tail the last kernel's id bits, live mask and segment starts as they are. Otherwise
 // they go through BPEWidenKernel (to 16 id bits), BPERetirePackKernel and
@@ -551,7 +553,7 @@ static cl::opt<bool> TailDirectInput(
 // with every rule on each pretoken, straight from the input bytes, and its per-thread word
 // cache is keyed by the pretoken's bytes (2..15 of them: two 8-byte loads, no id
 // gathering). Cheaper than the hybrid because a cache hit costs about the same at any cut
-// and nothing else runs: no BPERangeSeed, no bit-transformation kernels, no P2S16.
+// and nothing else runs: no base-id kernel, no bit-transformation kernels, no P2S16.
 // Single-thread harness (val_4MB): the whole BPE in 10.8 ms warm / 14.8 ms cold, vs ~30 ms
 // for the 15 kernels + the --bpe-tail=1 tail. Cache tag: BPE_TailResolveBytes.
 static cl::opt<bool> TailFromBytes(
@@ -571,10 +573,13 @@ static cl::opt<bool> TailCachePool(
              "runs and threads (default off)."),
     cl::init(false));
 
+// --vm-ring-buffers: retired, accepted and ignored. Circular buffers are now built with Mach
+// vm_remap on macOS by default (kernel/core make_circular_buffer); --CircularBufferImpl=memfd
+// selects the old temp-file mapping.
 static cl::opt<bool> VMRingBuffers(
     "vm-ring-buffers",
-    cl::desc("macOS: build circular buffers with vm_remap instead of a temp file (default off)."),
-    cl::init(false));
+    cl::desc("Retired: macOS circular buffers use vm_remap by default (see --CircularBufferImpl)."),
+    cl::init(false), cl::Hidden);
 
 // --memsource-block-capacity: the in-memory source's buffer capacity is the input length
 // rounded up to a whole block (kernel::MemorySourceBlockCapacity). Without it, an input whose
@@ -787,32 +792,18 @@ protected:
     }
 };
 
-// BPERangeSeed — the FIRST BPE kernel. It turns each raw input byte into its
-// base-alphabet token id: the starting single-byte token, before any merge.
-// Outputs:
-//   source (16-bit) — base id of each byte   (the id stream the merges build on)
-//   active (1-bit)  — all 1s                  (reused downstream as emit-all)
-//   end    (1-bit)  — all 0s                  (legacy; unused)
-//
-// GPT-2's byte-level alphabet (encoder.py bytes_to_unicode) maps
-// each raw byte to a printable char, then encoder.json assigns each char an id =
-// its POSITION in the alphabet. The alphabet lists the 188 "printable" bytes
-// first (ids 0..187), then the 68 remaining bytes (ids 188..255). So a byte's id
-// is NOT its value and NOT its unicode code point — it is its position.
-//
-// Composing byte→char→id gives a closed-form piecewise map: id = byte + offset,
-// one offset per contiguous byte range. We compute it by ARITHMETIC (a few range
-// masks + Sel) instead of a 256-way EQ lookup table — far fewer Pablo ops. The
-// alphabet is a fixed spec, so this kernel is data-independent (constant cache
-// name). 
+// GPT-2's byte-level alphabet (encoder.py bytes_to_unicode) maps each raw byte to a printable
+// char, then encoder.json assigns each char an id = its POSITION in the alphabet. The alphabet
+// lists the 188 "printable" bytes first (ids 0..187), then the 68 remaining bytes (ids
+// 188..255), each group in byte order. So a byte's id is NOT its value and NOT its unicode
+// code point — it is its position, and within each contiguous byte range id = byte + offset:
 //
 //   byte range   offset   id            byte range   offset   id
 //   0..32        +188     188..220      161..172     −67      94..105
 //   33..126      −33      0..93         173          →255     255
 //   127..160     +94      221..254      174..255     −68      106..187
 // (e.g. space 32 → 220 = 'Ġ', 'y' 121 → 88, 't' 116 → 83.)
-// GPT-2's base id of a byte (bytes_to_unicode order, T1): piecewise byte + offset, a
-// bijection over 0..255.
+// GPT-2's base id of a byte (bytes_to_unicode order, T1): a bijection over 0..255.
 static unsigned bpeBaseId(unsigned by) {
     if (by <= 32)  return by + 188;
     if (by <= 126) return by - 33;
@@ -822,52 +813,487 @@ static unsigned bpeBaseId(unsigned by) {
     return by - 68;                        // 174..255
 }
 
-class BPERangeSeed : public PabloKernel {
+// The 8 bits of every byte's base id as bit streams, by BixNum arithmetic: id = byte + offset
+// (mod 256), and as 8-bit constants 0..32 and 174..255 share their offset:
+//   0..32, 174..255: 0xBC (+188 = -68)   33..126: 0xDF (-33)   127..160: 0x5E (+94)
+//   161..172: 0xBD (-67)                 173: 0x52 (+82)
+// Four compares split the ranges, offset bit k is the OR of the ranges whose offset has bit k,
+// then one 8-bit modular add (Xor3 / Majority3 per bit): 77 Pablo statements, where one
+// character class per id bit took 776.
+static std::vector<PabloAST *> bpeBaseIdBits(PabloBuilder & pb, const std::vector<PabloAST *> & basisBits) {
+    BixNumCompiler bnc(pb);
+    const BixNum b(basisBits.begin(), basisBits.end());
+    PabloAST * const lt33 = bnc.ULT(b, 33), * const lt127 = bnc.ULT(b, 127);
+    PabloAST * const lt161 = bnc.ULT(b, 161), * const lt173 = bnc.ULT(b, 173);
+    PabloAST * const r1 = pb.createAnd(lt127, pb.createNot(lt33));        // 33..126
+    PabloAST * const r2 = pb.createAnd(lt161, pb.createNot(lt127));       // 127..160
+    PabloAST * const r3 = pb.createAnd(lt173, pb.createNot(lt161));       // 161..172
+    PabloAST * const r4 = bnc.EQ(b, 173);                                 // 173
+    PabloAST * const r0 = pb.createNot(pb.createOr(pb.createOr(r1, r2), pb.createOr(r3, r4)));
+    const std::pair<PabloAST *, unsigned> ranges[] = {{r0, 0xBC}, {r1, 0xDF}, {r2, 0x5E}, {r3, 0xBD}, {r4, 0x52}};
+    BixNum offset(8);
+    for (unsigned k = 0; k < 8; k++) {
+        PabloAST * bit = pb.createZeroes();
+        for (const auto & r : ranges) if ((r.second >> k) & 1) bit = pb.createOr(bit, r.first);
+        offset[k] = bit;
+    }
+    return bnc.AddModular(b, offset);
+}
+
+// BPEBaseIdKernel — each raw input byte's base-alphabet token id: the starting single-byte
+// token, before any merge, as 8 bit streams (ids). The merge pipeline's first kernel: ids is
+// the id stream the merges build on, and with `active` it also seeds the in-play mask (all
+// 1s: every byte starts as a live token start); kernel name BPE_BaseIds+active. Alone
+// (--tail-unit-seed), BPE_BaseIds. Data-independent, so the names are constant.
+class BPEBaseIdKernel final : public PabloKernel {
 public:
-    BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
-                 StreamSet * source, StreamSet * active, StreamSet * end)
-    : PabloKernel(ts, "BPERangeSeed",
-                  {Binding{"basis", basis}},
-                  {Binding{"source", source}, Binding{"active", active}, Binding{"end", end}}) {}
+    BPEBaseIdKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * ids, StreamSet * active = nullptr)
+    : PabloKernel(ts, active ? "BPE_BaseIds+active" : "BPE_BaseIds", {Binding{"basis", basis}},
+                  active ? Bindings{Binding{"ids", ids}, Binding{"active", active}} : Bindings{Binding{"ids", ids}})
+    , mActive(active != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
-        PabloAST * zeroes = pb.createZeroes();
-        PabloAST * ones   = pb.createNot(zeroes);
-
-        // id(byte) is a fixed byte->id bijection: piecewise byte + offset (T1). Expressed
-        // as CC instead of BixNum arithmetic: for each id output bit k, the SET of bytes
-        // whose id has bit k set is a byte character class, so compileCC over the byte
-        // basis yields that id-bit stream directly — no Select/AddModular/SubModular.
-        // Data-independent (constant) → cache name stays constant. Ranges (must stay a
-        // bijection over 0..255): 0..32→+188  33..126→-33  127..160→+94  161..172→-67
-        // 173→255  174..255→-68.
-        cc::Parabix_CC_Compiler_Builder ccc(basisBits);
-        auto idOf = bpeBaseId;
-        const unsigned IDBITS = 8;                 // base ids are 0..255
-        std::vector<PabloAST*> idBits(IDBITS);
-        for (unsigned k = 0; k < IDBITS; k++) {
-            re::CC * cc = nullptr;                  // bytes whose id has bit k set
-            for (unsigned by = 0; by < 256; ) {
-                if ((idOf(by) >> k) & 1u) {
-                    unsigned lo = by;
-                    while (by < 256 && ((idOf(by) >> k) & 1u)) by++;
-                    re::CC * part = re::makeByte(lo, by - 1);
-                    cc = cc ? re::makeCC(cc, part) : part;
-                } else ++by;
-            }
-            idBits[k] = cc ? ccc.compileCC(cc, pb) : zeroes;
-        }
-        // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
-        // active = all 1s, end = all 0s. idBits[i] = the i-th id bit (a compiled CC).
-        Var * sOut = getOutputStreamVar("source");
-        for (unsigned i = 0; i < 8; i++) {
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idBits[i]);
-        }
-        pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
-        pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
+        writeOutputStreamSet("ids", bpeBaseIdBits(pb, getInputStreamSet("basis")));
+        if (mActive)
+            pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)),
+                            pb.createNot(pb.createZeroes()));
     }
+    const bool mActive;
+};
+
+// --tail-unit-cuts: the pretoken starts cut at every frozen byte (a byte whose base id is in
+// no rule), and the positions whose token is already known. No token holds a frozen byte and
+// any other byte, so the BPE of a pretoken is the BPE of its pieces between such cuts (as for
+// --tail-hard-split), and every frozen byte is a pretoken of its own. Outputs:
+//   cuts = InFile(segs | F | Advance(F, 1)), F the frozen bytes: the pretoken starts after the cuts;
+//   unit = cuts & next(cuts): the pretokens of one byte, whose token is the byte's base id. At
+//          the input's last byte next(cuts) is whatever lies past the end, and either value is
+//          right: a start there is a pretoken of one byte, and a 0 only means not marked;
+//   scan = cuts & ~(unit & Advance(unit, 1)): the starts the resolve scan walks. A unit start
+//          right after another unit is dropped, so a run of units costs one scan step, while
+//          every start that ends a longer pretoken stays.
+// The frozen set depends on the merge list, so its bits are in the kernel's name.
+//
+// Runs of equal bytes (--byte-run-cuts=N). Pablo looks ahead only on
+// inputs, so a run of N equal bytes starting at p is found from the basis looked ahead by N-1:
+// eq[p] = (byte p+N-1 == byte p+N-2), and run[p] = AND of Advance(eq, k), k = 0 .. N-2, by
+// doubling; inRun = OR of Advance(run, k), k = 0 .. N-1: the bytes of the runs of N or more.
+// A hard self-pair byte c (no token holds c c) has a safe cut between any two copies, so
+// --byte-run-cuts cuts there inside such runs: every interior byte is a unit.
+// The input's first position. The pretoken starts are never at a continuation byte, so an input
+// that begins with one has no start there, and the pieces would begin after its first bytes.
+static PabloAST * bpeInputStart(PabloBuilder & pb) {
+    return pb.createNot(pb.createAdvance(pb.createOnes(), 1));
+}
+static PabloAST * bpeRunStarts(PabloBuilder & pb, const std::vector<PabloAST *> & basis, unsigned N) {
+    PabloAST * diff = pb.createZeroes();
+    for (PabloAST * b : basis) {
+        PabloAST * const la = pb.createLookahead(b, N - 1);
+        diff = pb.createOr(diff, pb.createXor(la, pb.createAdvance(la, 1)));
+    }
+    PabloAST * const eq = pb.createNot(diff);
+    // AND of Advance(eq, k) for k < N - 1: W(m) covers m terms; W(m + n) = W(m) & Advance(W(n), m)
+    PabloAST * acc = nullptr; unsigned have = 0;
+    PabloAST * pow = eq; unsigned powLen = 1;
+    for (unsigned need = N - 1; need; need >>= 1) {
+        if (need & 1) {
+            acc = acc ? pb.createAnd(acc, pb.createAdvance(pow, have)) : pow;
+            have += powLen;
+        }
+        if (need > 1) { pow = pb.createAnd(pow, pb.createAdvance(pow, powLen)); powLen *= 2; }
+    }
+    return acc;
+}
+static PabloAST * bpeRunCover(PabloBuilder & pb, PabloAST * runStarts, unsigned N) {
+    PabloAST * acc = nullptr; unsigned have = 0;
+    PabloAST * pow = runStarts; unsigned powLen = 1;
+    for (unsigned need = N; need; need >>= 1) {
+        if (need & 1) {
+            acc = acc ? pb.createOr(acc, pb.createAdvance(pow, have)) : pow;
+            have += powLen;
+        }
+        if (need > 1) { pow = pb.createOr(pow, pb.createAdvance(pow, powLen)); powLen *= 2; }
+    }
+    return acc;
+}
+static re::CC * bpeByteSetCC(const std::array<uint64_t, 4> & set) {
+    re::CC * cc = nullptr;
+    for (unsigned by = 0; by < 256; by++) {
+        if (((set[by >> 6] >> (by & 63)) & 1) == 0) continue;
+        re::CC * const part = re::makeByte(by, by);
+        cc = cc ? re::makeCC(cc, part) : part;
+    }
+    return cc;
+}
+// A hard self-pair byte c and the bytes x that no token holds before it (pre) or y after it
+// (suf): the run's edge cuts of --byte-run-edges.
+struct BPEHardRun {
+    uint8_t c;
+    std::array<uint64_t, 4> pre{}, suf{};
+};
+struct BPERunCutParams {
+    unsigned cutN = 0;                       // --byte-run-cuts: hard self-pair cuts in runs >= cutN
+    unsigned edges = 0;                      // --byte-run-edges: 1 cut before runs at a hard prefix, 2 also after
+    bool guard = false;                      // --byte-run-guard: compute the cuts inside an If
+    std::vector<BPEHardRun> hardRuns;        // the run bytes (ASCII hard self-pair bytes)
+    std::array<uint64_t, 4> hardSelf{};      // bytes c with no token holding c c (frozen excluded)
+    std::string tag() const {                // the parameters, for the kernel name
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        for (const auto & r : hardRuns) { mix(r.c); for (unsigned i = 0; i < 4; i++) { mix(r.pre[i]); mix(r.suf[i]); } }
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+        return "_rc" + std::to_string(cutN) + "e" + std::to_string(edges) + (guard ? "g" : "") + "_" + buf;
+    }
+};
+
+// The generator for --byte-run-cuts: cuts between the copies of a hard self-pair byte c in every
+// run of N or more (N = 2: every pair), and with edges the cut before the run (prefix x with no
+// token holding x c) and after it (next byte y with no token holding c y). Every such cut is
+// between a hard pair, so the BPE of the pieces is the BPE of the whole. Returns the cuts and
+// the cuts at p + 1 (for the units: positions p whose piece is one byte). With guard, the cut
+// logic is inside an If on "a run byte in this block"; Pablo ORs any pending carry into the
+// test, so the Advance of a run's end into the next block is not lost.
+// The basis bits at p (cur), p - 1 (prev: Advance) and p + 1 (next: Lookahead), computed once for
+// the cut generators.
+struct BPEShiftedBasis {
+    std::vector<PabloAST *> cur, prev, next;
+};
+static BPEShiftedBasis bpeShiftBasis(PabloBuilder & pb, const std::vector<PabloAST *> & basis) {
+    BPEShiftedBasis B{basis, std::vector<PabloAST *>(basis.size()), std::vector<PabloAST *>(basis.size())};
+    for (unsigned i = 0; i < basis.size(); i++) {
+        B.prev[i] = pb.createAdvance(basis[i], 1);
+        B.next[i] = pb.createLookahead(basis[i], 1);
+    }
+    return B;
+}
+static std::pair<PabloAST *, PabloAST *> bpeHardRunCuts(PabloBuilder & pb, const BPEShiftedBasis & B,
+                                                        const BPERunCutParams & P) {
+    PabloAST * const zero = pb.createZeroes();
+    const std::vector<PabloAST *> & basis = B.cur, & prevB = B.prev, & nextB = B.next;
+    PabloAST * diffPrev = zero, * diffNext = zero;
+    for (unsigned i = 0; i < basis.size(); i++) {
+        diffPrev = pb.createOr(diffPrev, pb.createXor(basis[i], prevB[i]));
+        diffNext = pb.createOr(diffNext, pb.createXor(basis[i], nextB[i]));
+    }
+    PabloAST * const eqPrev = pb.createNot(diffPrev), * const eqNext = pb.createNot(diffNext);
+    PabloAST * const inRun = P.cutN <= 2 ? pb.createOr(eqPrev, eqNext)
+                                         : bpeRunCover(pb, bpeRunStarts(pb, basis, P.cutN), P.cutN);
+    std::array<uint64_t, 4> hset{};
+    for (const auto & r : P.hardRuns) hset[r.c >> 6] |= 1ull << (r.c & 63);
+    cc::Parabix_CC_Compiler_Builder cur(basis), prev(prevB), next(nextB);
+    PabloAST * const hr = pb.createAnd(cur.compileCC(bpeByteSetCC(hset), pb), inRun);
+    auto emit = [&](PabloBuilder & b, PabloAST *& cut, PabloAST *& nxt) {
+        cut = b.createAnd(hr, eqPrev);               // c c: cut before the second
+        nxt = b.createAnd(hr, eqNext);               // the next byte is that second
+        if (!P.edges) return;
+        for (const auto & r : P.hardRuns) {
+            PabloAST * const isC = b.createAnd(cur.compileCC(re::makeByte(r.c, r.c), b), inRun);
+            PabloAST * const first = b.createAnd(isC, diffPrev), * const last = b.createAnd(isC, diffNext);
+            if (re::CC * const pre = bpeByteSetCC(r.pre))
+                cut = b.createOr(cut, b.createAnd(first, prev.compileCC(pre, b)));      // x | c c ...
+            if (re::CC * const suf = P.edges >= 2 ? bpeByteSetCC(r.suf) : nullptr) {
+                cut = b.createOr(cut, b.createAnd(b.createAdvance(last, 1), cur.compileCC(suf, b)));   // ... c c | y
+                nxt = b.createOr(nxt, b.createAnd(last, next.compileCC(suf, b)));
+            }
+        }
+    };
+    if (!P.guard) {
+        PabloAST * cut, * nxt;
+        emit(pb, cut, nxt);
+        return {cut, nxt};
+    }
+    Var * const cutV = pb.createVar("runCut", zero);
+    Var * const nxtV = pb.createVar("runCutNext", zero);
+    auto body = pb.createScope();
+    PabloAST * cut, * nxt;
+    emit(body, cut, nxt);
+    body.createAssign(cutV, cut);
+    body.createAssign(nxtV, nxt);
+    pb.createIf(hr, body);
+    return {cutV, nxtV};
+}
+static std::string bpeHexName(const std::array<uint64_t, 4> & f) {
+    char buf[68];
+    std::snprintf(buf, sizeof(buf), "%016llx%016llx%016llx%016llx", (unsigned long long) f[3],
+                  (unsigned long long) f[2], (unsigned long long) f[1], (unsigned long long) f[0]);
+    return buf;
+}
+class BPEUnitCutsKernel final : public PabloKernel {
+public:
+    BPEUnitCutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs,
+                      StreamSet * cuts, StreamSet * unit, StreamSet * scan, const std::array<uint64_t, 4> & frozen,
+                      const BPERunCutParams & runs = BPERunCutParams{}, StreamSet * pairCuts = nullptr)
+    : PabloKernel(ts, "BPE_UnitCuts_" + bpeHexName(frozen)
+                      + (runs.cutN ? runs.tag() : "") + (pairCuts ? "_pc" : "") + (unit ? "" : "_c"),
+                  inputs(basis, segs, pairCuts, runs.cutN, unit == nullptr),
+                  unit ? Bindings{Binding{"cuts", cuts}, Binding{"unit", unit}, Binding{"scan", scan}}
+                       : Bindings{Binding{"cuts", cuts}})
+    , mFrozen(frozen), mRuns(runs), mPairCuts(pairCuts != nullptr), mCutsOnly(unit == nullptr) {}
+protected:
+    // cutsOnly (--len-scan: BPE_LenSelect makes its own scan and cover streams from the cuts): no
+    // units, so nothing at p + 1 is needed but the run cuts' next byte.
+    static Bindings inputs(StreamSet * basis, StreamSet * segs, StreamSet * pairCuts, unsigned cutN, bool cutsOnly) {
+        const unsigned la = cutsOnly ? (cutN ? std::max(1u, cutN) : 0) : std::max(1u, cutN);
+        Bindings in{Binding{"basis", basis, FixedRate(), LookAhead(la)},
+                    Binding{"segs", segs, FixedRate(), LookAhead(cutsOnly ? 0 : 1)}};
+        if (pairCuts) in.emplace_back("pairCuts", pairCuts, FixedRate(), LookAhead(cutsOnly ? 0 : 1));
+        return in;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const segs = getInputStreamSet("segs")[0];
+        re::CC * frozenCC = nullptr;
+        for (unsigned by = 0; by < 256; by++) {
+            if (((mFrozen[by >> 6] >> (by & 63)) & 1) == 0) continue;
+            re::CC * const part = re::makeByte(by, by);
+            frozenCC = frozenCC ? re::makeCC(frozenCC, part) : part;
+        }
+        PabloAST * F = pb.createZeroes(), * Fnext = pb.createZeroes();
+        if (frozenCC) {
+            cc::Parabix_CC_Compiler_Builder ccc(basis);
+            F = ccc.compileCC(frozenCC, pb);
+        }
+        if (frozenCC && !mCutsOnly) {
+            std::vector<PabloAST *> next(basis.size());
+            for (unsigned i = 0; i < basis.size(); i++) next[i] = pb.createLookahead(basis[i], 1);
+            cc::Parabix_CC_Compiler_Builder cccNext(next);
+            Fnext = cccNext.compileCC(frozenCC, pb);
+        }
+        // segs, frozen bytes, and the input's first byte (not a pretoken start if it is a continuation byte)
+        PabloAST * cuts = pb.createOr(pb.createOr(segs, bpeInputStart(pb)), pb.createOr(F, pb.createAdvance(F, 1)));
+        // cuts at p + 1: segs or F there, or F at p (which cuts after itself)
+        PabloAST * cutsNext = mCutsOnly ? nullptr : pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
+        if (mRuns.cutN) {                          // hard self-pair cuts inside runs >= cutN (bpeHardRunCuts)
+            const auto rc = bpeHardRunCuts(pb, bpeShiftBasis(pb, basis), mRuns);
+            cuts = pb.createOr(cuts, rc.first);
+            if (!mCutsOnly) cutsNext = pb.createOr(cutsNext, rc.second);
+        }
+        if (mPairCuts) {                           // --pair-cuts: a cut before p (BPEPairCutsKernel)
+            PabloAST * const pc = getInputStreamSet("pairCuts")[0];
+            cuts = pb.createOr(cuts, pc);
+            if (!mCutsOnly) cutsNext = pb.createOr(cutsNext, pb.createLookahead(pc, 1));
+        }
+        cuts = pb.createInFile(cuts);
+        if (mCutsOnly) {
+            writeOutputStreamSet("cuts", std::vector<PabloAST *>{cuts});
+            return;
+        }
+        PabloAST * const unit = pb.createAnd(cuts, cutsNext);
+        PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(unit, pb.createAdvance(unit, 1))));
+        writeOutputStreamSet("cuts", std::vector<PabloAST *>{cuts});
+        writeOutputStreamSet("unit", std::vector<PabloAST *>{unit});
+        writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
+    }
+    const std::array<uint64_t, 4> mFrozen;
+    const BPERunCutParams mRuns;
+    const bool mPairCuts, mCutsOnly;
+};
+
+// The bytes b with pred(b), as a class; null when there are none.
+template <typename Pred> static re::CC * bpeByteClass(Pred pred) {
+    re::CC * cc = nullptr;
+    for (unsigned by = 0; by < 256; by++) {
+        if (!pred(by)) continue;
+        re::CC * const part = re::makeByte(by, by);
+        cc = cc ? re::makeCC(cc, part) : part;
+    }
+    return cc;
+}
+// The UTF-8 leads L with active[L], in groups of one to three that each get an If (GPT-2's leads by
+// how often they occur in text); the leads of another vocabulary not listed here each alone.
+static std::vector<std::vector<uint8_t>> bpeLeadGroups(const std::array<bool, 256> & active) {
+    static const std::vector<std::vector<uint8_t>> kGroups = {
+        {0xC2}, {0xC3}, {0xC4, 0xC5}, {0xCB, 0xCC}, {0xCE, 0xCF}, {0xD0, 0xD1}, {0xD6, 0xD7}, {0xD8, 0xD9},
+        {0xE0}, {0xE1}, {0xE2}, {0xE3, 0xE4}, {0xE5, 0xE6}, {0xE7, 0xE8}, {0xE9}, {0xEB, 0xEC}, {0xED, 0xEE, 0xEF}, {0xF0}};
+    std::vector<std::vector<uint8_t>> groups;
+    std::array<bool, 256> grouped{};
+    for (const auto & g : kGroups) {
+        std::vector<uint8_t> act;
+        for (uint8_t L : g) if (active[L]) { act.push_back(L); grouped[L] = true; }
+        if (!act.empty()) groups.push_back(act);
+    }
+    for (unsigned L = 0xC0; L < 0xF8; L++)
+        if (active[L] && !grouped[L]) groups.push_back({uint8_t(L)});
+    return groups;
+}
+// --pair-cuts: pairCuts[p] = 1 where no token holds bytes p - 1, p next to each other (isHardPair),
+// a cut before p. The pairs inside tokens are given as x << 8 | y (x the earlier byte), ascending.
+// mode 1: every pair. With guard, the pairs of two ASCII bytes are a 14-bit class over the low
+//         7 bits of both bytes, and the pairs with a byte >= 0x80 a 16-bit class inside an If on
+//         "bit 7 of either byte".
+// mode 2: only the pairs with a byte >= 0x80 (the If of mode 1); no ASCII pair is cut.
+class BPEPairCutsKernel final : public PabloKernel {
+public:
+    BPEPairCutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * pairCuts,
+                      std::vector<uint16_t> inside, unsigned mode, bool guard, const std::string & tag)
+    : PabloKernel(ts, "BPE_PairCuts" + std::string(mode == 2 ? "h_" : guard ? "g_" : "_") + tag,
+                  {Binding{"basis", basis}},
+                  {Binding{"pairCuts", pairCuts}})
+    , mInside(std::move(inside)), mMode(mode), mGuard(guard || mode == 2) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> cur = getInputStreamSet("basis");
+        std::vector<PabloAST *> prev(8);
+        for (unsigned i = 0; i < 8; i++) prev[i] = pb.createAdvance(cur[i], 1);
+        std::vector<PabloAST *> bits16(cur.begin(), cur.end());
+        bits16.insert(bits16.end(), prev.begin(), prev.end());
+        PabloAST * inside = nullptr;
+        if (!mGuard) {
+            UCD::UnicodeSet all;
+            for (uint16_t k : mInside) all.insert(k);
+            inside = cc::Parabix_CC_Compiler(bits16).compileCC("pairIn", re::makeCC(std::move(all)), pb);
+        } else {
+            UCD::UnicodeSet ascii, high;
+            for (uint16_t k : mInside) {
+                if (k & 0x8080) high.insert(k);
+                else ascii.insert(((k >> 8) << 7) | (k & 0x7F));
+            }
+            std::vector<PabloAST *> bits14(cur.begin(), cur.begin() + 7);
+            bits14.insert(bits14.end(), prev.begin(), prev.begin() + 7);
+            PabloAST * const hi = pb.createOr(cur[7], prev[7]);
+            Var * const inH = pb.createVar("pairInH", pb.createZeroes());
+            auto body = pb.createScope();
+            body.createAssign(inH, cc::Parabix_CC_Compiler(bits16).compileCC("pairInH", re::makeCC(std::move(high)), body));
+            pb.createIf(hi, body);
+            if (mMode == 2) {                      // an ASCII pair is never cut
+                inside = pb.createOr(pb.createNot(hi), inH);
+            } else {
+                PabloAST * const inA = cc::Parabix_CC_Compiler(bits14).compileCC("pairInA", re::makeCC(std::move(ascii)), pb);
+                inside = pb.createOr(pb.createAnd(inA, pb.createNot(hi)), inH);
+            }
+        }
+        writeOutputStreamSet("pairCuts", std::vector<PabloAST *>{pb.createInFile(pb.createNot(inside))});
+    }
+    const std::vector<uint16_t> mInside;
+    const unsigned mMode;
+    const bool mGuard;
+};
+
+// --pair-cuts=3: the cut classes, codepoint classes compiled with the pretokenizer's classes
+// (CharClassesKernel, BitMovementMode::LookAhead) and marked at each codepoint's first byte. They
+// are the last kCutClassCount streams of the class set. A codepoint b1 .. bn is in
+//   Before:     no token holds x b1, for every byte x: a cut before b1;
+//   BeforeCond: b1 a lead not in Before (some x with x b1 inside a token): a cut before b1 when
+//               no token holds the byte before and b1, tested in BPE_Cuts (bpeCondBeforeCuts);
+//   AfterLead:  n > 1 and no token holds b1 b2: a cut after the lead.
+// The UTF compiler confirms every byte of a codepoint, so a class is never set on ill-formed
+// input, which only loses cuts. Frozen bytes are in Before, and the frozen leads in AfterLead;
+// those that start no codepoint (C0, C1, F5-FF) are still cut from the basis. The cuts that
+// depend on a later byte of a codepoint repeat every 64 codepoints (End4 would be 245,760 ranges,
+// In3 29,697), so they are byte-pair tests in BPE_Cuts instead (bpeCodepointPairCuts).
+enum : unsigned { kCutBefore, kCutBeforeCond, kCutAfterLead, kCutClassCount };
+
+// The cuts before the leads of BeforeCond: at a lead L, a cut when no token holds the byte before
+// and L. Inside an If on the class, an If on the 2-byte leads and one on the 3- and 4-byte leads,
+// and an If per group of leads (bpeLeadGroups).
+static PabloAST * bpeCondBeforeCuts(PabloBuilder & pb, const BPEShiftedBasis & B, const std::vector<uint16_t> & inside,
+                                    PabloAST * cond) {
+    std::array<bool, 256> active{};                  // the leads L with some x L inside a token
+    for (uint16_t k : inside)
+        if ((k & 0xFF) >= 0xC0) active[k & 0xFF] = true;
+    cc::Parabix_CC_Compiler_Builder curC(B.cur), prevC(B.prev);
+    Var * const before = pb.createVar("condCutBefore", pb.createZeroes());
+    auto cb = pb.createScope();
+    for (const auto & outer : {std::pair<unsigned, unsigned>{0xC0, 0xDF}, std::pair<unsigned, unsigned>{0xE0, 0xF7}}) {
+        auto ob = cb.createScope();
+        bool any = false;
+        for (const auto & g : bpeLeadGroups(active)) {
+            if (g.front() < outer.first || g.front() > outer.second) continue;
+            any = true;
+            auto gb = ob.createScope();
+            re::CC * gcc = nullptr;
+            for (uint8_t L : g) {
+                gcc = gcc ? re::makeCC(gcc, re::makeByte(L, L)) : re::makeByte(L, L);
+                re::CC * const pre = bpeByteClass([&](unsigned x) {
+                    return !std::binary_search(inside.begin(), inside.end(), uint16_t((x << 8) | L));
+                });
+                if (pre == nullptr) continue;
+                PabloAST * const isL = curC.compileCC(re::makeByte(L, L), gb);
+                gb.createAssign(before, gb.createOr(before, gb.createAnd(isL, prevC.compileCC(pre, gb))));
+            }
+            ob.createIf(curC.compileCC(gcc, ob), gb);
+        }
+        if (any) cb.createIf(curC.compileCC(re::makeByte(outer.first, outer.second), cb), ob);
+    }
+    pb.createIf(cond, cb);
+    return pb.createAnd(before, cond);
+}
+
+// The cuts of --pair-cuts=3 that the classes leave out, from the pairs inside tokens (x << 8 | y):
+//   end: a cut before a byte that is not a continuation byte, after a byte z such that no token
+//        holds z y for any such y (the end of a codepoint that never merges with what follows:
+//        the 19 continuation bytes 81 84 8A ... BF, and the control bytes);
+//   continuation pairs: a cut between continuation bytes x y that no token holds next to each
+//        other (inside a codepoint, after its second or third byte; the cut in E2 80 y), a class
+//        over the low 6 bits of both, inside an If on "two continuation bytes in a row".
+static PabloAST * bpeCodepointPairCuts(PabloBuilder & pb, const BPEShiftedBasis & B, const std::vector<uint16_t> & inside) {
+    auto isCont = [](unsigned b) { return (b & 0xC0) == 0x80; };
+    std::array<bool, 256> joins{};                  // z y inside a token for some y not a continuation byte
+    UCD::UnicodeSet contIn;
+    for (uint16_t k : inside) {
+        const unsigned x = k >> 8, y = k & 0xFF;
+        if (!isCont(y)) joins[x] = true;
+        else if (isCont(x)) contIn.insert(((x & 0x3F) << 6) | (y & 0x3F));
+    }
+    PabloAST * const cont = pb.createAnd(B.cur[7], pb.createNot(B.cur[6]));
+    PabloAST * cuts = pb.createZeroes();
+    if (re::CC * const end = bpeByteClass([&](unsigned z) { return !joins[z]; })) {
+        PabloAST * const afterEnd = cc::Parabix_CC_Compiler_Builder(B.prev).compileCC(end, pb);
+        cuts = pb.createAnd(afterEnd, pb.createNot(cont));
+    }
+    PabloAST * const contPair = pb.createAnd(cont, pb.createAnd(B.prev[7], pb.createNot(B.prev[6])));
+    std::vector<PabloAST *> bits12(B.cur.begin(), B.cur.begin() + 6);
+    bits12.insert(bits12.end(), B.prev.begin(), B.prev.begin() + 6);
+    Var * const hard = pb.createVar("contPairCut", pb.createZeroes());
+    auto body = pb.createScope();
+    PabloAST * const in = cc::Parabix_CC_Compiler(bits12).compileCC("contPairIn", re::makeCC(std::move(contIn)), body);
+    body.createAssign(hard, body.createAnd(contPair, body.createNot(in)));
+    pb.createIf(contPair, body);
+    return pb.createOr(cuts, hard);
+}
+
+// --pair-cuts=3 (with --len-scan): the cuts, in one kernel. The pretoken starts and the input's first
+// byte; the frozen bytes that start no codepoint (C0, C1, F5-FF; cut before and after, the others are
+// in the cut classes); the run cuts; the cut classes, the last kCutClassCount streams of `classes`
+// (Before, BeforeCond with bpeCondBeforeCuts, AfterLead); and the cuts after a codepoint and between
+// continuation bytes (bpeCodepointPairCuts). The basis shifted once for all of them (bpeShiftBasis).
+class BPECutsKernel final : public PabloKernel {
+public:
+    BPECutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs, StreamSet * classes, StreamSet * cuts,
+                  const std::array<uint64_t, 4> & frozen, const BPERunCutParams & runs,
+                  std::vector<uint16_t> inside, const std::string & pairTag)
+    : PabloKernel(ts, "BPE_Cuts_" + bpeHexName(frozen) + (runs.cutN ? runs.tag() : "")
+                      + "_cc" + std::to_string(classes->getNumElements()) + "_p" + pairTag,
+                  {Binding{"basis", basis, FixedRate(), LookAhead(std::max(runs.cutN, 1u))}, Binding{"segs", segs},
+                   Binding{"classes", classes}},
+                  {Binding{"cuts", cuts}})
+    , mFrozen(frozen), mRuns(runs), mInside(std::move(inside)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        const BPEShiftedBasis B = bpeShiftBasis(pb, basis);
+        PabloAST * cuts = pb.createOr(getInputStreamSet("segs")[0], bpeInputStart(pb));
+        if (re::CC * const frozenCC = bpeByteSetCC(mFrozen)) {      // a frozen byte is a piece of its own
+            PabloAST * const F = cc::Parabix_CC_Compiler_Builder(basis).compileCC(frozenCC, pb);
+            cuts = pb.createOr(cuts, pb.createOr(F, pb.createAdvance(F, 1)));
+        }
+        if (mRuns.cutN) cuts = pb.createOr(cuts, bpeHardRunCuts(pb, B, mRuns).first);
+        const std::vector<PabloAST *> c = getInputStreamSet("classes");
+        const unsigned o = c.size() - kCutClassCount;
+        cuts = pb.createOr(cuts, c[o + kCutBefore]);
+        cuts = pb.createOr(cuts, bpeCondBeforeCuts(pb, B, mInside, c[o + kCutBeforeCond]));
+        cuts = pb.createOr(cuts, pb.createAdvance(c[o + kCutAfterLead], 1));
+        cuts = pb.createOr(cuts, bpeCodepointPairCuts(pb, B, mInside));
+        writeOutputStreamSet("cuts", std::vector<PabloAST *>{pb.createInFile(cuts)});
+    }
+    const std::array<uint64_t, 4> mFrozen;
+    const BPERunCutParams mRuns;
+    const std::vector<uint16_t> mInside;
 };
 
 // BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
@@ -1112,14 +1538,19 @@ private:
 // binary search was 40% slower: one left part such as U+0120 starts thousands of rules.)
 // left / right: one bit per id, set when the id is the left / right part of some rule in
 // the table; a pair failing either (most non-rules) never touches the 2 MB table.
+// pair: the rule of every pair of byte ids (both < 256) in a direct 256 x 256 table, 0xFFFF for
+// none, 128 KB. A pretoken's first round of pairs is all byte pairs: 47% of the lookups of a
+// cache miss on val_4MB and webtext_cases (7 of 15). (Was --tail-pair-table; built in 2026-11-04.)
 struct TailTable {
     std::vector<uint64_t> slots;
     uint32_t mask = 0, shift = 0;
     unsigned idBits = 16;                // the width of the ids reaching the tail
     uint64_t left[1024], right[1024];
+    std::vector<uint16_t> pair;
 };
 static constexpr uint64_t kTailEmpty = ~0ull;
 static TailTable gTail;
+static uint16_t gTailBase[256];          // --tail-from-bytes: each byte's base id
 static BPETailSink gTailSink = nullptr;
 
 void bpeTailSetSink(BPETailSink sink) { gTailSink = sink; }
@@ -1127,6 +1558,7 @@ void bpeTailSetSink(BPETailSink sink) { gTailSink = sink; }
 static inline uint32_t tailSlot(uint32_t key) { return (key * 0x9E3779B1u) >> gTail.shift; }
 
 static inline uint16_t tailMerge(uint16_t a, uint16_t b) {
+    if ((a | b) < 256) return gTail.pair[(uint32_t(a) << 8) | b];
     if (!((gTail.left[a >> 6] >> (a & 63)) & (gTail.right[b >> 6] >> (b & 63)) & 1)) return 0xFFFF;
     const uint32_t key = (uint32_t(a) << 16) | b;
     for (uint32_t h = tailSlot(key); ; h = (h + 1) & gTail.mask) {
@@ -1198,6 +1630,118 @@ static inline void tailMergeSegment(uint16_t * t, uint32_t * pos, size_t & n) {
     }
 }
 
+// --tail-batch-bpe (with --tail-from-bytes): the BPE of a cache miss, tailMergeSegment, is a
+// chain of dependent steps (argmin, shift, two rule lookups) whose branches mispredict: ~130 ns
+// per pretoken, 36-66% of a 1-thread cold run. Its rule lookups are only ~20% of that (measured
+// with the answers precomputed). So the misses of 2..15 bytes wait in a queue (TailScratch::
+// batch, flushed when full and at the end of each call) and are merged K at a time, each one
+// branch-free: tokens stay at their byte positions (a live mask instead of shifting), every
+// pair's rank is held as rank << 4 | position so one unsigned min over 16 lanes gives both the
+// lowest rank and, on a tie, the leftmost pair, and a rule is looked up in a cuckoo table of
+// 4-entry buckets (both buckets read, no probe loop); a missing neighbour is id 0xFFFF, which
+// is in no rule. The K chains are independent, so the processor overlaps them: 45-52 ns per
+// pretoken in a micro-benchmark (K = 6) against 124-143. Runtime only, no cache tag.
+static cl::opt<bool> TailBatchBPE(
+    "tail-batch-bpe",
+    cl::desc("With --tail-from-bytes: merge cache misses of up to 15 bytes in batches, several "
+             "at once without branches (default off)."),
+    cl::init(false));
+struct alignas(32) TailRuleBucket {
+    uint32_t key[4];                     // idA << 16 | idB; ~0u: empty
+    uint16_t val[4];                     // idAB ^ 0xFFFF, 0: empty
+    uint16_t pad[4];
+};
+static std::vector<TailRuleBucket> gTailRuleMem;
+static TailRuleBucket * gTailRules = nullptr;
+static unsigned gTailRuleShift = 32;
+static inline uint32_t tailRuleH1(uint32_t k) { return (k * 0x9E3779B1u) >> gTailRuleShift; }
+static inline uint32_t tailRuleH2(uint32_t k) { return ((k ^ (k >> 15)) * 0x85EBCA77u) >> gTailRuleShift; }
+// Cuckoo insertion (a random walk of evictions); false if some rule found no place.
+static bool tailRuleBuild(const std::vector<MergeRuleGroup> & ruleRanges, size_t from, unsigned bits) {
+    gTailRuleMem.assign((size_t(1) << bits) + 1, TailRuleBucket{});
+    gTailRules = reinterpret_cast<TailRuleBucket *>((reinterpret_cast<uintptr_t>(gTailRuleMem.data()) + 31) & ~uintptr_t(31));
+    gTailRuleShift = 32 - bits;
+    for (size_t i = 0; i < (size_t(1) << bits); i++)
+        for (unsigned j = 0; j < 4; j++) { gTailRules[i].key[j] = ~0u; gTailRules[i].val[j] = 0; }
+    uint32_t seed = 12345;
+    for (size_t gi = from; gi < ruleRanges.size(); gi++)
+        for (const auto & r : ruleRanges[gi].rules) {
+            uint32_t key = (r.idA << 16) | r.idB;
+            uint16_t val = uint16_t(r.idAB) ^ 0xFFFF;
+            for (unsigned kick = 0;; kick++) {
+                if (kick > 4000) return false;
+                TailRuleBucket * const b[2] = {&gTailRules[tailRuleH1(key)], &gTailRules[tailRuleH2(key)]};
+                bool placed = false;
+                for (unsigned q = 0; q < 2 && !placed; q++)
+                    for (unsigned j = 0; j < 4; j++)
+                        if (b[q]->key[j] == ~0u) { b[q]->key[j] = key; b[q]->val[j] = val; placed = true; break; }
+                if (placed) break;
+                seed = seed * 1103515245u + 12345u;
+                TailRuleBucket * const v = b[(seed >> 16) & 1];
+                const unsigned j = (seed >> 8) & 3;
+                std::swap(v->key[j], key);
+                std::swap(v->val[j], val);
+            }
+        }
+    return true;
+}
+static_assert(sizeof(TailRuleBucket) == 32 && offsetof(TailRuleBucket, val) == 16,
+              "bpe_batch_merge (generated) reads 32-byte buckets, val[0] at byte 16");
+// The rule of the pair key = idA << 16 | idB: idAB, 0xFFFF if none. (The batch's generated
+// merge, bpe_batch_merge, does this lookup with vector compares and no branch.)
+static inline uint32_t tailRuleLookup(uint32_t key) {
+    const TailRuleBucket & b1 = gTailRules[tailRuleH1(key)], & b2 = gTailRules[tailRuleH2(key)];
+    uint32_t v = 0;
+    for (unsigned j = 0; j < 4; j++) {
+        v |= b1.key[j] == key ? b1.val[j] : 0;
+        v |= b2.key[j] == key ? b2.val[j] : 0;
+    }
+    return v ^ 0xFFFFu;
+}
+
+// One pretoken being merged: its tokens at their byte positions (T, 0xFFFF past the end and at
+// 16: no token), the live ones (L), and R[p] = rank << 4 | p of the pair (token at p, next live
+// token), ~0u for none.
+static constexpr uint32_t kTailLaneDead = ~0u;
+struct TailLane {
+    alignas(16) uint32_t R[20];
+    uint16_t T[18];
+    uint32_t L, end;
+    unsigned unit;
+};
+static inline void tailLaneInit(TailLane & l, const uint8_t * w, size_t n) {
+    for (size_t i = 0; i < n; i++) l.T[i] = gTailBase[w[i]];
+    l.T[16] = l.T[n] = 0xFFFF;
+    for (size_t i = 0; i < 20; i++) l.R[i] = kTailLaneDead;
+    for (size_t i = 0; i + 1 < n; i++) {
+        const uint32_t m = gTail.pair[(uint32_t(l.T[i]) << 8) | l.T[i + 1]];   // byte ids
+        l.R[i] = (m << 4) | uint32_t(i);
+    }
+    l.L = (1u << n) - 1;
+    l.end = 1u << n;
+}
+// One merge, without a branch; false (and no change) when no pair is a rule.
+static inline bool tailLaneStep(TailLane & l) {
+    uint32_t key = l.R[0];
+    for (unsigned j = 1; j < 16; j++) key = std::min(key, l.R[j]);
+    if (LLVM_UNLIKELY(key >= 0xFFFF0u)) return false;
+    const uint32_t i = key & 15, id = key >> 4;
+    const uint32_t hi = ~((2u << i) - 1);               // positions after i
+    const uint32_t nx = __builtin_ctz(l.L & hi);        // the token merged into i
+    l.L &= ~(1u << nx);
+    const uint32_t nn = __builtin_ctz((l.L | l.end) & hi);
+    const uint32_t below = l.L & ((1u << i) - 1);
+    const uint32_t pv = below ? 31 - __builtin_clz(below) : 16;
+    l.T[i] = uint16_t(id);
+    l.R[nx] = kTailLaneDead;
+    const uint32_t rr = tailRuleLookup((id << 16) | l.T[nn]);
+    const uint32_t rl = tailRuleLookup((uint32_t(l.T[pv]) << 16) | id);
+    l.R[i] = (rr << 4) | i;
+    l.R[pv] = (rl << 4) | pv;
+    l.R[16] = kTailLaneDead;
+    return true;
+}
+
 // A growable scratch array of segment tokens: ids and positions.
 struct TailSegBuf {
     std::vector<uint16_t> t;
@@ -1221,12 +1765,46 @@ struct TailCacheEntry {
     uint16_t keep;
     uint16_t out[7];
 };
-// --tail-cache-bits=N: 2^N sets x 64 bytes per thread (default 15: 2 MB).
-static cl::opt<unsigned> TailCacheBits(
-    "tail-cache-bits",
-    cl::desc("With --bpe-tail: the tail's per-thread segment cache has 2^N sets of 64 bytes "
-             "(default 15, 2 MB)."),
-    cl::init(15));
+// The per-thread segment cache: 2^kTailCacheBits sets of kTailCacheWays entries (64 bytes), 2 MB.
+// (--tail-cache-ways=4, 4-entry LRU sets, and --tail-cache-bits were deleted 2026-11-04: once the
+// vocabulary table is checked first only multi-token pretokens reach this cache, and 2 ways were
+// as fast or 1-3% faster at 4 threads.)
+static constexpr unsigned kTailCacheWays = 2, kTailCacheBits = 15;
+// --tail-long-cache (with --tail-from-bytes): a per-thread cache for the pretokens too long
+// for the segment cache's 15-byte key (kTailByteKeyMax+1 .. kTailLongMax bytes), which
+// otherwise merge on every occurrence. They are 0.5-4% of pretokens but 11-21% of the bytes of
+// val_4MB, code_4MB and multi_4MB (NUL runs, indentation, long words), and most repeat: on
+// code_4MB 15% of their bytes are in distinct ones. Runtime only, no cache tag.
+static cl::opt<bool> TailLongCache(
+    "tail-long-cache",
+    cl::desc("With --tail-from-bytes: cache the BPE of pretokens over 15 bytes (default off)."),
+    cl::init(false));
+// --tail-long-admit=N (with --tail-long-cache): which long pretokens are kept. 0 (default): all.
+// 1: a cut one only when one of its pieces had to merge as a long piece (> 15 bytes); its other
+// pieces are in the vocabulary table or the thread cache after this, so doing it again is cheap.
+// Uncut ones are always kept. 2: any long pretoken only the second time it is seen (a 2^17-bit
+// "seen once" map per thread, cleared after 2^15 first sightings): multi_4MB's long pretokens
+// are 81% distinct, so most stores were never read. 3: those that needed long merging at once,
+// the others on their second sighting (code_4MB's cut long pretokens repeat: 1 made it slower).
+// Runtime only, no cache tag.
+static cl::opt<unsigned> TailLongAdmit(
+    "tail-long-admit",
+    cl::desc("With --tail-long-cache: 0 keep every long pretoken, 1 only those that needed long "
+             "merging, 2 only on their second sighting, 3 those that needed long merging at once "
+             "and the others on their second sighting (default 0)."),
+    cl::init(0));
+static constexpr unsigned kTailLongSeenBits = 17, kTailLongSeenMax = 1u << 15;
+static constexpr unsigned kTailLongMax = 4096;       // longer pretokens always merge
+static constexpr unsigned kTailLongIndexBits = 14;   // 16K slots of 16 bytes
+static constexpr size_t kTailLongArena = size_t(4) << 20;
+// An entry takes at most 4 + kTailLongMax bytes + 4 per token (one per byte), so a cleared
+// arena always holds the entry that filled it.
+static_assert(4 + kTailLongMax + 4 * kTailLongMax <= kTailLongArena, "a long cache entry must fit the arena");
+// A slot of the long cache's index: the pretoken's hash, length and arena offset (len 0: empty).
+struct TailLongSlot {
+    uint64_t h;
+    uint32_t len, off;
+};
 static constexpr unsigned kTailCacheOut = 7;
 static std::atomic<uint64_t> gTailGeneration{0};   // bumped whenever gTail is rebuilt
 
@@ -1236,14 +1814,60 @@ template <unsigned B> struct TailKey {
     static constexpr unsigned fast = max < 8 ? max : 8;        // gathered without a loop
 };
 
+// --tail-batch-bpe: a pretoken of 2..kTailByteKeyMax bytes waiting for its BPE (offset s in the
+// call), its key, and the thread cache set to keep the result in (null: none).
+struct TailBPEUnit {
+    uint64_t k0, k1;
+    TailCacheEntry * set;
+    uint32_t s, len;
+};
+static constexpr unsigned kTailBatch = 32;
+// --tail-batch-bpe with --tail-scan-kernel: the scan kernel's module also holds bpe_batch_merge
+// (tailBatchMergeIR), the batch's lane loop in generated code, so its vector steps (the min over
+// 16 pair ranks, the 8-way bucket compare) are compiled for the CPU it runs on. It merges
+// units[0, n) and writes each one's live tokens (L) and token ids (T) to out[i]; the cache
+// bookkeeping stays in C++ (tailBatchKeep).
+struct TailBatchResult {
+    uint32_t L;
+    uint16_t T[16];
+};
+static_assert(sizeof(TailBatchResult) == 36 && offsetof(TailBatchResult, T) == 4,
+              "bpe_batch_merge (generated) writes 36-byte results, T at byte 4");
+using TailBatchMergeFn = void (*)(const uint8_t * bytes, const TailBPEUnit * units, uint32_t n,
+                                  TailBatchResult * out, const uint16_t * base, const uint16_t * pair,
+                                  const TailRuleBucket * rules, uint32_t shift);
+// --tail-batch-bpe with --tail-hard-split: a cut pretoken whose pieces may wait in the batch;
+// once they are merged its tokens are read back from res / emit and kept whole (lng: in the
+// long cache, h its hash there; else in its thread cache set, h unused).
+struct TailPost {
+    uint64_t k0, k1, h;
+    TailCacheEntry * set;
+    uint32_t s, len;
+    bool lng;
+};
+
 // The resolve kernel's per-thread state, fetched once per call: on macOS every access to a
 // thread_local with a constructor is a _tlv_get_addr call.
 struct TailScratch {
+    TailBPEUnit batch[kTailBatch];       // --tail-batch-bpe: the call's pretokens waiting for BPE
+    unsigned batchN = 0;
+    TailBatchMergeFn batchFn = nullptr;  // ... merged by the scan kernel's generated code (or null)
+    TailPost post[kTailBatch];           // ... and its cut pretokens to keep after them
+    unsigned postN = 0;
     std::vector<uint16_t> t;             // an uncached segment: ids ...
     std::vector<uint32_t> pos;           // ... and positions
     std::vector<TailCacheEntry> cache;
+    TailCacheEntry * sets = nullptr;     // set 0 (cache.data())
     uint64_t generation = 0;
     unsigned setBits = 0;                // log2 of the cache's sets
+    // --tail-long-cache: an open-addressed index (load <= 1/2) into an arena holding, per entry,
+    // the pretoken's bytes and then its tokens as id | offset in the pretoken << 16. Both are
+    // cleared when either fills.
+    std::vector<TailLongSlot> longIndex;
+    std::vector<uint8_t> longArena;
+    size_t longUsed = 0, longCount = 0;
+    std::vector<uint64_t> longSeen;      // --tail-long-admit=2: hashes seen once
+    size_t longSeenN = 0;
 };
 // --tail-cache-pool: scratches not in use; a thread leases one and returns it as it exits.
 static std::mutex gTailPoolMutex;
@@ -1271,15 +1895,39 @@ static TailScratch & tailScratch() {
         sp = &s;
     }
     const uint64_t g = gTailGeneration.load(std::memory_order_relaxed);
-    if (sp->generation != g || sp->setBits != TailCacheBits) {
-        sp->setBits = std::min<unsigned>(std::max<unsigned>(TailCacheBits, 4), 24);
-        sp->cache.assign(size_t(2) << sp->setBits, TailCacheEntry{});
+    if (sp->generation != g || sp->setBits != kTailCacheBits) {
+        sp->setBits = kTailCacheBits;
+        sp->cache.assign(size_t(kTailCacheWays) << sp->setBits, TailCacheEntry{});
+        sp->sets = sp->cache.data();
+        if (TailLongCache) {
+            sp->longIndex.assign(size_t(1) << kTailLongIndexBits, TailLongSlot{0, 0, 0});
+            sp->longArena.resize(kTailLongArena);
+            sp->longUsed = sp->longCount = 0;
+            if (TailLongAdmit >= 2) sp->longSeen.assign(size_t(1) << (kTailLongSeenBits - 6), 0);
+            sp->longSeenN = 0;
+        }
         sp->generation = g;
     }
     return *sp;
 }
 
+void bpeDropTailCaches() { gTailGeneration++; }
+
 static inline void tailMark(uint64_t * emit, uint32_t p) { emit[p / 64] |= 1ull << (p % 64); }
+
+// --tail-emit-from-segs (with --tail-from-bytes): every pretoken's first token starts at the
+// pretoken's start, so the byte resolve loop starts its emit stream as a copy of the pretoken
+// start bits (64 positions per word) and marks only the later tokens of multi-token pretokens,
+// instead of one read-modify-write of emit per pretoken. Runtime only, no cache tag.
+static cl::opt<bool> TailEmitFromSegs(
+    "tail-emit-from-segs",
+    cl::desc("With --tail-from-bytes: start the emit stream from the pretoken start bits and mark "
+             "only later tokens (default off)."),
+    cl::init(false));
+// tailMark for the j-th token of a pretoken (j = 0: the pretoken's start).
+static inline void tailMarkTok(uint64_t * emit, uint32_t p, size_t j) {
+    if (j != 0 || !TailEmitFromSegs) tailMark(emit, p);
+}
 static inline uint64_t tailLowMask(size_t k) { return k >= 64 ? ~0ull : (1ull << k) - 1; }
 
 // A cached segment on its way through the resolve loop: its tokens (positions, ids), its key
@@ -1293,7 +1941,7 @@ struct TailDesc {
 };
 
 // Look d up (or merge it and fill the cache) and write its output ids at their positions.
-static inline void tailFinishDesc(const TailDesc & d, uint32_t * res, uint64_t * emit) {
+static inline void tailFinishDesc(const TailDesc & d, uint16_t * res, uint64_t * emit) {
     TailCacheEntry * const set = d.set;
     const TailCacheEntry * e;
     if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
@@ -1323,12 +1971,13 @@ static inline void tailFinishDesc(const TailDesc & d, uint32_t * res, uint64_t *
 }
 
 // The tail runs in two kernels. BPETailResolveKernel is data-parallel: each call finishes
-// every segment that lies wholly inside its own blocks and writes one word per token start:
-// the finished id, or the input id with kTailOpen for a token of a segment cut by the call's
-// edges (bit kTailSeg on the first token of such a segment); a bit in `emit` marks each of
-// these, and not the tokens merged into their left neighbour. BPETailKernel then walks the
-// marked words in order on one thread, emits, and finishes the cut segments, a couple per call.
-static constexpr uint32_t kTailOpen = 1u << 16, kTailSeg = 1u << 18;
+// every segment that lies wholly inside its own blocks and writes one 16-bit id per token
+// start in `res`: the finished id, or the input id for a token of a segment cut by the call's
+// edges, which the bit stream `open` marks (and `seg` the first token of such a segment); a
+// bit in `emit` marks each of these, and not the tokens merged into their left neighbour.
+// open and seg are 0 everywhere else. BPETailKernel then walks the marked ids in order on one
+// thread, emits, and finishes the cut segments, a couple per call.
+static inline void tailClearBits(uint64_t * bits, uint64_t numItems) { std::fill(bits, bits + numItems / 64, 0); }
 
 // The resolve loop walks the segment starts. A segment of one token is its own output; one
 // of 2 .. TailKey<B>::max tokens becomes a TailDesc, whose cache set is prefetched and which
@@ -1340,10 +1989,13 @@ static constexpr unsigned kTailAhead = 4;
 
 template <unsigned B>
 static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
-                        uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+                        uint16_t * res, uint64_t * emit, uint64_t * open, uint64_t * seg,
+                        uint64_t numItems, uint64_t n, uint64_t final) {
     using K = TailKey<B>;
     TailScratch & S = tailScratch();
     std::fill(emit, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
     if (n > numItems) n = numItems;
     const size_t nWords = (n + 63) / 64;
     if (nWords == 0) return;
@@ -1352,7 +2004,7 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
         mask0[k] = tailLowMask(std::min(k, K::per0) * B);
         mask1[k] = k <= K::per0 ? 0 : tailLowMask((k - K::per0) * B);
     }
-    TailCacheEntry * const cache = S.cache.data();
+    TailCacheEntry * const cache = S.sets;
     const unsigned setShift = 64 - S.setBits;
     auto bitsIn = [&](size_t w, size_t lo, size_t hi) {      // starts bits of word w in [lo, hi)
         uint64_t x = starts[w];
@@ -1368,7 +2020,8 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
     for (size_t w = 0; w * 64 < first; w++)                     // cut by the left edge
         for (uint64_t x = bitsIn(w, 0, first); x; x &= x - 1) {
             const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
-            res[p] = ids[p] | kTailOpen;
+            res[p] = ids[p];
+            tailMark(open, p);
             tailMark(emit, p);
         }
     if (!sx) return;
@@ -1384,12 +2037,14 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
         const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
         if (last && !final) {                                   // may go on in the next call
             drain();
-            uint32_t seg = kTailSeg;
+            bool segStart = true;
             for (size_t w = s / 64; w * 64 < n; w++)
                 for (uint64_t x = bitsIn(w, s, n); x; x &= x - 1) {
                     const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
-                    res[p] = ids[p] | kTailOpen | seg;
-                    seg = 0;
+                    res[p] = ids[p];
+                    tailMark(open, p);
+                    if (segStart) tailMark(seg, p);
+                    segStart = false;
                     tailMark(emit, p);
                 }
             return;
@@ -1455,10 +2110,10 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
 // emit: one bit per token the emitter must visit (finished or cut), so it skips the
 // merged-away ones without reading them.
 extern "C" void bpe_tail_resolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
-                                 uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n,
-                                 uint64_t final) {
+                                 uint16_t * res, uint64_t * emit, uint64_t * open, uint64_t * seg,
+                                 uint64_t numItems, uint64_t n, uint64_t final) {
     switch (gTail.idBits) {
-#define TAIL_CASE(B) case B: tailResolve<B>(ids, starts, segs, res, emit, numItems, n, final); return;
+#define TAIL_CASE(B) case B: tailResolve<B>(ids, starts, segs, res, emit, open, seg, numItems, n, final); return;
         TAIL_CASE(8) TAIL_CASE(9) TAIL_CASE(10) TAIL_CASE(11) TAIL_CASE(12)
         TAIL_CASE(13) TAIL_CASE(14) TAIL_CASE(15) TAIL_CASE(16)
 #undef TAIL_CASE
@@ -1466,9 +2121,144 @@ extern "C" void bpe_tail_resolve(const uint16_t * ids, const uint64_t * starts, 
     }
 }
 
-// --tail-from-bytes: the tokens are the input bytes, as their GPT-2 base ids (T1).
-static uint16_t gTailBase[256];
+// --tail-from-bytes: the tokens are the input bytes, as their GPT-2 base ids (T1); gTailBase
+// is defined with the tail's rule table.
 static constexpr unsigned kTailByteKeyMax = 15;   // cached pretokens: 2 .. 15 bytes
+
+// --tail-scan-kernel (with --tail-from-bytes): ZTF's LengthGroupCompression pattern for the
+// tail. The resolve loop is a Parabix two-level scan kernel (TwoLevelScanKernel) over the
+// pretoken starts, with the previous start in a loop variable, that finishes the common
+// pretokens in generated code: one byte (its base id) and a vocabulary-table hit of
+// 2 .. kTailByteKeyMax bytes (key from two loads, hash, the set's 4 entries compared at once,
+// one id stored). Only the rest (vocabulary misses, long pretokens, the call's edges) calls
+// the C++ walk. The emit stream starts as the start bits (--tail-emit-from-segs).
+// Kernel name: BPE_TailScanIR.
+static cl::opt<bool> TailScanKernel(
+    "tail-scan-kernel",
+    cl::desc("With --tail-from-bytes: walk the pretoken starts in a two-level scan kernel that "
+             "finishes one-byte pretokens and vocabulary-table hits in generated code (default off)."),
+    cl::init(false));
+// --tail-scan-ir-cache (with --tail-scan-kernel): after a vocabulary miss the generated code
+// also checks the first entry of the pretoken's set in the thread's cache (its most recent: a
+// hit there moves nothing) and writes that entry's tokens. Kernel name tag "c<ways>".
+static cl::opt<bool> TailScanIRCache(
+    "tail-scan-ir-cache",
+    cl::desc("With --tail-scan-kernel: also finish hits on the first entry of the thread cache's "
+             "set in generated code (default off)."),
+    cl::init(false));
+// --tail-unit-cuts (with --tail-scan-kernel): BPEUnitCutsKernel cuts the pretokens at every
+// frozen byte and marks the pretokens of one byte (unit), whose token is the byte's base id.
+// The scan kernel walks its `scan` starts: a start after a unit start is a run of units, which
+// it finishes by writing their base ids (a scalar loop over the table) and nothing else; any
+// other start is a pretoken as before. A call's edges are not cut where they fall in a run of
+// units (unit is exact there: BPEUnitCutsKernel looks one byte past the call). Runtime and
+// kernel names: BPE_UnitCuts_<frozen set>, BPE_TailScanIR..._u.
+static cl::opt<bool> TailUnitCuts(
+    "tail-unit-cuts",
+    cl::desc("With --tail-scan-kernel: cut pretokens at frozen bytes and finish the pretokens of one "
+             "byte without resolving them (default off)."),
+    cl::init(false));
+// --tail-unit-seed (implies --tail-unit-cuts): the base ids of all bytes come from bit streams,
+// BPEBaseIdKernel's 8 id bits packed to 16-bit ids by P2S16Kernel, and the scan kernel updates
+// that id stream in place (InOut) instead of writing the ids of units or of one-byte
+// pretokens. Kernel name tag: BPE_TailScanIR..._us.
+static cl::opt<bool> TailUnitSeed(
+    "tail-unit-seed",
+    cl::desc("With --tail-scan-kernel: start the tail's ids as every byte's base id, computed with "
+             "bit streams and packed by P2S16 (implies --tail-unit-cuts; default off)."),
+    cl::init(false));
+// --byte-run-cuts=N (implies --tail-unit-cuts): inside every run of N or more copies of a hard
+// self-pair byte c (no token holds c c: the space, among others; GPT-2 has no space-run tokens),
+// cut between the copies, so each interior copy is a unit. Default 2 (every run); 0 = off.
+static cl::opt<unsigned> ByteRunCuts(
+    "byte-run-cuts",
+    cl::desc("With --tail-scan-kernel: cut runs of N or more equal hard self-pair bytes into units "
+             "(implies --tail-unit-cuts; default 2, 0 = off)."),
+    cl::init(2));
+// --byte-run-edges (with --byte-run-cuts): also cut before a run where its prefix byte x and
+// first byte c are a hard pair (no token holds x c; e.g. \n before an indentation run), and
+// after it where its last byte and the next are. --byte-run-guard: compute the run cuts
+// inside a Pablo If on "a run byte in this block".
+static cl::opt<unsigned> ByteRunEdges("byte-run-edges", cl::desc("With --byte-run-cuts: also cut before a run at "
+    "a hard prefix pair (1, the default), and after it at a hard suffix pair (2); 0 = neither."), cl::init(1));
+// --byte-run-bytes: which hard self-pair bytes form runs: 0 the space only (default), 1 every ASCII one.
+static cl::opt<unsigned> ByteRunBytes("byte-run-bytes", cl::desc("With --byte-run-cuts: run bytes, 0 the space "
+    "(default), 1 every ASCII hard self-pair byte."), cl::init(0));
+static cl::opt<bool> ByteRunGuard("byte-run-guard", cl::desc("With --byte-run-cuts: compute the run cuts "
+    "inside an If guard (default on)."), cl::init(true));
+// --byte-run-cuts is on by default, but applies only with --tail-scan-kernel (the run cuts are units
+// of the scan kernel); given explicitly without it, it is an error.
+static bool byteRunCuts() { return ByteRunCuts && TailScanKernel; }
+// --len-scan=N (with --tail-scan-kernel; implies --tail-unit-cuts): the pieces of 2 .. N bytes
+// (between the cuts) are resolved by kernels of their own, BPE_len<L>_pretokenScan, each a two-level
+// scan over the end marks of the pieces of length L, and skipped by the general scan
+// (BPE_LenSelect<N>). L = 2: a direct 64K byte-pair table; L = 3 .. 15: a table of the L-byte tokens
+// in 64-byte buckets. N = 2 .. 15; 0 = off.
+static cl::opt<unsigned> LenScan("len-scan", cl::desc("With --tail-scan-kernel: resolve the pieces of 2 .. N "
+    "bytes in kernels of their own, BPE_len<L>_pretokenScan (N = 2 .. 15; 0 = off, the default)."), cl::init(0));
+static bool lenScan() { return LenScan >= 2 && TailScanKernel; }
+// --len-hash-search=N (with --len-scan): for each length table, try up to N bucket-hash multipliers
+// at the size of the load asked for (BPE_LEN_LOAD, 0.5), then at twice the size, and so on, until
+// one leaves no bucket over full, so the table holds every token. A multiplier fails at its first
+// full bucket, so most tries are short, and a size whose expected tries (from 8 multipliers' counts of
+// over full buckets) exceed N is skipped. GPT-2: 4096 builds 3.7 MB of tables in 34 ms (1M: 2.9 MB,
+// 348 ms; no search: 2.0 MB with 470 tokens left out); no difference in speed on the test files,
+// where the left-out tokens are under 0.2% of the 5..15-byte pieces. 0: the fixed multipliers.
+static cl::opt<unsigned> LenHashSearch("len-hash-search", cl::desc("With --len-scan: try up to N multipliers "
+    "per table size so that every token fits its bucket (default 4096; 0 = the fixed multiplier)."), cl::init(4096));
+// --len3-pair-check (with --len-scan=3 or more): the BPE of a 3-byte piece a b c missing from the
+// length-3 table, in generated code from the pair table (gTailPairBytes) instead of bpe_len_miss.
+// The table holds every 3-byte token whose BPE is itself, so a miss is two or three tokens: no rule
+// for (a, b) or (b, c), the three base ids (already in res); else the pair rule of lower id (id =
+// 256 + rank; the left one on a tie) merges, and the result can merge no further (that would be a
+// table hit). Only when the table left no 3-byte token out. Kernel name tag "_pc".
+static cl::opt<bool> Len3PairCheck("len3-pair-check", cl::desc("With --len-scan: resolve the 3-byte pieces "
+    "missing from the table from the pair rules, without the miss path (default on)."),
+    cl::init(true));
+// --len4-pair-check (with --len-scan=4 or more): the same for a 4-byte piece a b c d missing from
+// the length-4 table, from the pair ids p0 (a, b), p1 (b, c), p2 (c, d) and the length-3 table's
+// ids of abc and bcd (0xFFFF: not a token whose BPE is itself). The pair of lowest id merges first
+// (the left one on a tie); a pair and a byte then merge only if their 3 bytes are such a token (the
+// same merge would happen on those bytes alone), and a merge to all 4 bytes would be a table hit:
+//   p0 first: ab+c (abc) or c+d (p2), the lower; none: ab c d
+//   p1 first: a+bc (abc) or bc+d (bcd), the lower; none: a bc d
+//   p2 first: a+b (p0) or b+cd (bcd), the lower; none: a b cd
+// No pair rule: the four base ids. Checked against BPE on every 4-byte piece of the test files and
+// on 300K random 4-byte strings. The length-4 table is grown until it holds every 4-byte token, and
+// both tables must be complete. Kernel name tag "_pc".
+static cl::opt<bool> Len4PairCheck("len4-pair-check", cl::desc("With --len-scan: resolve the 4-byte pieces "
+    "missing from the table from the pair rules and the 3-byte tokens, without the miss path (default on)."),
+    cl::init(true));
+// --len-long-kernel (with --len-scan and --tail-unit-seed; on by default): BPE_LongPieces resolves
+// the pieces of more than N bytes in place of the general scan (BPE_TailScanIR).
+static cl::opt<bool> LenLongKernel("len-long-kernel", cl::desc("With --len-scan and --tail-unit-seed: the "
+    "pieces of more than N bytes in BPE_LongPieces, not the general scan (default on)."), cl::init(true));
+// --len-select-if=K[,K2...]: BPE_LenSelect computes the starts of pieces longer than K bytes inside
+// an If on "a piece of more than K bytes starts in the block" (nested for each further threshold,
+// ascending); none by default.
+static cl::list<unsigned> LenSelectIf("len-select-if", cl::desc("With --len-scan: compute the longer "
+    "lengths' starts inside nested Ifs, one per threshold (ascending)."), cl::CommaSeparated);
+// --pair-cuts=1 (with --tail-scan-kernel; implies --tail-unit-cuts): cut between every two bytes
+// that no token holds next to each other (isHardPair), from a kernel of its own, BPE_PairCuts.
+// GPT-2: 2,689 of the 65,536 byte pairs occur inside tokens (2,074 ASCII, 615 with a byte
+// >= 0x80). --pair-cut-guard: the pairs with a byte >= 0x80 inside an If, the ASCII pairs as a
+// 14-bit class outside it. --pair-cuts=2: only the pairs with a byte >= 0x80 (the If), no ASCII
+// pair is cut. --pair-cuts=3 (with --len-scan, and the pretokenizer's classes compiled on the UTF-8
+// bytes: --pretok-class-code --pretok-byte-domain --pretok-utf8-classes): the cuts of the cut classes
+// (kCutBefore .. kCutAfterLead, bpeCutClassCCs), compiled with the pretokenizer's classes, and of the
+// byte pairs in and after codepoints, all in BPE_Cuts (BPECutsKernel).
+static cl::opt<unsigned> PairCuts("pair-cuts", cl::desc("With --tail-scan-kernel: cut between the byte pairs that no "
+    "token holds: 1 all, 2 those with a byte >= 0x80, 3 from codepoint classes and the pairs in and after codepoints "
+    "(with --len-scan and --pretok-utf8-classes; implies --tail-unit-cuts; default 0, off)."), cl::init(0));
+static cl::opt<bool> PairCutGuard("pair-cut-guard", cl::desc("With --pair-cuts: the pairs with a non-ASCII "
+    "byte inside an If guard, the ASCII pairs a 14-bit class (default on)."), cl::init(true));
+static bool pairCuts() { return PairCuts && TailScanKernel; }
+// --pair-cuts=3: the cut classes are compiled with the pretokenizer's classes.
+static bool cutClasses() { return TailFromBytes && TailScanKernel && LenScan >= 2 && PairCuts == 3; }
+static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts() || lenScan() || pairCuts(); }
+// Measurement only (wrong output): pretokens of more than N bytes get a 0 and nothing else,
+// in BPETailScanKernel.
+static cl::opt<unsigned> TailSkipLong("tail-skip-long", cl::init(0), cl::Hidden);
 
 // A cached pretoken on its way through the byte resolve loop: its start (relative to the
 // call), length, key (k0 = bytes 0..7, k1 = bytes 8..14 and the length in the top byte)
@@ -1476,26 +2266,405 @@ static constexpr unsigned kTailByteKeyMax = 15;   // cached pretokens: 2 .. 15 b
 struct TailByteDesc {
     uint64_t k0, k1;
     TailCacheEntry * set;
+    const TailCacheEntry * vset;         // its --tail-vocab-table set, or null
     uint32_t s, len;
 };
 
-static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint32_t * res,
-                                   uint64_t * emit) {
+// Entries 0 .. w-1 of a W-entry set move down one, entry W-1 drops out (unrolled: a memmove
+// call for 32..96 bytes was 3% of a 1-thread run).
+template <unsigned W>
+static inline void tailShiftDown(TailCacheEntry * set, unsigned w) {
+#pragma clang loop unroll(full)
+    for (unsigned k = W - 1; k > 0; k--)
+        if (k <= w) set[k] = set[k - 1];
+}
+
+// --tail-vocab-table: the vocabulary tokens of 2..kTailByteKeyMax bytes that BPE turns back
+// into themselves, as finished cache entries (one output id) in 4-entry sets, read-only once
+// built. tiktoken returns any pretoken found in its vocabulary without merging; checking
+// each token once at load makes the same shortcut exact for any merge list (for GPT-2 every
+// merge token passes). Measured on val_4MB: 49% of the distinct cacheable pretokens (the
+// cold misses) are one token, webtext_cases 33%.
+static cl::opt<bool> TailVocabTable(
+    "tail-vocab-table",
+    cl::desc("With --tail-from-bytes: answer a cache miss on a pretoken that is itself a "
+             "vocabulary token from a table checked at load (default off)."),
+    cl::init(false));
+// Built on a thread of its own while the pipeline compiles and runs, and published when done
+// (release store; the resolve loop loads it with acquire): until then a miss just merges.
+static std::vector<TailCacheEntry> gTailVocabMem;
+static std::atomic<TailCacheEntry *> gTailVocab{nullptr};
+static unsigned gTailVocabShift = 64;
+// --tail-vocab-layout=1: a region of sets per key length L = 2 .. kTailByteKeyMax, sized for a
+// target load (no power of 2: the set is base + ((h >> 32) * sets) >> 32); the tokens of full sets
+// in a stash probed after a set miss (tailVocabFind). gTailVocabDesc[2L] is the region's first set,
+// [2L + 1] its set count. 0: one table of 2^bits sets for all lengths, some tokens left out when
+// sets fill. An experiment: slower than 0 (the stash probe on every miss, the descriptor loads).
+static cl::opt<unsigned> TailVocabLayout("tail-vocab-layout", cl::desc("With --tail-vocab-table: 0 one table "
+    "for all key lengths (default), 1 a region per key length (an experiment)."), cl::init(0));
+static uint64_t gTailVocabDesc[2 * 16] = {};
+// --tail-vocab-layout=1: the tokens whose set was full, open-addressed by the key's hash (k1 == 0:
+// empty), looked at only after a set miss, in C++ (the generated probe's misses come here too).
+static std::vector<TailCacheEntry> gTailVocabStash;
+static uint64_t gTailVocabStashMask = 0;
+static std::thread gTailVocabThread;
+static std::string gTailVocabReport;   // the builder's summary line
+static void tailVocabJoin() {
+    if (!gTailVocabThread.joinable()) return;
+    gTailVocabThread.join();
+    std::cerr << gTailVocabReport;
+}
+
+// The vocabulary table is looked at first, before the thread's cache, which keeps only the other
+// pretokens. 90% of pretoken occurrences in val_4MB are one token, and the table is full from the
+// start of a run while each thread's cache starts empty. (Was --tail-vocab-first; built in
+// 2026-11-04: ~2% faster.)
+
+static inline const TailCacheEntry * tailVocabSet(const TailCacheEntry * vocab, uint64_t h, size_t len) {
+    if (TailVocabLayout)
+        return vocab + (gTailVocabDesc[2 * len] + (((h >> 32) * gTailVocabDesc[2 * len + 1]) >> 32)) * 4;
+    return vocab + (h >> gTailVocabShift) * 4;
+}
+
+// W = entries per thread cache set, always kTailCacheWays (2, insertion order).
+// The entry of a 4-entry vocabulary set holding the key, 4 if none (an empty entry's k1 is 0, a
+// key's never is); all 4 compared at once, no exit branch. (--tail-branchless-probe, which also
+// used it in tailFinishBytes, was deleted 2026-11-04: no measurable effect.)
+static inline unsigned tailMatch4(const TailCacheEntry * s, uint64_t k0, uint64_t k1) {
+    unsigned m = 16;
+#pragma clang loop unroll(full)
+    for (unsigned i = 0; i < 4; i++) m |= unsigned((s[i].k0 == k0) & (s[i].k1 == k1)) << i;
+    return unsigned(__builtin_ctz(m));
+}
+// The vocabulary entry of the key: in its set, else (--tail-vocab-layout) in the stash; null if none.
+static inline const TailCacheEntry * tailVocabFind(const TailCacheEntry * vs, uint64_t k0, uint64_t k1) {
+    const unsigned v = tailMatch4(vs, k0, k1);
+    if (LLVM_LIKELY(v < 4)) return vs + v;
+    if (gTailVocabStashMask == 0) return nullptr;
+    const uint64_t h = (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+    for (uint64_t i = (h >> 20) & gTailVocabStashMask; ; i = (i + 1) & gTailVocabStashMask) {
+        const TailCacheEntry & e = gTailVocabStash[i];
+        if (e.k1 == 0) return nullptr;
+        if (e.k0 == k0 && e.k1 == k1) return &e;
+    }
+}
+
+// TailByteWalk::finish probes the vocabulary set itself (all 4 entries at once) and writes a
+// hit's one id in place; only a miss calls tailFinishBytes (as a call per pretoken, the hit path,
+// 90% of pretokens on val_4MB, spilled the loop's state). Each pretoken of 2 .. kTailByteKeyMax
+// bytes is finished as soon as it is found, from registers: a ring of descriptors whose sets are
+// prefetched ahead is no faster, as the out-of-order window already hides the set loads. (Were
+// --tail-inline-vocab-hit and --tail-no-ring; built in 2026-11-04.)
+
+// --tail-hard-split (with --tail-from-bytes): a merge makes token AB from neighbours A and B, so
+// the bytes next to each other inside any token are the pairs (last byte of A, first byte of
+// B) over all rules (by induction on rank): 2,689 of the 65,536 byte pairs for GPT-2. Between
+// two bytes that form none of them no merge can ever happen, so BPE of a pretoken is the BPE of
+// its pieces between such cuts, joined. A pretoken that missed the caches is cut there and each
+// piece is looked up on its own (one byte: its base id; else the vocabulary table, then the
+// thread's cache, else merged and cached), so pieces shared by many distinct pretokens (one
+// CJK character, a NUL, a run of punctuation) merge once. A vocabulary token has no cut, so hits
+// never change. Distinct cache misses split: val_4MB 6% (NUL runs), code_4MB 54%, multi_4MB 64%,
+// webtext_cases 6%. Runtime only, no cache tag.
+static cl::opt<bool> TailHardSplit(
+    "tail-hard-split",
+    cl::desc("With --tail-from-bytes: merge a cache miss as its pieces between byte pairs that no "
+             "token holds, each looked up on its own (default off)."),
+    cl::init(false));
+static uint64_t gHardPairs[1024];   // bit x << 8 | y: no token holds bytes x, y next to each other
+static inline bool isHardPair(uint8_t x, uint8_t y) {
+    const unsigned k = (unsigned(x) << 8) | y;
+    return (gHardPairs[k >> 6] >> (k & 63)) & 1;
+}
+// --tail-trigram-split (with --tail-hard-split): more exact cuts in pretokens over 15 bytes.
+// A token covering the spot between bytes i - 1 and i (start p < i < end q) either starts at
+// or before i - 2 and holds the 3 bytes w[i-2..i], or starts at i - 1 and begins with
+// w[i-1..i+1], or is exactly w[i-1..i]. Every token made while merging is a vocabulary token,
+// so when none of the three exists no merge can cross the spot: it is a cut. A hard pair (no
+// token holds w[i-1], w[i]) passes all three. Three bitmaps from the tokens' bytes: trigrams
+// inside tokens and 3-byte token prefixes (2^24 bits = 2 MB each), 2-byte tokens (8 KB).
+// Distinct long misses: bytes left in pieces over 15 bytes, code_4MB 28% → 6%. Runtime only.
+static cl::opt<bool> TailTrigramSplit(
+    "tail-trigram-split",
+    cl::desc("With --tail-hard-split: also cut pretokens over 15 bytes where no token can cover "
+             "the 3 bytes around a spot (default off)."),
+    cl::init(false));
+static std::vector<uint64_t> gTailTri3, gTailPre3;   // bit a << 16 | b << 8 | c
+static uint64_t gTailTok2[1024];                     // bit a << 8 | b: a 2-byte token
+static inline bool tailBit(const uint64_t * m, unsigned k) { return (m[k >> 6] >> (k & 63)) & 1; }
+// A cut between w[j - 1] and w[j] of a pretoken w[0, len) of more than 15 bytes.
+static inline bool tailLongCut(const uint8_t * w, size_t j, size_t len) {
+    if (isHardPair(w[j - 1], w[j])) return true;
+    if (!TailTrigramSplit) return false;
+    const unsigned x = w[j - 1], y = w[j];
+    if (tailBit(gTailTok2, x << 8 | y)) return false;
+    if (j >= 2 && tailBit(gTailTri3.data(), unsigned(w[j - 2]) << 16 | x << 8 | y)) return false;
+    if (j + 1 < len && tailBit(gTailPre3.data(), x << 16 | y << 8 | w[j + 1])) return false;
+    return true;
+}
+static inline bool tailHasCut(const uint8_t * w, size_t len) {
+    for (size_t j = 1; j < len; j++) if (tailLongCut(w, j, len)) return true;
+    return false;
+}
+// The cuts of a pretoken of len <= 15 bytes from its key (k0: bytes 0..7, k1: bytes 8..14 and
+// len): bit j set when there is a cut between bytes j - 1 and j. No branch.
+static inline uint32_t tailCutMask(uint64_t k0, uint64_t k1, size_t len) {
+    uint8_t b[16];
+    std::memcpy(b, &k0, 8);
+    std::memcpy(b + 8, &k1, 8);
+    uint32_t m = 0;
+#pragma clang loop unroll(full)
+    for (unsigned j = 1; j < 15; j++) m |= uint32_t(isHardPair(b[j - 1], b[j])) << j;
+    return m & ((1u << len) - 2);
+}
+// What a piece lookup needs: the thread's cache and the vocabulary table (null: no splitting).
+struct TailPieces {
+    TailCacheEntry * cache;
+    unsigned setShift;
+    const TailCacheEntry * vocab;
+    size_t n;                            // bytes [0, n) of the call may be read
+};
+
+// The tokens of the piece w[0, L) (after its cut, so never cut itself), at tt / idx (offsets
+// off + j in the pretoken), which have room for L; returns their count.
+template <unsigned W>
+static size_t tailPieceMerge(const TailPieces & P, const uint8_t * w, size_t L, uint16_t * tt, uint32_t * idx,
+                             uint32_t off) {
+    if (L == 1) { tt[0] = gTailBase[w[0]]; idx[0] = off; return 1; }
+    for (size_t j = 0; j < L; j++) { tt[j] = gTailBase[w[j]]; idx[j] = uint32_t(j); }
+    size_t m = L;
+    if (L > kTailByteKeyMax) {
+        tailMergeSegment(tt, idx, m);
+    } else {
+        uint8_t buf[16] = {};
+        std::memcpy(buf, w, L);
+        uint64_t k0, k1;
+        std::memcpy(&k0, buf, 8);
+        std::memcpy(&k1, buf + 8, 8);
+        k1 |= uint64_t(L) << 56;                                    // byte 15 is 0: L <= 15
+        const uint64_t h = (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+        const TailCacheEntry * const ve = tailVocabFind(tailVocabSet(P.vocab, h, L), k0, k1);
+        if (ve) { tt[0] = ve->out[0]; idx[0] = off; return 1; }
+        TailCacheEntry * const set = P.cache + (h >> P.setShift) * W;
+        unsigned way = W;
+        if (set[0].k0 == k0 && set[0].k1 == k1) way = 0;
+        else if (set[1].k0 == k0 && set[1].k1 == k1) way = 1;
+        if (way < W) {
+            m = 0;
+            for (uint32_t keep = set[way].keep; keep; keep &= keep - 1, m++) {
+                tt[m] = set[way].out[m];
+                idx[m] = off + uint32_t(__builtin_ctz(keep));
+            }
+            return m;
+        }
+        tailMergeSegment(tt, idx, m);
+        if (m <= kTailCacheOut) {
+            tailShiftDown<W>(set, W - 1);                           // the last one goes
+            TailCacheEntry & f = set[0];
+            f.k0 = k0; f.k1 = k1; f.keep = 0;
+            for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
+        }
+    }
+    for (size_t j = 0; j < m; j++) idx[j] += off;
+    return m;
+}
+
+// The BPE of the pretoken w[0, len) as its pieces' (tt / idx with room for len; idx = offsets).
+template <unsigned W>
+static size_t tailSplitMerge(const TailPieces & P, const uint8_t * w, size_t len, uint16_t * tt, uint32_t * idx) {
+    size_t m = 0, a = 0;
+    for (size_t j = 1; j <= len; j++) {
+        if (j < len && !(len > kTailByteKeyMax ? tailLongCut(w, j, len) : isHardPair(w[j - 1], w[j]))) continue;
+        m += tailPieceMerge<W>(P, w + a, j - a, tt + m, idx + m, uint32_t(a));
+        a = j;
+    }
+    return m;
+}
+
+// --tail-batch-bpe: merge the queued pretokens, kTailLanes at a time, write their tokens and keep
+// each result in its cache set, unless the set has it already (a pretoken can be queued twice
+// before its first result is kept).
+// 6 lanes: 4 were ~2% slower, 8 the same (1 thread, val_4MB and webtext_cases).
+static constexpr unsigned kTailLanes = 6;
+template <unsigned W>
+static void tailPostKeep(TailScratch & S, const uint8_t * bytes, const uint16_t * res, const uint64_t * emit);
+// One merged unit: its tokens (live positions L, ids T) to res / emit, and the result to its
+// cache set unless the set has it already.
+template <unsigned W>
+static inline void tailBatchKeep(const TailBPEUnit & u, uint32_t L, const uint16_t * T, uint16_t * res, uint64_t * emit) {
+    unsigned m = 0;
+    for (uint32_t x = L; x; x &= x - 1, m++) {
+        const uint32_t p = uint32_t(__builtin_ctz(x));
+        res[u.s + p] = T[p];
+        tailMark(emit, u.s + p);
+    }
+    TailCacheEntry * const set = u.set;
+    if (set == nullptr || m > kTailCacheOut) return;
+    unsigned way = W;
+    if (set[0].k0 == u.k0 && set[0].k1 == u.k1) way = 0;
+    else if (set[1].k0 == u.k0 && set[1].k1 == u.k1) way = 1;
+    if (way < W) return;
+    tailShiftDown<W>(set, W - 1);                               // the last one goes
+    TailCacheEntry & f = set[0];
+    f.k0 = u.k0; f.k1 = u.k1; f.keep = uint16_t(L);
+    m = 0;
+    for (uint32_t x = L; x; x &= x - 1) f.out[m++] = T[__builtin_ctz(x)];
+}
+template <unsigned W>
+static void tailBatchFlush(TailScratch & S, const uint8_t * bytes, uint16_t * res, uint64_t * emit) {
+    const unsigned n = S.batchN;
+    S.batchN = 0;
+    if (n == 0) { tailPostKeep<W>(S, bytes, res, emit); return; }
+    if (S.batchFn) {                                            // generated code (bpe_batch_merge)
+        TailBatchResult out[kTailBatch];
+        S.batchFn(bytes, S.batch, n, out, gTailBase, gTail.pair.data(), gTailRules, gTailRuleShift);
+        for (unsigned i = 0; i < n; i++) tailBatchKeep<W>(S.batch[i], out[i].L, out[i].T, res, emit);
+        tailPostKeep<W>(S, bytes, res, emit);
+        return;
+    }
+    TailLane lane[kTailLanes];
+    bool live[kTailLanes];
+    unsigned next = 0, nlive = 0;
+    auto load = [&](unsigned k) {
+        live[k] = next < n;
+        if (!live[k]) return;
+        lane[k].unit = next;
+        tailLaneInit(lane[k], bytes + S.batch[next].s, S.batch[next].len);
+        next++;
+    };
+    for (unsigned k = 0; k < kTailLanes; k++) { load(k); nlive += live[k]; }
+    while (nlive) {
+#pragma clang loop unroll(full)
+        for (unsigned k = 0; k < kTailLanes; k++) {
+            if (!live[k] || tailLaneStep(lane[k])) continue;
+            tailBatchKeep<W>(S.batch[lane[k].unit], lane[k].L, lane[k].T, res, emit);
+            load(k);
+            nlive -= !live[k];
+        }
+    }
+    tailPostKeep<W>(S, bytes, res, emit);
+}
+
+// The key and hash of the bytes w[0, L), 2 <= L <= kTailByteKeyMax, as TailByteWalk::describe;
+// wide: w[0, 16) may be read.
+static inline uint64_t tailBytesKey(const uint8_t * w, size_t L, uint64_t & k0, uint64_t & k1, bool wide) {
+    uint64_t a = 0, b = 0;
+    if (LLVM_LIKELY(wide)) {
+        std::memcpy(&a, w, 8);
+        std::memcpy(&b, w + 8, 8);
+    } else {
+        for (size_t i = 0; i < L; i++) (i < 8 ? a : b) |= uint64_t(w[i]) << (8 * (i % 8));
+    }
+    k0 = L >= 8 ? a : a & tailLowMask(L * 8);
+    k1 = (L > 8 ? b & tailLowMask((L - 8) * 8) : 0) | (uint64_t(L) << 56);
+    return (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+}
+
+// --tail-batch-bpe with --tail-hard-split: the pieces of the cut pretoken bytes[s, s + len),
+// each written at once (one byte, a vocabulary or thread cache hit, or over kTailByteKeyMax
+// bytes: merged here) or queued for the batch.
+template <unsigned W>
+static bool tailSplitQueue(TailScratch & S, const TailPieces & P, const uint8_t * bytes, size_t s, size_t len,
+                           uint16_t * res, uint64_t * emit, uint32_t cuts = 0,     // cuts: len <= 15
+                           bool * hadLong = nullptr) {                        // set: a piece over 15 bytes
+
+    bool queued = false;
+    size_t a = 0;
+    if (len <= kTailByteKeyMax) cuts |= 1u << len;                  // then j runs over the cuts and len
+    for (size_t j = len <= kTailByteKeyMax ? __builtin_ctz(cuts) : 1; j <= len;
+         j = len <= kTailByteKeyMax ? (cuts &= cuts - 1, cuts ? __builtin_ctz(cuts) : len + 1) : j + 1) {
+        if (len > kTailByteKeyMax && j < len && !tailLongCut(bytes + s, j, len)) continue;
+        const size_t L = j - a;
+        const uint8_t * const w = bytes + s + a;
+        const uint32_t q = uint32_t(s + a);
+        a = j;
+        if (L == 1) { res[q] = gTailBase[w[0]]; tailMark(emit, q); continue; }
+        if (L > kTailByteKeyMax) {
+            if (S.t.size() < L) { S.t.resize(L); S.pos.resize(L); }
+            size_t m = L;
+            for (size_t i = 0; i < L; i++) { S.t[i] = gTailBase[w[i]]; S.pos[i] = uint32_t(i); }
+            if (hadLong) *hadLong = true;
+            tailMergeSegment(S.t.data(), S.pos.data(), m);
+            for (size_t i = 0; i < m; i++) { res[q + S.pos[i]] = S.t[i]; tailMark(emit, q + S.pos[i]); }
+            continue;
+        }
+        uint64_t k0, k1;
+        const uint64_t h = tailBytesKey(w, L, k0, k1, q + 16 <= P.n);
+        const TailCacheEntry * const ve = tailVocabFind(tailVocabSet(P.vocab, h, L), k0, k1);
+        if (ve) { res[q] = ve->out[0]; tailMark(emit, q); continue; }
+        TailCacheEntry * const set = P.cache + (h >> P.setShift) * W;
+        unsigned way = W;
+        if (set[0].k0 == k0 && set[0].k1 == k1) way = 0;
+        else if (set[1].k0 == k0 && set[1].k1 == k1) way = 1;
+        if (way < W) {
+            unsigned i = 0;
+            for (uint32_t keep = set[way].keep; keep; keep &= keep - 1) {
+                const uint32_t p = q + uint32_t(__builtin_ctz(keep));
+                res[p] = set[way].out[i++];
+                tailMark(emit, p);
+            }
+            continue;
+        }
+        S.batch[S.batchN++] = TailBPEUnit{k0, k1, set, q, uint32_t(L)};
+        queued = true;
+        if (S.batchN == kTailBatch) tailBatchFlush<W>(S, bytes, res, emit);
+    }
+    return queued;
+}
+
+template <unsigned W>
+static void tailPostKeepOne(TailScratch & S, const TailPost & t, const uint8_t * bytes, const uint16_t * res,
+                            const uint64_t * emit);
+// Keep the cut pretoken t now if none of its pieces waits (queued false), else after the flush.
+template <unsigned W>
+static inline void tailPostAdd(TailScratch & S, const TailPost & t, bool queued, const uint8_t * bytes,
+                               uint16_t * res, uint64_t * emit) {
+    if (!queued) { tailPostKeepOne<W>(S, t, bytes, res, emit); return; }
+    if (S.postN == kTailBatch) tailBatchFlush<W>(S, bytes, res, emit);
+    S.post[S.postN++] = t;
+}
+
+// A pretoken of 2 .. kTailByteKeyMax bytes that is not in the vocabulary table: the thread cache,
+// else merged (or queued for the batch).
+template <unsigned W>
+static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint16_t * res,
+                                   uint64_t * emit, const TailPieces * pieces = nullptr,
+                                   TailScratch * batch = nullptr) {
     TailCacheEntry * const set = d.set;
     const TailCacheEntry * e;
-    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
-    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) e = &set[1];
-    else {
+    unsigned w = W;
+    static_assert(W == kTailCacheWays, "the thread cache's sets have 2 entries");
+    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) w = 0;
+    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) w = 1;
+    if (LLVM_LIKELY(w < W)) {
+        e = &set[w];
+    } else {
         uint16_t tt[kTailByteKeyMax];
         uint32_t idx[kTailByteKeyMax];
         size_t m = d.len;
-        for (size_t i = 0; i < m; i++) { tt[i] = gTailBase[bytes[d.s + i]]; idx[i] = uint32_t(i); }
-        tailMergeSegment(tt, idx, m);
-        if (m > kTailCacheOut) {
-            for (size_t j = 0; j < m; j++) { res[d.s + idx[j]] = tt[j]; tailMark(emit, d.s + idx[j]); }
+        const uint32_t cuts = pieces ? tailCutMask(d.k0, d.k1, d.len) : 0;
+        const bool cut = cuts != 0;
+        if (batch && !cut) {                                        // merged with others, later
+            batch->batch[batch->batchN++] = TailBPEUnit{d.k0, d.k1, set, d.s, d.len};
+            if (batch->batchN == kTailBatch) tailBatchFlush<W>(*batch, bytes, res, emit);
             return;
         }
-        set[1] = set[0];
+        if (batch) {                                                // its pieces, then kept whole
+            const bool queued = tailSplitQueue<W>(*batch, *pieces, bytes, d.s, d.len, res, emit, cuts);
+            tailPostAdd<W>(*batch, TailPost{d.k0, d.k1, 0, set, d.s, d.len, false}, queued, bytes, res, emit);
+            return;
+        }
+        if (cut) {
+            m = tailSplitMerge<W>(*pieces, bytes + d.s, d.len, tt, idx);
+        } else {
+            for (size_t i = 0; i < m; i++) { tt[i] = gTailBase[bytes[d.s + i]]; idx[i] = uint32_t(i); }
+            tailMergeSegment(tt, idx, m);
+        }
+        if (m > kTailCacheOut) {
+            for (size_t j = 0; j < m; j++) { res[d.s + idx[j]] = tt[j]; tailMarkTok(emit, d.s + idx[j], j); }
+            return;
+        }
+        tailShiftDown<W>(set, W - 1);                           // the last one goes
         TailCacheEntry & f = set[0];
         f.k0 = d.k0; f.k1 = d.k1; f.keep = 0;
         for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
@@ -1504,95 +2673,468 @@ static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes
     unsigned j = 0;
     for (uint32_t keep = e->keep; keep; keep &= keep - 1) {
         const uint32_t q = d.s + __builtin_ctz(keep);
-        res[q] = e->out[j++];
-        tailMark(emit, q);
+        res[q] = e->out[j];
+        tailMarkTok(emit, q, j++);
     }
 }
 
 // tailResolve for --tail-from-bytes: segments are the pretokens (segs = their starts), every
 // byte a token. Same protocol for res / emit and the segments cut by the call's edges. A
 // pretoken of one byte is its base id; 2 .. kTailByteKeyMax bytes go through the cache
-// (keyed by the bytes, prefetched kTailAhead pretokens ahead); longer ones merge on the spot.
-static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
-                             uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
-    TailScratch & S = tailScratch();
-    std::fill(emit, emit + numItems / 64, 0);
-    if (n > numItems) n = numItems;
-    const size_t nWords = (n + 63) / 64;
-    if (nWords == 0) return;
-    TailCacheEntry * const cache = S.cache.data();
-    const unsigned setShift = 64 - S.setBits;
-    auto segWord = [&](size_t w) { return segs[w] & (w * 64 + 64 > n ? tailLowMask(n - w * 64) : ~0ull); };
-    auto openRange = [&](size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
-        for (size_t p = lo; p < hi; p++) {
-            res[p] = gTailBase[bytes[p]] | kTailOpen | (segStart && p == lo ? kTailSeg : 0);
-            tailMark(emit, uint32_t(p));
-        }
-    };
-    size_t sw = 0;
-    uint64_t sx = segWord(0);
-    while (sx == 0 && ++sw < nWords) sx = segWord(sw);
-    const size_t first = sx ? sw * 64 + __builtin_ctzll(sx) : n;
-    openRange(0, first, false);                                     // cut by the left edge
-    if (!sx) return;
-    sx &= sx - 1;
-    TailByteDesc ring[kTailAhead];
-    unsigned head = 0, count = 0;
-    auto drain = [&] {
-        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishBytes(ring[head], bytes, res, emit);
-    };
-    for (size_t s = first;;) {
-        while (sx == 0 && ++sw < nWords) sx = segWord(sw);
-        const bool last = sx == 0;
-        const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
-        if (last && !final) {                                       // may go on in the next call
-            drain();
-            openRange(s, n, true);
-            return;
-        }
-        const size_t len = e - s;
-        if (len == 1) {
-            res[s] = gTailBase[bytes[s]];
-            tailMark(emit, uint32_t(s));
-        } else if (len <= kTailByteKeyMax) {
-            if (count == kTailAhead) {
-                tailFinishBytes(ring[head], bytes, res, emit);
-                head = (head + 1) % kTailAhead;
-                count--;
-            }
-            TailByteDesc & d = ring[(head + count++) % kTailAhead];
-            uint64_t a = 0, b = 0;
-            if (LLVM_LIKELY(s + 16 <= n)) {                         // stays inside the call
-                std::memcpy(&a, bytes + s, 8);
-                std::memcpy(&b, bytes + s + 8, 8);
-            } else {
-                for (size_t i = 0; i < len; i++)
-                    (i < 8 ? a : b) |= uint64_t(bytes[s + i]) << (8 * (i % 8));
-            }
-            d.k0 = len >= 8 ? a : a & tailLowMask(len * 8);
-            d.k1 = (len > 8 ? b & tailLowMask((len - 8) * 8) : 0) | (uint64_t(len) << 56);
-            d.s = uint32_t(s);
-            d.len = uint32_t(len);
-            const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
-            d.set = cache + (h >> setShift) * 2;
-            __builtin_prefetch(d.set);
-        } else {                                                    // longer: merge it here
-            if (S.t.size() < len) { S.t.resize(len); S.pos.resize(len); }
-            for (size_t i = 0; i < len; i++) { S.t[i] = gTailBase[bytes[s + i]]; S.pos[i] = uint32_t(s + i); }
-            size_t k = len;
-            tailMergeSegment(S.t.data(), S.pos.data(), k);
-            for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMark(emit, S.pos[i]); }
-        }
-        if (last) break;
-        sx &= sx - 1;
-        s = e;
+// (keyed by the bytes); longer ones merge on the spot.
+
+// The pretoken starts of a call below n, in order, scanned from its start bits; n when done.
+struct TailStartBits {
+    const uint64_t * segs;
+    size_t n, nWords, w = 0;
+    uint64_t x = 0;
+    TailStartBits(const uint64_t * segs, size_t n) : segs(segs), n(n), nWords((n + 63) / 64) {
+        if (nWords) x = word(0);
     }
-    drain();
+    uint64_t word(size_t i) const { return segs[i] & (i * 64 + 64 > n ? tailLowMask(n - i * 64) : ~0ull); }
+    size_t next() {
+        while (x == 0 && ++w < nWords) x = word(w);
+        if (x == 0) return n;
+        const size_t p = w * 64 + __builtin_ctzll(x);
+        x &= x - 1;
+        return p;
+    }
+};
+
+// --tail-long-cache: the hash of a long pretoken's bytes.
+static inline uint64_t tailLongHash(const uint8_t * p, size_t len) {
+    uint64_t h = len * 0x9E3779B97F4A7C15ull;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t c;
+        std::memcpy(&c, p + i, 8);
+        h = (h ^ c) * 0xC2B2AE3D27D4EB4Full;
+        h ^= h >> 31;
+    }
+    if (i < len) {
+        uint64_t c = 0;
+        std::memcpy(&c, p + i, len - i);
+        h = (h ^ c) * 0xC2B2AE3D27D4EB4Full;
+    }
+    return (h ^ (h >> 29)) * 0x9E3779B97F4A7C15ull;
 }
 
-extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
-                                       uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
-    tailResolveBytes(bytes, segs, res, emit, numItems, n, final);
+// --tail-long-admit: keep the long pretoken of hash h (costly: it had to merge a long piece)?
+static inline bool tailLongAdmit(TailScratch & S, uint64_t h, bool costly) {
+    if (TailLongAdmit == 0) return true;
+    if (TailLongAdmit == 1 || (TailLongAdmit == 3 && costly)) return costly;
+    const unsigned k = unsigned(h) & ((1u << kTailLongSeenBits) - 1);   // the index uses the top bits
+    uint64_t & w = S.longSeen[k >> 6];
+    const uint64_t b = 1ull << (k & 63);
+    if (w & b) return true;
+    w |= b;
+    if (++S.longSeenN > kTailLongSeenMax) {
+        std::fill(S.longSeen.begin(), S.longSeen.end(), 0);
+        S.longSeenN = 0;
+    }
+    return false;
+}
+
+// A pretoken of more than kTailByteKeyMax bytes, bytes[s, s + len): merge it and write its
+// tokens. With --tail-long-cache, look it up first and keep what was merged.
+template <unsigned W>
+static void tailLongPretoken(TailScratch & S, const uint8_t * bytes, size_t s, size_t len,
+                             uint16_t * res, uint64_t * emit, const TailPieces * pieces) {
+    const bool cached = TailLongCache && len <= kTailLongMax;
+    const size_t slots = size_t(1) << kTailLongIndexBits;
+    uint64_t h = 0;
+    size_t home = 0;
+    if (cached) {
+        h = tailLongHash(bytes + s, len);
+        home = h >> (64 - kTailLongIndexBits);
+        for (size_t i = home;; i = (i + 1) & (slots - 1)) {
+            const TailLongSlot & q = S.longIndex[i];
+            if (q.len == 0) { home = i; break; }
+            const uint8_t * entry = S.longArena.data() + q.off;
+            if (q.h == h && q.len == len && std::memcmp(entry + 4, bytes + s, len) == 0) {
+                uint32_t ntok;
+                std::memcpy(&ntok, entry, 4);
+                const uint32_t * tok = reinterpret_cast<const uint32_t *>(entry + 4 + ((len + 3) & ~size_t(3)));
+                for (uint32_t j = 0; j < ntok; j++) {
+                    const uint32_t p = uint32_t(s) + (tok[j] >> 16);
+                    res[p] = tok[j] & 0xFFFF;
+                    tailMarkTok(emit, p, j);
+                }
+                return;
+            }
+        }
+    }
+    if (S.t.size() < len) { S.t.resize(len); S.pos.resize(len); }
+    size_t k = len;
+    const bool cut = pieces && tailHasCut(bytes + s, len);
+    if (cut && TailBatchBPE) {                                      // its pieces, then kept whole
+        bool hadLong = false;
+        const bool queued = tailSplitQueue<W>(S, *pieces, bytes, s, len, res, emit, 0, &hadLong);
+        if (cached && tailLongAdmit(S, h, hadLong))
+            tailPostAdd<W>(S, TailPost{0, 0, h, nullptr, uint32_t(s), uint32_t(len), true}, queued, bytes, res, emit);
+        return;
+    }
+    if (cut) {
+        k = tailSplitMerge<W>(*pieces, bytes + s, len, S.t.data(), S.pos.data());
+        for (size_t i = 0; i < k; i++) S.pos[i] += uint32_t(s);
+    } else {
+        for (size_t i = 0; i < len; i++) { S.t[i] = gTailBase[bytes[s + i]]; S.pos[i] = uint32_t(s + i); }
+        tailMergeSegment(S.t.data(), S.pos.data(), k);
+    }
+    for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMarkTok(emit, S.pos[i], i); }
+    if (!cached || !tailLongAdmit(S, h, true)) return;
+    const size_t need = 4 + ((len + 3) & ~size_t(3)) + 4 * k;
+    if (S.longUsed + need > S.longArena.size() || 2 * (S.longCount + 1) > slots) {   // full: start over
+        std::fill(S.longIndex.begin(), S.longIndex.end(), TailLongSlot{0, 0, 0});
+        S.longUsed = S.longCount = 0;
+        home = h >> (64 - kTailLongIndexBits);
+    }
+    uint8_t * entry = S.longArena.data() + S.longUsed;
+    const uint32_t ntok = uint32_t(k);
+    std::memcpy(entry, &ntok, 4);
+    std::memcpy(entry + 4, bytes + s, len);
+    uint32_t * tok = reinterpret_cast<uint32_t *>(entry + 4 + ((len + 3) & ~size_t(3)));
+    for (size_t i = 0; i < k; i++) tok[i] = S.t[i] | ((S.pos[i] - uint32_t(s)) << 16);
+    S.longIndex[home] = TailLongSlot{h, uint32_t(len), uint32_t(S.longUsed)};
+    S.longUsed += need;
+    S.longCount++;
+}
+
+// --tail-batch-bpe with --tail-hard-split: keep the cut pretokens whose pieces are all written,
+// their tokens read back from res at the emit bits.
+template <unsigned W>
+static void tailPostKeep(TailScratch & S, const uint8_t * bytes, const uint16_t * res, const uint64_t * emit) {
+    const unsigned n = S.postN;
+    S.postN = 0;
+    for (unsigned i = 0; i < n; i++) tailPostKeepOne<W>(S, S.post[i], bytes, res, emit);
+}
+template <unsigned W>
+static void tailPostKeepOne(TailScratch & S, const TailPost & t, const uint8_t * bytes, const uint16_t * res,
+                            const uint64_t * emit) {
+    {
+        auto tokens = [&](auto && f) {                              // f(offset) at each token
+            const uint32_t e = t.s + t.len;
+            for (uint32_t w = t.s / 64; w * 64 < e; w++) {
+                uint64_t x = emit[w];
+                if (w * 64 < t.s) x &= ~0ull << (t.s - w * 64);
+                if (w * 64 + 64 > e) x &= tailLowMask(e - w * 64);
+                for (; x; x &= x - 1) f(uint32_t(w * 64 + __builtin_ctzll(x) - t.s));
+            }
+        };
+        if (!t.lng) {
+            TailCacheEntry f{t.k0, t.k1, 0, {}};
+            unsigned m = 0;
+            tokens([&](uint32_t o) {
+                f.keep |= uint16_t(1u << o);
+                if (m < kTailCacheOut) f.out[m] = uint16_t(res[t.s + o]);
+                m++;
+            });
+            if (m > kTailCacheOut) return;
+            TailCacheEntry * const set = t.set;
+            unsigned way = W;
+            if (set[0].k0 == t.k0 && set[0].k1 == t.k1) way = 0;
+            else if (set[1].k0 == t.k0 && set[1].k1 == t.k1) way = 1;
+            if (way < W) return;
+            tailShiftDown<W>(set, W - 1);                           // the last one goes
+            set[0] = f;
+            return;
+        }
+        size_t k = 0;                                               // the long cache
+        tokens([&](uint32_t o) { S.t[k] = uint16_t(res[t.s + o]); S.pos[k] = o; k++; });
+        const size_t slots = size_t(1) << kTailLongIndexBits;
+        const size_t need = 4 + ((t.len + 3) & ~size_t(3)) + 4 * k;
+        if (S.longUsed + need > S.longArena.size() || 2 * (S.longCount + 1) > slots) {   // full: start over
+            std::fill(S.longIndex.begin(), S.longIndex.end(), TailLongSlot{0, 0, 0});
+            S.longUsed = S.longCount = 0;
+        }
+        size_t home = t.h >> (64 - kTailLongIndexBits);
+        bool have = false;
+        for (;; home = (home + 1) & (slots - 1)) {
+            const TailLongSlot & q = S.longIndex[home];
+            if (q.len == 0) break;
+            if (q.h == t.h && q.len == t.len
+                    && std::memcmp(S.longArena.data() + q.off + 4, bytes + t.s, t.len) == 0) { have = true; break; }
+        }
+        if (have) return;
+        uint8_t * entry = S.longArena.data() + S.longUsed;
+        const uint32_t ntok = uint32_t(k);
+        std::memcpy(entry, &ntok, 4);
+        std::memcpy(entry + 4, bytes + t.s, t.len);
+        uint32_t * tok = reinterpret_cast<uint32_t *>(entry + 4 + ((t.len + 3) & ~size_t(3)));
+        for (size_t x = 0; x < k; x++) tok[x] = S.t[x] | (S.pos[x] << 16);
+        S.longIndex[home] = TailLongSlot{t.h, t.len, uint32_t(S.longUsed)};
+        S.longUsed += need;
+        S.longCount++;
+    }
+}
+
+// The pretokens of one resolve call over bytes [0, n): its outputs and the thread's cache.
+template <unsigned W>
+struct TailByteWalk {
+    TailScratch & S;
+    const uint8_t * const bytes;
+    uint16_t * const res;
+    uint64_t * const emit;
+    uint64_t * const open;                // the bytes of the segments cut by the call's edges
+    uint64_t * const seg;                 // ... and the first byte of the one cut by its right edge
+    const size_t n;
+    TailCacheEntry * const cache;
+    const unsigned setShift;
+    const TailCacheEntry * const vocab;   // null until built
+    const TailPieces pieces;              // --tail-hard-split
+    const bool split;
+    // the walk is copied into its call's storage, so no pointer to itself is kept
+    const TailPieces * piecesOn() const { return split ? &pieces : nullptr; }
+    TailScratch * batchOn() const { return TailBatchBPE ? &S : nullptr; }
+
+    TailByteWalk(TailScratch & S, const uint8_t * bytes, uint16_t * res, uint64_t * emit, uint64_t * open,
+                 uint64_t * seg, size_t n)
+    : S(S), bytes(bytes), res(res), emit(emit), open(open), seg(seg), n(n), cache(S.sets),
+      setShift(64 - S.setBits), vocab(gTailVocab.load(std::memory_order_acquire)),
+      pieces{cache, setShift, vocab, n}, split(TailHardSplit && vocab) {}
+
+    void unitRange(size_t lo, size_t hi) {                  // --tail-unit-cuts: bytes of units
+        if (TailUnitSeed) return;                           // their ids are there already
+        for (size_t p = lo; p < hi; p++) res[p] = gTailBase[bytes[p]];
+    }
+
+    void openRange(size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
+        if (segStart && lo < hi) tailMark(seg, uint32_t(lo));
+        for (size_t p = lo; p < hi; p++) {
+            res[p] = gTailBase[bytes[p]];
+            tailMark(open, uint32_t(p));
+            tailMark(emit, uint32_t(p));
+        }
+    }
+
+    void drain() {
+        if (TailBatchBPE) tailBatchFlush<W>(S, bytes, res, emit);
+    }
+
+    LLVM_ATTRIBUTE_ALWAYS_INLINE void finish(const TailByteDesc & d) {
+        if (d.vset) {                                               // the vocabulary table first
+            const TailCacheEntry * const ve = tailVocabFind(d.vset, d.k0, d.k1);
+            if (LLVM_LIKELY(ve != nullptr)) {                       // a vocabulary entry: one id
+                res[d.s] = ve->out[0];
+                tailMarkTok(emit, d.s, 0);
+                return;
+            }
+        }
+        tailFinishBytes<W>(d, bytes, res, emit, piecesOn(), batchOn());
+    }
+
+    // The whole pretoken [s, e). Always inlined: as a call, the loop's state lives in memory
+    // instead of registers, +5% on val_4MB at 1 thread.
+    LLVM_ATTRIBUTE_ALWAYS_INLINE void word(size_t s, size_t e) {
+        const size_t len = e - s;
+        if (len == 1) {                                             // one byte: its base id
+            res[s] = gTailBase[bytes[s]];
+            tailMarkTok(emit, uint32_t(s), 0);
+        } else if (len <= kTailByteKeyMax) {                        // finished at once
+            TailByteDesc d;
+            describe(d, s, e);
+            finish(d);
+        } else {                                                    // longer: merge it here
+            tailLongPretoken<W>(S, bytes, s, len, res, emit, piecesOn());
+        }
+    }
+
+    // The key, hash and sets of the pretoken [s, e) of 2 .. kTailByteKeyMax bytes.
+    LLVM_ATTRIBUTE_ALWAYS_INLINE void describe(TailByteDesc & d, size_t s, size_t e) {
+        const size_t len = e - s;
+        uint64_t a = 0, b = 0;
+        if (LLVM_LIKELY(s + 16 <= n)) {                             // stays inside the call
+            std::memcpy(&a, bytes + s, 8);
+            std::memcpy(&b, bytes + s + 8, 8);
+        } else {
+            for (size_t i = 0; i < len; i++)
+                (i < 8 ? a : b) |= uint64_t(bytes[s + i]) << (8 * (i % 8));
+        }
+        d.k0 = len >= 8 ? a : a & tailLowMask(len * 8);
+        d.k1 = (len > 8 ? b & tailLowMask((len - 8) * 8) : 0) | (uint64_t(len) << 56);
+        d.s = uint32_t(s);
+        d.len = uint32_t(len);
+        const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+        d.set = cache + (h >> setShift) * W;
+        d.vset = vocab ? tailVocabSet(vocab, h, len) : nullptr;
+    }
+};
+
+template <unsigned W>
+static void tailResolveBytes(TailScratch & S, const uint8_t * bytes, TailStartBits starts,
+                             uint16_t * res, uint64_t * emit, uint64_t * open, uint64_t * seg,
+                             uint64_t numItems, uint64_t n, uint64_t final) {
+    size_t copied = 0;
+    if (TailEmitFromSegs) {                                         // every start of the call
+        copied = starts.nWords;
+        for (size_t i = 0; i < copied; i++) emit[i] = starts.word(i);
+    }
+    std::fill(emit + copied, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
+    if (n == 0) return;
+    TailByteWalk<W> walk(S, bytes, res, emit, open, seg, n);
+    const size_t first = starts.next();
+    walk.openRange(0, first, false);                                // cut by the left edge
+    if (first == n) return;
+    for (size_t s = first;;) {
+        const size_t e = starts.next();
+        const bool last = e == n;
+        if (last && !final) {                                       // may go on in the next call
+            walk.drain();
+            walk.openRange(s, n, true);
+            return;
+        }
+        walk.word(s, e);
+        if (last) break;
+        s = e;
+    }
+    walk.drain();
+}
+
+// --tail-scan-kernel: the same walk, driven by BPETailScanKernel, a two-level scan over the
+// pretoken starts that finishes the common pretokens itself and hands the rest to
+// tailWalkSlowIR. tailWalkBeginIR sets up the call's walk (thread-local: one kernel call at a
+// time per thread), tailWalkStart takes the call's first start, tailWalkEnd finishes the call.
+// prev = the previous start, kTailNoStart before the first.
+static constexpr uint64_t kTailNoStart = ~0ull;
+template <unsigned W>
+struct TailWalkCall {
+    TailByteWalk<W> walk;
+    bool final;
+    const uint64_t * unit;                    // --tail-unit-cuts: the units, else null
+    bool isUnit(uint64_t p) const { return unit && p < walk.n && ((unit[p / 64] >> (p % 64)) & 1); }
+};
+
+// With --tail-unit-cuts, a call edge that falls in a run of units cuts nothing: if the call's
+// first byte (or the last scan start) is a unit, every byte up to the next scan start (or the
+// call's end) is one, as the scan stream drops only units that follow units.
+template <unsigned W>
+static void tailWalkStart(uint64_t call, uint64_t prev, uint64_t p) {
+    TailWalkCall<W> & c = *reinterpret_cast<TailWalkCall<W> *>(call);
+    TailByteWalk<W> & walk = c.walk;
+    if (LLVM_LIKELY(prev != kTailNoStart)) walk.word(prev, p);
+    else if (c.isUnit(0)) walk.unitRange(0, p);
+    else walk.openRange(0, p, false);                                // cut by the left edge
+}
+
+template <unsigned W>
+static void tailWalkEnd(uint64_t call, uint64_t prev) {
+    TailWalkCall<W> & c = *reinterpret_cast<TailWalkCall<W> *>(call);
+    TailByteWalk<W> & walk = c.walk;
+    if (prev == kTailNoStart) {                                      // no start in the call
+        if (c.isUnit(0)) walk.unitRange(0, walk.n);
+        else walk.openRange(0, walk.n, false);
+    } else if (c.isUnit(prev)) walk.unitRange(prev, walk.n);
+    else if (c.final) walk.word(prev, walk.n);
+    else walk.openRange(prev, walk.n, true);                         // may go on in the next call
+    walk.drain();
+}
+
+// What the generated hit path reads, per call: the walk for everything else, the vocabulary
+// table (null until built) and its set shift, and the base ids of the bytes.
+struct TailIRCtx {
+    uint64_t call;
+    const TailCacheEntry * vocab;
+    uint64_t vshift;
+    const uint16_t * base;
+    const TailCacheEntry * cache;   // the thread's cache and its set shift (--tail-scan-ir-cache)
+    uint64_t cshift;
+    const uint64_t * vdesc;         // --tail-vocab-layout=1: gTailVocabDesc
+};
+static_assert(sizeof(TailCacheEntry) == 32 && offsetof(TailCacheEntry, out) == 18,
+              "the generated vocabulary probe reads 32-byte entries, out[0] at byte 18");
+
+// segs: the starts whose first token is a token start (with --tail-unit-cuts, the cut starts:
+// emit begins as a copy); unit: --tail-unit-cuts's units, else null.
+// batchFn: the module's bpe_batch_merge (--tail-batch-bpe), else null.
+template <unsigned W>
+static uint64_t tailWalkBeginIR(const uint8_t * bytes, const uint64_t * segs, const uint64_t * unit, uint16_t * res,
+                                uint64_t * emit, uint64_t * open, uint64_t * seg, uint64_t numItems, uint64_t n,
+                                uint64_t final, TailBatchMergeFn batchFn) {
+    using Call = TailWalkCall<W>;
+    alignas(Call) thread_local unsigned char mem[sizeof(Call)];
+    n = std::min(n, numItems);
+    TailScratch & S = tailScratch();
+    S.batchFn = batchFn;
+    Call * const c = new (mem) Call{TailByteWalk<W>(S, bytes, res, emit, open, seg, n), final != 0, unit};
+    const TailStartBits st(segs, n);
+    for (size_t i = 0; i < st.nWords; i++) emit[i] = st.word(i);   // every pretoken's first token
+    std::fill(emit + st.nWords, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
+    const TailCacheEntry * const vocab = gTailVocab.load(std::memory_order_acquire);
+    thread_local TailIRCtx ctx;
+    ctx = TailIRCtx{reinterpret_cast<uint64_t>(c), vocab, gTailVocabShift,
+                    gTailBase, c->walk.cache, c->walk.setShift, gTailVocabDesc};
+    return reinterpret_cast<uint64_t>(&ctx);
+}
+
+// The pretoken [s, e) the generated code left to the walk.
+// BPE_DBG=irslow: count the pretokens the scan kernel leaves to C++, by length (16: longer).
+static std::atomic<uint64_t> gIRSlow[17];
+static const bool gIRSlowCount = [] {
+    const char * e = std::getenv("BPE_DBG");
+    if (!e || std::string(e) != "irslow") return false;
+    std::atexit([] {
+        uint64_t t = 0;
+        std::cerr << "[BPE] irslow by length:";
+        for (unsigned i = 1; i <= 16; i++) { std::cerr << " " << i << ":" << gIRSlow[i].load(); t += gIRSlow[i].load(); }
+        std::cerr << " total " << t << "\n";
+    });
+    return true;
+}();
+
+template <unsigned W>
+static void tailWalkSlowIR(uint64_t call, uint64_t s, uint64_t e) {
+    if (LLVM_UNLIKELY(gIRSlowCount)) gIRSlow[std::min<uint64_t>(e - s, 16)]++;
+    reinterpret_cast<TailWalkCall<W> *>(call)->walk.word(s, e);
+}
+
+// --len-scan with --tail-unit-seed: BPE_LongPieces, in place of the general scan. Every piece of
+// 1 .. N bytes is resolved by the seed and BPE_len<L>_pretokenScan; this resolves the rest: the
+// pieces of more than N bytes (lng: their starts) and the input's last piece (also in lng, as the
+// cut after it is not in the input). emit starts as a copy of the cuts; a long piece cut by the
+// call's right edge, or continued from the previous call (position 0 neither a cut nor covered:
+// cover = the bytes of the pieces of 1 .. N bytes), goes to open / seg, as tailWalkStart and
+// tailWalkEnd do.
+extern "C" void bpe_long_block(const uint8_t * bytes, const uint64_t * lng, const uint64_t * cuts,
+                               const uint64_t * cover, uint16_t * res, uint64_t * emit, uint64_t * open,
+                               uint64_t * seg, uint64_t numItems, uint64_t n, uint64_t final) {
+    n = std::min(n, numItems);
+    const TailStartBits c(cuts, n);
+    for (size_t i = 0; i < c.nWords; i++) emit[i] = c.word(i);       // every piece's first token
+    std::fill(emit + c.nWords, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
+    if (n == 0) return;
+    auto bit = [](const uint64_t * v, size_t p) { return (v[p / 64] >> (p % 64)) & 1; };
+    auto nextCut = [&](size_t p) -> size_t {                         // the first cut at p or later; n if none
+        for (size_t w = p / 64; w < c.nWords; w++) {
+            uint64_t x = c.word(w);
+            if (w == p / 64) x &= ~0ull << (p % 64);
+            if (x) return w * 64 + __builtin_ctzll(x);
+        }
+        return n;
+    };
+    TailByteWalk<kTailCacheWays> walk(tailScratch(), bytes, res, emit, open, seg, n);
+    if (!bit(cuts, 0) && !bit(cover, 0)) walk.openRange(0, nextCut(1), false);   // cut by the left edge
+    TailStartBits L(lng, n);
+    for (size_t s = L.next(); s < n; s = L.next()) {
+        const size_t e = nextCut(s + 1);
+        if (e == n && !final) walk.openRange(s, n, true);            // may go on in the next call
+        else walk.word(s, e);
+    }
+    walk.drain();
+}
+
+extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint16_t * res,
+                                       uint64_t * emit, uint64_t * open, uint64_t * seg, uint64_t numItems,
+                                       uint64_t n, uint64_t final) {
+    n = std::min(n, numItems);
+    TailScratch & S = tailScratch();
+    const TailStartBits starts(segs, n);
+    tailResolveBytes<kTailCacheWays>(S, bytes, starts, res, emit, open, seg, numItems, n, final);
 }
 
 // BPETailKernel's body: the tokens in order. A cut segment's tokens collect in gTailOpen and
@@ -1610,41 +3152,91 @@ static size_t tailFlushOpen(uint16_t * out, size_t k) {
     return k;
 }
 
-extern "C" void bpe_tail_block(const uint32_t * res, const uint64_t * starts,
-                               uint64_t numItems, uint64_t n, uint64_t final) {
-    const size_t room = std::min(n, numItems) + gTailOpen.n;
+// --tail-simd-emit (with --tail-from-bytes): BPETailKernel (named BPE_TailV then) compacts the
+// finished ids of each 64 positions in generated code, one vector of bitBlockWidth/16 ids at a
+// time: IDISA's mvmd_compress(16, ids, emit bits) moves the emitted ids to the front, one
+// unaligned store writes the vector, and the output advances by their count; no branch per token
+// (the scalar loop's exit mispredicted once per 64 positions, and it was ~0.9 ns per token on one
+// thread, ~10% of a run). The JIT picks the instructions for the CPU it runs on (IDISA: ARM a
+// table of byte shuffles + TBL, SSE a shift network, AVX2 a PEXT-built permute). A word with an
+// open token (a segment cut by a call's edge), with a cut segment pending, or past the call's
+// items goes to bpe_tail_emit_word (C++, the scalar loop).
+static cl::opt<bool> TailSIMDEmit(
+    "tail-simd-emit",
+    cl::desc("With --tail-from-bytes: compact the tail's output ids with vector compress "
+             "in generated code (default off)."),
+    cl::init(false));
+
+// Room for one call's ids: every position, the cut segment carried in, and one vector store
+// past the last id (a vector holds at most 512 / 16 = 32 ids).
+static constexpr size_t kTailEmitSlack = 64;
+static uint16_t * tailEmitOut(uint64_t numItems, uint64_t n) {
+    const size_t room = std::min(n, numItems) + gTailOpen.n + kTailEmitSlack;
     if (room > gTailOutCap) {
         gTailOutCap = std::max<size_t>(room, 2 * gTailOutCap);
         gTailOutBuf.reset(new uint16_t[gTailOutCap]);
     }
-    uint16_t * const out = gTailOutBuf.get();
+    return gTailOutBuf.get();
+}
+// One word: the ids at the set bits of st (res = the word's first position; op = the open ones,
+// sg = the segment starts) go to out[k ...], open ones to gTailOpen. Returns the new k.
+static inline size_t tailEmitWordScalar(const uint16_t * res, uint64_t st, uint64_t op, uint64_t sg,
+                                        uint16_t * out, size_t k) {
+    if (LLVM_LIKELY(op == 0 && gTailOpen.n == 0)) {                  // only finished ids
+        for (; st; st &= st - 1) out[k++] = res[__builtin_ctzll(st)];
+        return k;
+    }
+    for (; st; st &= st - 1) {
+        const unsigned b = unsigned(__builtin_ctzll(st));
+        const uint16_t v = res[b];
+        if (((op >> b) & 1) == 0) {
+            if (gTailOpen.n != 0) k = tailFlushOpen(out, k);
+            out[k++] = v;
+        } else {
+            if (((sg >> b) & 1) && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+            gTailOpen.push(v, 0);
+        }
+    }
+    return k;
+}
+static void tailEmitFinish(uint16_t * out, size_t k, uint64_t final) {
+    if (final && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+    if (gTailSink && k) gTailSink(out, k);
+}
+
+extern "C" void bpe_tail_block(const uint16_t * res, const uint64_t * starts, const uint64_t * open,
+                               const uint64_t * seg, uint64_t numItems, uint64_t n, uint64_t final) {
+    uint16_t * const out = tailEmitOut(numItems, n);
     size_t k = 0;
     for (uint64_t wi = 0; wi * 64 < n && wi * 64 < numItems; wi++) {
         uint64_t st = starts[wi];
         if (n - wi * 64 < 64) st &= (1ull << (n - wi * 64)) - 1;
-        for (; st; st &= st - 1) {
-            const uint32_t v = res[wi * 64 + __builtin_ctzll(st)];
-            if (LLVM_LIKELY((v & kTailOpen) == 0)) {
-                if (LLVM_UNLIKELY(gTailOpen.n != 0)) k = tailFlushOpen(out, k);
-                out[k++] = uint16_t(v);
-            } else {
-                if ((v & kTailSeg) && gTailOpen.n != 0) k = tailFlushOpen(out, k);
-                gTailOpen.push(uint16_t(v), 0);
-            }
-        }
+        k = tailEmitWordScalar(res + wi * 64, st, open[wi] & st, seg[wi], out, k);
     }
-    if (final && gTailOpen.n != 0) k = tailFlushOpen(out, k);
-    if (gTailSink && k) gTailSink(out, k);
+    tailEmitFinish(out, k, final);
 }
+
+// BPE_TailV's C++ side (--tail-simd-emit): the call's output buffer, whether a cut segment is
+// pending, one word by the scalar loop (returns k, with bit 63 set when a cut segment is
+// pending after it), and the call's end.
+extern "C" uint16_t * bpe_tail_emit_begin(uint64_t numItems, uint64_t n) { return tailEmitOut(numItems, n); }
+extern "C" uint64_t bpe_tail_emit_open() { return gTailOpen.n; }
+extern "C" uint64_t bpe_tail_emit_word(const uint16_t * res, uint64_t st, uint64_t op, uint64_t sg,
+                                       uint16_t * out, uint64_t k) {
+    k = tailEmitWordScalar(res, st, op, sg, out, size_t(k));
+    return k | (uint64_t(gTailOpen.n != 0) << 63);
+}
+extern "C" void bpe_tail_emit_end(uint16_t * out, uint64_t k, uint64_t final) { tailEmitFinish(out, size_t(k), final); }
 
 // --bpe-tail kernels, both thin wrappers around their C++ bodies above.
 class BPETailResolveKernel final : public MultiBlockKernel {
 public:
     BPETailResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * ids16, StreamSet * starts,
-                         StreamSet * segs, StreamSet * res, StreamSet * emit)
+                         StreamSet * segs, StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg)
     : MultiBlockKernel(ts, "BPE_TailResolve",
                        {Binding{"ids", ids16}, Binding{"starts", starts}, Binding{"segs", segs}},
-                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+                       {Binding{"res", res}, Binding{"emit", emit}, Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}) {
         // No state between calls (the C++ body only uses thread_local scratch), so the
         // pipeline may run its calls on several threads at once.
         addAttribute(Statefree());
@@ -1659,41 +3251,151 @@ protected:
         b.CreateCall(fn->getFunctionType(), fn,
                      {b.getInputStreamBlockPtr("ids", zero), b.getInputStreamBlockPtr("starts", zero),
                       b.getInputStreamBlockPtr("segs", zero), b.getOutputStreamBlockPtr("res", zero),
-                      b.getOutputStreamBlockPtr("emit", zero), numItems, n,
+                      b.getOutputStreamBlockPtr("emit", zero), b.getOutputStreamBlockPtr("open", zero),
+                      b.getOutputStreamBlockPtr("seg", zero), numItems, n,
                       b.CreateZExt(b.isFinal(), b.getInt64Ty())});
     }
 };
 
 // Side-effecting, so the pipeline keeps it and runs it in order, one call at a time.
+// simd (--tail-simd-emit): BPE_TailV, the word loop in generated code (see TailSIMDEmit).
 class BPETailKernel final : public MultiBlockKernel {
 public:
-    BPETailKernel(LLVMTypeSystemInterface & ts, StreamSet * res, StreamSet * starts)
-    : MultiBlockKernel(ts, "BPE_Tail",
-                       {Binding{"res", res}, Binding{"starts", starts}},
-                       {}, {}, {}, {}) {
+    BPETailKernel(LLVMTypeSystemInterface & ts, StreamSet * res, StreamSet * starts, StreamSet * open,
+                  StreamSet * seg, bool simd = false)
+    : MultiBlockKernel(ts, simd ? "BPE_TailV" : "BPE_Tail",
+                       {Binding{"res", res}, Binding{"starts", starts}, Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}, {})
+    , mSIMD(simd) {
         addAttribute(SideEffecting());
     }
 protected:
+    Function * linked(KernelBuilder & b, StringRef name) {
+        Function * const fn = b.getModule()->getFunction(name);
+        if (fn == nullptr) report_fatal_error(StringRef("BPE_Tail: ") + name + " is not linked");
+        return fn;
+    }
     void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
-        Function * const fn = b.getModule()->getFunction("bpe_tail_block");
-        if (fn == nullptr) report_fatal_error("BPE_Tail: bpe_tail_block is not linked");
         Value * const zero = b.getInt32(0);
         Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
         Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
-        b.CreateCall(fn->getFunctionType(), fn,
-                     {b.getInputStreamBlockPtr("res", zero), b.getInputStreamBlockPtr("starts", zero),
-                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+        Value * const final = b.CreateZExt(b.isFinal(), b.getInt64Ty());
+        if (!mSIMD) {
+            Function * const fn = linked(b, "bpe_tail_block");
+            b.CreateCall(fn->getFunctionType(), fn,
+                         {b.getInputStreamBlockPtr("res", zero), b.getInputStreamBlockPtr("starts", zero),
+                          b.getInputStreamBlockPtr("open", zero), b.getInputStreamBlockPtr("seg", zero),
+                          numItems, n, final});
+            return;
+        }
+        // for wi in [0, ceil(n / 64)): a word whose ids are all finished, inside the call's items,
+        // with no cut segment pending, is compacted here; any other word goes to C++.
+        Type * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
+        const unsigned fw = 16;
+        const unsigned fc = b.getBitBlockWidth() / fw;          // ids per vector: 8 (128-bit), 16, 32
+        if (fc == 0 || 64 % fc != 0) report_fatal_error("BPE_TailV: unsupported bit block width");
+        FixedVectorType * const vecTy = b.fwVectorType(fw);
+        Value * const res = b.getInputStreamBlockPtr("res", zero);
+        Value * const starts = b.getInputStreamBlockPtr("starts", zero);
+        Value * const open = b.getInputStreamBlockPtr("open", zero);
+        Value * const seg = b.getInputStreamBlockPtr("seg", zero);
+        Function * const beginFn = linked(b, "bpe_tail_emit_begin");
+        Function * const openFn = linked(b, "bpe_tail_emit_open");
+        Function * const wordFn = linked(b, "bpe_tail_emit_word");
+        Function * const endFn = linked(b, "bpe_tail_emit_end");
+        Value * const out = b.CreateCall(beginFn->getFunctionType(), beginFn, {numItems, n});
+        Value * const pending0 = b.CreateICmpNE(b.CreateCall(openFn->getFunctionType(), openFn, {}), b.getInt64(0));
+        Value * const nWords = b.CreateLShr(b.CreateAdd(n, b.getInt64(63)), b.getInt64(6));
+
+        BasicBlock * const entry = b.GetInsertBlock();
+        BasicBlock * const loop = b.CreateBasicBlock("emitWord");
+        BasicBlock * const fast = b.CreateBasicBlock("emitVector");
+        BasicBlock * const slow = b.CreateBasicBlock("emitScalar");
+        BasicBlock * const next = b.CreateBasicBlock("emitNext");
+        BasicBlock * const exit = b.CreateBasicBlock("emitEnd");
+        b.CreateCondBr(b.CreateICmpEQ(nWords, b.getInt64(0)), exit, loop);
+
+        b.SetInsertPoint(loop);
+        PHINode * const wi = b.CreatePHI(i64, 2);
+        PHINode * const k = b.CreatePHI(i64, 2);
+        PHINode * const pending = b.CreatePHI(b.getInt1Ty(), 2);
+        wi->addIncoming(b.getInt64(0), entry);
+        k->addIncoming(b.getInt64(0), entry);
+        pending->addIncoming(pending0, entry);
+        Value * const pos = b.CreateShl(wi, b.getInt64(6));
+        Value * const st0 = b.CreateLoad(i64, b.CreateGEP(i64, starts, wi));
+        Value * const left = b.CreateSub(n, pos);                // > 0
+        Value * const partMask = b.CreateSub(b.CreateShl(b.getInt64(1), b.CreateAnd(left, b.getInt64(63))), b.getInt64(1));
+        Value * const st = b.CreateSelect(b.CreateICmpULT(left, b.getInt64(64)), b.CreateAnd(st0, partMask), st0);
+        Value * const op = b.CreateAnd(b.CreateLoad(i64, b.CreateGEP(i64, open, wi)), st);
+        Value * const full = b.CreateICmpULE(b.CreateAdd(pos, b.getInt64(64)), numItems);
+        Value * const isFast = b.CreateAnd(b.CreateAnd(b.CreateICmpEQ(op, b.getInt64(0)), b.CreateNot(pending)), full);
+        b.CreateLikelyCondBr(isFast, fast, slow);
+
+        b.SetInsertPoint(fast);                                  // 64 / fc vectors, no branch
+        Value * kk = k;
+        for (unsigned g = 0; g < 64 / fc; g++) {
+            Value * const m = b.CreateTrunc(b.CreateLShr(st, b.getInt64(g * fc)), b.getIntNTy(fc));
+            Value * const ids = b.CreateAlignedLoad(vecTy, b.CreateGEP(i16, res, b.CreateAdd(pos, b.getInt64(g * fc))), 2);
+            Value * const packed = b.mvmd_compress(fw, ids, m);
+            b.CreateAlignedStore(packed, b.CreateGEP(i16, out, kk), 2);
+            kk = b.CreateAdd(kk, b.CreateZExt(b.CreatePopcount(m), i64));
+        }
+        BasicBlock * const fastEnd = b.GetInsertBlock();
+        b.CreateBr(next);
+
+        b.SetInsertPoint(slow);
+        Value * const sg = b.CreateLoad(i64, b.CreateGEP(i64, seg, wi));
+        Value * const r = b.CreateCall(wordFn->getFunctionType(), wordFn,
+                                       {b.CreateGEP(i16, res, pos), st, op, sg, out, k});
+        Value * const kSlow = b.CreateAnd(r, b.getInt64(~(1ull << 63)));
+        Value * const pSlow = b.CreateICmpNE(b.CreateLShr(r, b.getInt64(63)), b.getInt64(0));
+        BasicBlock * const slowEnd = b.GetInsertBlock();
+        b.CreateBr(next);
+
+        b.SetInsertPoint(next);
+        PHINode * const kN = b.CreatePHI(i64, 2);
+        PHINode * const pN = b.CreatePHI(b.getInt1Ty(), 2);
+        kN->addIncoming(kk, fastEnd);
+        kN->addIncoming(kSlow, slowEnd);
+        pN->addIncoming(b.getFalse(), fastEnd);
+        pN->addIncoming(pSlow, slowEnd);
+        Value * const wi1 = b.CreateAdd(wi, b.getInt64(1));
+        BasicBlock * const nextEnd = b.GetInsertBlock();
+        wi->addIncoming(wi1, nextEnd);
+        k->addIncoming(kN, nextEnd);
+        pending->addIncoming(pN, nextEnd);
+        b.CreateCondBr(b.CreateICmpULT(wi1, nWords), loop, exit);
+
+        b.SetInsertPoint(exit);
+        PHINode * const kE = b.CreatePHI(i64, 2);
+        kE->addIncoming(b.getInt64(0), entry);
+        kE->addIncoming(kN, nextEnd);
+        b.CreateCall(endFn->getFunctionType(), endFn, {out, kE, final});
     }
+    const bool mSIMD;
 };
+
+static void linkTailEmit(PipelineBuilder & P, Kernel * k) {
+    if (!TailSIMDEmit) {
+        P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+        return;
+    }
+    P.LinkFunction(k, "bpe_tail_emit_begin", bpe_tail_emit_begin);
+    P.LinkFunction(k, "bpe_tail_emit_open", bpe_tail_emit_open);
+    P.LinkFunction(k, "bpe_tail_emit_word", bpe_tail_emit_word);
+    P.LinkFunction(k, "bpe_tail_emit_end", bpe_tail_emit_end);
+}
 
 // --tail-from-bytes: BPETailResolveKernel on the input bytes and the pretoken starts.
 class BPETailByteResolveKernel final : public MultiBlockKernel {
 public:
     BPETailByteResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
-                             StreamSet * res, StreamSet * emit)
+                             StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg)
     : MultiBlockKernel(ts, "BPE_TailResolveBytes",
                        {Binding{"bytes", bytes}, Binding{"segs", segs}},
-                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+                       {Binding{"res", res}, Binding{"emit", emit}, Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}) {
         addAttribute(Statefree());   // see BPETailResolveKernel
     }
 protected:
@@ -1706,17 +3408,1305 @@ protected:
         b.CreateCall(fn->getFunctionType(), fn,
                      {b.getInputStreamBlockPtr("bytes", zero), b.getInputStreamBlockPtr("segs", zero),
                       b.getOutputStreamBlockPtr("res", zero), b.getOutputStreamBlockPtr("emit", zero),
+                      b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
                       numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
     }
 };
 
-void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * segs) {
-    StreamSet * res = P.CreateStreamSet(1, 32);
+// bpe_batch_merge(bytes, units, n, out, base, pair, rules, shift): the batch's merge
+// (tailBatchFlush's lane loop) as a function in the scan kernel's module, so the JIT compiles its
+// vector steps for the CPU it runs on. kTailLanes lanes, each a pretoken being merged as in
+// TailLane (tokens at byte positions, live mask L, R[p] = rank << 4 | p); every round, a lane
+// with no pretoken takes the next unit, and a live lane does one merge (tailLaneStep) or, when
+// no pair is a rule, writes its result to out[unit] and empties. The merge: the lowest R by
+// llvm.vector.reduce.umin over 16 lanes; a rule = both cuckoo buckets compared 4 keys at a time,
+// the matching value selected (no branch).
+static Function * tailBatchMergeIR(KernelBuilder & b) {
+    Module * const M = b.getModule();
+    if (Function * const f = M->getFunction("bpe_batch_merge")) return f;
+    LLVMContext & C = b.getContext();
+    Type * const i16 = b.getInt16Ty(), * const i32 = b.getInt32Ty(), * const i64 = b.getInt64Ty(), * const i8 = b.getInt8Ty();
+    PointerType * const ptr = PointerType::getUnqual(C);
+    FunctionType * const fty = FunctionType::get(b.getVoidTy(), {ptr, ptr, i32, ptr, ptr, ptr, ptr, i32}, false);
+    Function * const f = Function::Create(fty, Function::InternalLinkage, "bpe_batch_merge", M);
+    const auto savedIP = b.saveIP();
+    auto block = [&](const char * name) { return BasicBlock::Create(C, name, f); };
+    b.SetInsertPoint(block("entry"));
+    auto arg = f->arg_begin();
+    Value * const bytes = &*arg++;
+    Value * const units = &*arg++;
+    Value * const n = &*arg++;
+    Value * const out = &*arg++;
+    Value * const base = &*arg++;
+    Value * const pair = &*arg++;
+    Value * const rules = &*arg++;
+    Value * const shift = &*arg++;
+    auto c32 = [&](uint32_t v) { return b.getInt32(v); };
+    const unsigned K = kTailLanes;
+    ArrayType * const rTy = ArrayType::get(i32, 20);
+    ArrayType * const tTy = ArrayType::get(i16, 18);
+    FixedVectorType * const v16i32 = FixedVectorType::get(i32, 16);
+    FixedVectorType * const v4i32 = FixedVectorType::get(i32, 4);
+    FixedVectorType * const v4i16 = FixedVectorType::get(i16, 4);
+    FixedVectorType * const v16i16 = FixedVectorType::get(i16, 16);
+    std::vector<AllocaInst *> R(K), T(K), L(K), E(K), U(K), Live(K);
+    for (unsigned k = 0; k < K; k++) {
+        R[k] = b.CreateAlloca(rTy); R[k]->setAlignment(Align(16));
+        T[k] = b.CreateAlloca(tTy); T[k]->setAlignment(Align(16));
+        L[k] = b.CreateAlloca(i32); E[k] = b.CreateAlloca(i32); U[k] = b.CreateAlloca(i32);
+        Live[k] = b.CreateAlloca(b.getInt1Ty());
+        b.CreateStore(b.getFalse(), Live[k]);
+    }
+    AllocaInst * const next = b.CreateAlloca(i32);
+    b.CreateStore(c32(0), next);
+    auto rAt = [&](unsigned k, Value * i) { return b.CreateGEP(rTy, R[k], {c32(0), i}); };
+    auto tAt = [&](unsigned k, Value * i) { return b.CreateGEP(tTy, T[k], {c32(0), i}); };
+    Value * const dead = c32(kTailLaneDead);
+    // The rule of key = idA << 16 | idB: idAB, 0xFFFF if none (tailRuleLookup).
+    auto lookup = [&](Value * key) {
+        Value * const h1 = b.CreateLShr(b.CreateMul(key, c32(0x9E3779B1u)), shift);
+        Value * const h2 = b.CreateLShr(b.CreateMul(b.CreateXor(key, b.CreateLShr(key, c32(15))), c32(0x85EBCA77u)), shift);
+        Value * const ks = b.CreateVectorSplat(4, key);
+        Value * v = nullptr;
+        for (Value * h : {h1, h2}) {
+            Value * const bucket = b.CreateGEP(i8, rules, b.CreateShl(b.CreateZExt(h, i64), b.getInt64(5)));
+            Value * const keys = b.CreateAlignedLoad(v4i32, bucket, 16);
+            Value * const vals = b.CreateAlignedLoad(v4i16, b.CreateGEP(i8, bucket, b.getInt64(16)), 8);
+            Value * const sel = b.CreateSelect(b.CreateICmpEQ(keys, ks), vals, Constant::getNullValue(v4i16));
+            v = v ? b.CreateOr(v, sel) : sel;
+        }
+        return b.CreateXor(b.CreateZExt(b.CreateOrReduce(v), i32), c32(0xFFFF));
+    };
+    auto cttz = [&](Value * x) { return b.CreateBinaryIntrinsic(llvm::Intrinsic::cttz, x, b.getFalse()); };
+    auto ctlz = [&](Value * x) { return b.CreateBinaryIntrinsic(llvm::Intrinsic::ctlz, x, b.getFalse()); };
+
+    BasicBlock * const loop = block("round");
+    BasicBlock * const done = block("done");
+    b.CreateBr(loop);
+    b.SetInsertPoint(loop);
+    for (unsigned k = 0; k < K; k++) {
+        BasicBlock * const tryLoad = block("tryLoad");
+        BasicBlock * const doLoad = block("load");
+        BasicBlock * const step = block("step");
+        BasicBlock * const merge = block("merge");
+        BasicBlock * const finish = block("finish");
+        BasicBlock * const cont = block("lane");
+        b.CreateCondBr(b.CreateLoad(b.getInt1Ty(), Live[k]), step, tryLoad);
+
+        b.SetInsertPoint(tryLoad);                              // an empty lane takes the next unit
+        Value * const nx = b.CreateLoad(i32, next);
+        b.CreateCondBr(b.CreateICmpULT(nx, n), doLoad, cont);
+
+        b.SetInsertPoint(doLoad);                               // tailLaneInit
+        {
+            Value * const unit = b.CreateGEP(i8, units, b.CreateMul(b.CreateZExt(nx, i64), b.getInt64(sizeof(TailBPEUnit))));
+            Value * const s = b.CreateLoad(i32, b.CreateGEP(i8, unit, b.getInt64(offsetof(TailBPEUnit, s))));
+            Value * const len = b.CreateLoad(i32, b.CreateGEP(i8, unit, b.getInt64(offsetof(TailBPEUnit, len))));
+            Value * const w = b.CreateGEP(i8, bytes, b.CreateZExt(s, i64));
+            b.CreateAlignedStore(b.CreateVectorSplat(16, dead), R[k], 16);
+            b.CreateAlignedStore(b.CreateVectorSplat(4, dead), rAt(k, c32(16)), 16);
+            BasicBlock * const initEntry = b.GetInsertBlock();
+            BasicBlock * const initLoop = block("init");
+            BasicBlock * const initDone = block("initDone");
+            b.CreateBr(initLoop);
+            b.SetInsertPoint(initLoop);                         // T[i] = base id; R[i - 1] = pair rule
+            PHINode * const i = b.CreatePHI(i32, 2);
+            PHINode * const prev = b.CreatePHI(i32, 2);
+            i->addIncoming(c32(0), initEntry);
+            prev->addIncoming(c32(0), initEntry);
+            Value * const t = b.CreateZExt(b.CreateLoad(i16, b.CreateGEP(i16, base,
+                                  b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, w, b.CreateZExt(i, i64))), i64))), i32);
+            b.CreateStore(b.CreateTrunc(t, i16), tAt(k, i));
+            BasicBlock * const pairBlk = block("initPair");
+            BasicBlock * const initNext = block("initNext");
+            b.CreateCondBr(b.CreateICmpEQ(i, c32(0)), initNext, pairBlk);
+            b.SetInsertPoint(pairBlk);
+            Value * const m = b.CreateZExt(b.CreateLoad(i16, b.CreateGEP(i16, pair,
+                                  b.CreateZExt(b.CreateOr(b.CreateShl(prev, c32(8)), t), i64))), i32);
+            Value * const im1 = b.CreateSub(i, c32(1));
+            b.CreateStore(b.CreateOr(b.CreateShl(m, c32(4)), im1), rAt(k, im1));
+            b.CreateBr(initNext);
+            b.SetInsertPoint(initNext);
+            Value * const i1v = b.CreateAdd(i, c32(1));
+            i->addIncoming(i1v, initNext);
+            prev->addIncoming(t, initNext);
+            b.CreateCondBr(b.CreateICmpULT(i1v, len), initLoop, initDone);
+            b.SetInsertPoint(initDone);
+            b.CreateStore(b.getInt16(0xFFFF), tAt(k, c32(16)));
+            b.CreateStore(b.getInt16(0xFFFF), tAt(k, len));
+            Value * const end = b.CreateShl(c32(1), len);
+            b.CreateStore(b.CreateSub(end, c32(1)), L[k]);
+            b.CreateStore(end, E[k]);
+            b.CreateStore(nx, U[k]);
+            b.CreateStore(b.getTrue(), Live[k]);
+            b.CreateStore(b.CreateAdd(nx, c32(1)), next);
+            b.CreateBr(cont);
+        }
+
+        b.SetInsertPoint(step);                                 // tailLaneStep
+        Value * const key = b.CreateIntMinReduce(b.CreateAlignedLoad(v16i32, R[k], 16), false);
+        b.CreateCondBr(b.CreateICmpUGE(key, c32(0xFFFF0u)), finish, merge);
+
+        b.SetInsertPoint(merge);
+        {
+            Value * const i = b.CreateAnd(key, c32(15));
+            Value * const id = b.CreateLShr(key, c32(4));
+            Value * const hi = b.CreateNot(b.CreateSub(b.CreateShl(c32(2), i), c32(1)));
+            Value * const l0 = b.CreateLoad(i32, L[k]);
+            Value * const nxt = cttz(b.CreateAnd(l0, hi));
+            Value * const l1 = b.CreateAnd(l0, b.CreateNot(b.CreateShl(c32(1), nxt)));
+            b.CreateStore(l1, L[k]);
+            Value * const nn = cttz(b.CreateAnd(b.CreateOr(l1, b.CreateLoad(i32, E[k])), hi));
+            Value * const below = b.CreateAnd(l1, b.CreateSub(b.CreateShl(c32(1), i), c32(1)));
+            Value * const pv = b.CreateSelect(b.CreateICmpNE(below, c32(0)), b.CreateSub(c32(31), ctlz(below)), c32(16));
+            b.CreateStore(b.CreateTrunc(id, i16), tAt(k, i));
+            b.CreateStore(dead, rAt(k, nxt));
+            Value * const tnn = b.CreateZExt(b.CreateLoad(i16, tAt(k, nn)), i32);
+            Value * const tpv = b.CreateZExt(b.CreateLoad(i16, tAt(k, pv)), i32);
+            Value * const rr = lookup(b.CreateOr(b.CreateShl(id, c32(16)), tnn));
+            Value * const rl = lookup(b.CreateOr(b.CreateShl(tpv, c32(16)), id));
+            b.CreateStore(b.CreateOr(b.CreateShl(rr, c32(4)), i), rAt(k, i));
+            b.CreateStore(b.CreateOr(b.CreateShl(rl, c32(4)), pv), rAt(k, pv));
+            b.CreateStore(dead, rAt(k, c32(16)));
+            b.CreateBr(cont);
+        }
+
+        b.SetInsertPoint(finish);                               // out[unit] = {L, T[0, 16)}
+        {
+            Value * const o = b.CreateGEP(i8, out, b.CreateMul(b.CreateZExt(b.CreateLoad(i32, U[k]), i64),
+                                                               b.getInt64(sizeof(TailBatchResult))));
+            b.CreateAlignedStore(b.CreateLoad(i32, L[k]), o, 4);
+            b.CreateAlignedStore(b.CreateAlignedLoad(v16i16, T[k], 16),
+                                 b.CreateGEP(i8, o, b.getInt64(offsetof(TailBatchResult, T))), 2);
+            b.CreateStore(b.getFalse(), Live[k]);
+            b.CreateBr(cont);
+        }
+        b.SetInsertPoint(cont);
+    }
+    Value * more = b.CreateICmpULT(b.CreateLoad(i32, next), n);   // units left, or a lane busy
+    for (unsigned k = 0; k < K; k++) more = b.CreateOr(more, b.CreateLoad(b.getInt1Ty(), Live[k]));
+    b.CreateCondBr(more, loop, done);
+    b.SetInsertPoint(done);
+    b.CreateRetVoid();
+    b.restoreIP(savedIP);
+    return f;
+}
+
+// --tail-scan-kernel: BPETailByteResolveKernel as a two-level scan over the pretoken starts.
+// The scan keeps the previous start in a loop variable; at each start it finishes the pretoken
+// between the two in generated code (generateIRWord) or calls bpe_tail_ir_slow for it.
+// --tail-unit-cuts: segs is BPEUnitCutsKernel's scan stream, cuts its cut starts (emit's first
+// value) and unit its units; a step from a unit start is a run of units. --tail-unit-seed: resIn
+// holds every byte's base id and res updates it in place.
+class BPETailScanKernel final : public TwoLevelScanKernel {
+public:
+    BPETailScanKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
+                      StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg, unsigned cacheWays,
+                      StreamSet * cuts = nullptr, StreamSet * unit = nullptr, StreamSet * resIn = nullptr)
+    : TwoLevelScanKernel(ts, std::string("BPE_TailScanIR") + (cacheWays ? "c" + std::to_string(cacheWays) : "")
+                             + (TailSkipLong ? "_skip" + std::to_string(TailSkipLong) : "")
+                             + (unit ? (resIn ? "_us" : "_u") : "")
+                             + (TailVocabLayout ? "_vl" + std::to_string(TailVocabLayout) : "")
+                             + (TailBatchBPE ? "_bj" : ""),
+                         64, "segs", {LoopVar("prev", ts.getInt64Ty())})
+    , mCacheWays(cacheWays), mUnitCuts(unit != nullptr), mSeeded(resIn != nullptr), mBatchJIT(TailBatchBPE) {
+        mInputStreamSets.push_back(Binding{"segs", segs, FixedRate(1), Principal()});
+        mInputStreamSets.push_back(Binding{"bytes", bytes});
+        if (mUnitCuts) {
+            mInputStreamSets.push_back(Binding{"cuts", cuts});
+            mInputStreamSets.push_back(Binding{"unit", unit});
+        }
+        if (mSeeded) {
+            // LLVM's greedy register allocator crashes (SplitEditor::deleteRematVictims, LLVM 19
+            // and 22) compiling the pipeline function when resIn is a thread-local buffer, as it
+            // did for --tail-len-kernels' InOut chain; LookBehind(1) keeps it out of one (so
+            // would -DisableThreadLocalStreamSets).
+            mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), LookBehind(1)});
+            mOutputStreamSets.push_back(Binding{"res", res, FixedRate(1), InOut("resIn")});
+        } else {
+            mOutputStreamSets.push_back(Binding{"res", res});
+        }
+        mOutputStreamSets.push_back(Binding{"emit", emit});
+        mOutputStreamSets.push_back(Binding{"open", open});
+        mOutputStreamSets.push_back(Binding{"seg", seg});
+        addAttribute(Statefree());   // see BPETailResolveKernel
+    }
+protected:
+    Function * linked(KernelBuilder & b, StringRef name) {
+        Function * const fn = b.getModule()->getFunction(name);
+        if (fn == nullptr) report_fatal_error(StringRef("BPE_TailScan: ") + name + " is not linked");
+        return fn;
+    }
+    void initialize(KernelBuilder & b) override {
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(b.getNumOfStrides(), b.getSize(getStride()));
+        mN = b.CreateUMin(numItems, b.getAccessibleItemCount("segs"));
+        mBase = b.getProcessedItemCount("segs");
+        mLoopVarInitialValues = {b.getInt64(kTailNoStart)};
+        Function * const fn = linked(b, "bpe_tail_ir_begin");
+        mBytes = b.getInputStreamBlockPtr("bytes", zero);
+        mRes = b.getOutputStreamBlockPtr("res", zero);
+        mEmit = b.getOutputStreamBlockPtr("emit", zero);
+        Type * const i8 = b.getInt8Ty(), * const i64 = b.getInt64Ty(), * const ptr = PointerType::getUnqual(b.getContext());
+        mUnit = mUnitCuts ? b.getInputStreamBlockPtr("unit", zero) : nullptr;
+        Value * const firstStarts = b.getInputStreamBlockPtr(mUnitCuts ? "cuts" : "segs", zero);
+        Value * const ctx = b.CreateIntToPtr(
+            b.CreateCall(fn->getFunctionType(), fn,
+                         {mBytes, firstStarts, mUnitCuts ? mUnit : ConstantPointerNull::get(cast<PointerType>(ptr)),
+                          mRes, mEmit,
+                          b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
+                          numItems, mN, b.CreateZExt(b.isFinal(), b.getInt64Ty()),
+                          mBatchJIT ? static_cast<Value *>(tailBatchMergeIR(b))
+                                    : ConstantPointerNull::get(cast<PointerType>(ptr))}),
+            ptr);
+        mCall = b.CreateLoad(i64, ctx);
+        mVocab = b.CreateLoad(ptr, b.CreateGEP(i8, ctx, b.getInt64(offsetof(TailIRCtx, vocab))));
+        mVShift = b.CreateLoad(i64, b.CreateGEP(i8, ctx, b.getInt64(offsetof(TailIRCtx, vshift))));
+        mBaseIds = b.CreateLoad(ptr, b.CreateGEP(i8, ctx, b.getInt64(offsetof(TailIRCtx, base))));
+        mCache = b.CreateLoad(ptr, b.CreateGEP(i8, ctx, b.getInt64(offsetof(TailIRCtx, cache))));
+        mCShift = b.CreateLoad(i64, b.CreateGEP(i8, ctx, b.getInt64(offsetof(TailIRCtx, cshift))));
+        if (TailVocabLayout) mVDesc = b.CreateLoad(ptr, b.CreateGEP(i8, ctx, b.getInt64(offsetof(TailIRCtx, vdesc))));
+    }
+    void wordPrologueLogic(KernelBuilder &, Value *, std::vector<Value *>, std::vector<Value *> &) override {}
+    void generateProcessingLogic(KernelBuilder & b, Value * absItemPos, std::vector<Value *> & loopVars) override {
+        Value * const p = b.CreateSub(absItemPos, mBase);
+        generateIRWord(b, loopVars[0], p);
+        loopVars[0] = p;
+    }
+    // The pretoken [prev, p), as TailByteWalk's word() + finish() would for one byte or a
+    // vocabulary hit; anything else goes to bpe_tail_ir_slow.
+    void generateIRWord(KernelBuilder & b, Value * prev, Value * p) {
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
+        auto c64 = [&](uint64_t v) { return b.getInt64(v); };
+        BasicBlock * const first = b.CreateBasicBlock("irFirst");
+        BasicBlock * const word = b.CreateBasicBlock("irWord");
+        BasicBlock * const one = b.CreateBasicBlock("irOne");
+        BasicBlock * const multi = b.CreateBasicBlock("irMulti");
+        BasicBlock * const probe = b.CreateBasicBlock("irProbe");
+        BasicBlock * const hit = b.CreateBasicBlock("irHit");
+        BasicBlock * const slow = b.CreateBasicBlock("irSlow");
+        BasicBlock * const done = b.CreateBasicBlock("irDone");
+        b.CreateUnlikelyCondBr(b.CreateICmpEQ(prev, c64(kTailNoStart)), first, word);
+
+        b.SetInsertPoint(first);                    // the call's first start: its left edge
+        Function * const start = linked(b, "bpe_tail_walk_start");
+        b.CreateCall(start->getFunctionType(), start, {mCall, prev, p});
+        b.CreateBr(done);
+
+        b.SetInsertPoint(word);
+        if (mUnitCuts) {                            // a step from a unit start: a run of units
+            BasicBlock * const units = b.CreateBasicBlock("irUnits");
+            BasicBlock * const pretoken = b.CreateBasicBlock("irPretoken");
+            Value * const uw = b.CreateLoad(i64, b.CreateGEP(i64, mUnit, b.CreateLShr(prev, 6)));
+            Value * const isUnit = b.CreateTrunc(b.CreateLShr(uw, b.CreateAnd(prev, c64(63))), b.getInt1Ty());
+            b.CreateCondBr(isUnit, units, pretoken);
+            b.SetInsertPoint(units);
+            if (mSeeded) {
+                b.CreateBr(done);                   // their base ids are in res already
+            } else {                                // [prev, p): each byte's base id
+                BasicBlock * const loop = b.CreateBasicBlock("irUnitLoop");
+                BasicBlock * const entry = b.GetInsertBlock();
+                b.CreateBr(loop);
+                b.SetInsertPoint(loop);
+                PHINode * const q = b.CreatePHI(i64, 2);
+                q->addIncoming(prev, entry);
+                Value * const by = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, q)), i64);
+                b.CreateStore(b.CreateLoad(i16, b.CreateGEP(i16, mBaseIds, by)), b.CreateGEP(i16, mRes, q));
+                Value * const q1 = b.CreateAdd(q, c64(1));
+                q->addIncoming(q1, loop);
+                b.CreateCondBr(b.CreateICmpULT(q1, p), loop, done);
+            }
+            b.SetInsertPoint(pretoken);
+        }
+        Value * const len = b.CreateSub(p, prev);
+        if (TailSkipLong) {                         // measurement only
+            BasicBlock * const keep = b.CreateBasicBlock("irKeep");
+            BasicBlock * const skip = b.CreateBasicBlock("irSkip");
+            b.CreateCondBr(b.CreateICmpUGT(len, c64(TailSkipLong)), skip, keep);
+            b.SetInsertPoint(skip);
+            b.CreateStore(b.getInt16(0), b.CreateGEP(i16, mRes, prev));
+            b.CreateBr(done);
+            b.SetInsertPoint(keep);
+        }
+        b.CreateCondBr(b.CreateICmpEQ(len, c64(1)), one, multi);
+
+        b.SetInsertPoint(one);                      // one byte: its base id
+        if (!mSeeded) {                             // (--tail-unit-seed: there already)
+            Value * const byte = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, prev)), i64);
+            Value * const baseId = b.CreateLoad(i16, b.CreateGEP(i16, mBaseIds, byte));
+            b.CreateStore(baseId, b.CreateGEP(i16, mRes, prev));
+        }
+        b.CreateBr(done);
+
+        b.SetInsertPoint(multi);                    // 2 .. 15 bytes inside the call, table built
+        Value * const ok = b.CreateAnd(b.CreateAnd(b.CreateICmpULE(len, c64(kTailByteKeyMax)),
+                                                   b.CreateICmpULE(b.CreateAdd(prev, c64(16)), mN)),
+                                       b.CreateIsNotNull(mVocab));
+        b.CreateLikelyCondBr(ok, probe, slow);
+
+        b.SetInsertPoint(probe);                    // the key as in TailByteWalk::multi
+        Value * const src = b.CreateGEP(i8, mBytes, prev);
+        Value * const lo = b.CreateAlignedLoad(i64, src, 1);
+        Value * const hi = b.CreateAlignedLoad(i64, b.CreateGEP(i8, src, c64(8)), 1);
+        Value * const bits = b.CreateShl(len, 3);
+        Value * const long0 = b.CreateICmpUGE(len, c64(8)), * const long1 = b.CreateICmpUGT(len, c64(8));
+        Value * const mask0 = b.CreateSub(b.CreateShl(c64(1), b.CreateSelect(long0, c64(0), bits)), c64(1));
+        Value * const mask1 = b.CreateSub(b.CreateShl(c64(1), b.CreateSelect(long1, b.CreateSub(bits, c64(64)), c64(0))), c64(1));
+        Value * const k0 = b.CreateSelect(long0, lo, b.CreateAnd(lo, mask0));
+        Value * const k1 = b.CreateOr(b.CreateSelect(long1, b.CreateAnd(hi, mask1), c64(0)), b.CreateShl(len, 56));
+        Value * const h = b.CreateMul(b.CreateXor(k0, b.CreateMul(k1, c64(0xC2B2AE3D27D4EB4Full))), c64(0x9E3779B97F4A7C15ull));
+        Value * setIdx = nullptr;
+        if (TailVocabLayout) {                      // the length's region (tailVocabSet)
+            Value * const d = b.CreateGEP(i64, mVDesc, b.CreateShl(len, 1));
+            Value * const sets = b.CreateLoad(i64, b.CreateGEP(i64, d, c64(1)));
+            setIdx = b.CreateAdd(b.CreateLoad(i64, d), b.CreateLShr(b.CreateMul(b.CreateLShr(h, 32), sets), 32));
+        } else {
+            setIdx = b.CreateLShr(h, mVShift);
+        }
+        Value * const set = b.CreateGEP(i8, mVocab, b.CreateShl(setIdx, 7));   // 4 entries of 32 bytes
+        Value * found = c64(16);                    // all 4 compared into a mask, as tailMatch4: an
+        for (unsigned i = 0; i < 4; i++) {          // or-chain of the 4 matches becomes 4 branches
+            Value * const e = b.CreateGEP(i8, set, c64(32 * i));
+            Value * const m = b.CreateAnd(b.CreateICmpEQ(b.CreateLoad(i64, e), k0),
+                                          b.CreateICmpEQ(b.CreateLoad(i64, b.CreateGEP(i8, e, c64(8))), k1));
+            found = b.CreateOr(found, b.CreateShl(b.CreateZExt(m, i64), i));
+        }
+        Value * const way = b.CreateCountForwardZeroes(found);
+        BasicBlock * const vocabMiss = mCacheWays ? b.CreateBasicBlock("irVocabMiss") : slow;
+        b.CreateLikelyCondBr(b.CreateICmpULT(way, c64(4)), hit, vocabMiss);
+
+        b.SetInsertPoint(hit);                      // a vocabulary token: one id
+        Value * const out = b.CreateGEP(i8, set, b.CreateAdd(b.CreateShl(way, 5), c64(offsetof(TailCacheEntry, out))));
+        b.CreateStore(b.CreateLoad(i16, out), b.CreateGEP(i16, mRes, prev));
+        b.CreateBr(done);
+
+        if (mCacheWays) {                           // the thread cache's most recent entry
+            b.SetInsertPoint(vocabMiss);
+            BasicBlock * const cacheHit = b.CreateBasicBlock("irCacheHit");
+            BasicBlock * const tokens = b.CreateBasicBlock("irCacheTokens");
+            Value * const e = b.CreateGEP(i8, mCache, b.CreateMul(b.CreateLShr(h, mCShift), c64(32 * mCacheWays)));
+            Value * const m = b.CreateAnd(b.CreateICmpEQ(b.CreateLoad(i64, e), k0),
+                                          b.CreateICmpEQ(b.CreateLoad(i64, b.CreateGEP(i8, e, c64(8))), k1));
+            b.CreateLikelyCondBr(m, cacheHit, slow);
+
+            b.SetInsertPoint(cacheHit);
+            Value * const keep0 = b.CreateZExt(b.CreateLoad(i16, b.CreateGEP(i8, e, c64(offsetof(TailCacheEntry, keep)))), i64);
+            Value * const outs = b.CreateGEP(i8, e, c64(offsetof(TailCacheEntry, out)));
+            b.CreateBr(tokens);
+
+            b.SetInsertPoint(tokens);                // token j at the j-th set bit of keep; the
+            PHINode * const keep = b.CreatePHI(i64, 2);   // first one's emit bit is already set
+            PHINode * const j = b.CreatePHI(i64, 2);
+            keep->addIncoming(keep0, cacheHit);
+            j->addIncoming(c64(0), cacheHit);
+            Value * const q = b.CreateAdd(prev, b.CreateCountForwardZeroes(keep));
+            Value * const tok = b.CreateLoad(i16, b.CreateGEP(i16, outs, j));
+            b.CreateStore(tok, b.CreateGEP(i16, mRes, q));
+            Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(q, 6));
+            b.CreateStore(b.CreateOr(b.CreateLoad(i64, ew), b.CreateShl(c64(1), b.CreateAnd(q, c64(63)))), ew);
+            Value * const nextKeep = b.CreateAnd(keep, b.CreateSub(keep, c64(1)));
+            keep->addIncoming(nextKeep, tokens);
+            j->addIncoming(b.CreateAdd(j, c64(1)), tokens);
+            b.CreateCondBr(b.CreateICmpNE(nextKeep, c64(0)), tokens, done);
+        }
+
+        b.SetInsertPoint(slow);
+        Function * const fn = linked(b, "bpe_tail_ir_slow");
+        b.CreateCall(fn->getFunctionType(), fn, {mCall, prev, p});
+        b.CreateBr(done);
+
+        b.SetInsertPoint(done);
+    }
+    void finalize(KernelBuilder & b, std::vector<Value *> & loopVarFinalValues) override {
+        Function * const fn = linked(b, "bpe_tail_walk_end");
+        b.CreateCall(fn->getFunctionType(), fn, {mCall, loopVarFinalValues[0]});
+    }
+    const unsigned mCacheWays;
+    const bool mUnitCuts, mSeeded;
+    const bool mBatchJIT;                                                    // --tail-batch-bpe: bpe_batch_merge
+    Value * mUnit = nullptr;                                                 // --tail-unit-cuts
+    Value * mBase = nullptr, * mCall = nullptr;
+    Value * mBytes = nullptr, * mRes = nullptr, * mN = nullptr;
+    Value * mVocab = nullptr, * mVShift = nullptr, * mBaseIds = nullptr;
+    Value * mCache = nullptr, * mCShift = nullptr, * mEmit = nullptr;       // --tail-scan-ir-cache
+    Value * mVDesc = nullptr;                                                // --tail-vocab-layout=1
+};
+
+// --len-scan with --tail-unit-seed: the pieces the length kernels do not resolve (bpe_long_block).
+class BPELongPiecesKernel final : public MultiBlockKernel {
+public:
+    BPELongPiecesKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * lng, StreamSet * cuts,
+                        StreamSet * cover, StreamSet * resIn, StreamSet * res, StreamSet * emit,
+                        StreamSet * open, StreamSet * seg)
+    : MultiBlockKernel(ts, "BPE_LongPieces",
+                       // LookBehind(1) on resIn: see BPETailScanKernel
+                       {Binding{"bytes", bytes}, Binding{"long", lng, FixedRate(1), Principal()},
+                        Binding{"cuts", cuts}, Binding{"cover", cover},
+                        Binding{"resIn", resIn, FixedRate(1), LookBehind(1)}},
+                       {Binding{"res", res, FixedRate(1), InOut("resIn")}, Binding{"emit", emit},
+                        Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}) {
+        addAttribute(Statefree());   // see BPETailResolveKernel
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_long_block");
+        if (fn == nullptr) report_fatal_error("BPE_LongPieces: bpe_long_block is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("long"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("bytes", zero), b.getInputStreamBlockPtr("long", zero),
+                      b.getInputStreamBlockPtr("cuts", zero), b.getInputStreamBlockPtr("cover", zero),
+                      b.getOutputStreamBlockPtr("res", zero), b.getOutputStreamBlockPtr("emit", zero),
+                      b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
+                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+// --len-scan=N: the pieces of exactly L bytes, L = 2 .. N. From the cuts (piece starts) of
+// BPEUnitCutsKernel:
+//   s<L>  = cuts & ~next(cuts) & .. & ~next<L-1>(cuts) & next<L>(cuts)   the starts of L-byte pieces
+//   cover = the bytes of the pieces of 1 .. N bytes   (the pieces the general scan does not resolve)
+//   scan  = cuts & ~(cover & Advance(cover, 1))
+// The general scan (BPETailScanKernel) takes scan and cover in place of its scan and unit streams: a
+// step from a covered start is a run of units and short pieces, whose bytes it gives their base
+// ids; BPE_len<L>_pretokenScan then fixes the pieces of length L. cuts is InFile, so a piece ending
+// at the end of the input is not marked (no cut after it): it counts as longer than N, and the
+// general scan resolves it.
+class BPELenSelectKernel final : public PabloKernel {
+public:
+    BPELenSelectKernel(LLVMTypeSystemInterface & ts, unsigned N, StreamSet * cuts,
+                       StreamSet * scan, StreamSet * cover, StreamSet * starts,
+                       std::vector<unsigned> ifs = {}, bool longOut = false)
+    : PabloKernel(ts, "BPE_LenSelect" + std::to_string(N) + ifTag(ifs) + (longOut ? "_long" : ""),
+                  {Binding{"cuts", cuts, FixedRate(), LookAhead(N)}},
+                  {Binding{longOut ? "long" : "scan", scan}, Binding{"cover", cover}, Binding{"starts", starts}})
+    , mN(N), mIfs(std::move(ifs)), mLongOut(longOut) {}
+protected:
+    static std::string ifTag(const std::vector<unsigned> & ifs) {
+        std::string t;
+        for (unsigned k : ifs) t += "_if" + std::to_string(k);
+        return t;
+    }
+    // A = the starts of pieces of at least L bytes: s<L> = A & next<L>, then A &= ~next<L>, for
+    // L = from .. N; past a threshold K (pieces of more than K bytes), the rest in an If on A.
+    // Returns A for pieces of more than N bytes.
+    PabloAST * lengths(PabloBuilder & pb, PabloAST * const cuts, PabloAST * A, unsigned from, unsigned k) {
+        for (unsigned L = from; L <= mN; L++) {
+            if (k < mIfs.size() && L == mIfs[k] + 1) {           // A: the pieces of more than L - 1 bytes
+                Var * const longV = pb.createVar("long" + std::to_string(L), pb.createZeroes());
+                for (unsigned M = L; M <= mN; M++) {               // (an outer If's Vars serve)
+                    if (mStartVar[M] == nullptr) mStartVar[M] = pb.createVar("s" + std::to_string(M) + "v", pb.createZeroes());
+                }
+                auto body = pb.createScope();
+                body.createAssign(longV, lengths(body, cuts, A, L, k + 1));
+                pb.createIf(A, body);
+                return longV;
+            }
+            PabloAST * const next = pb.createLookahead(cuts, L);
+            PabloAST * const sL = pb.createAnd(A, next);
+            if (mStartVar[L]) pb.createAssign(mStartVar[L], sL);
+            else mStart[L] = sL;
+            A = pb.createAnd(A, pb.createNot(next));
+        }
+        return A;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const cuts = getInputStreamSet("cuts")[0];
+        PabloAST * cover = nullptr;
+        mStart.assign(mN + 1, nullptr);
+        mStartVar.assign(mN + 1, nullptr);
+        PabloAST * const A2 = pb.createAnd(cuts, pb.createNot(pb.createLookahead(cuts, 1)));
+        PabloAST * const longS = lengths(pb, cuts, A2, 2, 0);
+        std::vector<PabloAST *> starts;                    // one stream set: stream L - 2 for length L
+        for (unsigned L = 2; L <= mN; L++) starts.push_back(mStartVar[L] ? mStartVar[L] : mStart[L]);
+        writeOutputStreamSet("starts", starts);
+        // cover = every byte not in a piece of more than N bytes (unit pieces included): the
+        // longer pieces' starts and the non-cut bytes after them, up to the next cut.
+        PabloAST * const notCut = pb.createNot(cuts);
+        PabloAST * const longBody = pb.createOr(longS, pb.createAnd(pb.createMatchStar(pb.createAdvance(longS, 1), notCut), notCut));
+        cover = pb.createInFile(pb.createNot(longBody));
+        if (mLongOut) {                             // BPE_LongPieces: the long pieces' starts
+            writeOutputStreamSet("long", std::vector<PabloAST *>{pb.createInFile(longS)});
+        } else {
+            PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(cover, pb.createAdvance(cover, 1))));
+            writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
+        }
+        writeOutputStreamSet("cover", std::vector<PabloAST *>{cover});
+    }
+    const unsigned mN;
+    const std::vector<unsigned> mIfs;
+    const bool mLongOut;
+    std::vector<PabloAST *> mStart;
+    std::vector<Var *> mStartVar;
+};
+
+// --len-scan, L = 2: the BPE of a two-byte piece b0 b1 is the rule's id if (b0, b1) is a rule, else
+// the two base ids: one load from this table, the id of each byte pair or 0xFFFF (128 KB).
+static std::vector<uint16_t> gTailPairBytes;
+// --len-scan, L = 3 .. 15: the L-byte tokens whose BPE is themselves, by key (byte 0 lowest; a NUL
+// is in no token, so a key is never 0), in 64-byte buckets, 2^bits of them per length:
+//   L = 3, 4:   8 u32 keys, 8 ids;                 bucket (key * mult) >> (32 - bits), mult 32 bits
+//   L = 5 .. 8: 6 u64 keys, 6 ids;                 bucket (key * mult) >> (64 - bits)
+//   L > 8:      3 keys k0 (bytes 0..7), k1 (bytes 8..L-1), 3 ids;
+//               bucket ((k0 ^ k1 * kTailLenM1) * mult) >> (64 - bits)
+// mult is searched per length (--len-hash-search) so that no bucket overflows; with no search, the
+// fixed multipliers (kLenMult32, kTailLenM), and a token whose bucket is full is left out (a lookup
+// then misses, and the miss path gives the same tokens). bits and mult are in the kernels' names.
+static constexpr uint64_t kTailLenM = 0x9E3779B97F4A7C15ull, kTailLenM1 = 0xC2B2AE3D27D4EB4Full;
+static constexpr uint32_t kLenMult32 = 0x9E3779B1u;
+struct alignas(64) TailLenBucket {
+    uint32_t key[8];                         // 0: empty
+    uint16_t id[8];
+    uint16_t pad[8];
+};
+struct alignas(64) TailLenBucket64 {
+    uint64_t key[6];
+    uint16_t id[6];
+    uint32_t pad;
+};
+struct alignas(64) TailLenBucket128 {
+    uint64_t key[6];                         // k0, k1 of way 0, of way 1, of way 2
+    uint16_t id[3];
+    uint16_t pad[5];
+};
+static_assert(sizeof(TailLenBucket64) == 64 && sizeof(TailLenBucket128) == 64, "64-byte buckets");
+static constexpr unsigned kTailLenMax = 15;      // = kTailByteKeyMax: the misses use the thread cache
+static unsigned tailLenWays(unsigned L) { return L <= 4 ? 8 : L <= 8 ? 6 : 3; }
+struct TailLenTable {
+    std::vector<TailLenBucket> buckets;      // the 64-byte buckets, in L's format
+    unsigned bits = 0;
+    unsigned dropped = 0;                    // the tokens left out (bucket full)
+    uint64_t mult = 0;                       // the bucket hash's multiplier (L <= 4: 32 bits)
+};
+static TailLenTable gTailLenTab[kTailLenMax + 1];   // [3 .. kTailLenMax]
+// The name tag of length L's table: its bits, and its multiplier when not the fixed one.
+static std::string lenTableTag(unsigned L) {
+    const TailLenTable & t = gTailLenTab[L];
+    const uint64_t fixed = L <= 4 ? kLenMult32 : kTailLenM;
+    char buf[24] = "";
+    if (t.mult != fixed) std::snprintf(buf, sizeof(buf), "m%llx", (unsigned long long) t.mult);
+    return "_b" + std::to_string(t.bits) + buf;
+}
+static uint64_t tailLenTable2() { return reinterpret_cast<uint64_t>(gTailPairBytes.data()); }
+static bool tailLen3PairCheck() { return Len3PairCheck && gTailLenTab[3].dropped == 0; }
+static bool tailLen4PairCheck() {
+    return Len4PairCheck && LenScan >= 4 && gTailLenTab[3].dropped == 0 && gTailLenTab[4].dropped == 0;
+}
+template <unsigned L> static uint64_t tailLenTable() { return reinterpret_cast<uint64_t>(gTailLenTab[L].buckets.data()); }
+static uint64_t (* const kTailLenTables[kTailLenMax + 1])() = {
+    nullptr, nullptr, tailLenTable2, tailLenTable<3>, tailLenTable<4>, tailLenTable<5>, tailLenTable<6>,
+    tailLenTable<7>, tailLenTable<8>, tailLenTable<9>, tailLenTable<10>, tailLenTable<11>, tailLenTable<12>,
+    tailLenTable<13>, tailLenTable<14>, tailLenTable<15>};
+
+// The emit bits of a piece starting at s: bit i of mask for position s + i. A piece may end in
+// the next call's first word, which that call (state free: perhaps on another thread at the same
+// time) also updates, so the bits go in by atomic or.
+static inline void tailLenEmit(uint64_t * emit, uint64_t s, uint32_t mask) {
+    if (mask == 0) return;
+    const unsigned off = unsigned(s % 64);
+    __atomic_fetch_or(&emit[s / 64], uint64_t(mask) << off, __ATOMIC_RELAXED);
+    if (off > 64 - kTailLenMax && (uint64_t(mask) >> (64 - off)) != 0)
+        __atomic_fetch_or(&emit[s / 64 + 1], uint64_t(mask) >> (64 - off), __ATOMIC_RELAXED);
+}
+// --tail-batch-bpe: the queued pieces of BPE_len<L>_pretokenScan, merged together as by
+// tailBatchFlush, with their emit bits by tailLenEmit.
+static void tailLenFlush(TailScratch & S, const uint8_t * bytes, uint16_t * res, uint64_t * emit) {
+    constexpr unsigned W = kTailCacheWays;
+    const unsigned n = S.batchN;
+    S.batchN = 0;
+    TailLane lane[kTailLanes];
+    bool live[kTailLanes];
+    unsigned next = 0, nlive = 0;
+    auto load = [&](unsigned k) {
+        live[k] = next < n;
+        if (!live[k]) return;
+        lane[k].unit = next;
+        tailLaneInit(lane[k], bytes + S.batch[next].s, S.batch[next].len);
+        next++;
+    };
+    auto finish = [&](const TailLane & l) {
+        const TailBPEUnit & u = S.batch[l.unit];
+        unsigned m = 0;
+        for (uint32_t x = l.L; x; x &= x - 1, m++) {
+            const uint32_t p = uint32_t(__builtin_ctz(x));
+            res[u.s + p] = l.T[p];
+        }
+        tailLenEmit(emit, u.s, l.L & ~1u);
+        TailCacheEntry * const set = u.set;
+        if (m > kTailCacheOut) return;
+        if ((set[0].k0 == u.k0 && set[0].k1 == u.k1) || (set[1].k0 == u.k0 && set[1].k1 == u.k1)) return;
+        tailShiftDown<W>(set, W - 1);                               // the last one goes
+        TailCacheEntry & f = set[0];
+        f.k0 = u.k0; f.k1 = u.k1; f.keep = uint16_t(l.L);
+        m = 0;
+        for (uint32_t x = l.L; x; x &= x - 1) f.out[m++] = l.T[__builtin_ctz(x)];
+    };
+    for (unsigned k = 0; k < kTailLanes; k++) { load(k); nlive += live[k]; }
+    while (nlive) {
+#pragma clang loop unroll(full)
+        for (unsigned k = 0; k < kTailLanes; k++) {
+            if (!live[k] || tailLaneStep(lane[k])) continue;
+            finish(lane[k]);
+            load(k);
+            nlive -= !live[k];
+        }
+    }
+}
+// At the end of a call of BPE_len<L>_pretokenScan: its queued pieces.
+extern "C" void bpe_len_flush(const uint8_t * bytes, uint16_t * res, uint64_t * emit) {
+    TailScratch & S = tailScratch();
+    if (S.batchN) tailLenFlush(S, bytes, res, emit);
+}
+// The miss path of BPE_len<L>_pretokenScan: the tokens of the piece bytes[s, s + len), from the
+// thread cache (keyed as the general scan keys its pretokens) or BPE on the base ids (with
+// --tail-batch-bpe, queued: written by tailLenFlush); each token's id at its start and, past the
+// first token, its emit bit. lim: the end of the readable bytes.
+extern "C" void bpe_len_miss(const uint8_t * bytes, uint16_t * res, uint64_t * emit, int64_t s, uint64_t len,
+                             int64_t lim) {
+    uint64_t a = 0, b = 0;
+    if (LLVM_LIKELY(s + 16 <= lim)) {
+        std::memcpy(&a, bytes + s, 8);
+        std::memcpy(&b, bytes + s + 8, 8);
+    } else {
+        for (size_t i = 0; i < len; i++) (i < 8 ? a : b) |= uint64_t(bytes[s + int64_t(i)]) << (8 * (i % 8));
+    }
+    const uint64_t k0 = len >= 8 ? a : a & tailLowMask(len * 8);
+    const uint64_t k1 = (len > 8 ? b & tailLowMask((len - 8) * 8) : 0) | (uint64_t(len) << 56);
+    const uint64_t h = (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+    TailScratch & S = tailScratch();
+    TailCacheEntry * const set = S.sets + (h >> (64 - S.setBits)) * kTailCacheWays;
+    static_assert(kTailCacheWays == 2, "the thread cache's sets have 2 entries");
+    const TailCacheEntry * e = nullptr;
+    if (LLVM_LIKELY(set[0].k0 == k0 && set[0].k1 == k1)) e = &set[0];
+    else if (set[1].k0 == k0 && set[1].k1 == k1) e = &set[1];
+    if (LLVM_UNLIKELY(e == nullptr) && TailBatchBPE) {
+        S.batch[S.batchN++] = TailBPEUnit{k0, k1, set, uint32_t(s), uint32_t(len)};
+        if (S.batchN == kTailBatch) tailLenFlush(S, bytes, res, emit);
+        return;
+    }
+    if (LLVM_UNLIKELY(e == nullptr)) {
+        uint16_t t[kTailLenMax];
+        uint32_t pos[kTailLenMax];
+        size_t m = len;
+        for (size_t i = 0; i < len; i++) { t[i] = gTailBase[bytes[s + int64_t(i)]]; pos[i] = uint32_t(i); }
+        tailMergeSegment(t, pos, m);
+        if (m > kTailCacheOut) {
+            uint32_t mask = 0;
+            for (size_t j = 0; j < m; j++) { res[s + pos[j]] = t[j]; mask |= 1u << pos[j]; }
+            tailLenEmit(emit, uint64_t(s), mask & ~1u);
+            return;
+        }
+        tailShiftDown<kTailCacheWays>(set, kTailCacheWays - 1);   // the last one goes
+        TailCacheEntry & f = set[0];
+        f.k0 = k0; f.k1 = k1; f.keep = 0;
+        for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << pos[j]); f.out[j] = t[j]; }
+        e = &f;
+    }
+    unsigned j = 0;
+    for (uint32_t keep = e->keep; keep; keep &= keep - 1) res[s + __builtin_ctz(keep)] = e->out[j++];
+    tailLenEmit(emit, uint64_t(s), uint32_t(e->keep) & ~1u);
+}
+// BPE_len<L>_pretokenScan: a two-level scan over the starts s of the pieces of L bytes. The
+// general scan has already given every byte its base id and the piece's start its emit bit, so at
+// s this only fixes the piece's tokens. A piece starting in the call is finished there, also when
+// it ends in the next call's first L - 1 positions: LookAhead(L - 1) on bytes, resIn and emitIn has
+// them written by the kernels before this one, and no kernel after it has read them yet; so there
+// is no edge case. (The final call's last pieces are marked only when they end in the input, see
+// BPELenSelectKernel.) L = 2: one load from the direct pair table; a rule gives res[s] its id, no
+// rule sets emit at s + 1. L = 3, 4: the key from one 4-byte load at s (L = 3: its low 3 bytes), its
+// bucket's 8 keys compared at once; L = 5 .. 8: one 8-byte load at s, its low L bytes, 6 keys;
+// L > 8: 8-byte loads at s and ending at s + L - 1, 3 key pairs. No load reads before s: the
+// source buffer has nothing before the input's first byte (a piece of fewer than 8 bytes at the
+// start of a page aligned buffer read the unmapped page before it). The loads past s + L - 1 are
+// in the bytes' LookAhead. A hit gives res[s] the token's id, a miss calls bpe_len_miss. res and
+// emit are updated in place (InOut), after the general scan; emit by atomic or (tailLenEmit);
+// LookBehind(1) on resIn keeps it out of a thread-local buffer (an LLVM register allocator crash
+// otherwise, as for --tail-unit-seed).
+class BPELenScanKernel final : public TwoLevelScanKernel {
+public:
+    BPELenScanKernel(LLVMTypeSystemInterface & ts, unsigned L, StreamSet * starts,
+                     StreamSet * bytes, StreamSet * resIn, StreamSet * emitIn, StreamSet * res, StreamSet * emit)
+    : TwoLevelScanKernel(ts, "BPE_len" + std::to_string(L) + "_pretokenScan"
+                             + (L >= 3 ? lenTableTag(L) : std::string())
+                             + ((L == 3 && tailLen3PairCheck()) || (L == 4 && tailLen4PairCheck()) ? "_pc" : "")
+                             + (L == 4 && tailLen4PairCheck() ? "_t3" + lenTableTag(3) : std::string())
+                             + "_of" + std::to_string(starts->getNumElements()),
+                         64, "starts", {}, int(L - 2))
+    , mL(L), mPairCheck((L == 3 && tailLen3PairCheck()) || (L == 4 && tailLen4PairCheck())) {
+        mInputStreamSets.push_back(Binding{"starts", starts, FixedRate(1), Principal()});
+        mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), LookAhead(L == 2 ? 1 : L <= 4 ? 3 : std::max(L - 1, 7u))});
+        mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), {LookBehind(1), LookAhead(L - 1)}});
+        mInputStreamSets.push_back(Binding{"emitIn", emitIn, FixedRate(1), LookAhead(L - 1)});
+        mOutputStreamSets.push_back(Binding{"res", res, FixedRate(1), InOut("resIn")});
+        mOutputStreamSets.push_back(Binding{"emit", emit, FixedRate(1), InOut("emitIn")});
+        addAttribute(Statefree());
+    }
+protected:
+    Function * linked(KernelBuilder & b, StringRef name) {
+        Function * const fn = b.getModule()->getFunction(name);
+        if (fn == nullptr) report_fatal_error(StringRef("BPE_len_pretokenScan: ") + name + " is not linked");
+        return fn;
+    }
+    void initialize(KernelBuilder & b) override {
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(b.getNumOfStrides(), b.getSize(getStride()));
+        mN = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
+        mBase = b.getProcessedItemCount("starts");
+        mBytes = b.getInputStreamBlockPtr("bytes", zero);
+        mRes = b.getOutputStreamBlockPtr("res", zero);
+        mEmit = b.getOutputStreamBlockPtr("emit", zero);
+        Function * const fn = linked(b, tableName());
+        mTable = b.CreateIntToPtr(b.CreateCall(fn->getFunctionType(), fn, {}), PointerType::getUnqual(b.getContext()));
+        if (mPairCheck) {
+            Function * const pf = linked(b, tableNameFor(2));
+            mPairs = b.CreateIntToPtr(b.CreateCall(pf->getFunctionType(), pf, {}), PointerType::getUnqual(b.getContext()));
+        }
+        if (mPairCheck && mL == 4) {
+            Function * const tf = linked(b, tableNameFor(3));
+            mTable3 = b.CreateIntToPtr(b.CreateCall(tf->getFunctionType(), tf, {}), PointerType::getUnqual(b.getContext()));
+        }
+        mLoopVarInitialValues = {};
+    }
+    void wordPrologueLogic(KernelBuilder &, Value *, std::vector<Value *>, std::vector<Value *> &) override {}
+    Value * pairId(KernelBuilder & b, Value * p) {              // L = 2: the rule id of bytes p - 1, p, or 0xFFFF
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
+        Value * const b0 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(1)))), i64);
+        Value * const b1 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, p)), i64);
+        return b.CreateLoad(i16, b.CreateGEP(i16, mTable, b.CreateOr(b.CreateShl(b0, 8), b1)));
+    }
+    // L = 3, 4: the bucket of the u32 key x in length L's table, its 8 keys compared at once:
+    // the way of x (8: none) and the id stored in that way (in the padding for way 8).
+    std::pair<Value *, Value *> probe32(KernelBuilder & b, Value * table, unsigned L, Value * x) {
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i32 = b.getInt32Ty(), * const i64 = b.getInt64Ty();
+        const TailLenTable & t = gTailLenTab[L];
+        Value * const bucket = b.CreateZExt(b.CreateLShr(b.CreateMul(x, b.getInt32(uint32_t(t.mult))), b.getInt32(32 - t.bits)), i64);
+        Value * const set = b.CreateGEP(i8, table, b.CreateShl(bucket, b.getInt64(6)));
+        FixedVectorType * const v8 = FixedVectorType::get(i32, 8);
+        Value * const keys = b.CreateAlignedLoad(v8, set, 32);
+        Value * const eq = b.CreateICmpEQ(keys, b.CreateVectorSplat(8, x));
+        Value * const mask = b.CreateZExt(b.CreateBitCast(eq, i8), i32);
+        Value * const way = b.CreateCountForwardZeroes(b.CreateOr(mask, b.getInt32(0x100)));
+        Value * const id = b.CreateLoad(i16, b.CreateGEP(i8, set, b.CreateZExt(b.CreateAdd(b.getInt32(32), b.CreateShl(way, b.getInt32(1))), i64)));
+        return {way, id};
+    }
+    void generateProcessingLogic(KernelBuilder & b, Value * absItemPos, std::vector<Value *> &) override {
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i32 = b.getInt32Ty(), * const i64 = b.getInt64Ty();
+        Value * const s = b.CreateSub(absItemPos, mBase);          // the piece [s, p]
+        Value * const p = b.CreateAdd(s, b.getInt64(mL - 1));
+        BasicBlock * const hit = b.CreateBasicBlock("lenHit");
+        BasicBlock * const miss = b.CreateBasicBlock("lenMiss");
+        BasicBlock * const done = b.CreateBasicBlock("lenDone");
+        Value * id = nullptr;
+        Value * xk = nullptr;                       // L = 3, 4: bytes s .. s + L - 1, s lowest
+        if (mL == 2) {
+            id = pairId(b, p);
+            b.CreateLikelyCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), hit, miss);
+        } else if (mL <= 4) {
+            Value * x = b.CreateAlignedLoad(i32, b.CreateGEP(i8, mBytes, s), 1);
+            if (mL == 3) x = b.CreateAnd(x, b.getInt32(0xFFFFFF));
+            xk = x;
+            Value * way = nullptr;
+            std::tie(way, id) = probe32(b, mTable, mL, x);
+            b.CreateLikelyCondBr(b.CreateICmpULT(way, b.getInt32(8)), hit, miss);
+        } else {                                    // u64 keys (L <= 8) or k0, k1 pairs
+            const unsigned bits = gTailLenTab[mL].bits;
+            // bytes s .. s + 7: the key's first 8 bytes (L <= 8: its low L bytes are the key)
+            Value * const k0 = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, s), 1);
+            Value * h = nullptr, * splat = nullptr;
+            if (mL <= 8) {
+                Value * const key = mL == 8 ? k0 : b.CreateAnd(k0, b.getInt64((uint64_t(1) << (8 * mL)) - 1));
+                h = b.CreateMul(key, b.getInt64(gTailLenTab[mL].mult));
+                splat = b.CreateVectorSplat(8, key);
+            } else {
+                // bytes p - 7 .. p (p - 7 > s): the key's last L - 8 bytes at the top
+                Value * const top = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(7))), 1);
+                Value * const k1 = b.CreateLShr(top, b.getInt64(8 * (16 - mL)));
+                h = b.CreateMul(b.CreateXor(k0, b.CreateMul(k1, b.getInt64(kTailLenM1))), b.getInt64(gTailLenTab[mL].mult));
+                Value * v = UndefValue::get(FixedVectorType::get(i64, 8));
+                for (unsigned i = 0; i < 8; i++) v = b.CreateInsertElement(v, i % 2 ? k1 : k0, b.getInt32(i));
+                splat = v;
+            }
+            Value * const bucket = b.CreateLShr(h, b.getInt64(64 - bits));
+            Value * const set = b.CreateGEP(i8, mTable, b.CreateShl(bucket, b.getInt64(6)));
+            Value * const keys = b.CreateAlignedLoad(FixedVectorType::get(i64, 8), set, 64);
+            Value * mask = b.CreateZExt(b.CreateBitCast(b.CreateICmpEQ(keys, splat), i8), i32);
+            if (mL <= 8) mask = b.CreateAnd(mask, b.getInt32(0x3F));               // ways 0 .. 5
+            else mask = b.CreateAnd(b.CreateAnd(mask, b.CreateLShr(mask, b.getInt32(1))), b.getInt32(0x15));
+            Value * way = b.CreateCountForwardZeroes(b.CreateOr(mask, b.getInt32(0x100)));
+            if (mL > 8) way = b.CreateLShr(way, b.getInt32(1));                       // 0, 1, 2; 4: none
+            const unsigned ways = tailLenWays(mL);
+            id = b.CreateLoad(i16, b.CreateGEP(i8, set, b.CreateZExt(b.CreateAdd(b.getInt32(48), b.CreateShl(way, b.getInt32(1))), i64)));
+            b.CreateLikelyCondBr(b.CreateICmpULT(way, b.getInt32(ways)), hit, miss);
+        }
+        b.SetInsertPoint(hit);                      // one token at the start
+        b.CreateStore(id, b.CreateGEP(i16, mRes, s));
+        b.CreateBr(done);
+        b.SetInsertPoint(miss);
+        if (mL == 2) {                              // two tokens: the second starts at e
+            Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(p, 6));   // atomic: see tailLenEmit
+            b.CreateAtomicRMW(AtomicRMWInst::Or, ew, b.CreateShl(b.getInt64(1), b.CreateAnd(p, b.getInt64(63))),
+                              MaybeAlign(8), AtomicOrdering::Monotonic);
+            b.CreateBr(done);
+        } else if (mPairCheck && mL == 3) {         // two or three tokens, from the pair rules
+            Value * const x = b.CreateZExt(xk, i64);
+            Value * const c0 = b.CreateAnd(x, b.getInt64(0xFF));
+            Value * const c1 = b.CreateAnd(b.CreateLShr(x, b.getInt64(8)), b.getInt64(0xFF));
+            Value * const c2 = b.CreateLShr(x, b.getInt64(16));
+            Value * const idL = b.CreateLoad(i16, b.CreateGEP(i16, mPairs, b.CreateOr(b.CreateShl(c0, b.getInt64(8)), c1)));
+            Value * const idR = b.CreateLoad(i16, b.CreateGEP(i16, mPairs, b.CreateOr(b.CreateShl(c1, b.getInt64(8)), c2)));
+            Value * const none = b.CreateICmpEQ(b.CreateAnd(idL, idR), b.getInt16(0xFFFF));
+            Value * const left = b.CreateICmpULE(idL, idR);           // (a, b) merges; 0xFFFF: no rule
+            // a b c: the token at s or s + 1 (none: rewrite s + 1's base id); emit bits at s + 1,
+            // s + 2: none 11, left (ab c) 10, right (a bc) 01.
+            Value * const q = b.CreateAdd(s, b.getInt64(1));
+            Value * const at = b.CreateSelect(b.CreateAnd(left, b.CreateNot(none)), s, q);
+            Value * const rp = b.CreateGEP(i16, mRes, at);
+            Value * const id3 = b.CreateSelect(none, b.CreateLoad(i16, rp), b.CreateSelect(left, idL, idR));
+            b.CreateStore(id3, rp);
+            Value * const m = b.CreateSelect(none, b.getInt64(3), b.CreateSelect(left, b.getInt64(2), b.getInt64(1)));
+            Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(q, b.getInt64(6)));   // atomic: see tailLenEmit
+            Value * const off = b.CreateAnd(q, b.getInt64(63));
+            b.CreateAtomicRMW(AtomicRMWInst::Or, ew, b.CreateShl(m, off), MaybeAlign(8), AtomicOrdering::Monotonic);
+            BasicBlock * const straddle = b.CreateBasicBlock("len3Straddle");
+            b.CreateUnlikelyCondBr(b.CreateAnd(b.CreateICmpEQ(off, b.getInt64(63)), b.CreateICmpUGE(m, b.getInt64(2))),
+                                   straddle, done);
+            b.SetInsertPoint(straddle);         // s + 2 in the next word
+            b.CreateAtomicRMW(AtomicRMWInst::Or, b.CreateGEP(i64, ew, b.getInt64(1)), b.getInt64(1), MaybeAlign(8),
+                              AtomicOrdering::Monotonic);
+            b.CreateBr(done);
+        } else if (mPairCheck) {                    // L = 4: two to four tokens (--len4-pair-check)
+            Value * const x = b.CreateZExt(xk, i64);
+            Value * c[4];
+            for (unsigned i = 0; i < 4; i++) c[i] = b.CreateAnd(b.CreateLShr(x, b.getInt64(8 * i)), b.getInt64(0xFF));
+            Value * pr[3];
+            for (unsigned i = 0; i < 3; i++)
+                pr[i] = b.CreateLoad(i16, b.CreateGEP(i16, mPairs, b.CreateOr(b.CreateShl(c[i], b.getInt64(8)), c[i + 1])));
+            auto token3 = [&](Value * k) {          // the id of a 3-byte token whose BPE is itself, or 0xFFFF
+                auto [way, id3] = probe32(b, mTable3, 3, k);
+                return b.CreateSelect(b.CreateICmpULT(way, b.getInt32(8)), id3, b.getInt16(0xFFFF));
+            };
+            Value * const tABC = token3(b.CreateAnd(xk, b.getInt32(0xFFFFFF)));
+            Value * const tBCD = token3(b.CreateLShr(xk, b.getInt32(8)));
+            Value * const F = b.getInt16(0xFFFF);
+            Value * const none = b.CreateICmpEQ(b.CreateAnd(b.CreateAnd(pr[0], pr[1]), pr[2]), F);
+            Value * const w0 = b.CreateAnd(b.CreateICmpULE(pr[0], pr[1]), b.CreateICmpULE(pr[0], pr[2]));
+            Value * const w1 = b.CreateAnd(b.CreateNot(w0), b.CreateICmpULE(pr[1], pr[2]));
+            // the second merge: X (left) or Y (right), the lower id; neither when both are 0xFFFF
+            Value * const X = b.CreateSelect(b.CreateOr(w0, w1), tABC, pr[0]);
+            Value * const Y = b.CreateSelect(w0, pr[2], tBCD);
+            Value * const neither = b.CreateICmpEQ(b.CreateAnd(X, Y), F);
+            Value * const xFirst = b.CreateICmpULT(X, Y);
+            // the result: 0 a b c d, 1 ab c d, 2 abc d, 3 ab cd, 4 a bc d, 5 a bcd, 6 a b cd
+            auto k3 = [&](unsigned n, unsigned xs, unsigned ys) {
+                return b.CreateSelect(neither, b.getInt64(n), b.CreateSelect(xFirst, b.getInt64(xs), b.getInt64(ys)));
+            };
+            Value * const k = b.CreateSelect(none, b.getInt64(0),
+                                b.CreateSelect(w0, k3(1, 2, 3), b.CreateSelect(w1, k3(4, 2, 5), k3(6, 3, 5))));
+            auto is = [&](unsigned v) { return b.CreateICmpEQ(k, b.getInt64(v)); };
+            // ids at s, s + 1, s + 2 (else the base id already there); emit bits at s + 1 .. s + 3
+            Value * r[3];
+            for (unsigned i = 0; i < 3; i++) r[i] = b.CreateGEP(i16, mRes, b.CreateAdd(s, b.getInt64(i)));
+            b.CreateStore(b.CreateSelect(is(2), tABC, b.CreateSelect(b.CreateOr(is(1), is(3)), pr[0], b.CreateLoad(i16, r[0]))), r[0]);
+            b.CreateStore(b.CreateSelect(is(4), pr[1], b.CreateSelect(is(5), tBCD, b.CreateLoad(i16, r[1]))), r[1]);
+            b.CreateStore(b.CreateSelect(b.CreateOr(is(3), is(6)), pr[2], b.CreateLoad(i16, r[2])), r[2]);
+            constexpr uint64_t kEmits = 7 | 6 << 4 | 4 << 8 | 2 << 12 | 5 << 16 | 1 << 20 | 3 << 24;
+            Value * const m = b.CreateAnd(b.CreateLShr(b.getInt64(kEmits), b.CreateShl(k, b.getInt64(2))), b.getInt64(7));
+            Value * const q = b.CreateAdd(s, b.getInt64(1));
+            Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(q, b.getInt64(6)));   // atomic: see tailLenEmit
+            Value * const off = b.CreateAnd(q, b.getInt64(63));
+            b.CreateAtomicRMW(AtomicRMWInst::Or, ew, b.CreateShl(m, off), MaybeAlign(8), AtomicOrdering::Monotonic);
+            BasicBlock * const straddle = b.CreateBasicBlock("len4Straddle");
+            b.CreateUnlikelyCondBr(b.CreateICmpUGT(off, b.getInt64(61)), straddle, done);
+            b.SetInsertPoint(straddle);             // s + 2 or s + 3 in the next word
+            b.CreateAtomicRMW(AtomicRMWInst::Or, b.CreateGEP(i64, ew, b.getInt64(1)), b.CreateLShr(m, b.CreateSub(b.getInt64(64), off)),
+                              MaybeAlign(8), AtomicOrdering::Monotonic);
+            b.CreateBr(done);
+        } else {
+            Function * const fn = linked(b, "bpe_len_miss");
+            b.CreateCall(fn->getFunctionType(), fn, {mBytes, mRes, mEmit, s, b.getInt64(mL), b.CreateAdd(mN, b.getInt64(mL - 1))});
+            b.CreateBr(done);
+        }
+        b.SetInsertPoint(done);
+    }
+    void finalize(KernelBuilder & b, std::vector<Value *> &) override {
+        if (mL == 2) return;                        // (no miss path)
+        Function * const fn = linked(b, "bpe_len_flush");
+        b.CreateCall(fn->getFunctionType(), fn, {mBytes, mRes, mEmit});
+    }
+    // Each length's table under a name of its own: the JIT resolves a linked name once for the
+    // whole pipeline, so kernels linking one name to different functions would share one of them.
+    std::string tableName() const { return "bpe_len" + std::to_string(mL) + "_table"; }
+public:
+    static std::string tableNameFor(unsigned L) { return "bpe_len" + std::to_string(L) + "_table"; }
+protected:
+    const unsigned mL;
+    const bool mPairCheck;                          // --len3-pair-check, --len4-pair-check
+    Value * mPairs = nullptr;                       // the pair table
+    Value * mTable3 = nullptr;                      // L = 4: the length-3 table
+    Value * mN = nullptr, * mBase = nullptr;
+    Value * mBytes = nullptr, * mRes = nullptr, * mEmit = nullptr, * mTable = nullptr;
+};
+
+// --len-scan: the tables. The pair table from gTail.pair (rules of two base ids); the L-byte token
+// tables from every rule's bytes (gTail.slots: (idA << 16 | idB) << 16 | idAB), keeping the tokens
+// whose BPE on their own bytes is themselves.
+static void tailLenBuildTables(unsigned N) {
+    gTailPairBytes.assign(65536, 0xFFFF);
+    unsigned nPairs = 0;
+    for (unsigned b0 = 0; b0 < 256; b0++)
+        for (unsigned b1 = 0; b1 < 256; b1++) {
+            const uint16_t id = gTail.pair[(bpeBaseId(b0) << 8) | bpeBaseId(b1)];
+            gTailPairBytes[(b0 << 8) | b1] = id;
+            nPairs += id != 0xFFFF;
+        }
+    std::cerr << "[BPE] --len-scan=" << N << ": " << nPairs << " byte-pair rules";
+    if (N >= 3) {
+        std::unordered_map<uint32_t, uint32_t> parts;            // idAB -> idA << 16 | idB
+        for (uint64_t e : gTail.slots) if (e != kTailEmpty) parts[uint32_t(e & 0xFFFF)] = uint32_t(e >> 16);
+        std::unordered_map<uint32_t, std::string> memo;
+        std::function<const std::string &(uint32_t)> bytesOf = [&](uint32_t id) -> const std::string & {
+            auto it = memo.find(id);
+            if (it != memo.end()) return it->second;
+            std::string str;
+            if (id < 256) { for (unsigned by = 0; by < 256; by++) if (bpeBaseId(by) == id) str = std::string(1, char(by)); }
+            else { const uint32_t ab = parts.at(id); str = bytesOf(ab >> 16) + bytesOf(ab & 0xFFFF); }
+            return memo.emplace(id, std::move(str)).first->second;
+        };
+        // BPE_LEN_LOAD: the buckets' load at most (default 0.5), sizing each length's table
+        const char * const loadEnv = std::getenv("BPE_LEN_LOAD");
+        const double load = loadEnv ? std::atof(loadEnv) : 0.5;
+        size_t totalKB = 0;
+        unsigned totalDropped = 0, totalTries = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (unsigned L = 3; L <= N; L++) {
+            struct Tok { uint64_t k0, k1; uint16_t id; };
+            std::vector<Tok> toks;
+            for (const auto & kv : parts) {
+                const std::string & str = bytesOf(kv.first);
+                if (str.size() != L) continue;
+                uint16_t t[kTailLenMax]; uint32_t pos[kTailLenMax]; size_t m = L;
+                for (unsigned i = 0; i < L; i++) { t[i] = gTailBase[uint8_t(str[i])]; pos[i] = i; }
+                tailMergeSegment(t, pos, m);
+                if (m != 1 || t[0] != kv.first) continue;
+                Tok tk{0, 0, uint16_t(kv.first)};
+                for (unsigned i = 0; i < L; i++) (i < 8 ? tk.k0 : tk.k1) |= uint64_t(uint8_t(str[i])) << (8 * (i % 8));
+                if (tk.k0 == 0) continue;                                // (no such token)
+                toks.push_back(tk);
+            }
+            std::sort(toks.begin(), toks.end(), [](const Tok & x, const Tok & y) { return x.id < y.id; });
+            const unsigned ways = tailLenWays(L);
+            TailLenTable & tab = gTailLenTab[L];
+            tab.bits = std::max(4u, unsigned(ceil_log2(size_t(std::ceil(toks.size() / (ways * load))))));
+            // the value multiplied: the u32 key (L <= 4), the u64 key, or k0 ^ k1 * kTailLenM1
+            std::vector<uint64_t> pre(toks.size());
+            for (size_t i = 0; i < toks.size(); i++)
+                pre[i] = L <= 4 ? uint32_t(toks[i].k0) : L <= 8 ? toks[i].k0 : toks[i].k0 ^ (toks[i].k1 * kTailLenM1);
+            auto bucketOf = [&](uint64_t v, uint64_t mult) -> size_t {
+                return L <= 4 ? size_t(uint32_t(uint32_t(v) * uint32_t(mult)) >> (32 - tab.bits))
+                              : size_t((v * mult) >> (64 - tab.bits));
+            };
+            const uint64_t fixed = L <= 4 ? kLenMult32 : kTailLenM;
+            tab.mult = fixed;
+            // --len-hash-search: the first multiplier with no full bucket, of up to LenHashSearch tried at
+            // each size (the fixed one first, then a splitmix64 sequence), from the size of the load
+            // asked for up; with no search, the fixed one (the length-4 table grown until complete
+            // for --len4-pair-check).
+            if (LenHashSearch) {
+                std::vector<uint8_t> fill;
+                uint64_t seed = 0x5DEECE66Dull * L;
+                auto nextMult = [&] {
+                    uint64_t z = (seed += 0x9E3779B97F4A7C15ull);
+                    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                    z = (z ^ (z >> 31)) | 1;
+                    return L <= 4 ? uint64_t(uint32_t(z) | 1) : z;
+                };
+                for (bool found = false; !found && tab.bits < 20; tab.bits += !found) {
+                    fill.assign(size_t(1) << tab.bits, 0);
+                    // A size is searched only if the expected tries are within the budget: e^lambda,
+                    // lambda the mean number of over full buckets of 8 multipliers.
+                    double lambda = 0;
+                    for (unsigned t = 0; t < 8; t++) {
+                        const uint64_t m = t ? nextMult() : fixed;
+                        unsigned over = 0;
+                        for (uint64_t v : pre) over += ++fill[bucketOf(v, m)] == ways + 1;
+                        for (uint64_t v : pre) fill[bucketOf(v, m)] = 0;
+                        lambda += over / 8.0;
+                        totalTries++;
+                        if (over == 0) { found = true; tab.mult = m; break; }
+                    }
+                    if (found || lambda > std::log(double(LenHashSearch)) + 2) continue;
+                    for (unsigned t = 0; t < LenHashSearch && !found; t++) {
+                        const uint64_t m = nextMult();
+                        size_t i = 0;
+                        for (; i < pre.size(); i++)
+                            if (++fill[bucketOf(pre[i], m)] > ways) break;
+                        totalTries++;
+                        if (i == pre.size()) { found = true; tab.mult = m; break; }
+                        for (size_t j = 0; j <= i; j++) fill[bucketOf(pre[j], m)] = 0;   // undo the try
+                    }
+                }
+            }
+            unsigned dropped = 0;
+            for (;;) {                                                   // grown for --len4-pair-check
+                tab.buckets.assign(size_t(1) << tab.bits, TailLenBucket{});
+                dropped = 0;
+                for (size_t i = 0; i < toks.size(); i++) {                    // in rank order
+                    const Tok & tk = toks[i];
+                    unsigned w = 0;
+                    if (L <= 4) {
+                        TailLenBucket & bk = tab.buckets[bucketOf(pre[i], tab.mult)];
+                        while (w < ways && bk.key[w] != 0) w++;
+                        if (w < ways) { bk.key[w] = uint32_t(tk.k0); bk.id[w] = tk.id; }
+                    } else if (L <= 8) {
+                        auto & bk = reinterpret_cast<TailLenBucket64 &>(tab.buckets[bucketOf(pre[i], tab.mult)]);
+                        while (w < ways && bk.key[w] != 0) w++;
+                        if (w < ways) { bk.key[w] = tk.k0; bk.id[w] = tk.id; }
+                    } else {
+                        auto & bk = reinterpret_cast<TailLenBucket128 &>(tab.buckets[bucketOf(pre[i], tab.mult)]);
+                        while (w < ways && bk.key[2 * w] != 0) w++;
+                        if (w < ways) { bk.key[2 * w] = tk.k0; bk.key[2 * w + 1] = tk.k1; bk.id[w] = tk.id; }
+                    }
+                    dropped += w == ways;
+                }
+                if (!(dropped && L == 4 && Len4PairCheck && tab.bits < 20)) break;
+                tab.bits++;
+            }
+            tab.dropped = dropped;
+            totalKB += tab.buckets.size() * 64 / 1024;
+            totalDropped += dropped;
+            std::cerr << (L == 3 ? "; L:tokens/KB/left out " : " ") << L << ":" << toks.size() << "/"
+                      << (tab.buckets.size() * 64 / 1024) << "/" << dropped;
+        }
+        std::cerr << "; " << totalKB << " KB, " << totalDropped << " left out (load " << load << ")";
+        if (LenHashSearch)
+            std::cerr << "; " << totalTries << " multipliers tried in "
+                      << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() << " ms";
+    }
+    std::cerr << "\n";
+}
+
+static void linkTailWalkIR(PipelineBuilder & P, Kernel * k) {
+    P.LinkFunction(k, "bpe_tail_ir_begin", tailWalkBeginIR<kTailCacheWays>);
+    P.LinkFunction(k, "bpe_tail_ir_slow", tailWalkSlowIR<kTailCacheWays>);
+    P.LinkFunction(k, "bpe_tail_walk_start", tailWalkStart<kTailCacheWays>);
+    P.LinkFunction(k, "bpe_tail_walk_end", tailWalkEnd<kTailCacheWays>);
+}
+
+// BPE_DUMP=<prefix> (debug): write the byte offsets of the marks of each dumped stream to
+// <prefix>.<name> at exit, one per line, ascending. Every dump scans the source byte stream
+// (the input buffer, --memsource-in-place); its first byte is always a pretoken start, so the
+// lowest pointer of the "segs" dump is the base.
+static constexpr unsigned kBpeDumpSlots = 12;
+static std::mutex gBpeDumpMutex;
+static std::vector<const uint8_t *> gBpeDumpPos[kBpeDumpSlots];
+static std::string gBpeDumpName[kBpeDumpSlots];
+static unsigned gBpeDumpCount = 0;
+static void bpeDumpWrite() {
+    const char * const prefix = std::getenv("BPE_DUMP");
+    const uint8_t * base = nullptr;
+    for (unsigned k = 0; k < gBpeDumpCount; k++)
+        if (gBpeDumpName[k] == "segs" && !gBpeDumpPos[k].empty())
+            base = *std::min_element(gBpeDumpPos[k].begin(), gBpeDumpPos[k].end());
+    if (base == nullptr) return;
+    for (unsigned k = 0; k < gBpeDumpCount; k++) {
+        std::vector<size_t> off;
+        for (const uint8_t * q : gBpeDumpPos[k]) off.push_back(size_t(q - base));
+        std::sort(off.begin(), off.end());
+        std::ofstream out(std::string(prefix) + "." + gBpeDumpName[k]);
+        for (size_t o : off) out << o << "\n";
+    }
+}
+template <unsigned K> void bpeDumpCallback(const uint8_t * p) {
+    std::lock_guard<std::mutex> lock(gBpeDumpMutex);
+    gBpeDumpPos[K].push_back(p);
+}
+template <unsigned... K>
+static void (*bpeDumpCallbackFor(unsigned k, std::integer_sequence<unsigned, K...>))(const uint8_t *) {
+    static void (* const table[])(const uint8_t *) = {bpeDumpCallback<K>...};
+    return table[k];
+}
+void bpeDumpStream(PipelineBuilder & P, StreamSet * bytes, StreamSet * marks, const std::string & name) {
+    if (gBpeDumpCount == kBpeDumpSlots) return;
+    if (gBpeDumpCount == 0) std::atexit(bpeDumpWrite);
+    const unsigned k = gBpeDumpCount++;
+    gBpeDumpName[k] = name;
+    StreamSet * const idx = P.CreateStreamSet(1, 64);
+    P.CreateKernelCall<ScanIndexGenerator>(marks, idx);
+    const std::string fn = "bpe_dump_" + std::to_string(k);
+    Kernel * const r = P.CreateKernelCall<ScanReader>(bytes, idx, fn);
+    void (* const cb)(const uint8_t *) = bpeDumpCallbackFor(k, std::make_integer_sequence<unsigned, kBpeDumpSlots>{});
+    P.LinkFunction(r, fn, FunctionTypeBuilder<void(const uint8_t *)>::get(P.getTypeSystem().getContext()),
+                   reinterpret_cast<void *>(cb));
+}
+
+void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * basis, StreamSet * segs,
+                             StreamSet * cutClassSet) {
+    StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
-    Kernel * const r = P.CreateKernelCall<BPETailByteResolveKernel>(bytes, segs, res, emit);
-    P.LinkFunction(r, "bpe_tail_resolve_bytes", bpe_tail_resolve_bytes);
-    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
-    P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+    StreamSet * open = P.CreateStreamSet(1, 1);
+    StreamSet * seg = P.CreateStreamSet(1, 1);
+    if ((TailUnitCuts || TailUnitSeed || PairCuts || (ByteRunCuts.getNumOccurrences() > 0 && ByteRunCuts != 0)) && !TailScanKernel) {
+        std::cerr << "tokenizer: --tail-unit-cuts, --tail-unit-seed, --byte-run-cuts and --pair-cuts need --tail-scan-kernel\n";
+        std::exit(1);
+    }
+    if (PairCuts > 3) {
+        std::cerr << "tokenizer: --pair-cuts is 0, 1, 2 or 3\n";
+        std::exit(1);
+    }
+    if (TailScanKernel && tailUnitCuts()) {
+        // frozen bytes: base id in no rule, as left or right part (gTail.left / right)
+        std::array<uint64_t, 4> frozen{};
+        unsigned nFrozen = 0;
+        for (unsigned by = 0; by < 256; by++) {
+            const unsigned id = bpeBaseId(by);
+            if (((gTail.left[id >> 6] | gTail.right[id >> 6]) >> (id & 63)) & 1) continue;
+            frozen[by >> 6] |= 1ull << (by & 63);
+            nFrozen++;
+        }
+        std::cerr << "[BPE] --tail-unit-cuts: " << nFrozen << " frozen bytes"
+                  << (TailUnitSeed ? ", ids seeded from bit streams (--tail-unit-seed)" : "") << "\n";
+        StreamSet * cuts = P.CreateStreamSet(1, 1);
+        StreamSet * unit = lenScan() ? nullptr : P.CreateStreamSet(1, 1);   // (see BPEUnitCutsKernel)
+        StreamSet * scan = lenScan() ? nullptr : P.CreateStreamSet(1, 1);
+        BPERunCutParams runs;
+        runs.cutN = !byteRunCuts() ? 0 : ByteRunCuts == 1 ? 2 : unsigned(ByteRunCuts);
+        if (runs.cutN) {
+            unsigned nHard = 0;
+            for (unsigned by = 0; by < 256; by++)
+                if (((frozen[by >> 6] >> (by & 63)) & 1) == 0 && isHardPair(uint8_t(by), uint8_t(by))) {
+                    runs.hardSelf[by >> 6] |= 1ull << (by & 63);
+                    nHard++;
+                }
+            runs.edges = ByteRunEdges;
+            runs.guard = ByteRunGuard;
+            for (unsigned c = 0; c < 128; c++) {     // the run bytes: ASCII hard self-pair bytes
+                if (((runs.hardSelf[c >> 6] >> (c & 63)) & 1) == 0) continue;
+                if (ByteRunBytes == 0 && c != 0x20) continue;
+                BPEHardRun r{uint8_t(c), {}, {}};
+                for (unsigned x = 0; x < 256; x++) {
+                    if (x == c) continue;
+                    if (isHardPair(uint8_t(x), uint8_t(c))) r.pre[x >> 6] |= 1ull << (x & 63);
+                    if (isHardPair(uint8_t(c), uint8_t(x))) r.suf[x >> 6] |= 1ull << (x & 63);
+                }
+                runs.hardRuns.push_back(r);
+            }
+            std::cerr << "[BPE] --byte-run-cuts=" << runs.cutN << ": " << runs.hardRuns.size() << " ASCII hard self-pair bytes ("
+                      << nHard << " in all)" << (runs.edges ? ", edges " + std::to_string(runs.edges) : std::string()) << (runs.guard ? ", guarded" : "") << "\n";
+        }
+        StreamSet * pairCutSet = nullptr;
+        const bool combined = pairCuts() && PairCuts == 3;            // BPE_Cuts
+        if (combined && (!lenScan() || cutClassSet == nullptr)) {
+            std::cerr << "tokenizer: --pair-cuts=3 needs --len-scan and the pretokenizer's classes on the UTF-8 bytes "
+                         "(--pretok-class-code --pretok-byte-domain --pretok-utf8-classes)\n";
+            std::exit(1);
+        }
+        if (pairCuts()) {
+            std::vector<uint16_t> inside;
+            uint64_t h = 1469598103934665603ull;
+            unsigned nHigh = 0;
+            for (unsigned k = 0; k < 65536; k++) {
+                if (isHardPair(uint8_t(k >> 8), uint8_t(k))) continue;
+                inside.push_back(uint16_t(k));
+                nHigh += (k & 0x8080) != 0;
+                h = (h ^ k) * 1099511628211ull;
+            }
+            char tag[24];
+            std::snprintf(tag, sizeof(tag), "%016llx", (unsigned long long) h);
+            std::cerr << "[BPE] --pair-cuts: " << inside.size() << " byte pairs inside tokens ("
+                      << inside.size() - nHigh << " ASCII, " << nHigh << " with a byte >= 0x80)"
+                      << (PairCuts == 3 ? ", cut classes and the pairs in and after codepoints"
+                          : PairCuts == 2 ? ", only those with a byte >= 0x80 cut" : PairCutGuard ? ", guarded" : "") << "\n";
+            if (combined) {                     // only the frozen bytes that start no codepoint
+                std::array<uint64_t, 4> noStart{};
+                for (unsigned by = 0; by < 256; by++)
+                    if (((frozen[by >> 6] >> (by & 63)) & 1) && ((by & 0xC0) == 0x80 || by == 0xC0 || by == 0xC1 || by >= 0xF5))
+                        noStart[by >> 6] |= 1ull << (by & 63);
+                P.CreateKernelCall<BPECutsKernel>(basis, segs, cutClassSet, cuts, noStart, runs, std::move(inside), tag);
+            } else {
+                pairCutSet = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<BPEPairCutsKernel>(basis, pairCutSet, std::move(inside), unsigned(PairCuts),
+                                                      bool(PairCutGuard), tag);
+            }
+        }
+        if (!combined) P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen, runs, pairCutSet);
+        if (std::getenv("BPE_DUMP")) {
+            bpeDumpStream(P, bytes, segs, "segs");
+            bpeDumpStream(P, bytes, cuts, "cuts");
+        }
+        StreamSet * resIn = nullptr;
+        if (TailUnitSeed) {
+            StreamSet * ids8 = P.CreateStreamSet(8, 1);
+            P.CreateKernelCall<BPEBaseIdKernel>(basis, ids8);
+            resIn = P.CreateStreamSet(1, 16);
+            StreamSets idSets{ids8};
+            P.CreateKernelCall<P2S16Kernel>(idSets, resIn);
+        }
+        StreamSet * scanIn = scan, * unitIn = unit;
+        StreamSet * lenStarts = nullptr;
+        if (LenScan > kTailLenMax) {
+            std::cerr << "tokenizer: --len-scan supports N = 2 .. " << kTailLenMax << "\n";
+            std::exit(1);
+        }
+        const bool longKernel = lenScan() && TailUnitSeed && LenLongKernel;
+        if (lenScan()) {
+            tailLenBuildTables(LenScan);
+            scanIn = P.CreateStreamSet(1, 1);
+            unitIn = P.CreateStreamSet(1, 1);
+            lenStarts = P.CreateStreamSet(LenScan - 1, 1);         // stream L - 2: the starts of length L
+            P.CreateKernelCall<BPELenSelectKernel>(unsigned(LenScan), cuts, scanIn, unitIn, lenStarts,
+                                                   std::vector<unsigned>(LenSelectIf.begin(), LenSelectIf.end()),
+                                                   longKernel);
+        }
+        TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the cuts
+        if (longKernel) {                    // scanIn: the long pieces' starts; unitIn: cover
+            Kernel * const r = P.CreateKernelCall<BPELongPiecesKernel>(bytes, scanIn, cuts, unitIn, resIn,
+                                                                       res, emit, open, seg);
+            P.LinkFunction(r, "bpe_long_block", bpe_long_block);
+        } else {
+            const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
+            Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, scanIn, res, emit, open, seg, cacheWays,
+                                                                     cuts, unitIn, resIn);
+            linkTailWalkIR(P, r);
+        }
+        if (lenScan()) {                     // BPE_len<L>_pretokenScan, chained on res and emit
+            for (unsigned L = 2; L <= LenScan; L++) {
+                StreamSet * const resL = P.CreateStreamSet(1, 16);
+                StreamSet * const emitL = P.CreateStreamSet(1, 1);
+                Kernel * const kL = P.CreateKernelCall<BPELenScanKernel>(L, lenStarts, bytes,
+                                                                         res, emit, resL, emitL);
+                if (L == 2) P.LinkFunction(kL, BPELenScanKernel::tableNameFor(2), tailLenTable2);
+                else {
+                    P.LinkFunction(kL, BPELenScanKernel::tableNameFor(L),
+                                  FunctionTypeBuilder<uint64_t()>::get(P.getTypeSystem().getContext()),
+                                  reinterpret_cast<void *>(kTailLenTables[L]));
+                    P.LinkFunction(kL, "bpe_len_miss", bpe_len_miss);
+                    P.LinkFunction(kL, "bpe_len_flush", bpe_len_flush);
+                    if ((L == 3 && tailLen3PairCheck()) || (L == 4 && tailLen4PairCheck()))
+                        P.LinkFunction(kL, BPELenScanKernel::tableNameFor(2), tailLenTable2);
+                    if (L == 4 && tailLen4PairCheck())
+                        P.LinkFunction(kL, BPELenScanKernel::tableNameFor(3),
+                                       FunctionTypeBuilder<uint64_t()>::get(P.getTypeSystem().getContext()),
+                                       reinterpret_cast<void *>(kTailLenTables[3]));
+                }
+                res = resL;
+                emit = emitL;
+            }
+        }
+    } else if (TailScanKernel) {
+        TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the starts
+        const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
+        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, segs, res, emit, open, seg, cacheWays);
+        linkTailWalkIR(P, r);
+    } else {
+        Kernel * const r = P.CreateKernelCall<BPETailByteResolveKernel>(bytes, segs, res, emit, open, seg);
+        P.LinkFunction(r, "bpe_tail_resolve_bytes", bpe_tail_resolve_bytes);
+    }
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit, open, seg, bool(TailSIMDEmit));
+    linkTailEmit(P, k);
 }
 
 // --tail-direct-input: the tail's segment starts, the word starts that are live tokens (what
@@ -1743,12 +4733,14 @@ void buildBPETailEmitter(PipelineBuilder & P, StreamSet * ids, StreamSet * start
     } else {
         P.CreateKernelCall<P2S16Kernel>(ids, ids16);
     }
-    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
-    Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit);
+    StreamSet * open = P.CreateStreamSet(1, 1);
+    StreamSet * seg = P.CreateStreamSet(1, 1);
+    Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit, open, seg);
     P.LinkFunction(r, "bpe_tail_resolve", bpe_tail_resolve);
-    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
-    P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit, open, seg, bool(TailSIMDEmit));
+    linkTailEmit(P, k);
 }
 
 // Merge-back at one retirement point, in Fp: `later` = the tokens that survived the point,
@@ -3367,45 +6359,21 @@ static bool bitXfrmEligible(const MergeRuleGroup & g) {
 // buildBPEPassPipeline — real BPE merge on the id stream.
 //   1. buildMergeRuleRanges() partitions merges into clean id-ranges (dependency-independent
 //      + token-adjacency-overlap-free, rank order).
-//   2. BPERangeSeed seeds source = base id of each RAW byte (active=1s, end=0s).
+//   2. BPEBaseIdKernel seeds source = base id of each RAW byte (active=1s).
 //   3. One BPEMergeKernel per range (ascending = rank order) glues adjacent ids:
 //      for each rule (A,B→AB) it detects A's end, checks B at +lenB, stamps idAB.
 //      `source` threads kernel→kernel; lower-rank merges feed higher-rank ones.
 //   Returns (matchEnd, vocabID=source). NOTE: emission is Stage-B debug —
 //   matchEnd = active (all ones) prints the id at EVERY byte, so stale interior
 //   ids of swallowed parts still show. Correct emission (consume) is Stage C.
-#ifdef __APPLE__
-// --vm-ring-buffers: the same layout as make_circular_buffer (m = 2 + hasUnderflow copies of
-// one size-byte region, back to back), built by mapping slot 0's pages over the other slots.
-static uint8_t * bpeVMRingBuffer(const size_t size, const size_t hasUnderflow) {
-    const size_t m = 2 + hasUnderflow;
-    const mach_port_t task = mach_task_self();
-    vm_address_t base = 0;
-    if (vm_allocate(task, &base, m * size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-        report_fatal_error("--vm-ring-buffers: vm_allocate failed");
-    for (size_t i = 1; i < m; i++) {
-        vm_address_t target = base + i * size;
-        vm_prot_t cur, max;
-        if (vm_remap(task, &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base,
-                     FALSE, &cur, &max, VM_INHERIT_DEFAULT) != KERN_SUCCESS || target != base + i * size)
-            report_fatal_error("--vm-ring-buffers: vm_remap failed");
-    }
-    return reinterpret_cast<uint8_t *>(base) + hasUnderflow * size;
-}
-#endif
-
 void bpeSetFrameworkHooks() {
-#ifdef __APPLE__
-    if (VMRingBuffers) kernel::CircularBufferAllocator = bpeVMRingBuffer;
-#else
-    if (VMRingBuffers) std::cerr << "[BPE] --vm-ring-buffers ignored: macOS only\n";
-#endif
+    if (VMRingBuffers) std::cerr << "[BPE] --vm-ring-buffers is retired: vm_remap is the macOS default\n";
     if (MemSourceBlockCapacity) kernel::MemorySourceBlockCapacity = true;
 }
-
+// builds the rule table
 // The --bpe-tail rule table (gTail) from the rules of groups `from` on; idBits: the width
 // of the ids reaching the tail. Returns the number of rules.
-static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, size_t from, unsigned idBits) {
+inline static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, size_t from, unsigned idBits) {
     size_t numRules = 0;
     for (size_t gi = from; gi < ruleRanges.size(); gi++) numRules += ruleRanges[gi].rules.size();
     const unsigned bits = std::max<unsigned>(4, ceil_log2(4 * numRules + 1));
@@ -3416,8 +6384,10 @@ static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, siz
     gTail.mask = (1u << bits) - 1;
     gTail.shift = 32 - bits;
     gTail.idBits = idBits;
+    gTail.pair.assign(65536, 0xFFFF);
     for (size_t gi = from; gi < ruleRanges.size(); gi++)
         for (const auto & r : ruleRanges[gi].rules) {
+            if (r.idA < 256 && r.idB < 256) gTail.pair[(r.idA << 8) | r.idB] = uint16_t(r.idAB);
             const uint32_t key = (r.idA << 16) | r.idB;
             uint32_t h = tailSlot(key);
             while (gTail.slots[h] != kTailEmpty && uint32_t(gTail.slots[h] >> 16) != key)
@@ -3426,7 +6396,315 @@ static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, siz
             gTail.left[r.idA >> 6] |= 1ull << (r.idA & 63);
             gTail.right[r.idB >> 6] |= 1ull << (r.idB & 63);
         }
+    if (TailBatchBPE) {                         // 4 x 2^bits slots, load <= 0.76
+        unsigned rb = std::max<unsigned>(4, ceil_log2((numRules + 3) / 4));
+        while (!tailRuleBuild(ruleRanges, from, rb)) rb++;
+    }
     return numRules;
+}
+
+// --tail-vocab-file=PATH (with --tail-vocab-table): keep the finished table in PATH, so later
+// runs read it instead of building it. The build runs BPE once over every token (~7.5 ms of
+// CPU on a thread of its own for GPT-2), and a short run starts before it is done: its first
+// words go without the table. A loaded table is published before the pipeline runs. The file
+// is keyed by the rules, the base ids, the set hash and the layout; a missing, stale or broken
+// file is built as without the flag and then written (temporary file + rename, so a run never
+// sees half a file). Runtime only, no cache tag.
+static cl::opt<std::string> TailVocabFile(
+    "tail-vocab-file",
+    cl::desc("With --tail-vocab-table: read the table from this file, or build it and write it "
+             "there when the file is missing or was made from other rules (default: none)."),
+    cl::init(""));
+static constexpr uint32_t kTailVocabFileVersion = 1;   // bump when the build's output changes
+struct TailVocabFileHeader {                           // the file: this, then 4 << bits entries
+    char magic[8];
+    uint32_t version, entrySize, keyMax, bits;
+    uint64_t key, stored, unreachable, full;
+    uint8_t pad[128 - 56];                             // entries 128-byte aligned, as built
+};
+static_assert(sizeof(TailVocabFileHeader) == 128, "vocabulary file header layout");
+static constexpr char kTailVocabMagic[8] = {'B', 'P', 'E', 'V', 'O', 'C', 'A', 'B'};
+static void * gTailVocabMap = nullptr;                 // the mapped file, while in use
+static size_t gTailVocabMapSize = 0;
+static uint64_t gTailVocabFileKey = 0;                 // the key the builder writes with
+
+// The vocabulary set of key (k0, k1), as the walk and the scan kernel compute it.
+static inline uint64_t tailVocabSetHash(uint64_t k0, uint64_t k1) {
+    return (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+}
+static inline uint64_t tailMix64(uint64_t x) {         // splitmix64's finalizer
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+// What the table is made from. The rules are summed (any group order gives the same key);
+// idAB = 256 + rank, so a reordered merge list changes it.
+static uint64_t tailVocabKey(const std::vector<MergeRuleGroup> & all) {
+    uint64_t sum = 0, n = 0;
+    for (const auto & g : all)
+        for (const MergeRule & r : g.rules) {
+            sum += tailMix64((uint64_t(r.idA) << 42) ^ (uint64_t(r.idB) << 21) ^ r.idAB);
+            n++;
+        }
+    uint64_t k = tailMix64(sum ^ tailMix64(n));
+    for (unsigned by = 0; by < 256; by++) k = tailMix64(k ^ (uint64_t(by) << 32) ^ gTailBase[by]);
+    const char * e = std::getenv("BPE_VOCAB_BITS");
+    k = tailMix64(k ^ (uint64_t(e ? std::atoi(e) : 0) << 48) ^ (uint64_t(kTailVocabFileVersion) << 32)
+                  ^ (sizeof(TailCacheEntry) << 8) ^ kTailByteKeyMax);
+    return tailMix64(k ^ tailVocabSetHash(0x0123456789ABCDEFull, 0x0F00000000000042ull));
+}
+// Publish the table in `path` if it was made with `key`; false (nothing changed) otherwise.
+static bool tailVocabLoad(const std::string & path, uint64_t key) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    TailVocabFileHeader hd;
+    const bool okHead = ::fstat(fd, &st) == 0 && size_t(st.st_size) >= sizeof hd
+        && ::pread(fd, &hd, sizeof hd, 0) == ssize_t(sizeof hd)
+        && std::memcmp(hd.magic, kTailVocabMagic, 8) == 0 && hd.version == kTailVocabFileVersion
+        && hd.entrySize == sizeof(TailCacheEntry) && hd.keyMax == kTailByteKeyMax && hd.key == key
+        && hd.bits >= 4 && hd.bits <= 24
+        && size_t(st.st_size) == sizeof hd + (sizeof(TailCacheEntry) << (hd.bits + 2));
+    void * map = okHead ? ::mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    if (map == MAP_FAILED) return false;
+    if (gTailVocabMap) ::munmap(gTailVocabMap, gTailVocabMapSize);
+    gTailVocabMap = map;
+    gTailVocabMapSize = size_t(st.st_size);
+    gTailVocabShift = 64 - hd.bits;
+    gTailVocab.store(reinterpret_cast<TailCacheEntry *>(static_cast<char *>(map) + sizeof hd),
+                     std::memory_order_release);
+    std::cerr << "[BPE] --tail-vocab-table: " << hd.stored << " tokens in "
+              << ((size_t(128) << hd.bits) / 1024) << " KB, read from " << path << " in "
+              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()
+              << " ms\n";
+    return true;
+}
+// Write the built table to `path` (all or nothing); the outcome, for the build's report line.
+static std::string tailVocabSave(const std::string & path, const TailVocabFileHeader & hd,
+                                 const TailCacheEntry * vocab) {
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    const size_t entries = size_t(4) << hd.bits;
+    FILE * f = std::fopen(tmp.c_str(), "wb");
+    bool ok = f && std::fwrite(&hd, sizeof hd, 1, f) == 1
+        && std::fwrite(vocab, sizeof(TailCacheEntry), entries, f) == entries;
+    if (f) ok = std::fclose(f) == 0 && ok;
+    if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) { std::remove(tmp.c_str()); return "; could not write " + path; }
+    return "; written to " + path;
+}
+
+struct TailVocabBytes { uint8_t len; uint8_t b[kTailByteKeyMax]; };   // len 0: longer than the key
+// --tail-vocab-layout=1: the tokens that BPE turns back into themselves, by key length, each length
+// in a region of 4-entry sets sized for the load BPE_VOCAB_LOAD; a token whose set is full goes to
+// the stash (none with BPE_VOCAB_STASH=0: it is left out). Published like the flat table.
+static void tailVocabBuildByLength(const std::vector<MergeRule> & rules, const std::vector<TailVocabBytes> & bytesOf,
+                                   std::chrono::steady_clock::time_point t0) {
+    struct Tok { uint64_t k0, k1, h; uint16_t id; };
+    std::vector<Tok> byLen[kTailByteKeyMax + 1];
+    size_t unreachable = 0;
+    for (const MergeRule & r : rules) {
+        const TailVocabBytes & s = bytesOf[r.idAB];
+        const size_t len = s.len;
+        if (len < 2) continue;
+        uint16_t tt[kTailByteKeyMax];
+        uint32_t idx[kTailByteKeyMax];
+        size_t m = len;
+        for (size_t i = 0; i < len; i++) { tt[i] = gTailBase[s.b[i]]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m != 1 || tt[0] != r.idAB) { unreachable++; continue; }
+        uint64_t a = 0, b = 0;
+        std::memcpy(&a, s.b, std::min<size_t>(len, 8));
+        if (len > 8) std::memcpy(&b, s.b + 8, len - 8);
+        const uint64_t k1 = b | (uint64_t(len) << 56);
+        byLen[len].push_back(Tok{a, k1, tailVocabSetHash(a, k1), uint16_t(r.idAB)});
+    }
+    // each length's set count for the load BPE_VOCAB_LOAD (tokens per entry, default 0.75)
+    double load = 0.75;
+    if (const char * e = std::getenv("BPE_VOCAB_LOAD")) if (std::atof(e) > 0) load = std::atof(e);
+    uint64_t sets[kTailByteKeyMax + 1] = {}, total = 0;
+    for (size_t len = 2; len <= kTailByteKeyMax; len++) {
+        sets[len] = std::max<uint64_t>(1, uint64_t(std::ceil(byLen[len].size() / (4 * load))));
+        total += sets[len];
+    }
+    gTailVocabMem.assign(size_t(4) * total + 4, TailCacheEntry{});
+    TailCacheEntry * const vocab = reinterpret_cast<TailCacheEntry *>(
+        (reinterpret_cast<uintptr_t>(gTailVocabMem.data()) + 127) & ~uintptr_t(127));
+    uint64_t base = 0;
+    size_t stored = 0;
+    std::vector<Tok> over;
+    std::string regions;
+    for (size_t len = 2; len <= kTailByteKeyMax; len++) {
+        gTailVocabDesc[2 * len] = base;
+        gTailVocabDesc[2 * len + 1] = sets[len];
+        for (const Tok & t : byLen[len]) {
+            TailCacheEntry * const vs = vocab + (base + (((t.h >> 32) * sets[len]) >> 32)) * 4;
+            unsigned i = 0;
+            while (i < 4 && vs[i].k1 != 0) i++;
+            if (i == 4) { over.push_back(t); continue; }
+            vs[i].k0 = t.k0; vs[i].k1 = t.k1; vs[i].keep = 1; vs[i].out[0] = t.id;
+            stored++;
+        }
+        regions += (len == 2 ? "" : " ") + std::to_string(len) + ":" + std::to_string(byLen[len].size())
+                   + "/" + std::to_string(sets[len]);
+        base += sets[len];
+    }
+    gTailVocabStash.clear();
+    gTailVocabStashMask = 0;
+    const char * const noStash = std::getenv("BPE_VOCAB_STASH");     // =0: none (the rest merge)
+    if (!over.empty() && !(noStash && std::string(noStash) == "0")) {   // the stash: at most half full
+        const uint64_t cap = uint64_t(1) << ceil_log2(2 * over.size() + 2);
+        gTailVocabStash.assign(cap, TailCacheEntry{});
+        for (const Tok & t : over) {
+            uint64_t i = (t.h >> 20) & (cap - 1);
+            while (gTailVocabStash[i].k1 != 0) i = (i + 1) & (cap - 1);
+            TailCacheEntry & e = gTailVocabStash[i];
+            e.k0 = t.k0; e.k1 = t.k1; e.keep = 1; e.out[0] = t.id;
+        }
+        gTailVocabStashMask = cap - 1;
+    }
+    gTailVocab.store(vocab, std::memory_order_release);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    gTailVocabReport = "[BPE] --tail-vocab-table --tail-vocab-layout=1: " + std::to_string(stored) + " tokens in "
+        + std::to_string(total * 128 / 1024) + " KB (" + std::to_string(unreachable)
+        + " not reached by their own merges, " + std::to_string(over.size()) + " in the stash; load "
+        + std::to_string(load) + "; length:tokens/sets " + regions + "), "
+        + std::to_string(ms) + " ms\n";
+}
+
+// --tail-vocab-table: build the table from the rules (gTail must be built) and publish it.
+// Tokens go in by rank, so when a set is full it is a rarer token that is left to the merge
+// path. Runs on gTailVocabThread.
+static void tailVocabBuild(std::vector<MergeRule> rules) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::sort(rules.begin(), rules.end(), [](const MergeRule & a, const MergeRule & b) { return a.idAB < b.idAB; });
+    unsigned maxId = 256;
+    for (const MergeRule & r : rules) maxId = std::max(maxId, r.idAB + 1);
+    using Bytes = TailVocabBytes;
+    std::vector<Bytes> bytesOf(maxId, Bytes{0, {}});
+    for (unsigned by = 0; by < 256; by++) { bytesOf[bpeBaseId(by)].len = 1; bytesOf[bpeBaseId(by)].b[0] = uint8_t(by); }
+    size_t want = 0;
+    for (const MergeRule & r : rules) {
+        const Bytes & a = bytesOf[r.idA], & b = bytesOf[r.idB];
+        if (a.len == 0 || b.len == 0 || a.len + b.len > kTailByteKeyMax) continue;
+        Bytes & t = bytesOf[r.idAB];
+        t.len = uint8_t(a.len + b.len);
+        std::memcpy(t.b, a.b, a.len);
+        std::memcpy(t.b + a.len, b.b, b.len);
+        want++;
+    }
+    if (TailVocabLayout) {
+        tailVocabBuildByLength(rules, bytesOf, t0);
+        return;
+    }
+    unsigned bits = ceil_log2(std::max<size_t>(want / 4, 16));
+    if (const char * e = std::getenv("BPE_VOCAB_BITS")) if (std::atoi(e) >= 4) bits = unsigned(std::atoi(e));
+    gTailVocabMem.assign((size_t(4) << bits) + 4, TailCacheEntry{});
+    TailCacheEntry * const vocab = reinterpret_cast<TailCacheEntry *>(
+        (reinterpret_cast<uintptr_t>(gTailVocabMem.data()) + 127) & ~uintptr_t(127));
+    gTailVocabShift = 64 - bits;
+    size_t stored = 0, unreachable = 0, full = 0;
+    for (const MergeRule & r : rules) {
+        const Bytes & s = bytesOf[r.idAB];
+        const size_t len = s.len;
+        if (len < 2) continue;
+        uint16_t tt[kTailByteKeyMax];
+        uint32_t idx[kTailByteKeyMax];
+        size_t m = len;
+        for (size_t i = 0; i < len; i++) { tt[i] = gTailBase[s.b[i]]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m != 1 || tt[0] != r.idAB) { unreachable++; continue; }
+        uint64_t a = 0, b = 0;
+        std::memcpy(&a, s.b, std::min<size_t>(len, 8));
+        if (len > 8) std::memcpy(&b, s.b + 8, len - 8);
+        const uint64_t k0 = a, k1 = b | (uint64_t(len) << 56);
+        TailCacheEntry * vs = vocab + (tailVocabSetHash(k0, k1) >> gTailVocabShift) * 4;
+        unsigned i = 0;
+        while (i < 4 && vs[i].k1 != 0) i++;
+        if (i == 4) { full++; continue; }
+        vs[i].k0 = k0; vs[i].k1 = k1; vs[i].keep = 1; vs[i].out[0] = uint16_t(r.idAB);
+        stored++;
+    }
+    gTailVocab.store(vocab, std::memory_order_release);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::string saved;
+    if (!TailVocabFile.empty()) {
+        TailVocabFileHeader hd{};
+        std::memcpy(hd.magic, kTailVocabMagic, 8);
+        hd.version = kTailVocabFileVersion;
+        hd.entrySize = sizeof(TailCacheEntry);
+        hd.keyMax = kTailByteKeyMax;
+        hd.bits = bits;
+        hd.key = gTailVocabFileKey;
+        hd.stored = stored; hd.unreachable = unreachable; hd.full = full;
+        saved = tailVocabSave(TailVocabFile, hd, vocab);
+    }
+    // printed by tailVocabJoin on the main thread: from here it could split another stderr line
+    gTailVocabReport = "[BPE] --tail-vocab-table: " + std::to_string(stored) + " tokens in "
+        + std::to_string((size_t(128) << bits) / 1024) + " KB (" + std::to_string(unreachable)
+        + " not reached by their own merges, " + std::to_string(full) + " left out: full sets), "
+        + std::to_string(ms) + " ms" + saved + "\n";
+}
+
+// gHardPairs from the merge rules: a pair x y is inside a token when some rule joins a token
+// ending in x to one starting with y. Returns the rules in rank order; maxId: 1 + the highest id.
+static std::vector<const MergeRule *> buildHardPairs(const std::vector<MergeRuleGroup> & all, unsigned & maxId) {
+    std::vector<const MergeRule *> byRank;
+    maxId = 256;
+    for (const auto & g : all)
+        for (const MergeRule & r : g.rules) { byRank.push_back(&r); maxId = std::max(maxId, r.idAB + 1); }
+    std::sort(byRank.begin(), byRank.end(), [](const MergeRule * a, const MergeRule * b) { return a->idAB < b->idAB; });
+    std::vector<uint8_t> first(maxId, 0), last(maxId, 0);
+    for (unsigned by = 0; by < 256; by++) first[bpeBaseId(by)] = last[bpeBaseId(by)] = uint8_t(by);
+    std::fill(std::begin(gHardPairs), std::end(gHardPairs), ~0ull);
+    for (const MergeRule * r : byRank) {
+        first[r->idAB] = first[r->idA];
+        last[r->idAB] = last[r->idB];
+        const unsigned k = (unsigned(last[r->idA]) << 8) | first[r->idB];
+        gHardPairs[k >> 6] &= ~(1ull << (k & 63));
+    }
+    return byRank;
+}
+
+std::vector<re::CC *> bpeCutClassCCs(const BPETokenizer & bpe) {
+    if (!cutClasses()) return {};
+    const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
+    unsigned maxId;
+    buildHardPairs(all, maxId);
+    std::array<bool, 256> before{}, beforeCond{};
+    for (unsigned b = 0; b < 256; b++) {
+        bool all256 = true;
+        for (unsigned x = 0; x < 256; x++)
+            if (!isHardPair(uint8_t(x), uint8_t(b))) all256 = false;
+        before[b] = all256;
+        beforeCond[b] = !all256 && b >= 0xC0;
+    }
+    std::vector<UCD::UnicodeSet> sets(kCutClassCount);
+    for (unsigned b = 0; b < 0xF5; b++) {           // the codepoints of lead (or ASCII byte) b
+        if ((b & 0xC0) == 0x80 || b == 0xC0 || b == 0xC1) continue;
+        const unsigned n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+        const UCD::codepoint_t lo = n == 1 ? b : n == 2 ? (b & 0x1F) << 6 : n == 3 ? (b & 0x0F) << 12 : (b & 0x07) << 18;
+        const UCD::codepoint_t sub = n == 1 ? 0 : 1u << (6 * (n - 2));   // the codepoints with second byte 80 | j
+        // the second bytes of the shortest form: E0 A0-BF, F0 90-BF, F4 80-8F
+        const unsigned jlo = b == 0xE0 ? 0x20 : b == 0xF0 ? 0x10 : 0, jhi = b == 0xF4 ? 0x0F : 0x3F;
+        const UCD::codepoint_t first = n == 1 ? lo : lo + jlo * sub, last = n == 1 ? lo : lo + (jhi + 1) * sub - 1;
+        if (before[b]) sets[kCutBefore].insert_range(first, last);
+        if (beforeCond[b]) sets[kCutBeforeCond].insert_range(first, last);
+        if (n == 1) continue;
+        for (unsigned j = jlo; j <= jhi; j++)
+            if (isHardPair(uint8_t(b), uint8_t(0x80 | j))) sets[kCutAfterLead].insert_range(lo + j * sub, lo + (j + 1) * sub - 1);
+    }
+    static const char * const kNames[kCutClassCount] = {"Before", "BeforeCond", "AfterLead"};
+    std::vector<re::CC *> ccs;
+    std::cerr << "[BPE] --pair-cuts=3 cut classes:";
+    for (unsigned c = 0; c < kCutClassCount; c++) {
+        std::cerr << " " << kNames[c] << " " << sets[c].count() << "/" << sets[c].size();
+        ccs.push_back(re::makeCC(std::move(sets[c]), &cc::Unicode));
+    }
+    std::cerr << " (codepoints/ranges)\n";
+    return ccs;
 }
 
 BPEPassResult buildBPEPassPipeline(
@@ -3435,14 +6713,65 @@ BPEPassResult buildBPEPassPipeline(
         const BPETokenizer & bpe,
         kernel::StreamSet * boundary) {
 
-    compactionMode();   // validate the compaction settings first: conflicts halt here
+    compactionMode();   // validate the compaction settings first: conflicts halt here   
     // --tail-from-bytes: every rule goes to the tail, which reads the bytes itself
     // (buildBPEByteTailEmitter); no merge kernel and no id stream.
     if (TailFromBytes && boundary) {
         const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
         const size_t numRules = buildTailTable(all, 0, 8);
         for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
+        if (TailHardSplit || byteRunCuts() || pairCuts()) {   // the byte pairs inside tokens, by rank
+            unsigned maxId = 256;
+            const std::vector<const MergeRule *> byRank = buildHardPairs(all, maxId);
+            if (TailTrigramSplit) {                 // every token's bytes: its trigrams, prefix, 2-byte tokens
+                const auto t0 = std::chrono::steady_clock::now();
+                std::vector<std::string> tb(maxId);
+                for (unsigned by = 0; by < 256; by++) tb[bpeBaseId(by)] = std::string(1, char(by));
+                gTailTri3.assign(size_t(1) << 18, 0);
+                gTailPre3.assign(size_t(1) << 18, 0);
+                std::fill(std::begin(gTailTok2), std::end(gTailTok2), 0);
+                auto setBit = [](uint64_t * m, unsigned k) { m[k >> 6] |= 1ull << (k & 63); };
+                for (const MergeRule * r : byRank) {
+                    std::string & t = tb[r->idAB];
+                    t = tb[r->idA] + tb[r->idB];
+                    const uint8_t * u = reinterpret_cast<const uint8_t *>(t.data());
+                    const size_t n = t.size();
+                    if (n == 2) setBit(gTailTok2, unsigned(u[0]) << 8 | u[1]);
+                    if (n >= 3) setBit(gTailPre3.data(), unsigned(u[0]) << 16 | unsigned(u[1]) << 8 | u[2]);
+                    for (size_t i = 0; i + 3 <= n; i++)
+                        setBit(gTailTri3.data(), unsigned(u[i]) << 16 | unsigned(u[i + 1]) << 8 | u[i + 2]);
+                }
+                if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "trigram") {
+                    size_t c3 = 0, cp = 0, c2 = 0;
+                    for (uint64_t x : gTailTri3) c3 += __builtin_popcountll(x);
+                    for (uint64_t x : gTailPre3) cp += __builtin_popcountll(x);
+                    for (uint64_t x : gTailTok2) c2 += __builtin_popcountll(x);
+                    std::cerr << "[BPE] --tail-trigram-split: " << c3 << " trigrams, " << cp << " prefixes, " << c2
+                              << " 2-byte tokens, "
+                              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()
+                              << " ms\n";
+                }
+            }
+        }
         gTailOpen.n = 0;
+        tailVocabJoin();
+        gTailVocab.store(nullptr, std::memory_order_relaxed);
+        if (TailVocabLayout && !TailVocabFile.empty()) {
+            std::cerr << "tokenizer: --tail-vocab-file is not supported with --tail-vocab-layout\n";
+            std::exit(1);
+        }
+        if (TailVocabTable && !TailVocabFile.empty()
+                && tailVocabLoad(TailVocabFile, gTailVocabFileKey = tailVocabKey(all))) {
+            // published: no builder thread
+        } else if (TailVocabTable) {
+            std::vector<MergeRule> rules;
+            for (const auto & g : all) rules.insert(rules.end(), g.rules.begin(), g.rules.end());
+            // joined at exit before the statics it reads (gTail, gTailBase) are destroyed
+            static const bool joinAtExit = (std::atexit(tailVocabJoin), true);
+            (void) joinAtExit;
+            if (std::getenv("BPE_VOCAB_SYNC")) tailVocabBuild(std::move(rules));
+            else gTailVocabThread = std::thread(tailVocabBuild, std::move(rules));
+        }
         std::cerr << "[BPE] --tail-from-bytes: no merge kernels; the tail applies all "
                   << numRules << " rules per pretoken\n";
         return {nullptr, nullptr, boundary};
@@ -3513,11 +6842,10 @@ BPEPassResult buildBPEPassPipeline(
         }
     }
 
-    // Seed: source = base id of each raw byte, active = ones, end = zeroes.
+    // Seed: source = base id of each raw byte, active = ones.
     StreamSet * source = P.CreateStreamSet(8, 1);
     StreamSet * active = P.CreateStreamSet(1, 1);
-    StreamSet * end    = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BPERangeSeed>(basis, source, active, end);
+    P.CreateKernelCall<BPEBaseIdKernel>(basis, source, active);
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
         return {active, source};   // dump seed source at every byte
     // BPE_DBG=bound: dump the pretoken-boundary mask — prints the base id at each

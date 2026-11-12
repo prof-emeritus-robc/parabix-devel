@@ -57,7 +57,7 @@ using namespace llvm;
 
 
 
-unsigned round_up_to_blocksize(int lgth) {
+static unsigned round_up_to_blocksize(int lgth) {
     unsigned lookahead_blocks = (codegen::BlockSize - 1 + lgth)/codegen::BlockSize;
     return lookahead_blocks * codegen::BlockSize;
 }

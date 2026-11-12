@@ -6,6 +6,7 @@
 parabix_add_module(
 NAME
     testing
+EXCLUDE_FROM_SINGLE
 SRC
     assert.cpp
     runtime.cpp

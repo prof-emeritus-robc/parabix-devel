@@ -10,6 +10,7 @@
 #include <iostream>
 #include <fstream>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
@@ -40,7 +41,12 @@
 
 using namespace llvm;
 
-static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<regex> <input file ...>"), cl::OneOrMore);
+static cl::list<std::string> inputFiles(cl::Positional, cl::desc("[<regex>] [<input file>]"), cl::ZeroOrMore);
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
+// The input, read once for each group of patterns in some modes (so the
+// standard input is copied to a temporary file if it is a pipe)
+static toolio::Input EditdInput;
 
 static cl::list<std::string> pattVector("e", cl::desc("pattern"), cl::ZeroOrMore);
 static cl::opt<std::string> PatternFilename("f", cl::desc("Take patterns (one per line) from a file"), cl::value_desc("regex file"), cl::init(""));
@@ -54,7 +60,6 @@ static cl::opt<bool> ShowPositions("display", cl::desc("Display the match positi
 
 static cl::opt<bool> UsePhases("phased", cl::desc("Use phased pipeline stages instead of multiple pipelines."), cl::init(false));
 
-static cl::opt<int> Threads("threads", cl::desc("Total number of threads."), cl::init(1));
 
 static cl::opt<bool> MultiEditdKernels("enable-multieditd-kernels", cl::desc("Construct multiple editd kernels in one pipeline."));
 #ifdef USE_MULTI_EDITD_MERGE_GROUPS
@@ -108,7 +113,7 @@ void run_second_filter(int pattern_segs, int total_len, float errRate){
         }
     }
 
-    std::cout << "pattern_segs = " << pattern_segs << ", total_len = " << total_len << std::endl;
+    toolio::out() << "pattern_segs = " << pattern_segs << ", total_len = " << total_len << "\n";
 
     int v = pattern_segs * (editDistance+1) - total_len * errRate;
 
@@ -130,8 +135,8 @@ void run_second_filter(int pattern_segs, int total_len, float errRate){
         }
     }
 
-    std::cout << "total candidate from the first filter is " << matchList.size() << std::endl;
-    std::cout << "total candidate from the second filter is " << count << std::endl;
+    toolio::out() << "total candidate from the first filter is " << matchList.size() << "\n";
+    toolio::out() << "total candidate from the second filter is " << count << "\n";
 }
 
 void get_editd_pattern(int & pattern_segs, int & total_len) {
@@ -164,13 +169,13 @@ void get_editd_pattern(int & pattern_segs, int & total_len) {
     // if there are no regexes specified through -e or -f, the first positional argument
     // must be a regex, not an input file.
 
-    if (pattVector.size() == 0 && inputFiles.size() > 1) {
+    if (pattVector.size() == 0 && PatternFilename.empty() && !inputFiles.empty()) {
         pattVector.push_back(inputFiles[0]);
         inputFiles.erase(inputFiles.begin());
     }
 }
 
-typedef void (*preprocessFunctionType)(StreamSetPtr & chStream, const uint32_t fd);
+typedef void (*preprocessFunctionType)(StreamSetPtr & chStream, const uint32_t useMMap, const uint32_t fd);
 
 class PreprocessKernel final: public pablo::PabloKernel {
 public:
@@ -201,40 +206,36 @@ void PreprocessKernel::generatePabloMethod() {
 void preprocessPipeline(ProgramBuilder & P, StreamSet * const CCResults) {
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const BasisBits = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     P.CreateKernelCall<PreprocessKernel>(BasisBits, CCResults);
 }
 
 preprocessFunctionType preprocessPipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Output<streamset_t>("chStream", 4, 1, ReturnedBuffer(1)), Input<uint32_t>("fileDescriptor"));
+    auto P = CreatePipeline(driver, Output<streamset_t>("chStream", 4, 1, ReturnedBuffer(1)), Input<uint32_t>("useMMap"), Input<uint32_t>("fileDescriptor"));
     StreamSet * const CCResults = P.getOutputStreamSet("chStream");
     preprocessPipeline(P, CCResults);
     return P.compile();
 }
 
 StreamSetPtr preprocess(preprocessFunctionType preprocess) {
-    const auto fd = open(inputFiles[0].c_str(), O_RDONLY);
+    const int fd = toolio::rewindInput(EditdInput);
     if (LLVM_UNLIKELY(fd == -1)) {
-        std::cerr << "Error: cannot open " << inputFiles[0] << " for processing.\n";
-        exit(-1);
+        exit(1);
     }
     StreamSetPtr chStream;
-    preprocess(chStream, fd);
-    close(fd);
+    preprocess(chStream, EditdInput.useMMap, fd);
     return chStream;
 }
 
 template<typename FuncType, typename ... Args>
 void runPhasedEditPipeline(FuncType editdFunc, Args... args) {
-    const auto fd = open(inputFiles[0].c_str(), O_RDONLY);
+    const int fd = toolio::rewindInput(EditdInput);
     if (LLVM_UNLIKELY(fd == -1)) {
-        std::cerr << "Error: cannot open " << inputFiles[0] << " for processing.\n";
-        exit(-1);
+        exit(1);
     }
-    editdFunc(fd, args...);
-    close(fd);
+    editdFunc(EditdInput.useMMap, fd, args...);
 }
 
 LLVM_READNONE std::string createName(const std::vector<std::string> & patterns) {
@@ -290,7 +291,7 @@ void wrapped_report_pos(size_t match_pos, int dist) {
     curMatch.dist = dist;
     matchList.push_back(curMatch);
     if (ShowPositions) {
-        std::cout << "pos: " << match_pos << ", dist:" << dist << "\n";
+        toolio::out() << "pos: " << match_pos << ", dist:" << dist << "\n";
     }
 }
 
@@ -320,14 +321,14 @@ editdFunctionType editdPipeline(CPUDriver & driver, const std::vector<std::strin
     return P.compile();
 }
 
-typedef void (*multiEditdFunctionType)(const uint32_t fd);
+typedef void (*multiEditdFunctionType)(const uint32_t useMMap, const uint32_t fd);
 
 void multiEditdPipeline(ProgramBuilder & P) {
 
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     StreamSet * const BasisBits = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
@@ -383,7 +384,7 @@ void multiEditdPipeline(ProgramBuilder & P) {
 }
 
 multiEditdFunctionType multiEditdPipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("fileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("fileDescriptor"));
     multiEditdPipeline(P);
     return P.compile();
 }
@@ -412,44 +413,53 @@ int main(int argc, char *argv[]) {
     int total_len = 0;
 
     get_editd_pattern(pattern_segs, total_len);
+    if (pattVector.empty()) {
+        llvm::errs() << toolio::programName() << ": no pattern (a first argument, -e or -f)\n";
+        return 1;
+    }
+    if (inputFiles.size() > 1) {
+        llvm::errs() << toolio::programName() << ": one input file only\n";
+        return 1;
+    }
+    if (!toolio::openSeekableInput(inputFiles.empty() ? "" : inputFiles[0], EditdInput) || !toolio::openOutput()) {
+        return 1;
+    }
 
     CPUDriver driver("editd");
     if (MultiEditdKernels) {
         auto editd = multiEditdPipeline(driver);
-        const auto & fileName = inputFiles[0];
-        const int fd = open(inputFiles[0].c_str(), O_RDONLY);
+        const int fd = toolio::rewindInput(EditdInput);
         if (LLVM_UNLIKELY(fd == -1)) {
-            std::cerr << "Error: cannot open " << fileName << " for processing. Skipped.\n";
-            exit(-1);
+            return 1;
         }
         #ifdef REPORT_PAPI_TESTS
         papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
         jitExecution.start();
         #endif
-        editd(fd);
+        editd(EditdInput.useMMap, fd);
         #ifdef REPORT_PAPI_TESTS
         jitExecution.stop();
         jitExecution.write(std::cerr);
         std::cerr << std::flush;
         #endif
-        close(fd);
+        toolio::closeInput(EditdInput);
         #ifndef REPORT_PAPI_TESTS
         run_second_filter(pattern_segs, total_len, 0.15);
         #endif
-        return 0;
+        return toolio::finishOutput() ? 0 : 1;
     }
 
     if (UsePhases) {
         if (pattVector.size() == 1) {
-            auto P = CreatePipeline(driver, Input<uint32_t>("fileDescriptor"));
+            auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("fileDescriptor"));
             StreamSet * const CCResults = P.CreateStreamSet(4, 1);
             preprocessPipeline(P, CCResults);
             P.InsertPhaseBoundary();
             editdPipeline(P, pattVector, CCResults);
             runPhasedEditPipeline(P.compile());
-            std::cout << "total matches is " << matchList.size() << std::endl;
+            toolio::out() << "total matches is " << matchList.size() << "\n";
         } else if (EditdIndexPatternKernels) {
-            auto P = CreatePipeline(driver, Input<uint32_t>("fileDescriptor"), Input<const char*>("pattStream"));
+            auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("fileDescriptor"), Input<const char*>("pattStream"));
             StreamSet * const CCResults = P.CreateStreamSet(4, 1);
             preprocessPipeline(P, CCResults);
             P.InsertPhaseBoundary();
@@ -466,7 +476,7 @@ int main(int argc, char *argv[]) {
             }
         }
         else {
-            auto P = CreatePipeline(driver, Input<uint32_t>("fileDescriptor"));
+            auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("fileDescriptor"));
             StreamSet * const CCResults = P.CreateStreamSet(4, 1);
             preprocessPipeline(P, CCResults);
             for(unsigned i=0; i< pattGroups.size(); i++){
@@ -485,7 +495,7 @@ int main(int argc, char *argv[]) {
         if (pattVector.size() == 1) {
             auto editd = editdPipeline(driver, pattVector);
             editd(chStream);
-            std::cout << "total matches is " << matchList.size() << std::endl;
+            toolio::out() << "total matches is " << matchList.size() << "\n";
         } else if (EditdIndexPatternKernels) {
             auto editd_ptr = editdIndexPatternPipeline(driver, pattVector[0].length());
             const unsigned gs = groupSize;
@@ -511,7 +521,8 @@ int main(int argc, char *argv[]) {
 
 
 
+    toolio::closeInput(EditdInput);
     run_second_filter(pattern_segs, total_len, 0.15);
 
-    return 0;
+    return toolio::finishOutput() ? 0 : 1;
 }

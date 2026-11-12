@@ -84,7 +84,7 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     }
 
     assert (memorySize);
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     assert (is_pow2(pageSize));
     memorySize = b.CreateShl(memorySize, b.getSize(floor_log2(pageSize)));
 
@@ -279,7 +279,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
     assert (in_degree(m, ThreadLocalPlacement) < -1U);
     toVisit[m] = -1U;
 
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     assert (is_pow2(pageSize));
 
     ConstantInt * const LOG_2_PAGE_SIZE = b.getSize(floor_log2(pageSize));

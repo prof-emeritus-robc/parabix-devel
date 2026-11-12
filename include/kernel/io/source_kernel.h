@@ -49,12 +49,16 @@ public:
     }
 protected:
     static void generatLinkExternalFunctions(KernelBuilder & b);
-    static void generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth);
+    // (readFunction: read, or toolio_read for FDSourceKernel, reading from
+    // what toolio reads ahead of a pipe)
+    static void generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth, llvm::StringRef readFunction = "read");
     static llvm::Value * generateExpectedOutputSizeMethod(KernelBuilder & b, const unsigned codeUnitWidth);
 private:
     const unsigned mCodeUnitWidth;
 };
 
+// Reads with toolio_read (toolchain/toolio.h): an input read ahead by toolio
+// is read from the data read ahead.
 class FDSourceKernel final : public SegmentOrientedKernel {
 public:
     FDSourceKernel(LLVMTypeSystemInterface & ts, Scalar * const useMMap, Scalar * const fd, StreamSet * const outputStream);
@@ -86,6 +90,11 @@ extern bool MemorySourceBlockCapacity;
 class MemorySourceKernel final : public SegmentOrientedKernel {
 public:
     MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fileSource, Scalar * fileItems, StreamSet * const outputStream);
+    // inPlace (opt-in, a size_t scalar read at each call): nonzero promises that fileSource
+    // is 64-byte aligned and followed by zeros up to its size rounded up to a page plus one
+    // more page, the layout of the kernel's own copy, so the kernel reads it in place
+    // instead of copying it. Zero copies as the other constructor does.
+    MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fileSource, Scalar * fileItems, Scalar * inPlace, StreamSet * const outputStream);
 protected:
     void generateInitializeMethod(KernelBuilder & b) override;
     void generateDoSegmentMethod(KernelBuilder & b) override;
@@ -94,6 +103,7 @@ private:
     const unsigned mCodeUnitWidth;
     const unsigned mNumElements;
     const bool mBlockCapacity;
+    const bool mInPlace;
 };
 
 }

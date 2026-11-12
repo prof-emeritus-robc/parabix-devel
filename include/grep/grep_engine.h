@@ -104,6 +104,8 @@ public:
     void initRE(re::RE * re);
     virtual void grepCodeGen();
     bool searchAllFiles();
+    // Whether an input file could not be read (reported unless suppressed).
+    bool fileErrorFound() const {return mFileErrorFound;}
     void DoGrepThreadMethod();
     virtual void showResult(uint64_t grepResult, const std::string & fileName, std::ostringstream & strm);
 
@@ -118,6 +120,9 @@ protected:
     kernel::StreamSet * applyMatchLimit(kernel::PipelineBuilder & P, kernel::StreamSet * matched);
     kernel::StreamSet * grepPipeline(kernel::PipelineBuilder & P, kernel::StreamSet * Source);
     virtual uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm);
+    // Whether an empty file can produce output (a count, or a file name for -L).
+    // If not, empty files are skipped without being opened.
+    virtual bool reportsEmptyFiles() const {return false;}
     int32_t openFile(const std::string & fileName, std::ostringstream & msgstrm);
     void applyColorization(kernel::PipelineBuilder & E,
                                               kernel::StreamSet * SourceCoords,
@@ -154,6 +159,7 @@ protected:
     std::vector<std::ostringstream> mResultStrs;
     std::vector<FileStatus> mFileStatus;
     bool grepMatchFound;
+    std::atomic<bool> mFileErrorFound{false};
     GrepRecordBreakKind mGrepRecordBreak;
 
     PreparedRE mPreparedRE;     // the RE as prepared by the regular expression engine
@@ -239,6 +245,7 @@ class CountOnlyEngine final : public GrepEngine {
 public:
     CountOnlyEngine(BaseDriver & driver, bool CountAll = false);
 private:
+    bool reportsEmptyFiles() const override {return true;}
     void showResult(uint64_t grepResult, const std::string & fileName, std::ostringstream & strm) override;
 };
 
@@ -246,6 +253,7 @@ class MatchOnlyEngine final : public GrepEngine {
 public:
     MatchOnlyEngine(BaseDriver & driver, bool showFilesWithoutMatch, bool useNullSeparators);
 private:
+    bool reportsEmptyFiles() const override {return mRequiredCount == 0;}
     void showResult(uint64_t grepResult, const std::string & fileName, std::ostringstream & strm) override;
     unsigned mRequiredCount;
 };

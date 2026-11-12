@@ -22,6 +22,7 @@
 #include <kernel/util/error_monitor_kernel.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
@@ -42,7 +43,9 @@ using namespace re;
 
 static cl::OptionCategory gb18030Options("gb18030 Options", "Transcoding control options.");
 
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(gb18030Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(gb18030Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 enum class GBerrorMode {Abort, DropBadInput, UseReplacementChar};
 static cl::opt<GBerrorMode> GBerrorOption(cl::desc("Treatment of erroneous GB 18030 input (default Abort)"),
     cl::values(
@@ -553,18 +556,18 @@ void GB_18030_FourByteLogic::generatePabloMethod() {
     }
 }
 
-typedef void (*gb18030FunctionType)(uint32_t fd, const char *);
+typedef void (*gb18030FunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 
 
 
 gb18030FunctionType generatePipeline(CPUDriver & driver, unsigned encodingBits, cc::ByteNumbering byteNumbering) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"), Input<const char *>("outputFileName"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"), Input<uint32_t>("outputFD"));
 
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     // Transposed bits from s2p
     StreamSet * BasisBits = P.CreateStreamSet(8);
@@ -649,11 +652,11 @@ gb18030FunctionType generatePipeline(CPUDriver & driver, unsigned encodingBits, 
     if (encodingBits == 32) {
         StreamSet * const u32data = P.CreateStreamSet(1, 32);
         P.CreateKernelCall<P2S21Kernel>(utfBasis, u32data, byteNumbering);
-        P.CreateKernelCall<StdOutKernel>(u32data);
+        P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u32data);
     } else if (encodingBits == 16) {
             StreamSet * const u16data = P.CreateStreamSet(1, 16);
             P.CreateKernelCall<P2S16Kernel>(utfBasis, u16data, byteNumbering);
-            P.CreateKernelCall<StdOutKernel>(u16data);
+            P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u16data);
     } else if (encodingBits == 8) {
         // Buffers for calculated deposit masks.
         StreamSet * const u8fieldMask = P.CreateStreamSet();
@@ -690,7 +693,7 @@ gb18030FunctionType generatePipeline(CPUDriver & driver, unsigned encodingBits, 
 
         P.CreateKernelCall<P2SKernel>(u8basis, u8bytes);
 
-        P.CreateKernelCall<StdOutKernel>(u8bytes);
+        P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u8bytes);
     } else {
         llvm::report_fatal_error(llvm::StringRef("Unsupported output encoding: ") + OutputEncoding);
     }
@@ -709,7 +712,7 @@ size_t file_size(const int fd) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&gb18030Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&gb18030Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     // Default output UTF-8
     unsigned encodingBits = 8;
@@ -734,22 +737,21 @@ int main(int argc, char *argv[]) {
         llvm::report_fatal_error("Unrecognized encoding.");
     }
 
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("gb18030");
     gb18030FunctionType gb18030Function = generatePipeline(driver, encodingBits, byteNumbering);
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        #ifdef REPORT_PAPI_TESTS
-        papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
-        jitExecution.start();
-        #endif
-        gb18030Function(fd, inputFile.c_str());
-        #ifdef REPORT_PAPI_TESTS
-        jitExecution.stop();
-        jitExecution.write(std::cerr);
-        #endif
-        close(fd);
-    }
-    return 0;
+    #ifdef REPORT_PAPI_TESTS
+    papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
+    jitExecution.start();
+    #endif
+    gb18030Function(in.useMMap, in.fd, toolio::outputFD());
+    #ifdef REPORT_PAPI_TESTS
+    jitExecution.stop();
+    jitExecution.write(std::cerr);
+    #endif
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

@@ -17,17 +17,16 @@ tiktoken runs its own Rust implementation of the same GPT-2 encoding (its
 "gpt2" built-in encoding), not loaded from this project's files at all --
 a genuinely independent implementation, not just a second config of the same one.
 
-Usage:
-    python compare_bpe.py                              # default input file
-    python compare_bpe.py --input path/to/cases.txt   # custom input file
-    python compare_bpe.py --verbose                    # full token-by-token table always
-    python compare_bpe.py --parabix-only               # skip HF + tiktoken
-    python compare_bpe.py --hf-only                    # skip Parabix + tiktoken
-    python compare_bpe.py --tiktoken-only               # skip Parabix + HF
-    python compare_bpe.py --no-tiktoken                 # Parabix vs HF only (original behavior)
-    python compare_bpe.py --runs 10                    # timed runs per side (default 5)
-    python compare_bpe.py --no-timing                  # skip the timing section
-    python compare_bpe.py --parabix-args="--level-partition --compact-base=2"
+Usage (--input is required: no input file is built into the script):
+    python compare_bpe.py --input path/to/cases.txt
+    python compare_bpe.py --input FILE --verbose         # full token-by-token table always
+    python compare_bpe.py --input FILE --parabix-only    # skip HF + tiktoken
+    python compare_bpe.py --input FILE --hf-only         # skip Parabix + tiktoken
+    python compare_bpe.py --input FILE --tiktoken-only   # skip Parabix + HF
+    python compare_bpe.py --input FILE --no-tiktoken     # Parabix vs HF only (original behavior)
+    python compare_bpe.py --input FILE --runs 10         # timed runs per side (default 5)
+    python compare_bpe.py --input FILE --no-timing       # skip the timing section
+    python compare_bpe.py --input FILE --parabix-args="--partition=level --compact-base=2"
 """
 
 import sys
@@ -47,12 +46,12 @@ import tiktoken
 
 # Defaults only: the repo root is three levels above this script
 # (tools/lex/tokenizer-test/); --tokenizer/--merges/--vocab/--tokenizer-json override.
+# The input file has no default: it is always given with --input.
 REPO_ROOT      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
-DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val_4MB.txt")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "compare_bpe_output.txt")
 
@@ -113,7 +112,7 @@ def run_parabix_bpe(text: str) -> tuple[list[int], list[str]]:
 
     tokenizer.cpp's --pretokenizer=bytelevel path (buildBPEPipeline, PreTokenizer
     == bytelevel branch) feeds the merge stage the RAW input bytes as bpeBasis —
-    NOT the Ġ-remapped pretokenizer output, which would double-encode (BPERangeSeed
+    NOT the Ġ-remapped pretokenizer output, which would double-encode (BPEBaseIdKernel
     already applies GPT-2 bytes_to_unicode once) — and separately threads the
     regex pretoken-boundary mask through as bpeBoundary, so BPEMergeKernel blocks
     merges that would cross a pretoken boundary. This is the actual HF-equivalent
@@ -144,8 +143,10 @@ def run_hf_bpe(tokenizer_obj, text: str) -> tuple[list[int], list[str]]:
 
 def run_tiktoken_bpe(enc, text: str) -> tuple[list[int], list[str]]:
     """Run tiktoken's built-in "gpt2" encoding -- its own Rust implementation,
-    not loaded from this project's vocab.json/merges.txt at all."""
-    ids = enc.encode(text)
+    not loaded from this project's vocab.json/merges.txt at all. <|endoftext|> in
+    the text is the special token 50256, as in HF and Parabix (tiktoken's default
+    raises on it)."""
+    ids = enc.encode(text, allowed_special="all")
     toks = [enc.decode_single_token_bytes(i).decode("utf-8", errors="replace") for i in ids]
     return ids, toks
 
@@ -222,11 +223,11 @@ def bench_hf(tokenizer_obj, text: str, runs: int) -> dict:
 def bench_tiktoken(enc, text: str, runs: int) -> dict:
     """Fair tiktoken tokenize time: warm best-of-N in-process encode() (encoding
     already loaded by tiktoken.get_encoding() before timing)."""
-    enc.encode(text)                                  # one discarded warm-up
+    enc.encode(text, allowed_special="all")           # one discarded warm-up
     times_ms = []
     for _ in range(runs):
         t0 = time.perf_counter()
-        enc.encode(text)
+        enc.encode(text, allowed_special="all")
         times_ms.append((time.perf_counter() - t0) * 1e3)
     times_ms.sort()
     nbytes = len(text.encode("utf-8"))
@@ -455,8 +456,8 @@ def write_summary(out, results: dict) -> None:
 def main() -> None:
     global SHOW_INPUT, EXTRA_ARGS, TOKENIZER, MERGES, VOCAB, TOKENIZER_JSON
     parser = argparse.ArgumentParser(description="BPE tokenizer comparison test suite.")
-    parser.add_argument("--input",        default=DEFAULT_INPUT,
-                        help=f"Input file (entire file is one test case, default: {DEFAULT_INPUT})")
+    parser.add_argument("--input",        required=True, metavar="FILE",
+                        help="Input file (required; the entire file is one test case)")
     parser.add_argument("--hf-only",      action="store_true",
                         help="Run HuggingFace tokenizer only")
     parser.add_argument("--parabix-only", action="store_true",

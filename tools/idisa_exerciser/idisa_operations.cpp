@@ -4,6 +4,8 @@
  */
 
 #include "idisa_operations.h"
+#include <tuple>
+#include <unistd.h>
 
 #include <kernel/io/source_kernel.h>
 #include <kernel/util/hex_convert.h>
@@ -344,6 +346,11 @@ template <unsigned N> class NaryOpConfig : public OperationConfig {
     size_t executePipeline() override {
         resetPipeline();
         assert(mPipelineBuilder);
+        // Each run replaces the output of the run before, in a file (on a pipe,
+        // the outputs of repeated runs follow one another)
+        if (mOutputFD >= 0 && lseek(mOutputFD, 0, SEEK_SET) == 0) {
+            std::ignore = ftruncate(mOutputFD, 0);
+        }
         return mExecuteFunc();
     }
 
@@ -389,28 +396,28 @@ template <> void NaryOpConfig<3>::constructPipeline(CPUDriver &driver);
 
 template <> void NaryOpConfig<0>::constructPipeline(CPUDriver &driver) {
     assert(!mPipelineBuilder);
-    auto pTmp = CreatePipeline(driver, Input<const char *>{OperationConfig::outputFilenameIdent},
+    auto pTmp = CreatePipeline(driver, Input<uint32_t>{OperationConfig::outputFDIdent},
                                Output<size_t>{OperationConfig::failureCountIdent});
     auto p = make_unique<decltype(pTmp)>(std::move(pTmp));
     auto pPtr = p.get();
     mPipelineBuilder = std::move(p);
     mCompileFunc = [=, this]() {
         auto pipelineFunc = pPtr->compile();
-        mExecuteFunc = [=, this]() -> size_t { return pipelineFunc(mOutputFilename.c_str()); };
+        mExecuteFunc = [=, this]() -> size_t { return pipelineFunc(static_cast<uint32_t>(mOutputFD)); };
     };
 }
 
 template <> void NaryOpConfig<1>::constructPipeline(CPUDriver &driver) {
     assert(!mPipelineBuilder);
     auto pTmp = CreatePipeline(driver, Input<int32_t>{OperationConfig::operandFDIdent(0)},
-                               Input<const char *>{OperationConfig::outputFilenameIdent},
+                               Input<uint32_t>{OperationConfig::outputFDIdent},
                                Output<size_t>{OperationConfig::failureCountIdent});
     auto p = make_unique<decltype(pTmp)>(std::move(pTmp));
     auto pPtr = p.get();
     mPipelineBuilder = std::move(p);
     mCompileFunc = [=, this]() {
         auto pipelineFunc = pPtr->compile();
-        mExecuteFunc = [=, this]() -> size_t { return pipelineFunc(mOperandFDs[0], mOutputFilename.c_str()); };
+        mExecuteFunc = [=, this]() -> size_t { return pipelineFunc(mOperandFDs[0], static_cast<uint32_t>(mOutputFD)); };
     };
 }
 
@@ -418,14 +425,14 @@ template <> void NaryOpConfig<2>::constructPipeline(CPUDriver &driver) {
     assert(!mPipelineBuilder);
     auto pTmp = CreatePipeline(
         driver, Input<int32_t>{OperationConfig::operandFDIdent(0)}, Input<int32_t>{OperationConfig::operandFDIdent(1)},
-        Input<const char *>{OperationConfig::outputFilenameIdent}, Output<size_t>{OperationConfig::failureCountIdent});
+        Input<uint32_t>{OperationConfig::outputFDIdent}, Output<size_t>{OperationConfig::failureCountIdent});
     auto p = make_unique<decltype(pTmp)>(std::move(pTmp));
     auto pPtr = p.get();
     mPipelineBuilder = std::move(p);
     mCompileFunc = [=, this]() {
         auto pipelineFunc = pPtr->compile();
         mExecuteFunc = [=, this]() -> size_t {
-            return pipelineFunc(mOperandFDs[0], mOperandFDs[1], mOutputFilename.c_str());
+            return pipelineFunc(mOperandFDs[0], mOperandFDs[1], static_cast<uint32_t>(mOutputFD));
         };
     };
 }
@@ -434,7 +441,7 @@ template <> void NaryOpConfig<3>::constructPipeline(CPUDriver &driver) {
     assert(!mPipelineBuilder);
     auto pTmp = CreatePipeline(
         driver, Input<int32_t>{OperationConfig::operandFDIdent(0)}, Input<int32_t>{OperationConfig::operandFDIdent(1)},
-        Input<int32_t>{OperationConfig::operandFDIdent(2)}, Input<const char *>{OperationConfig::outputFilenameIdent},
+        Input<int32_t>{OperationConfig::operandFDIdent(2)}, Input<uint32_t>{OperationConfig::outputFDIdent},
         Output<size_t>{OperationConfig::failureCountIdent});
     auto p = make_unique<decltype(pTmp)>(std::move(pTmp));
     auto pPtr = p.get();
@@ -442,7 +449,7 @@ template <> void NaryOpConfig<3>::constructPipeline(CPUDriver &driver) {
     mCompileFunc = [=, this]() {
         auto pipelineFunc = pPtr->compile();
         mExecuteFunc = [=, this]() -> size_t {
-            return pipelineFunc(mOperandFDs[0], mOperandFDs[1], mOperandFDs[2], mOutputFilename.c_str());
+            return pipelineFunc(mOperandFDs[0], mOperandFDs[1], mOperandFDs[2], static_cast<uint32_t>(mOutputFD));
         };
     };
 }

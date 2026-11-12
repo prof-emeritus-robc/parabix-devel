@@ -129,14 +129,28 @@ endif()
 
 llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink mcjit native IRReader Linker IRPrinter Passes)
 # The shared module libraries of a development build link LLVM's own shared
-# library where LLVM was built with one (as LLVM's tools are, e.g., in the
-# Linux distributions and FreeBSD).  Linked with the static LLVM libraries,
-# several module libraries would each have a copy of some of LLVM's
-# command-line options ("Option ... registered more than once").
-if(ARTIFACT_MODE STREQUAL "Multiple" AND ARTIFACT_TYPE STREQUAL "Shared" AND NOT APPLE
-   AND LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
-    set(REQ_LLVM_LIBRARIES LLVM)
-    message(STATUS "Linking LLVM's shared library")
+# library where LLVM was built with one (LLVM_BUILD_LLVM_DYLIB, whether or not
+# LLVM's tools use it).  Linked with the static LLVM libraries, several module
+# libraries would each have a copy of some of LLVM's command-line options
+# ("Option ... registered more than once"), on systems other than Apple's
+# (where each library keeps its own).
+if(ARTIFACT_MODE STREQUAL "Multiple" AND ARTIFACT_TYPE STREQUAL "Shared" AND NOT APPLE)
+    set(PARABIX_LLVM_COMPONENTS_SHARED FALSE)
+    if(TARGET LLVMCore)
+        get_target_property(LLVM_CORE_TYPE LLVMCore TYPE)
+        if(LLVM_CORE_TYPE STREQUAL "SHARED_LIBRARY")
+            set(PARABIX_LLVM_COMPONENTS_SHARED TRUE)    # LLVM built with BUILD_SHARED_LIBS
+        endif()
+    endif()
+    if(TARGET LLVM AND NOT PARABIX_LLVM_COMPONENTS_SHARED)
+        set(REQ_LLVM_LIBRARIES LLVM)
+        message(STATUS "Linking LLVM's shared library")
+    elseif(NOT PARABIX_LLVM_COMPONENTS_SHARED)
+        message(WARNING "LLVM (${LLVM_DIR}) has no shared library: each module library "
+            "links its own copy of the LLVM code it uses, and the tools may fail with "
+            "\"Option ... registered more than once\".  Configure with "
+            "-DARTIFACT_MODE=Single, or use an LLVM built with LLVM_BUILD_LLVM_DYLIB=ON.")
+    endif()
 endif()
 
 include_directories(${LLVM_INCLUDE_DIRS})

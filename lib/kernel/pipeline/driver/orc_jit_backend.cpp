@@ -1272,11 +1272,12 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
     const StringMap<bool> features = sys::getHostCPUFeatures();
     #endif
 
+    // The features the host lacks are disabled as well: a CPU name implies
+    // features of its own, which a virtual machine may not provide (e.g.,
+    // AVX-512 masked by the hypervisor, giving SIGILL)
     std::vector<std::string> attrs;
     for (auto & flag : features) {
-        if (flag.second) {
-            attrs.push_back("+" + flag.first().str());
-        }
+        attrs.push_back((flag.second ? "+" : "-") + flag.first().str());
     }
 
     auto TripleStr = Triple{sys::getProcessTriple()}.normalize();

@@ -97,7 +97,10 @@ int main(int argc, char *argv[]) {
 
     auto RE = readRE();
 
-    const argv::FileSelection allFiles(driver, inputFiles);
+    // Standard input is searched in its place among the files, as "-".
+    argv::FileSelectConfig config;
+    config.stdinAsPath = true;
+    const argv::FileSelection allFiles(driver, inputFiles, config);
     // Read while compiling: the standard input, from a pipe or a terminal (not
     // with -q, which may stop before reading it: the data read ahead would be
     // taken from its writer for nothing), and the files.
@@ -107,7 +110,7 @@ int main(int argc, char *argv[]) {
     std::vector<std::string> fileNames;
     fileNames.reserve(allFiles.size());
     for (const auto & path : allFiles.paths()) {
-        fileNames.push_back(path.string());
+        if (path.string() != "-") fileNames.push_back(path.string());
     }
     toolio::prefetchFiles(std::move(fileNames));
     if (allFiles.showFileNames() && !argv::NoFilenameFlag) {
@@ -155,7 +158,6 @@ int main(int argc, char *argv[]) {
     grep->setContextLines(argv::BeforeContext, argv::AfterContext);
 
     grep->setStdinLabel(argv::LabelFlag);
-    if (allFiles.stdinSelected()) grep->setGrepStdIn();
     if (argv::NoMessagesFlag) grep->suppressFileMessages();
     if (toolio::mmapRequested()) grep->setPreferMMap();
     grep->setBinaryFilesOption(argv::BinaryFilesFlag);

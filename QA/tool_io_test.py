@@ -8,7 +8,9 @@
 #  - an input that cannot be read is reported (tool: file: reason) on the
 #    standard error, with a nonzero exit status and no output;
 #  - icgrep colors its output only on a terminal (--colors=auto), not in a
-#    file of --output nor with NO_COLOR or TERM=dumb.
+#    file of --output nor with NO_COLOR or TERM=dumb;
+#  - icgrep searches the standard input ("-") in its place among the files,
+#    labeled "(standard input)" (or --label) in every output mode.
 #  The tools not in the directory are skipped (make installcheck runs this
 #  on those installed).
 #
@@ -174,6 +176,33 @@ def check_colors(bin_dir, tmp):
         fail("icgrep colors", "no colors with --colors=always")
 
 
+def check_stdin_place(bin_dir, tmp):
+    icgrep = os.path.join(bin_dir, "icgrep")
+    a = os.path.join(tmp, "a")
+    b = os.path.join(tmp, "b")
+    with open(a, "wb") as f:
+        f.write(b"apple\nbanana\n")
+    with open(b, "wb") as f:
+        f.write(b"apple pie\ncherry\n")
+    stdin = b"apple tart\nplum\n"
+    S = "(standard input)"
+    cases = [
+        ([], [a, "-", b], "%s:apple\n%s:apple tart\n%s:apple pie\n" % (a, S, b)),
+        (["-n"], ["-", a], "%s:1:apple tart\n%s:1:apple\n" % (S, a)),
+        (["-c"], [a, "-", b], "%s:1\n%s:1\n%s:1\n" % (a, S, b)),
+        (["-l"], [a, "-"], "%s\n%s\n" % (a, S)),
+        (["-H"], [], "%s:apple tart\n" % S),
+        (["-c", "--label=IN"], ["-", b], "IN:1\n%s:1\n" % b),
+    ]
+    for flags, files, expected in cases:
+        for threads in ["1", "4"]:
+            command = [icgrep, "-thread-num=" + threads] + flags + ["apple"] + files
+            result = subprocess.run(command, input=stdin, capture_output=True)
+            if result.stdout.decode() != expected:
+                fail("icgrep stdin in place " + " ".join(command[1:]),
+                     "output %r, expected %r" % (result.stdout.decode(), expected))
+
+
 def main():
     bin_dir = sys.argv[1]
     present = lambda tool: os.path.exists(os.path.join(bin_dir, tool))
@@ -189,6 +218,7 @@ def main():
                 check_errors(bin_dir, tmp, tool, args)
         if present("icgrep"):
             check_colors(bin_dir, tmp)
+            check_stdin_place(bin_dir, tmp)
     print("%d cases, %d failures" % (tested, failures))
     return 1 if failures else 0
 

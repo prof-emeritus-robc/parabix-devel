@@ -90,7 +90,6 @@ public:
     void setInitialTab(bool b = true) {mInitialTab = b;}
 
     void setMaxCount(int m) {mMaxCount = m;}
-    void setGrepStdIn(bool b = true) {mGrepStdIn = b;}
     void setInvertMatches(bool b = true) {mInvertMatches = b;}
 
     void suppressFileMessages(bool b = true) {mSuppressFileMessages = b;}
@@ -128,6 +127,8 @@ protected:
                                               kernel::StreamSet * SourceCoords,
                                               kernel::StreamSet * MatchSpans,
                                               kernel::StreamSet * Basis);
+    // The name to show for a file: the --label of standard input ("-").
+    std::string fileLabel(const std::string & fileName) const;
     std::string linePrefix(std::string fileName);
 
 protected:
@@ -145,7 +146,6 @@ protected:
     bool mInitialTab;
     bool mInvertMatches;
     int mMaxCount;
-    bool mGrepStdIn;
     NullCharMode mNullMode;
     BaseDriver & mGrepDriver;
     GrepFunctionType mMainMethod;

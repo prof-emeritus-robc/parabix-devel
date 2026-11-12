@@ -10044,7 +10044,10 @@ static int run(int argc, char *argv[]) {
     ldml::TransformRegistry registry;
     const std::string dir = TransformsDir.empty() ? ldml::defaultTransformDirectory() : TransformsDir;
     std::vector<std::string> warnings;
-    if (!registry.loadDirectory(dir, warnings)) {
+    // Without the default directory (no CLDR checkout), the built-in transforms
+    // are known: reported for a directory given, or a transform not found.
+    const bool dirLoaded = registry.loadDirectory(dir, warnings);
+    if (!dirLoaded && !TransformsDir.empty()) {
         llvm::errs() << "Warning: cannot read transform directory " << dir << "; only built-in transforms are known.\n";
     }
     if (ShowWarnings) {
@@ -10145,6 +10148,9 @@ static int run(int argc, char *argv[]) {
     const ldml::TransformEntry * entry = registry.lookup(TransformName);
     if (entry == nullptr) {
         llvm::errs() << "Error: unknown transform " << TransformName << "\n";
+        if (!dirLoaded) {
+            llvm::errs() << "(cannot read transform directory " << dir << "; only built-in transforms are known)\n";
+        }
         return 1;
     }
     if (KernelCounts) return printKernelCounts(registry, entry);

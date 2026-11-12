@@ -20,6 +20,8 @@
 #include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
+#include <toolchain/fileutil.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/streamutils/deletion.h>
@@ -148,16 +150,16 @@ static void emitToken(uint16_t id, const std::string & tokStr) {
             offsetAdvanceTo(eByte);
         }
         if (gOutputStrings)
-            llvm::outs() << id << '\t' << s << '\t' << e << '\t' << tokStr << "\n";
+            toolio::out() << id << '\t' << s << '\t' << e << '\t' << tokStr << "\n";
         else
-            llvm::outs() << id << '\t' << s << '\t' << e << "\n";
+            toolio::out() << id << '\t' << s << '\t' << e << "\n";
         return;
     }
 
     if (gOutputStrings && gBPE)
-        llvm::outs() << id << '\t' << tokStr << "\n";
+        toolio::out() << id << '\t' << tokStr << "\n";
     else
-        llvm::outs() << id << "\n";
+        toolio::out() << id << "\n";
 }
 
 // bpe_emit_token
@@ -194,7 +196,7 @@ static void bpe_emit_id(uint16_t id) {
         unsigned v = id;
         do { *--p = char('0' + v % 10); v /= 10; } while (v);
         std::lock_guard<std::mutex> lock(gEmitMutex);
-        llvm::outs().write(p, end - p);
+        toolio::out().write(p, end - p);
         return;
     }
     const std::string tokStr = gBPE ? gBPE->decodeToken(static_cast<int>(id)) : std::string();
@@ -244,8 +246,10 @@ static void runBPEWithSpecialTokens(BPEFnPtr bpeFn, const char * buf, size_t nby
 }
 
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required,
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"),
                                       cl::cat(wordBreakerFlags));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 
 static cl::list<NormalizationMode> Normalization(
     "normalize",
@@ -471,7 +475,7 @@ static void applyAutoSegmentSize(const std::string & path) {
     std::cerr << "[BPE] --auto-segment-size: " << codegen::SegmentSize << "\n";
 }
 
-using WordBreakerFunctionType = void (*)(uint32_t fd);
+using WordBreakerFunctionType = void (*)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 // writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
 // to stdout.  Extracted to avoid repeating the P2SKernel + StdOutKernel pair
@@ -479,7 +483,7 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
     StreamSet * output = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(basis, output);
-    P.CreateKernelCall<StdOutKernel>(output);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), output);
 }
 
 //  bpePipeline
@@ -655,7 +659,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                     p += table.second[ids[i]];
                 }
                 std::lock_guard<std::mutex> lock(gEmitMutex);
-                llvm::outs().write(buf.data(), p - buf.data());
+                toolio::out().write(buf.data(), p - buf.data());
                 return;
             }
             if (gFastEmit && !gEmitDbg) {
@@ -671,7 +675,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                     text.append(p, end - p);
                 }
                 std::lock_guard<std::mutex> lock(gEmitMutex);
-                llvm::outs().write(text.data(), text.size());
+                toolio::out().write(text.data(), text.size());
                 return;
             }
             for (size_t i = 0; i < n; i++) bpe_emit_id(ids[i]);
@@ -731,13 +735,13 @@ static BPEPipelineFunctionType buildBPEPipeline(
 }
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fileDescriptor"}, Input<uint32_t>{"outputFD"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
 
     //  Stage 0: I/O — read file, convert to parallel bit streams 
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
@@ -778,7 +782,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, 
-        {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+        {&wordBreakerFlags, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     // BPE pipeline mode — enabled when --vocab OR --merges is supplied. merges.txt
     // is self-sufficient (it generates the 256 base tokens internally), so
@@ -822,30 +826,28 @@ int main(int argc, char *argv[]) {
         CPUDriver driver("bpe_tokenizer");
         BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
 
-        const int fd = open(inputFile.c_str(), O_RDONLY);
-        if (LLVM_UNLIKELY(fd == -1)) {
-            llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
+        toolio::Input in;
+        if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
             return 1;
         }
+        // The output of the tokens (written under gEmitMutex), created before
+        // the pipeline's threads write to it
+        (void)toolio::out();
 
-        // Load the whole file ONCE into memory (before any timing). mmap gives a
-        // page-aligned pointer, which satisfies MemorySourceKernel's alignment
-        // requirement and is zero-copy. Every pipeline call reads these resident
-        // bytes with no fd access — so --bench-loop times pure tokenization, and
-        // file I/O is excluded from the timed region exactly as HuggingFace does.
-        struct stat st;
-        const size_t nbytes = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
-        void * mapping = MAP_FAILED;
-        const char * buf = nullptr;
-        if (nbytes > 0) {
-            mapping = mmap(nullptr, nbytes, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (mapping == MAP_FAILED) {
-                llvm::errs() << "Error: cannot mmap " << inputFile << ".\n";
-                close(fd);
-                return 1;
-            }
-            buf = static_cast<const char *>(mapping);
+        // Load the whole input ONCE into memory (before any timing). A file is
+        // mapped: a page-aligned pointer, which satisfies MemorySourceKernel's
+        // alignment requirement, and zero-copy; the standard input (a pipe) is
+        // read into a page-aligned buffer. Every pipeline call reads these
+        // resident bytes with no fd access — so --bench-loop times pure
+        // tokenization, and file I/O is excluded from the timed region exactly
+        // as HuggingFace does.
+        AlignedFileBuffer input;
+        if (!input.load(in.fd, in.mappable)) {
+            llvm::errs() << toolio::programName() << ": " << in.name << ": " << std::strerror(errno) << "\n";
+            return 1;
         }
+        const size_t nbytes = input.getBufSize();
+        const char * buf = (nbytes > 0) ? input.getBuf() : nullptr;
         // --memsource-in-place: one copy here, laid out like MemorySourceKernel's own (page
         // aligned, zeroed from the end of the data through one more page), instead of the
         // kernel's copy on every pipeline call.
@@ -899,8 +901,8 @@ int main(int argc, char *argv[]) {
                 auto t1 = std::chrono::steady_clock::now();
                 ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
             }
-            if (mapping != MAP_FAILED) munmap(mapping, nbytes);
-            close(fd);
+            input.release();
+            toolio::closeInput(in);
 
             std::sort(ms.begin(), ms.end());
             const double minv    = ms.front();
@@ -918,7 +920,7 @@ int main(int argc, char *argv[]) {
                          "BENCH_RESULT bytes=%zu iters=%u min_ms=%.6f median_ms=%.6f "
                          "mean_ms=%.6f mbps=%.4f\n",
                          nbytes, N, minv, median, mean, mbps);
-            return 0;
+            return toolio::finishOutput() ? 0 : 1;
         }
 
         auto __tRun0 = std::chrono::steady_clock::now();
@@ -929,21 +931,19 @@ int main(int argc, char *argv[]) {
                   << std::chrono::duration<double, std::milli>(__tRun1 - __tRun0).count()
                   << " ms\n";
         reportBPEStatistics();
-        if (mapping != MAP_FAILED) munmap(mapping, nbytes);
-        close(fd);
-        return 0;
+        input.release();
+        toolio::closeInput(in);
+        return toolio::finishOutput() ? 0 : 1;
     }
 
     // Pre-tokenizer pipeline mode (existing behaviour) 
-    CPUDriver driver("unicode_word_tokenizer");
-    WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);
-
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
         return 1;
     }
-    wordBreakerFn(fd);
-    close(fd);
-    return 0;
+    CPUDriver driver("unicode_word_tokenizer");
+    WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);
+    wordBreakerFn(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

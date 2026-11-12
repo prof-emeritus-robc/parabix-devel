@@ -33,6 +33,7 @@
 #include <re/cc/cc_compiler_target.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fcntl.h>
 #include <iostream>
 #include <kernel/pipeline/driver/cpudriver.h>
@@ -45,7 +46,7 @@ using namespace pablo;
 static cl::opt<bool> FilterBasisBits("FilterBasisBits", cl::desc("Perform filtering on basis bits rather than on byte stream"), 
     cl::init(false), cl::cat(csv::CSV_Options), cl::Hidden);
 
-typedef void (*CSVFunctionType)(uint32_t fd);
+typedef void (*CSVFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -55,14 +56,14 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
 
     // A Parabix program is build as a set of kernel calls called a pipeline.
     // A pipeline is construction using a Parabix driver object.
-    auto P = CreatePipeline(driver, Input<uint32_t>{"inputFileDecriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"inputFileDecriptor"}, Input<uint32_t>{"outputFD"});
     //  The program will use a file descriptor as an input.
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     // File data from mmap
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    //  ReadSourceKernel is a Parabix Kernel that produces a stream of bytes
-    //  from a file descriptor.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    //  FDSourceKernel is a Parabix Kernel that produces a stream of bytes
+    //  from a file descriptor, mapping the file into memory or reading it.
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     //  The Parabix basis bits representation is created by the Parabix S2P kernel.
     //  S2P stands for serial-to-parallel.
@@ -94,7 +95,7 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     }
     SHOW_BYTES(Filtered);
     //  The StdOut kernel writes a byte stream to standard output.
-    P.CreateKernelCall<StdOutKernel>(Filtered);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), Filtered);
     return P.compile();
 }
 
@@ -102,23 +103,22 @@ int main(int argc, char *argv[]) {
     llvm_shutdown_obj shutdown;
     csv::InitializeCommandLineInterface(argc, argv);
 
-    std::vector<std::string> headers = csv::get_CSV_headers();
+    //  The input is read twice (its first line for the headers), so the
+    //  standard input is copied to a temporary file if it is a pipe.
+    toolio::Input in;
+    if (!toolio::openSeekableInput(csv::inputFile, in) || !toolio::openOutput()) {
+        return csv::InternalFailureCode;
+    }
+    std::vector<std::string> headers = csv::get_CSV_headers(in);
 
     std::vector<unsigned> colNos = csv::getColumnArgs(headers);
 
     CPUDriver driver("csv_function");
     //  Build and compile the Parabix pipeline by calling the Pipeline function above.
     CSVFunctionType fn = generatePipeline(driver, colNos);
-    //  The compile function "fn"  can now be used.   It takes a file
-    //  descriptor as an input, which is specified by the filename given by
-    //  the inputFile command line option.]
-
-    const int fd = open(csv::inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::report_fatal_error(llvm::StringRef("Cannot open ") + csv::inputFile);
-    } else {
-        fn(fd);
-        close(fd);
-    }
-    return csv::SuccessExitCode;
+    //  The compiled function "fn" can now be used.  It takes whether to map
+    //  the input, and the input and output file descriptors.
+    fn(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? csv::SuccessExitCode : csv::InternalFailureCode;
 }

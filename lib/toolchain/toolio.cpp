@@ -116,10 +116,85 @@ bool openInput(const std::string & name, Input & in) {
         return false;
     }
     in.isRegularFile = S_ISREG(st.st_mode);
-    // A mapping starts at the beginning of the file, but the standard input
-    // may have been read in part already: then it is read from where it is.
-    in.useMMap = MMapFlag && in.isRegularFile && (::lseek(in.fd, 0, SEEK_CUR) == 0);
+    if (in.isRegularFile) {
+        // A mapping starts at the beginning of the file, but the standard
+        // input may have been read in part already: then it is read from
+        // where it is.
+        const off_t position = ::lseek(in.fd, 0, SEEK_CUR);
+        in.start = (position > 0) ? position : 0;
+        in.mappable = (position == 0);
+    }
+    in.useMMap = MMapFlag && in.mappable;
     return true;
+}
+
+bool openSeekableInput(const std::string & name, Input & in) {
+    if (!openInput(name, in)) {
+        return false;
+    }
+    if (in.isRegularFile) {
+        return true;
+    }
+    // A temporary file, removed at once (it lasts while open)
+    const char * const dir = std::getenv("TMPDIR");
+    const std::string pattern = std::string((dir && *dir) ? dir : "/tmp") + "/parabix-input.XXXXXX";
+    std::vector<char> temporary(pattern.begin(), pattern.end());
+    temporary.push_back('\0');
+    const int fd = ::mkstemp(temporary.data());
+    if (fd == -1) {
+        report("cannot create a temporary file for " + in.name, errno);
+        closeInput(in);
+        return false;
+    }
+    ::unlink(temporary.data());
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    std::vector<char> buffer(1 << 16);
+    for (;;) {
+        const ssize_t n = ::read(in.fd, buffer.data(), buffer.size());
+        if (n == 0) {
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            report(in.name, errno);
+            ::close(fd);
+            closeInput(in);
+            return false;
+        }
+        for (ssize_t done = 0; done < n; ) {
+            const ssize_t w = ::write(fd, buffer.data() + done, static_cast<size_t>(n - done));
+            if (w < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                report("cannot copy " + in.name + " to a temporary file", errno);
+                ::close(fd);
+                closeInput(in);
+                return false;
+            }
+            done += w;
+        }
+    }
+    ::lseek(fd, 0, SEEK_SET);
+    closeInput(in);
+    in.fd = fd;
+    in.isStdIn = false;
+    in.isRegularFile = true;
+    in.mappable = true;
+    in.useMMap = MMapFlag;
+    in.start = 0;
+    in.spooled = true;
+    return true;
+}
+
+int rewindInput(const Input & in) {
+    if (::lseek(in.fd, static_cast<off_t>(in.start), SEEK_SET) == -1) {
+        report(in.name, errno);
+        return -1;
+    }
+    return in.fd;
 }
 
 void closeInput(Input & in) {

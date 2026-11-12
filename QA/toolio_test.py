@@ -29,6 +29,17 @@ def run(cat, args, stdin=None, input=None):
     return subprocess.run([cat] + args, stdin=stdin, input=input, capture_output=True)
 
 
+def first_difference(got, expected):
+    for i, (a, b) in enumerate(zip(got, expected)):
+        if a != b:
+            end = i
+            while end < min(len(got), len(expected)) and got[end] != expected[end]:
+                end += 1
+            return "first difference at byte %d (page %d, offset %d), %d bytes differ from there: %r, expected %r" % (
+                i, i // 4096, i % 4096, end - i, got[i:i + 16], expected[i:i + 16])
+    return "the shorter is a prefix of the other"
+
+
 def expect_output(case, result, expected, stdout=True):
     """The run succeeded, wrote expected (to stdout if stdout), and no messages."""
     if result.returncode != 0:
@@ -37,7 +48,8 @@ def expect_output(case, result, expected, stdout=True):
     if result.stderr:
         fail(case, "messages: %s" % result.stderr.decode(errors="replace")[:300])
     if stdout and result.stdout != expected:
-        fail(case, "%d bytes written, %d expected" % (len(result.stdout), len(expected)))
+        fail(case, "%d bytes written, %d expected; %s" % (len(result.stdout), len(expected),
+                                                         first_difference(result.stdout, expected)))
     if not stdout and result.stdout:
         fail(case, "%d bytes written to the standard output" % len(result.stdout))
 

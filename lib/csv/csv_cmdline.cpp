@@ -15,6 +15,10 @@
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/raw_ostream.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/locale/encoding_utf.hpp>
@@ -41,7 +45,7 @@ namespace {
 // the CSV tools have them (see RegisterFileSelectOptions in fileselect).
 struct CSVOptions {
 
-cl::opt<std::string, true> inputFileOption{cl::location(inputFile), cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(csv::CSV_Options)};
+cl::opt<std::string, true> inputFileOption{cl::location(inputFile), cl::Positional, cl::desc("<input file>"), cl::cat(csv::CSV_Options)};
 
 // Although CSV files normally have column headers as the first line,
 // we can provide them directly or from a file.
@@ -106,10 +110,33 @@ std::vector<std::string> read_CSV_headers(std::string filename) {
 
 const unsigned MaxHeaderSize = 24;
 
-std::vector<std::string> get_CSV_headers() {
+// The first line of an input, read from in.start (without moving its position).
+static std::vector<std::string> read_CSV_headers(const toolio::Input & in) {
+    std::string line1;
+    char buffer[4096];
+    for (off_t offset = static_cast<off_t>(in.start); ; ) {
+        const ssize_t n = pread(in.fd, buffer, sizeof(buffer), offset);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        const char * const end = static_cast<const char *>(std::memchr(buffer, '\n', static_cast<size_t>(n)));
+        if (end) {
+            line1.append(buffer, static_cast<size_t>(end - buffer));
+            break;
+        }
+        line1.append(buffer, static_cast<size_t>(n));
+        offset += n;
+    }
+    return parse_CSV_headers(line1);
+}
+
+std::vector<std::string> get_CSV_headers(const toolio::Input & in) {
 	std::vector<std::string> headers;
     if (csv::HeaderSpec == "") {
-        headers = csv::read_CSV_headers(csv::inputFile);
+        headers = csv::read_CSV_headers(in);
     } else if (csv::HeaderSpecNamesFile) {
         headers = csv::read_CSV_headers(csv::HeaderSpec);
     } else {
@@ -221,7 +248,11 @@ void InitializeCommandLineInterface(int argc, char *argv[]) {
     llvm::install_fatal_error_handler(&csv_error_handler);
     static CSVOptions opts;
     Registered = &opts;
-    codegen::ParseCommandLineOptions(argc, argv, {&CSV_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    // (Registered here, not by static objects: the single library has this
+    // code in every tool.)
+    static toolio::RegisterInputOptions InputOptions;
+    static toolio::RegisterOutputOptions OutputOptions;
+    codegen::ParseCommandLineOptions(argc, argv, {&CSV_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     // Set the delimiter and quote characters.
     if (registeredOptions().TabDelimiter) {

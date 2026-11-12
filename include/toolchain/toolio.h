@@ -50,13 +50,24 @@ struct Input {
     int fd = -1;
     bool isStdIn = false;
     bool isRegularFile = false;
-    bool useMMap = false;       // --mmap, and the input can be mapped: a regular
-                                // file, read from its beginning
+    bool mappable = false;      // a regular file, read from its beginning
+    bool useMMap = false;       // --mmap, and mappable
+    long long start = 0;        // where reading starts (the standard input may
+                                // have been read in part)
+    bool spooled = false;       // a copy of the standard input (openSeekableInput)
 };
 
 // Opens the input file name ("" and "-" are the standard input).  On failure,
 // reports it (tool: file: reason) and returns false.
 bool openInput(const std::string & name, Input & in);
+// As openInput, for a tool that reads its input more than once (from
+// in.start, e.g., with rewindInput or pread): an input that is not a regular
+// file (a pipe, a terminal) is first copied to a temporary file (removed
+// when closed).
+bool openSeekableInput(const std::string & name, Input & in);
+// The input, positioned at its start again (an input of openSeekableInput);
+// -1 (reported) on failure.
+int rewindInput(const Input & in);
 void closeInput(Input & in);
 
 // Opens the output: the standard output, or the file of --output, written

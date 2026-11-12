@@ -4684,7 +4684,9 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         const std::vector<PabloAST *> basis = getInputStreamSet("U21");
-        std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> ahead(mConfig.lookahead() + 1);
+        //  (Optional and Star items of the tracked capture look one character
+        //  ahead, as the lookahead of U21 provides: at least 1.)
+        std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> ahead(std::max(1u, mConfig.lookahead()) + 1);
         auto cls = [&](unsigned k, const UCD::UnicodeSet & set) -> PabloAST * {
             if (!ahead[k]) {
                 std::vector<PabloAST *> bits(basis.size());

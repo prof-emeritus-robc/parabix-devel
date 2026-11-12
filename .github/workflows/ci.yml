@@ -230,4 +230,7 @@ jobs:
           run: |
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/local/llvm18
             cmake --build build -- -k 0
-            ctest --test-dir build --output-on-failure -j 4
+            if ! ctest --test-dir build --output-on-failure -j 4; then
+              sh .github/scripts/freebsd-crash-report.sh build
+              exit 1
+            fi

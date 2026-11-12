@@ -106,6 +106,8 @@ public:
     // Whether an input file could not be read (reported unless suppressed).
     bool fileErrorFound() const {return mFileErrorFound;}
     void DoGrepThreadMethod();
+    // Prints the messages of a group of files, then its results.
+    void printFileGroup(unsigned i);
     virtual void showResult(uint64_t grepResult, const std::string & fileName, std::ostringstream & strm);
 
 protected:
@@ -118,7 +120,10 @@ protected:
     kernel::StreamSet * matchedLines(kernel::PipelineBuilder & P, kernel::StreamSet * matches, kernel::StreamSet * linebreaks);
     kernel::StreamSet * applyMatchLimit(kernel::PipelineBuilder & P, kernel::StreamSet * matched);
     kernel::StreamSet * grepPipeline(kernel::PipelineBuilder & P, kernel::StreamSet * Source);
-    virtual uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm);
+    // Searches a group of files: the results go to strm, and the messages
+    // (files that cannot be read, binary files) to msgs, for the standard
+    // error.
+    virtual uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm, std::ostringstream & msgs);
     // Whether an empty file can produce output (a count, or a file name for -L).
     // If not, empty files are skipped without being opened.
     virtual bool reportsEmptyFiles() const {return false;}
@@ -157,6 +162,7 @@ protected:
     std::vector<boost::filesystem::path> mInputPaths;
     std::vector<std::vector<std::string>> mFileGroups;
     std::vector<std::ostringstream> mResultStrs;
+    std::vector<std::ostringstream> mMessageStrs;
     std::vector<FileStatus> mFileStatus;
     bool grepMatchFound;
     std::atomic<bool> mFileErrorFound{false};
@@ -237,7 +243,7 @@ public:
     // The matching lines with their matches replaced (see setReplacement).
     void replacePipeline(kernel::PipelineBuilder & P, kernel::StreamSet * ByteStream);
 private:
-    uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) override;
+    uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm, std::ostringstream & msgs) override;
     bool detectsBinaryByNull() const;
 };
 

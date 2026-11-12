@@ -56,9 +56,10 @@ struct PreTokenizerResult {
     StreamSet * AlphanumericMask;
     StreamSet * PunctuationStream;
     SplitBehaviorMode effectiveBehavior;
-    StreamSet * WordClassMask;         // \w mask; set only for simpleWordBoundaries,
-                                        // nullptr otherwise. Used by the real "removed"
-                                        // behavior to delete matched \w+ characters.
+    StreamSet * WordClassMask;         // the pattern's match mask: \w for
+                                        // simpleWordBoundaries, BERT punctuation for
+                                        // punctuation; nullptr otherwise. Used by the real
+                                        // "removed" behavior to delete the matched characters.
 };
 
 // Stage 2a: compute token boundaries and apply split-behavior rules.

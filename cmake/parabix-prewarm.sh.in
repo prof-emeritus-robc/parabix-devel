@@ -73,8 +73,9 @@ printf 'name,count\nfox,1\ndog,2\n' > "$CSV"
 prewarm() {
     TOOL=$1
     case "$TOOL" in
-        icgrep) PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/icgrep" ;;
-        *)      PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/px-$TOOL" ;;
+        wc)     PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/pwc" ;;
+        base64) PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/pbase64" ;;
+        *)      PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/$TOOL" ;;
     esac
     set --
     case "$TOOL" in

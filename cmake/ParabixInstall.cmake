@@ -18,12 +18,13 @@
 #   DESTDIR=<staging dir> applies to all of them.
 #
 # Layout (GNUInstallDirs, below the prefix):
-#   bin/icgrep, bin/px-<tool>        the tools (all but icgrep prefixed, so as
-#                                    not to shadow system commands)
+#   bin/<tool>                       the tools, under their own names, but for
+#                                    pwc and pbase64 (wc and base64), so as not
+#                                    to shadow the system commands
 #   lib/libparabix.so.0.9            the Parabix library (.0.9.dylib on macOS)
 #   libexec/parabix/cachejanitord    the object cache cleanup daemon
-#   libexec/parabix/bin/<tool>       unprefixed links to some tools, for
-#                                    those who put this directory on their PATH
+#   libexec/parabix/bin/{wc,base64}  links to pwc and pbase64, for those who
+#                                    put this directory on their PATH
 #   share/parabix/pablo/             pablo sources read by json, xml and ztf1
 #   share/doc/parabix/               READMEs and licenses
 #
@@ -52,18 +53,22 @@
 
 # The default set: tools for general use.
 set(PARABIX_TOOLS_DEFAULT
-    icgrep wc base64 csvcut csvgrep csv2json tconv ldml_trules hexlines
+    icgrep wc base64 csvcut csvgrep csv2json tconv hexlines
     gb18030 nfc nfd nfkd u32u16 u32u8 u8u16 x8u16)
 # The dev set: developer tools and demonstrations.
 set(PARABIX_TOOLS_DEV
-    ucount tokenizer xch editd idisa_exerciser idisa_test hashdemo matchprior
+    ldml_trules ucount tokenizer xch editd idisa_exerciser idisa_test hashdemo matchprior
     ufilter audioamplifier discontinuity stereo2mono ztf-runs ztf-hash)
 # Tools reading pablo sources at run time: installed for a user only (not
 # for all users, who would all depend on files that one may change), and
 # only by name, in no set.
 set(PARABIX_TOOLS_USER_ONLY json xml ztf1)
-# Tools that also get an unprefixed link in libexec/parabix/bin.
-set(PARABIX_TOOLS_LINKED wc base64 csvgrep csvcut csv2json tconv hexlines)
+# Tools installed under another name, not to shadow system commands
+set(PARABIX_TOOLS_RENAMED wc base64)
+set(PARABIX_INSTALL_NAME_wc pwc)
+set(PARABIX_INSTALL_NAME_base64 pbase64)
+# ... which also get a link under their own name in libexec/parabix/bin.
+set(PARABIX_TOOLS_LINKED ${PARABIX_TOOLS_RENAMED})
 
 if(NOT ARTIFACT_MODE STREQUAL "Single")
     install(CODE "message(FATAL_ERROR \"Parabix is installed from a build with -DARTIFACT_MODE=Single (see cmake/ParabixInstall.cmake)\")")
@@ -110,10 +115,10 @@ list(REMOVE_DUPLICATES SELECTED_TOOLS)
 
 # The tool name as installed
 function(parabix_install_name OUT TOOL)
-    if(TOOL STREQUAL "icgrep")
-        set(${OUT} ${TOOL} PARENT_SCOPE)
+    if(TOOL IN_LIST PARABIX_TOOLS_RENAMED)
+        set(${OUT} ${PARABIX_INSTALL_NAME_${TOOL}} PARENT_SCOPE)
     else()
-        set(${OUT} px-${TOOL} PARENT_SCOPE)
+        set(${OUT} ${TOOL} PARENT_SCOPE)
     endif()
 endfunction(parabix_install_name)
 

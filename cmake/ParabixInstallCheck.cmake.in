@@ -3,7 +3,7 @@
 
 # make installcheck: runs the tests of the build (CTestTestfile.cmake) on
 # the installed tools.  A directory of links with the names the tests use
-# (wc -> <prefix>/bin/px-wc) stands in for <build>/bin, and the tests of
+# (wc -> <prefix>/bin/pwc) stands in for <build>/bin, and the tests of
 # tools not installed are left out.
 #
 #   cmake [-DPREFIX=<prefix>] [-DCTEST_ARGS="-j4;-R;grep"] -P <build>/ParabixInstallCheck.cmake
@@ -27,12 +27,14 @@ file(MAKE_DIRECTORY "${WORK}/bin")
 file(GLOB TOOL_RECORDS RELATIVE "${RECORDS}" "${RECORDS}/tool-*.txt")
 string(REGEX REPLACE "tool-([^;]*)\\.txt" "\\1" INSTALLED "${TOOL_RECORDS}")
 foreach(TOOL ${INSTALLED})
-    if(TOOL STREQUAL "icgrep")
-        set(NAME icgrep)
-    else()
-        set(NAME px-${TOOL})
+    # The program is the file the tool's record lists in bin (its installed
+    # name, e.g., pwc for wc, is that of the installation, which may be older)
+    file(STRINGS "${RECORDS}/tool-${TOOL}.txt" FILES REGEX "^@CMAKE_INSTALL_BINDIR@/[^/]+$")
+    if(NOT FILES)
+        message(FATAL_ERROR "No program in the record of ${TOOL}: ${RECORDS}/tool-${TOOL}.txt")
     endif()
-    file(CREATE_LINK "${PREFIX}/@CMAKE_INSTALL_BINDIR@/${NAME}" "${WORK}/bin/${TOOL}" SYMBOLIC)
+    list(GET FILES 0 PROGRAM)
+    file(CREATE_LINK "${PREFIX}/${PROGRAM}" "${WORK}/bin/${TOOL}" SYMBOLIC)
 endforeach()
 
 # The tools of the tests given the whole bin directory

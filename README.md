@@ -74,12 +74,16 @@ By default this installs the tools for your own use, under `~/.local` (make sure
 
 The tool sets:
 
-- `default`: `icgrep`, `wc`, `base64`, `csvcut`, `csvgrep`, `csv2json`, `tconv`, `ldml_trules`,
-  `hexlines`, the transcoders `gb18030`, `u32u16`, `u32u8`, `u8u16`, `x8u16`, and the Unicode
-  normalizers `nfc`, `nfd`, `nfkd`.
-- `dev`: developer tools and demonstrations (`ucount`, `tokenizer`, `xch`, `editd`,
-  `idisa_exerciser`, `idisa_test`, `hashdemo`, `matchprior`, `ufilter`, the audio tools,
-  `ztf-runs`, `ztf-hash`).
+- `default`: `icgrep`, `wc`, `base64`, `csvcut`, `csvgrep`, `csv2json`, `tconv`, `hexlines`,
+  the transcoders `gb18030`, `u32u16`, `u32u8`, `u8u16`, `x8u16`, and the Unicode normalizers
+  `nfc`, `nfd`, `nfkd`.
+- `dev`: developer tools and demonstrations (`ldml_trules`, `ucount`, `tokenizer`, `xch`,
+  `editd`, `idisa_exerciser`, `idisa_test`, `hashdemo`, `matchprior`, `ufilter`, the audio
+  tools, `ztf-runs`, `ztf-hash`).
+
+The tools are installed under their own names, except `wc` and `base64`, which are installed
+as `pwc` and `pbase64` so as not to hide the system commands.  `make install-<tool>` and
+`make uninstall-<tool>` use the tool's own name (`make install-wc`).
 - `json`, `xml` and `ztf1` read Pablo source files at run time.  They are in no set, and can be
   installed (by name) only for your own use.
 
@@ -101,10 +105,10 @@ The installed files:
 
 | Path (below the prefix) | Contents |
 |---|---|
-| `bin/icgrep`, `bin/px-<tool>` | The tools; all but `icgrep` are prefixed, so as not to hide system commands such as `wc` and `base64` |
+| `bin/<tool>`, `bin/pwc`, `bin/pbase64` | The tools |
 | `lib/libparabix.so.0.9` (`libparabix.0.9.dylib` on macOS) | The Parabix library |
 | `libexec/parabix/cachejanitord` | The object cache cleanup process |
-| `libexec/parabix/bin/` | Unprefixed links to `wc`, `base64`, `csvgrep`, `csvcut`, `csv2json`, `tconv` and `hexlines`, for those who put this directory on their `PATH` |
+| `libexec/parabix/bin/` | Links `wc` and `base64` to `pwc` and `pbase64`, for those who put this directory on their `PATH` |
 | `share/parabix/` | Pablo sources, the records of the installed files, and the uninstall script |
 | `share/doc/parabix/` | READMEs and licenses |
 

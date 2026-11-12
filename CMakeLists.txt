@@ -328,7 +328,7 @@ get_filename_component(PARABIX_BUILD_DATADIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$
 # libraries as well (<build>/lib/libparabix), and programs find them by a
 # run path relative to their own directory ($ORIGIN/../lib), the one they
 # are installed with.  Installing a program is then copying it, under its
-# installed name (px-<tool>).
+# installed name (e.g., pwc for wc).
 if(ARTIFACT_MODE STREQUAL "Single")
     file(RELATIVE_PATH PARABIX_BINDIR_TO_LIBDIR ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_LIBDIR})
     get_filename_component(PARABIX_BUILD_LIBDIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PARABIX_BINDIR_TO_LIBDIR} ABSOLUTE)

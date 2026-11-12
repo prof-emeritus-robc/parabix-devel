@@ -21,7 +21,7 @@ name: CI
 
 on:
   schedule:
-    - cron: "17 9 * * *"     # 09:17 UTC daily
+    - cron: "47 10 * * *"    # 10:47 UTC daily: 03:47 PDT (02:47 PST)
   workflow_dispatch:
     inputs:
       jobs:
@@ -181,7 +181,7 @@ jobs:
           cmake --build build --target installcheck
           # The kernels of a prewarmed tool come from the system-wide cache
           rm -rf "$RUNNER_TEMP/usercache"
-          PARABIX_OBJECT_CACHE_DIR="$RUNNER_TEMP/usercache" /usr/local/bin/px-wc -trace-object-cache README.md 2>&1 \
+          PARABIX_OBJECT_CACHE_DIR="$RUNNER_TEMP/usercache" /usr/local/bin/pwc -trace-object-cache README.md 2>&1 \
             | tee "$RUNNER_TEMP/trace.txt"
           grep -q "Read cache file (system cache)" "$RUNNER_TEMP/trace.txt"
       - name: Uninstall

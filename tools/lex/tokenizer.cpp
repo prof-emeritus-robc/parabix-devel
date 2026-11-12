@@ -822,10 +822,7 @@ int main(int argc, char *argv[]) {
                                 "NORMALIZED text, which may not align with the input file.\n";
         }
 
-        applyAutoSegmentSize(inputFile);
-        CPUDriver driver("bpe_tokenizer");
-        BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
-
+        // (Opened before compiling: a pipe is read ahead meanwhile.)
         toolio::Input in;
         if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
             return 1;
@@ -833,6 +830,10 @@ int main(int argc, char *argv[]) {
         // The output of the tokens (written under gEmitMutex), created before
         // the pipeline's threads write to it
         (void)toolio::out();
+
+        applyAutoSegmentSize(inputFile);
+        CPUDriver driver("bpe_tokenizer");
+        BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
 
         // Load the whole input ONCE into memory (before any timing). A file is
         // mapped: a page-aligned pointer, which satisfies MemorySourceKernel's

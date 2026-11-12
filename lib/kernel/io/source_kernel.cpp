@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <boost/interprocess/mapped_region.hpp>
 #include <llvm/Support/raw_ostream.h>
 #include <unistd.h>
@@ -180,7 +181,7 @@ inline IntTy round_up_to(const IntTy x, const IntTy y) {
     return (x + y - 1) & -y;
 }
 
-void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth) {
+void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth, StringRef readFunction) {
 
     Value * const segmentItems = b.getNumOfStrides();
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
@@ -212,7 +213,7 @@ void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     PHINode * const producedSoFar = b.CreatePHI(sizeTy, 2);
     producedSoFar->addIncoming(produced, entryBlock);
     Value * const sourceBuffer = b.getRawOutputPointer("sourceBuffer", producedSoFar);
-    Function *  const preadFunc = b.getModule()->getFunction("read");
+    Function *  const preadFunc = b.getModule()->getFunction(readFunction);
     FixedArray<Value *, 3> args;
     args[0] = fd;
     args[1] = sourceBuffer;
@@ -311,7 +312,7 @@ void FDSourceKernel::generateDoSegmentMethod(KernelBuilder & b) {
     MMapSourceKernel::generateDoSegmentMethod(b, mCodeUnitWidth);
     b.CreateBr(DoSegmentDone);
     b.SetInsertPoint(DoSegmentRead);
-    ReadSourceKernel::generateDoSegmentMethod(b, mCodeUnitWidth);
+    ReadSourceKernel::generateDoSegmentMethod(b, mCodeUnitWidth, "toolio_read");
     b.CreateBr(DoSegmentDone);
     b.SetInsertPoint(DoSegmentDone);
 }
@@ -349,6 +350,7 @@ void FDSourceKernel::generateFinalizeMethod(KernelBuilder & b) {
 void FDSourceKernel::linkExternalMethods(KernelBuilder & b) {
     MMapSourceKernel::generatLinkExternalFunctions(b);
     ReadSourceKernel::generatLinkExternalFunctions(b);
+    b.LinkFunction("toolio_read", toolio_read);
     Kernel::linkExternalMethods(b);
 }
 

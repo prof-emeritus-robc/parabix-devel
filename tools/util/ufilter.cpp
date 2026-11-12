@@ -109,6 +109,11 @@ UFiltertFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&ufFlags, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    // (Opened before compiling: a pipe is read ahead meanwhile.)
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("ufilter");
 
     UFiltertFunctionType fnPtr = nullptr;
@@ -124,10 +129,6 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    toolio::Input in;
-    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
-        return 1;
-    }
     fnPtr(in.useMMap, in.fd, toolio::outputFD());
     toolio::closeInput(in);
     return toolio::finishOutput() ? 0 : 1;

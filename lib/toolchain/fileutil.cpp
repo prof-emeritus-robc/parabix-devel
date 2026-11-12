@@ -4,6 +4,7 @@
  */
 
 #include <toolchain/fileutil.h>
+#include <toolchain/toolio.h>
 #include <string>
 #include <boost/filesystem.hpp>
 #include <algorithm>
@@ -142,7 +143,8 @@ bool AlignedFileBuffer::load(const int fd, const bool useMMap) {
             mBuffer = newBuffer;
             capacity = newCapacity;
         }
-        const auto n = read(fd, mBuffer + mBufSize, std::min(capacity - mBufSize, MaximumReadSize));
+        // (toolio_read: the data read ahead of a pipe, then read())
+        const auto n = toolio_read(fd, mBuffer + mBufSize, std::min(capacity - mBufSize, MaximumReadSize));
         if (n > 0) {
             mBufSize += n;
         } else if (n == 0) {

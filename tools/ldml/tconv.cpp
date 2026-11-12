@@ -9710,7 +9710,7 @@ static void applyToInput(const std::function<void (int)> & fn, int fd) {
     }
     std::string text;
     char buffer[1 << 16];
-    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
+    for (ssize_t n; (n = toolio_read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
     for (size_t pos = 0; pos < text.size(); ) {
         const size_t nl = text.find('\n', pos);
         const size_t end = nl == std::string::npos ? text.size() : nl;
@@ -9820,7 +9820,7 @@ using Runner = std::function<void (int)>;
 static std::string readAll(int fd) {
     std::string text;
     char buffer[1 << 16];
-    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
+    for (ssize_t n; (n = toolio_read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
     return text;
 }
 

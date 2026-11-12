@@ -98,6 +98,18 @@ int main(int argc, char *argv[]) {
     auto RE = readRE();
 
     const argv::FileSelection allFiles(driver, inputFiles);
+    // Read while compiling: the standard input, from a pipe or a terminal (not
+    // with -q, which may stop before reading it: the data read ahead would be
+    // taken from its writer for nothing), and the files.
+    if (allFiles.stdinSelected() && (argv::Mode != argv::QuietMode)) {
+        toolio::startReadAhead(STDIN_FILENO);
+    }
+    std::vector<std::string> fileNames;
+    fileNames.reserve(allFiles.size());
+    for (const auto & path : allFiles.paths()) {
+        fileNames.push_back(path.string());
+    }
+    toolio::prefetchFiles(std::move(fileNames));
     if (allFiles.showFileNames() && !argv::NoFilenameFlag) {
         argv::WithFilenameFlag = true;
     }

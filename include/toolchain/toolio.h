@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <iosfwd>
 #include <string>
+#include <vector>
 
 namespace llvm { class raw_ostream; namespace cl { class OptionCategory; } }
 
@@ -63,6 +64,21 @@ bool mmapRequested();
 // Whether to map the open file fd: --mmap was given, and fd is a regular file
 // read from its beginning.
 bool useMMapFor(int fd);
+
+// Read-ahead (with RegisterInputOptions; -read-ahead=false turns it off): an
+// input that is a pipe or a terminal is read by a thread from the time it is
+// opened (openInput, or startReadAhead for a tool opening it itself), while
+// the tool compiles its kernels, at most 64 MiB ahead of the tool.  All the
+// reads of that input then go through toolio_read (as those of
+// FDSourceKernel and AlignedFileBuffer::load(fd) do).
+void startReadAhead(int fd);
+// Files (regular ones, in order, up to limit bytes in all) that the system is
+// asked to read into its cache while the tool compiles, by a thread: for a
+// tool reading several files (with RegisterInputOptions, unless
+// -read-ahead=false).  The default limit is about what a disk reads while
+// a tool compiles; advising files already in the cache costs the system some
+// time (a few ms for 512 MB, nothing measurable for 256 MB).
+void prefetchFiles(std::vector<std::string> names, size_t limit = size_t{256} << 20);
 
 // Opens the input file name ("" and "-" are the standard input).  On failure,
 // reports it (tool: file: reason) and returns false.
@@ -114,3 +130,8 @@ bool useColor(ColorMode mode, int fd);
 // Writes the n bytes at buf to fd, as FDSinkKernel does: repeating short and
 // interrupted writes; the first error is reported by finishOutput.
 extern "C" void toolio_write(int fd, const void * buf, size_t n);
+
+// Reads up to n bytes of fd into buf, as read() does (what is available,
+// waiting only if nothing is; 0 at the end; -1 and errno on error): from
+// the data read ahead, if fd is read ahead (startReadAhead), then from fd.
+extern "C" long toolio_read(int fd, void * buf, size_t n);

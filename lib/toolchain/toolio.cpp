@@ -8,7 +8,12 @@
 #include <toolchain/toolchain.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
@@ -31,7 +36,52 @@ cl::OptionCategory InputOutputOptions("Input and Output Options", "These options
 namespace {
 
 bool MMapFlag = false;
+bool InputOptionsRegistered = false;
+bool ReadAheadFlag = true;
 std::string OutputFileName;
+
+// The data of an input read ahead by a thread: read() results queued, at
+// most Limit bytes ahead of the reader (toolio_read).
+struct ReadAhead {
+    static constexpr size_t Limit = size_t{64} << 20;
+    static constexpr size_t ReadSize = size_t{1} << 20;
+    int fd;
+    std::mutex lock;
+    std::condition_variable changed;
+    std::deque<std::vector<char>> chunks;
+    size_t frontOffset = 0;         // of the first chunk, already read
+    size_t buffered = 0;            // bytes queued
+    bool done = false;              // the end of the input, or an error
+    int error = 0;
+};
+
+// The input read ahead (one per process; never freed, as its thread may
+// still be waiting for data at exit)
+std::atomic<ReadAhead *> ActiveReadAhead{nullptr};
+
+void readAheadThread(ReadAhead * const ra) {
+    std::vector<char> buffer(ReadAhead::ReadSize);
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> guard(ra->lock);
+            ra->changed.wait(guard, [ra] { return ra->buffered < ReadAhead::Limit; });
+        }
+        const ssize_t n = ::read(ra->fd, buffer.data(), buffer.size());
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        std::lock_guard<std::mutex> guard(ra->lock);
+        if (n <= 0) {
+            ra->error = (n < 0) ? errno : 0;
+            ra->done = true;
+            ra->changed.notify_all();
+            return;
+        }
+        ra->chunks.emplace_back(buffer.begin(), buffer.begin() + n);
+        ra->buffered += static_cast<size_t>(n);
+        ra->changed.notify_all();
+    }
+}
 
 // The first error of toolio_write (an errno value)
 std::atomic<int> WriteError{0};
@@ -76,6 +126,9 @@ void atExit() {
 RegisterInputOptions::RegisterInputOptions() {
     static cl::opt<bool, true> MMapOption("mmap", cl::location(MMapFlag), cl::init(false),
         cl::desc("Map input files into memory, instead of reading them."), cl::cat(InputOutputOptions));
+    static cl::opt<bool, true> ReadAheadOption("read-ahead", cl::location(ReadAheadFlag), cl::init(true),
+        cl::desc("Read the input while compiling: a pipe or a terminal, by a thread; files, by asking the system to read them (default true)."), cl::cat(InputOutputOptions));
+    InputOptionsRegistered = true;
 }
 
 RegisterOutputOptions::RegisterOutputOptions() {
@@ -99,6 +152,53 @@ bool mmapRequested() {
 bool useMMapFor(const int fd) {
     struct stat st;
     return MMapFlag && ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && ::lseek(fd, 0, SEEK_CUR) == 0;
+}
+
+void startReadAhead(const int fd) {
+    if (!InputOptionsRegistered || !ReadAheadFlag || ActiveReadAhead.load() != nullptr) {
+        return;
+    }
+    struct stat st;
+    if (::fstat(fd, &st) != 0 || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) {
+        return;
+    }
+    ReadAhead * const ra = new ReadAhead;
+    ra->fd = fd;
+    ActiveReadAhead.store(ra);
+    std::thread(readAheadThread, ra).detach();
+}
+
+void prefetchFiles(std::vector<std::string> names, const size_t limit) {
+    if (!InputOptionsRegistered || !ReadAheadFlag || names.empty()) {
+        return;
+    }
+    // A thread, so that opening many files does not delay the compilation
+    std::thread([names = std::move(names), limit] {
+        size_t remaining = limit;
+        for (const std::string & name : names) {
+            if (remaining == 0) {
+                return;
+            }
+            const int fd = ::open(name.c_str(), O_RDONLY);
+            if (fd < 0) {
+                continue;
+            }
+            struct stat st;
+            if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                const size_t n = std::min(remaining, static_cast<size_t>(st.st_size));
+                remaining -= n;
+                #if defined(__APPLE__)
+                struct radvisory advice;
+                advice.ra_offset = 0;
+                advice.ra_count = static_cast<int>(std::min<size_t>(n, INT_MAX));
+                ::fcntl(fd, F_RDADVISE, &advice);
+                #elif defined(POSIX_FADV_WILLNEED)
+                ::posix_fadvise(fd, 0, static_cast<off_t>(n), POSIX_FADV_WILLNEED);
+                #endif
+            }
+            ::close(fd);
+        }
+    }).detach();
 }
 
 bool openInput(const std::string & name, Input & in) {
@@ -136,6 +236,9 @@ bool openInput(const std::string & name, Input & in) {
         in.mappable = (position == 0);
     }
     in.useMMap = MMapFlag && in.mappable;
+    if (!in.isRegularFile) {
+        startReadAhead(in.fd);
+    }
     return true;
 }
 
@@ -161,7 +264,7 @@ bool openSeekableInput(const std::string & name, Input & in) {
     ::fcntl(fd, F_SETFD, FD_CLOEXEC);
     std::vector<char> buffer(1 << 16);
     for (;;) {
-        const ssize_t n = ::read(in.fd, buffer.data(), buffer.size());
+        const ssize_t n = toolio_read(in.fd, buffer.data(), buffer.size());
         if (n == 0) {
             break;
         }
@@ -418,4 +521,36 @@ extern "C" void toolio_write(const int fd, const void * const buf, size_t n) {
         p += written;
         n -= static_cast<size_t>(written);
     }
+}
+
+extern "C" long toolio_read(const int fd, void * const buf, const size_t n) {
+    toolio::ReadAhead * const ra = toolio::ActiveReadAhead.load();
+    if (ra == nullptr || ra->fd != fd) {
+        return ::read(fd, buf, n);
+    }
+    std::unique_lock<std::mutex> guard(ra->lock);
+    ra->changed.wait(guard, [ra] { return ra->buffered > 0 || ra->done; });
+    if (ra->buffered == 0) {
+        if (ra->error != 0) {
+            errno = ra->error;
+            return -1;
+        }
+        return 0;
+    }
+    char * out = static_cast<char *>(buf);
+    size_t copied = 0;
+    while (copied < n && !ra->chunks.empty()) {
+        std::vector<char> & front = ra->chunks.front();
+        const size_t k = std::min(n - copied, front.size() - ra->frontOffset);
+        std::memcpy(out + copied, front.data() + ra->frontOffset, k);
+        copied += k;
+        ra->frontOffset += k;
+        if (ra->frontOffset == front.size()) {
+            ra->chunks.pop_front();
+            ra->frontOffset = 0;
+        }
+    }
+    ra->buffered -= copied;
+    ra->changed.notify_all();
+    return static_cast<long>(copied);
 }

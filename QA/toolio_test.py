@@ -94,6 +94,12 @@ def main():
                 expect_output("stdin from a pipe " + tag, run(cat, mmap, input=content), content)
                 expect_output("- from a pipe " + tag, run(cat, mmap + ["-"], input=content), content)
 
+        # Read-ahead (a pipe read by a thread while compiling): turned off, and
+        # beyond its 64 MiB limit (the thread waiting for the program)
+        expect_output("pipe -read-ahead=false", run(cat, ["-read-ahead=false"], input=data), data)
+        huge = data * 70
+        expect_output("pipe of 70 MiB", run(cat, [], input=huge), huge)
+
         # The standard input read in part already: the rest (not mapped from the start)
         for mmap in ([], ["--mmap"]):
             with open(path("large"), "rb") as f:

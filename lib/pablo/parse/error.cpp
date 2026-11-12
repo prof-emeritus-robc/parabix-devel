@@ -3,6 +3,8 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
+#include <toolchain/toolio.h>
+#include <unistd.h>
 #include <pablo/parse/error.h>
 
 #include <cassert>
@@ -49,7 +51,10 @@ bool ErrorContext::canUseColor() const {
 #ifdef WIN32
     return false;
 #else
-    return &outStream == &std::cout || &outStream == &std::cerr;
+    // Only on a terminal (and not with NO_COLOR or TERM=dumb)
+    if (&outStream == &std::cout) return toolio::useColor(toolio::ColorMode::Auto, STDOUT_FILENO);
+    if (&outStream == &std::cerr) return toolio::useColor(toolio::ColorMode::Auto, STDERR_FILENO);
+    return false;
 #endif
 }
 

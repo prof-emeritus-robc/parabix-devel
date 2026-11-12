@@ -17,6 +17,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Format.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <cstdarg>
@@ -955,8 +956,9 @@ struct __backtrace_data {
 extern "C"
 BOOST_NOINLINE
 void __report_failure_v(const char * name, const char * fmt, const __backtrace_data * const trace[], const uint32_t traceLength, va_list & args) {
-    // colourize the output if and only if stderr is piped to the terminal
-    const auto colourize = isatty(STDERR_FILENO) == 1;
+    // colourize the output if and only if stderr is a terminal (and not with
+    // NO_COLOR or TERM=dumb)
+    const auto colourize = toolio::useColor(toolio::ColorMode::Auto, STDERR_FILENO);
     raw_fd_ostream out(STDERR_FILENO, false);
     out << "Assertion Failure: ";
     if (trace) {

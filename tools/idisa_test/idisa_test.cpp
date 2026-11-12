@@ -572,8 +572,8 @@ int main(int argc, char *argv[]) {
     auto idisaTestFunction = pipelineGen(driver);
     if (ReportTiming) compileEnd = std::chrono::steady_clock::now();
 
-    const int32_t fd1 = openFile(Operand1TestFile, llvm::outs());
-    const int32_t fd2 = openFile(Operand2TestFile, llvm::outs());
+    const int32_t fd1 = openFile(Operand1TestFile, llvm::errs());
+    const int32_t fd2 = openFile(Operand2TestFile, llvm::errs());
 
     std::chrono::steady_clock::time_point execStart, execEnd;
     if (ReportTiming) execStart = std::chrono::steady_clock::now();
@@ -585,14 +585,14 @@ int main(int argc, char *argv[]) {
         if (failure_count == 0) {
             llvm::outs() << "Test success: " << TestOperation << "<" << TestFieldWidth << ">\n";
         } else {
-            llvm::outs() << "Test failure: " << TestOperation << "<" << TestFieldWidth << "> failed " << failure_count << " tests!\n";
+            llvm::errs() << "Test failure: " << TestOperation << "<" << TestFieldWidth << "> failed " << failure_count << " tests!\n";
         }
     }
     if (ReportTiming) {
         const auto compileUs = std::chrono::duration_cast<std::chrono::microseconds>(compileEnd - compileStart).count();
         const auto execUs = std::chrono::duration_cast<std::chrono::microseconds>(execEnd - execStart).count();
-        llvm::outs() << "Pipeline compile time: " << compileUs << " us\n";
-        llvm::outs() << "Kernel execution time: " << execUs << " us\n";
+        llvm::errs() << "Pipeline compile time: " << compileUs << " us\n";
+        llvm::errs() << "Kernel execution time: " << execUs << " us\n";
     }
 
     close(fd1);

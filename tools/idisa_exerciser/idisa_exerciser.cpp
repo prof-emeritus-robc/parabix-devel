@@ -91,7 +91,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (ReportTiming && !DisableChecks) {
-        outs() << "timing: warning: checks are enabled, parallelization of the test and check kernels can result in "
+        errs() << "timing: warning: checks are enabled, parallelization of the test and check kernels can result in "
                   "timing which only depends on the slowest kernel\n";
     }
     CPUDriver driver("idisa_exerciser");
@@ -121,7 +121,7 @@ int main(int argc, char *argv[]) {
     operationConfig->compilePipeline();
     if (ReportTiming) {
         auto compileTimeUs = chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now() - compileStart);
-        outs() << "timing: compile: " << operationConfig->getKernelBuilderID() << " took " << compileTimeUs.count()
+        errs() << "timing: compile: " << operationConfig->getKernelBuilderID() << " took " << compileTimeUs.count()
                << " us\n";
     }
     if (!QuietMode && !DisableChecks) {
@@ -137,7 +137,7 @@ int main(int argc, char *argv[]) {
                        << " incorrect blocks during warmup #" << i << "\n";
             }
             if (ReportTiming) {
-                outs() << "timing: aborting due to test failure during warmup #" << i << "\n";
+                errs() << "timing: aborting due to test failure during warmup #" << i << "\n";
             }
             return 1;
         }
@@ -158,7 +158,7 @@ int main(int argc, char *argv[]) {
                        << " incorrect blocks during run #" << i << "\n";
             }
             if (ReportTiming) {
-                outs() << "timing: aborting due to test failure during run #" << i << "\n";
+                errs() << "timing: aborting due to test failure during run #" << i << "\n";
             }
             return 1;
         }
@@ -175,24 +175,24 @@ int main(int argc, char *argv[]) {
     if (ReportTiming) {
         assert(execTimesUs.size() > 0);
         if (execTimesUs.size() == 0) {
-            outs() << "timing: kernel execution: no data!\n";
+            errs() << "timing: kernel execution: no data!\n";
         } else if (execTimesUs.size() == 1) {
-            outs() << "timing: kernel execution: " << execTimesUs[0].count() << " us\n";
+            errs() << "timing: kernel execution: " << execTimesUs[0].count() << " us\n";
         } else {
             if (!QuietMode) {
-                outs() << "timing: kernel execution: raw data us (including dropped elements): ";
+                errs() << "timing: kernel execution: raw data us (including dropped elements): ";
                 unsigned i = 0;
                 for (auto const &t : execTimesUs) {
                     if ((i >= 1000) && (execTimesUs.size() > 1000)) {
-                        outs() << " // Data table too large, truncating to 1000 elements";
+                        errs() << " // Data table too large, truncating to 1000 elements";
                         break;
                     }
                     if (i > 0)
-                        outs() << ", ";
-                    outs() << t.count();
+                        errs() << ", ";
+                    errs() << t.count();
                     ++i;
                 }
-                outs() << "\n";
+                errs() << "\n";
             }
             std::sort(execTimesUs.begin(), execTimesUs.end());
             execTimesUs.erase(execTimesUs.end() - DropWorstCount, execTimesUs.end());
@@ -209,23 +209,23 @@ int main(int argc, char *argv[]) {
             }
             // -1 from size for sample deviation
             double stdevExecUs = sqrt(devExecUs2 / (execTimesUs.size() - 1));
-            outs() << "timing: kernel execution: " << static_cast<int64_t>(round(meanExecUs)) << " us mean, "
+            errs() << "timing: kernel execution: " << static_cast<int64_t>(round(meanExecUs)) << " us mean, "
                    << static_cast<int64_t>(round(stdevExecUs)) << " us sample dev, " << execTimesUs.size()
                    << " runs counted";
             if (DropWorstCount || DropBestCount) {
-                outs() << "; ";
+                errs() << "; ";
                 if (DropWorstCount) {
-                    outs() << DropWorstCount << " worst";
+                    errs() << DropWorstCount << " worst";
                     if (DropBestCount) {
-                        outs() << ", ";
+                        errs() << ", ";
                     }
                 }
                 if (DropBestCount) {
-                    outs() << DropWorstCount << " best";
+                    errs() << DropBestCount << " best";
                 }
-                outs() << " not counted";
+                errs() << " not counted";
             }
-            outs() << "\n";
+            errs() << "\n";
         }
     }
     return toolio::finishOutput() ? 0 : 2;

@@ -94,6 +94,16 @@ def main():
                 expect_output("stdin from a pipe " + tag, run(cat, mmap, input=content), content)
                 expect_output("- from a pipe " + tag, run(cat, mmap + ["-"], input=content), content)
 
+        # Mapped files of whole pages and part of a block (the final partial
+        # block at a page boundary), with one thread and several
+        for size in (16384 + 8, 3 * 16384 + 100, (1 << 20) + 1):
+            mapped = data[:size]
+            with open(path("pages"), "wb") as f:
+                f.write(mapped)
+            for threads in ("1", "4"):
+                expect_output("--mmap, %d bytes, %s threads" % (size, threads),
+                              run(cat, ["--mmap", "-thread-num=" + threads, path("pages")]), mapped)
+
         # Read-ahead (a pipe read by a thread while compiling): turned off, and
         # beyond its 64 MiB limit (the thread waiting for the program)
         expect_output("pipe -read-ahead=false", run(cat, ["-read-ahead=false"], input=data), data)

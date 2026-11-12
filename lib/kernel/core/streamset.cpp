@@ -1076,7 +1076,10 @@ void ManagedDynamicBuffer::setCapacity(KernelBuilder & b, Value * const capacity
     indices[1] = b.getInt32(LinearInternalCapacity);
     Value * ptr = b.CreateInBoundsGEP(getHandleType(b), getHandle(), indices);
     ConstantInt * const BLOCK_WIDTH = b.getSize(b.getBitBlockWidth());
-    b.CreateAlignedStore(b.CreateExactUDiv(capacity, BLOCK_WIDTH), ptr, intPtrTyAlign);
+    // Whole blocks, covering every item: a capacity that is not a multiple of the
+    // block width (e.g., the items of a file mapped by MMapSourceKernel) rounded
+    // down would place its final partial block at the start of the buffer.
+    b.CreateAlignedStore(b.CreateCeilUDiv(capacity, BLOCK_WIDTH), ptr, intPtrTyAlign);
 }
 
 Value * ManagedDynamicBuffer::modByCapacity(KernelBuilder & b, Value * const offset) const {

@@ -146,6 +146,13 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_VERSION_INTEGER=${LLVM_VERSION_IN
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_VERSION_MAJOR=${LLVM_VERSION_MAJOR} -DLLVM_VERSION_MINOR=${LLVM_VERSION_MINOR}")
 message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
 
+###   Import Dependency: threads   ###
+
+# The C library has the POSIX thread functions on Linux and macOS, but not on
+# the BSDs (FreeBSD's libthr): every module links them (Threads::Threads).
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 ###   Import Dependency: Boost   ###
 
 if (POLICY CMP0167)
@@ -478,6 +485,7 @@ function(parabix_add_module)
             target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
         endif()
     endif()
+    target_link_libraries(${ARG_NAME} PUBLIC Threads::Threads)
     if (ARG_REQUIRES_RTTI)
         target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
     else()

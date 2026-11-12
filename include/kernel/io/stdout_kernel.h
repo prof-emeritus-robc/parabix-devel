@@ -21,6 +21,20 @@ private:
 
 };
 
+// Writes its input to the file descriptor fd (a uint32_t scalar) with
+// toolio_write, which repeats short writes and records the first error for
+// toolio::finishOutput to report.  One compiled kernel serves the standard
+// output and any file.
+class FDSinkKernel final : public SegmentOrientedKernel {
+public:
+    FDSinkKernel(LLVMTypeSystemInterface & ts, Scalar * fd, StreamSet * codeUnitBuffer);
+private:
+    void linkExternalMethods(KernelBuilder & b) override;
+    void generateDoSegmentMethod(KernelBuilder & b) override;
+private:
+    const unsigned mCodeUnitWidth;
+};
+
 class FileSink final : public SegmentOrientedKernel {
 public:
     FileSink(LLVMTypeSystemInterface & ts, Scalar * outputFileName, StreamSet * codeUnitBuffer);

@@ -272,14 +272,13 @@ void FDSourceKernel::generateInitializeMethod(KernelBuilder & b) {
     BasicBlock * initializeDone = b.CreateBasicBlock("initializeDone");
 
     // The source will use MMapSource or readSoure kernel logic depending on the useMMap
-    // parameter, possibly overridden.
+    // parameter, possibly overridden.  The caller sets useMMap only for a file that can
+    // be mapped (e.g., toolio::openInput: a regular file, read from its beginning), which
+    // may be the standard input redirected from a file.
 
     Value * const useMMap = b.getScalarField("useMMap");
-    // if the fileDescriptor is 0, the file is stdin, use readSource kernel logic.
     Value * const fd = b.getScalarField("fileDescriptor");
-    Value * const notStdIn = b.CreateICmpNE(fd, b.getInt32(STDIN_FILENO));
-    Value * const tryMMap = b.CreateAnd(b.CreateIsNotNull(useMMap), notStdIn);
-    b.CreateCondBr(tryMMap, checkFileSize, initializeRead);
+    b.CreateCondBr(b.CreateIsNotNull(useMMap), checkFileSize, initializeRead);
 
     b.SetInsertPoint(checkFileSize);
     // If the fileSize is 0, we may have a virtual file such as /proc/cpuinfo

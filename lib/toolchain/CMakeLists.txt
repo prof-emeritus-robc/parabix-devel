@@ -21,6 +21,7 @@ SRC
     fileutil.cpp
     install_paths.cpp
     toolchain.cpp
+    toolio.cpp
 DEPS
     ${Boost_LIBRARIES}
 )

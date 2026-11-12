@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <llvm/ADT/STLExtras.h> // for make_unique
 #include <kernel/pipeline/driver/cpudriver.h>
+#include <toolchain/toolio.h>
 #ifdef ENABLE_PAPI
 #include <util/papi_helper.hpp>
 #endif
@@ -88,11 +89,27 @@ namespace fs = boost::filesystem;
 int main(int argc, char *argv[]) {
     llvm_shutdown_obj shutdown;
     argv::InitializeCommandLineInterface(argc, argv);
+    // The output: the standard output, or the file of --output
+    if (!toolio::openOutput()) {
+        return argv::FileErrorExitCode;
+    }
     CPUDriver driver("icgrep");
 
     auto RE = readRE();
 
     const argv::FileSelection allFiles(driver, inputFiles);
+    // Read while compiling: the standard input, from a pipe or a terminal (not
+    // with -q, which may stop before reading it: the data read ahead would be
+    // taken from its writer for nothing), and the files.
+    if (allFiles.stdinSelected() && (argv::Mode != argv::QuietMode)) {
+        toolio::startReadAhead(STDIN_FILENO);
+    }
+    std::vector<std::string> fileNames;
+    fileNames.reserve(allFiles.size());
+    for (const auto & path : allFiles.paths()) {
+        fileNames.push_back(path.string());
+    }
+    toolio::prefetchFiles(std::move(fileNames));
     if (allFiles.showFileNames() && !argv::NoFilenameFlag) {
         argv::WithFilenameFlag = true;
     }
@@ -105,8 +122,10 @@ int main(int argc, char *argv[]) {
             if (argv::WithFilenameFlag) grep->showFileNames();
             if (argv::LineNumberFlag) grep->showLineNumbers();
             if (argv::InitialTabFlag) grep->setInitialTab();
-            if ((argv::ColorFlag == argv::alwaysColor) ||
-                ((argv::ColorFlag == argv::autoColor) && isatty(STDOUT_FILENO))) {
+            // (auto: when the output is a terminal)
+            if (toolio::useColor(argv::ColorFlag == argv::alwaysColor ? toolio::ColorMode::Always
+                                 : argv::ColorFlag == argv::neverColor ? toolio::ColorMode::Never
+                                 : toolio::ColorMode::Auto, toolio::outputFD())) {
                 grep->setColoring();
             }
            break;
@@ -138,7 +157,7 @@ int main(int argc, char *argv[]) {
     grep->setStdinLabel(argv::LabelFlag);
     if (allFiles.stdinSelected()) grep->setGrepStdIn();
     if (argv::NoMessagesFlag) grep->suppressFileMessages();
-    if (argv::MmapFlag) grep->setPreferMMap();
+    if (toolio::mmapRequested()) grep->setPreferMMap();
     grep->setBinaryFilesOption(argv::BinaryFilesFlag);
     grep->initFileResult(allFiles.paths()); // unnecessary copy!
     if (argv::ReplaceFlagSet) {
@@ -169,6 +188,9 @@ int main(int argc, char *argv[]) {
     jitExecution.stop();
     jitExecution.write(std::cerr);
     #endif
+    if (!toolio::finishOutput()) {
+        return argv::FileErrorExitCode;
+    }
     // As in GNU grep, a file error takes precedence over the match result,
     // except for a match found with -q.
     if (grep->fileErrorFound() && !(matchFound && (argv::Mode == argv::QuietMode))) {

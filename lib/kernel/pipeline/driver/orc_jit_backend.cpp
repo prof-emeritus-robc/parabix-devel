@@ -360,7 +360,7 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
         SlabNode(const size_t size, const Block * near = nullptr)
         : Slab([size, near](){
             std::error_code EC;
-            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PAGE_SIZE);
+            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PageSize);
             auto slab = Mem::allocateMappedMemory(alignedSize, near, Mem::MF_READ | Mem::MF_WRITE, EC);
             if (EC) {
                 SmallVector<char, 256> tmp;
@@ -516,7 +516,7 @@ public:
             const auto used = n->AllocatedOffset.load(std::memory_order_relaxed);
             const auto alreadyProtected = n->ProtectedOffset;
             if (LLVM_LIKELY(used > alreadyProtected)) {
-                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PAGE_SIZE), slabEnd);
+                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PageSize), slabEnd);
                 const Block toProtect(reinterpret_cast<void*>(alreadyProtected), protectEnd - alreadyProtected);
                 const auto ec = Mem::protectMappedMemory(toProtect, Mem::MF_READ | Mem::MF_EXEC);
                 if (ec) {
@@ -579,7 +579,7 @@ private:
                     SlabNode * nextSlab = CurrentSlab.load(std::memory_order_acquire);
                     if (nextSlab == currentSlab) {
                         const auto minSize = std::max<uintptr_t>(currentSlab->Slab.allocatedSize(), totalSize * 4);
-                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PAGE_SIZE);
+                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PageSize);
                         // Hint near the original exec slab (rather than currentSlab) so growth keeps
                         // accumulating close to the anchor point instead of drifting slab by slab.
                         nextSlab = new SlabNode(allocSize, &ExecSlab.Slab);
@@ -1272,11 +1272,12 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
     const StringMap<bool> features = sys::getHostCPUFeatures();
     #endif
 
+    // The features the host lacks are disabled as well: a CPU name implies
+    // features of its own, which a virtual machine may not provide (e.g.,
+    // AVX-512 masked by the hypervisor, giving SIGILL)
     std::vector<std::string> attrs;
     for (auto & flag : features) {
-        if (flag.second) {
-            attrs.push_back("+" + flag.first().str());
-        }
+        attrs.push_back((flag.second ? "+" : "-") + flag.first().str());
     }
 
     auto TripleStr = Triple{sys::getProcessTriple()}.normalize();
@@ -1313,7 +1314,16 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
     // InProcessMemoryManager, which allocates a small dedicated region per object rather
     // than long-lived shared pools, does not hit it). --use-custom-jit-memory-manager
     // controls which is used; see toolchain.cpp for its LLVM-version-dependent default.
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    // (From LLVM 23, ORC passes the creator a default memory manager, which is not used.)
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, jitlink::JITLinkMemoryManager &) {
+        auto objLinker = codegen::UseCustomJITMemoryManager
+            ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())
+            : std::make_unique<ObjectLinkingLayer>(ES, cantFail(jitlink::InProcessMemoryManager::Create()));
+        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
+        return objLinker;
+    });
+    #elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
     Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES) {
         auto objLinker = codegen::UseCustomJITMemoryManager
             ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())

@@ -26,6 +26,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <kernel/scan/index_generator.h>
@@ -57,7 +58,9 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory HashDemoOptions("Hash Demo Options", "Hash demo options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(HashDemoOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(HashDemoOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 
 
 class WordMarkKernel : public pablo::PabloKernel {
@@ -192,13 +195,13 @@ public:
         }
     }
         
-    void print() {
+    void print(raw_ostream & out) {
         for (unsigned h = 0; h < hash_entries; h++) {
             for (unsigned i = 0; i < mTable[h].size(); i++) {
                 uint64_t val = mTable[h][i];
                 char * key_ptr = reinterpret_cast<char *>(&val);
                 unsigned key_count = mCount[h][i];
-                std::cout << std::string(key_ptr, 6) << ": " << std::to_string(key_count) << " occurrences\n";
+                out << std::string(key_ptr, 6) << ": " << key_count << " occurrences\n";
             }
         }
     }
@@ -209,7 +212,7 @@ private:
 
 HashTable6 T6;
 
-typedef void (*HashDemoFunctionType)(uint32_t fd);
+typedef void (*HashDemoFunctionType)(uint32_t useMMap, uint32_t fd);
 
 
 extern "C" void callback(const char * L6end_ptr, uint8_t hashval) {
@@ -220,13 +223,13 @@ extern "C" void callback(const char * L6end_ptr, uint8_t hashval) {
 
 HashDemoFunctionType hashdemo_gen (CPUDriver & driver) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"inputFileDecriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"inputFileDecriptor"});
 
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     // Source data
     StreamSet * const codeUnitStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, codeUnitStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, codeUnitStream);
 
     StreamSet * const u8basis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(codeUnitStream, u8basis);
@@ -272,17 +275,15 @@ HashDemoFunctionType hashdemo_gen (CPUDriver & driver) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&HashDemoOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    CPUDriver driver("hashdemo");
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        HashDemoFunctionType func = nullptr;
-        func = hashdemo_gen(driver);
-        func(fd);
-        close(fd);
+    codegen::ParseCommandLineOptions(argc, argv, {&HashDemoOptions, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
-    T6.print();
-    return 0;
+    CPUDriver driver("hashdemo");
+    HashDemoFunctionType func = hashdemo_gen(driver);
+    func(in.useMMap, in.fd);
+    toolio::closeInput(in);
+    T6.print(toolio::out());
+    return toolio::finishOutput() ? 0 : 1;
 }

@@ -515,7 +515,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
     size_t unscaledUnitWeightDenomLCM = 1U;
 
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
 
     for (unsigned partitionId = 0; partitionId < PartitionCount; ++partitionId) {
         const auto firstKernel = FirstKernelInPartition[partitionId];

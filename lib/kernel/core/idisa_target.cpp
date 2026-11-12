@@ -54,7 +54,16 @@ Features getHostCPUFeatures(const StringMap<bool> & features) {
 
 bool ARM_available() {
 #ifdef PARABIX_ARM_TARGET
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+    // CpuInfo refers to its architecture by index only
+    const StringRef cpu = sys::getHostCPUName();
+    auto info = llvm::AArch64::parseCpu(cpu);
+    const llvm::AArch64::ArchInfo * arch = llvm::AArch64::getArchForCpu(cpu);
+    std::vector<StringRef> extNames;
+    if (info && arch) {
+        llvm::AArch64::getExtensionFeatures(arch->DefaultExts | info->DefaultExtensions, extNames);
+    }
+#elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
     auto info = llvm::AArch64::parseCpu(sys::getHostCPUName());
     std::vector<StringRef> extNames;
     if (info) {

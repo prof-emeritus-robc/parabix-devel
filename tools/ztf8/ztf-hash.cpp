@@ -27,6 +27,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <kernel/streamutils/run_index.h>
@@ -52,23 +53,25 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory ztfHashOptions("ztfHash Options", "ZTF-Hash options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(ztfHashOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(ztfHashOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> Decompression("d", cl::desc("Decompress from ZTF-Runs to UTF-8."), cl::cat(ztfHashOptions), cl::init(false));
 static cl::alias DecompressionAlias("decompress", cl::desc("Alias for -d"), cl::aliasopt(Decompression));
 
-typedef void (*ztfHashFunctionType)(uint32_t fd);
+typedef void (*ztfHashFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 EncodingInfo encodingScheme1(8,
                              {{3, 3, 2, 0xC0, 8, 0}, {4, 4, 2, 0xC4, 8, 0}, {5, 8, 2, 0xC8, 8, 0}, {9, 16, 2, 0xD0, 8, 0}});
 ztfHashFunctionType ztfHash_compression_gen (CPUDriver & driver) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"outputFD"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const codeUnitStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, codeUnitStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, codeUnitStream);
 
     StreamSet * const u8basis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(codeUnitStream, u8basis);
@@ -117,18 +120,18 @@ ztfHashFunctionType ztfHash_compression_gen (CPUDriver & driver) {
 
     StreamSet * const ZTF_bytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(ZTF_basis, ZTF_bytes);
-    P.CreateKernelCall<StdOutKernel>(ZTF_bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), ZTF_bytes);
     return reinterpret_cast<ztfHashFunctionType>(P.compile());
 }
 
 ztfHashFunctionType ztfHash_decompression_gen (CPUDriver & driver) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"outputFD"});
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const source = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, source);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, source);
     StreamSet * const ztfHashBasis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(source, ztfHashBasis);
     StreamSet * const ztfInsertionLengths = P.CreateStreamSet(4);
@@ -180,34 +183,33 @@ ztfHashFunctionType ztfHash_decompression_gen (CPUDriver & driver) {
         u8bytes = output_bytes;
     }
 
-    P.CreateKernelCall<StdOutKernel>(u8bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u8bytes);
     return reinterpret_cast<ztfHashFunctionType>(P.compile());
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&ztfHashOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&ztfHashOptions, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     CPUDriver driver("ztfHash");
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        ztfHashFunctionType func = nullptr;
-        if (Decompression) {
-            func = ztfHash_decompression_gen(driver);
-        } else {
-            func = ztfHash_compression_gen(driver);
-        }
-        #ifdef REPORT_PAPI_TESTS
-        papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
-        jitExecution.start();
-        #endif
-        func(fd);
-        #ifdef REPORT_PAPI_TESTS
-        jitExecution.stop();
-        jitExecution.write(std::cerr);
-        #endif
-        close(fd);
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
-    return 0;
+    ztfHashFunctionType func = nullptr;
+    if (Decompression) {
+        func = ztfHash_decompression_gen(driver);
+    } else {
+        func = ztfHash_compression_gen(driver);
+    }
+    #ifdef REPORT_PAPI_TESTS
+    papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
+    jitExecution.start();
+    #endif
+    func(in.useMMap, in.fd, toolio::outputFD());
+    #ifdef REPORT_PAPI_TESTS
+    jitExecution.stop();
+    jitExecution.write(std::cerr);
+    #endif
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

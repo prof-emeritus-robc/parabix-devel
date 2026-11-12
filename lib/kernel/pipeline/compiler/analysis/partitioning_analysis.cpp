@@ -1921,10 +1921,12 @@ void PipelineAnalysis::determinePartitionJumpIndices() {
         }
 
         for (auto partitionId = firstPartition; partitionId < oneAfterLastPartition; ++partitionId) {
-            const BitSet & prior =  rateDomSet[partitionId - 1];
             const BitSet & current =  rateDomSet[partitionId];
+            // (In a pipeline of no kernels, the first phase starts at partition 0,
+            // which has no prior partition.)
+            const bool differsFromPrior = (partitionId == 0) || (rateDomSet[partitionId - 1] != current);
             auto j = partitionId + 1U;
-            if (prior != current && in_degree(partitionId, J) > 0) {
+            if (differsFromPrior && in_degree(partitionId, J) > 0) {
                 assert (current.any());
                 for (; j < oneAfterLastPartition; ++j) {
                     const BitSet & next =  rateDomSet[j];

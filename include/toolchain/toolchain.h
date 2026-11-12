@@ -193,6 +193,7 @@ extern unsigned CompileThreads;
 extern bool UseMCJIT;
 extern bool EnableDynamicMultithreading;
 extern bool TraceObjectCache;
+extern bool PrewarmSystemObjectCache;  // set from command line: --prewarm-system-object-cache
 extern unsigned GroupNum;
 extern const char * ProgramName;
 extern llvm::TargetOptions target_Options;

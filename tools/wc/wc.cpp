@@ -22,10 +22,12 @@
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/pipeline/program_builder.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fileselect/file_select.h>
 #include <algorithm>
 #include <fcntl.h>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
@@ -40,6 +42,11 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory wcFlags("Command Flags", "wc options");
+static argv::RegisterFileSelectOptions FileSelectOptions;
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
+// The report, written to the output (toolio::out()) when complete
+static std::ostringstream Report;
 
 static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(wcFlags));
 
@@ -227,18 +234,18 @@ void WordCountKernel::generatePabloMethod() {
     }
 }
 
-typedef void (*WordCountFunctionType)(uint32_t fd, uint32_t fileIdx);
+typedef void (*WordCountFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t fileIdx);
 
 auto wcPipelineGen(CPUDriver & driver) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"}, Input<uint32_t>{"fileIdx"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"fileIdx"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fd");
     Scalar * const fileIdx = P.getInputScalar("fileIdx");
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
 
-    Kernel * sourceK = P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    Kernel * sourceK = P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     auto CountableStream = ByteStream;
     if (CountWords || CountChars) {
@@ -265,13 +272,16 @@ bool wc(WordCountFunctionType fn_ptr, const fs::path & path, const uint32_t file
     if (LLVM_UNLIKELY(fd == -1)) {
         return false;
     }
-    fn_ptr(fd, fileIdx);
+    fn_ptr(toolio::useMMapFor(fd), fd, fileIdx);
     close(fd);
     return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&wcFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&wcFlags, &argv::File_Select_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    if (!toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("wc");
 
     argv::FileSelectConfig config;
@@ -331,38 +341,38 @@ int main(int argc, char *argv[]) {
 
     for (unsigned i = 0; i < fileCount; ++i) {
         if (!counted[i]) continue;
-        std::cout << std::setw(displayColumnWidth-1);
+        Report << std::setw(displayColumnWidth-1);
         if (CountLines) {
-            std::cout << lineCount[i] << std::setw(displayColumnWidth);
+            Report << lineCount[i] << std::setw(displayColumnWidth);
         }
         if (CountWords) {
-            std::cout << wordCount[i] << std::setw(displayColumnWidth);
+            Report << wordCount[i] << std::setw(displayColumnWidth);
         }
         if (CountChars) {
-            std::cout << charCount[i] << std::setw(displayColumnWidth);
+            Report << charCount[i] << std::setw(displayColumnWidth);
         }
         if (CountBytes) {
-            std::cout << byteCount[i];
+            Report << byteCount[i];
         }
         const auto name = allFiles.displayName(i);
-        if (!name.empty()) std::cout << " " << name;
-        std::cout << std::endl;
+        if (!name.empty()) Report << " " << name;
+        Report << std::endl;
     }
     if (allFiles.showTotal()) {
-        std::cout << std::setw(displayColumnWidth-1);
+        Report << std::setw(displayColumnWidth-1);
         if (CountLines) {
-            std::cout << TotalLines << std::setw(displayColumnWidth);
+            Report << TotalLines << std::setw(displayColumnWidth);
         }
         if (CountWords) {
-            std::cout << TotalWords << std::setw(displayColumnWidth);
+            Report << TotalWords << std::setw(displayColumnWidth);
         }
         if (CountChars) {
-            std::cout << TotalChars << std::setw(displayColumnWidth);
+            Report << TotalChars << std::setw(displayColumnWidth);
         }
         if (CountBytes) {
-            std::cout << TotalBytes;
+            Report << TotalBytes;
         }
-        std::cout << " total" << std::endl;
+        Report << " total" << std::endl;
     }
 
     #ifdef REPORT_PAPI_TESTS
@@ -370,5 +380,9 @@ int main(int argc, char *argv[]) {
     jitExecution.write(std::cerr);
     #endif
 
+    toolio::out() << Report.str();
+    if (!toolio::finishOutput()) {
+        return 1;
+    }
     return std::all_of(counted.begin(), counted.end(), [](bool c) {return c;}) ? 0 : 1;
 }

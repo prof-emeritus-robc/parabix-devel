@@ -360,7 +360,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
             if (LLVM_UNLIKELY(checkProgress)) {
                 retVal.push_back(mPipelineProgress); assert (mPipelineProgress);
             }
-            b.CreateAggregateRet(retVal.data(), retVal.size());
+            b.CreateAggregateRet(retVal);
 
         };
 

@@ -11,6 +11,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <fileselect/file_select.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <re/parse/parser.h>
 #include <re/adt/re_alt.h>
 #include <re/toolchain/toolchain.h>
@@ -65,6 +66,7 @@ static cl::alias FileAlias("file", cl::desc("Alias for -f"), cl::aliasopt(FileOp
  */
     
 static cl::OptionCategory Input_Options("B. Input Options", "These options control the input.");
+static argv::RegisterFileSelectOptions FileSelectOptions;
 
 bool TextFlag;
 static cl::opt<bool, true> TextOption("a", cl::location(TextFlag), cl::desc("Treat each input file as text, even if it is a binary file."), cl::cat(Input_Options), cl::Grouping);
@@ -182,7 +184,7 @@ ColoringType ColorFlag;
 
 static cl::opt<ColoringType, true> Color("colors", cl::desc("Set colorization of the output"), cl::location(ColorFlag), cl::cat(Output_Options), cl::init(autoColor),
                                  cl::values(clEnumValN(alwaysColor, "always", "Enable colorization"),
-                                            clEnumValN(autoColor,   "auto", "Colorize output to stdout"),
+                                            clEnumValN(autoColor,   "auto", "Colorize output to a terminal (not with NO_COLOR or TERM=dumb)"),
                                             clEnumValN(neverColor,  "never", "Disable colorization")));
 static cl::alias ColorAlias("colours", cl::desc("Alias for -color"), cl::aliasopt(Color));
 
@@ -204,9 +206,13 @@ static void icgrep_error_handler(void *UserData, const char * Message, bool GenC
     exit(InternalFailureCode);
 }
 
+// --mmap and --output (toolchain/toolio.h)
+static toolio::RegisterInputOptions InputOutputInputOptions;
+static toolio::RegisterOutputOptions InputOutputOutputOptions;
+
 void InitializeCommandLineInterface(int argc, char *argv[]) {
     llvm::install_fatal_error_handler(&icgrep_error_handler);
-    codegen::ParseCommandLineOptions(argc, argv, {&re::RE_Options, &Input_Options, &argv::File_Select_Options, &Output_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&re::RE_Options, &Input_Options, &argv::File_Select_Options, &toolio::InputOutputOptions, &Output_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     
     if (TextFlag) {
         if (BinaryNonMatchingFlag || (BinaryFilesFlag == WithoutMatch)) {

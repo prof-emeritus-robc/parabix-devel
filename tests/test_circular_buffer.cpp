@@ -20,7 +20,6 @@
 #include <cstdlib>
 #ifdef __APPLE__
 #include <mach/mach.h>
-#undef PAGE_SIZE  // mach's macro (vm_page_size) would hide CBuilder::PAGE_SIZE
 #endif
 
 extern "C" uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow);
@@ -130,7 +129,7 @@ static void testPool(const size_t page) {
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv);
     codegen::CircularBufferPoolMiB = 0;  // fresh buffers, so that each impl's mapping is checked
-    const size_t page = CBuilder::PAGE_SIZE;
+    const size_t page = CBuilder::PageSize;
     const size_t sizes[] = {page, 4 * page, 64 * page};
     const struct { codegen::CircularBufferImplOptions opt; const char * name; } impls[] = {
         {codegen::CircularBufferImplOptions::Default, "default"},

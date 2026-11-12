@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <boost/interprocess/mapped_region.hpp>
 #include <llvm/Support/raw_ostream.h>
 #include <unistd.h>
@@ -62,7 +63,7 @@ void MMapSourceKernel::generateInitializeMethod(KernelBuilder & b, const unsigne
     b.CreateBr(exit);
 
     b.SetInsertPoint(emptyFile);
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     Value * const emptyFilePtr = b.CreateAnonymousMMap(b.getSize(pageSize));
     b.setScalarField("buffer", emptyFilePtr);
     b.setBaseAddress("sourceBuffer", emptyFilePtr);
@@ -90,31 +91,36 @@ void MMapSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     // TODO: could we improve overall performance by trying to "preload" the data by reading it? This would increase
     // the cost of this kernel but might allow the first kernel to read the file data be better balanced with it.
 
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     ConstantInt * const CODE_UNIT_BYTES = b.getSize(codeUnitWidth / 8);
 
+    // The pages before that of the first unconsumed item (in bytes, from the
+    // start of the mapping)
     Value * const consumedItems = b.getConsumedItemCount("sourceBuffer");
     Value * const consumedBytes = b.CreateMul(consumedItems, CODE_UNIT_BYTES);
     Value * const consumedPageOffset = b.CreateRoundDownRational(consumedBytes, pageSize);
-    Value * const consumedBuffer = b.getRawOutputPointer("sourceBuffer", consumedPageOffset);
+    Value * const consumedBuffer = b.CreateGEP(b.getInt8Ty(), b.getBaseAddress("sourceBuffer"), consumedPageOffset);
+    // "buffer": the first page not yet released
     Value * const readableBuffer = b.getScalarField("buffer");
-    Value * const unnecessaryBytes = b.CreateSub(consumedPageOffset, b.CreatePtrToInt(readableBuffer, b.getSizeTy()));
+    Value * const unnecessaryBytes = b.CreateSub(b.CreatePtrToInt(consumedBuffer, b.getSizeTy()),
+                                                 b.CreatePtrToInt(readableBuffer, b.getSizeTy()));
 
     Module * const m = b.getModule();
     Function * MAdviseFunc = m->getFunction("madvise");
     assert (MAdviseFunc);
     FixedArray<Value *, 3> args;
 
-    // avoid calling madvise unless an actual page table change could occur
-    b.CreateLikelyCondBr(b.CreateIsNotNull(unnecessaryBytes), dropPages, checkRemaining);
+    // avoid calling madvise unless pages were consumed since the last call
+    b.CreateUnlikelyCondBr(b.CreateIsNotNull(unnecessaryBytes), dropPages, checkRemaining);
     b.SetInsertPoint(dropPages);
-    // instruct the OS that it can safely drop any fully consumed pages
+    // instruct the OS that it can safely drop the pages consumed since
     #ifndef __APPLE__
     args[0] = readableBuffer;
-    args[1] = consumedPageOffset;
+    args[1] = unnecessaryBytes;
     args[2] = b.getInt32(MADV_DONTNEED);
     b.CreateCall(MAdviseFunc, args);
     #endif
+    b.setScalarField("buffer", consumedBuffer);
     b.CreateBr(checkRemaining);
 
     // determine whether or not we've exhausted the "safe" region of the file buffer
@@ -180,7 +186,7 @@ inline IntTy round_up_to(const IntTy x, const IntTy y) {
     return (x + y - 1) & -y;
 }
 
-void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth) {
+void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth, StringRef readFunction) {
 
     Value * const segmentItems = b.getNumOfStrides();
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
@@ -212,7 +218,7 @@ void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     PHINode * const producedSoFar = b.CreatePHI(sizeTy, 2);
     producedSoFar->addIncoming(produced, entryBlock);
     Value * const sourceBuffer = b.getRawOutputPointer("sourceBuffer", producedSoFar);
-    Function *  const preadFunc = b.getModule()->getFunction("read");
+    Function *  const preadFunc = b.getModule()->getFunction(readFunction);
     FixedArray<Value *, 3> args;
     args[0] = fd;
     args[1] = sourceBuffer;
@@ -272,14 +278,13 @@ void FDSourceKernel::generateInitializeMethod(KernelBuilder & b) {
     BasicBlock * initializeDone = b.CreateBasicBlock("initializeDone");
 
     // The source will use MMapSource or readSoure kernel logic depending on the useMMap
-    // parameter, possibly overridden.
+    // parameter, possibly overridden.  The caller sets useMMap only for a file that can
+    // be mapped (e.g., toolio::openInput: a regular file, read from its beginning), which
+    // may be the standard input redirected from a file.
 
     Value * const useMMap = b.getScalarField("useMMap");
-    // if the fileDescriptor is 0, the file is stdin, use readSource kernel logic.
     Value * const fd = b.getScalarField("fileDescriptor");
-    Value * const notStdIn = b.CreateICmpNE(fd, b.getInt32(STDIN_FILENO));
-    Value * const tryMMap = b.CreateAnd(b.CreateIsNotNull(useMMap), notStdIn);
-    b.CreateCondBr(tryMMap, checkFileSize, initializeRead);
+    b.CreateCondBr(b.CreateIsNotNull(useMMap), checkFileSize, initializeRead);
 
     b.SetInsertPoint(checkFileSize);
     // If the fileSize is 0, we may have a virtual file such as /proc/cpuinfo
@@ -312,7 +317,7 @@ void FDSourceKernel::generateDoSegmentMethod(KernelBuilder & b) {
     MMapSourceKernel::generateDoSegmentMethod(b, mCodeUnitWidth);
     b.CreateBr(DoSegmentDone);
     b.SetInsertPoint(DoSegmentRead);
-    ReadSourceKernel::generateDoSegmentMethod(b, mCodeUnitWidth);
+    ReadSourceKernel::generateDoSegmentMethod(b, mCodeUnitWidth, "toolio_read");
     b.CreateBr(DoSegmentDone);
     b.SetInsertPoint(DoSegmentDone);
 }
@@ -350,6 +355,7 @@ void FDSourceKernel::generateFinalizeMethod(KernelBuilder & b) {
 void FDSourceKernel::linkExternalMethods(KernelBuilder & b) {
     MMapSourceKernel::generatLinkExternalFunctions(b);
     ReadSourceKernel::generatLinkExternalFunctions(b);
+    b.LinkFunction("toolio_read", toolio_read);
     Kernel::linkExternalMethods(b);
 }
 
@@ -425,7 +431,7 @@ void MemorySourceKernel::generateInitializeMethod(KernelBuilder & b) {
     // the caller to have provided any. The extra page (beyond rounding fileBytes
     // up to a page) covers the case where fileBytes is itself an exact multiple
     // of the page size.
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     Value * const allocBytes = b.CreateAdd(b.CreateRoundUpRational(fileBytes, pageSize), b.getSize(pageSize));
     Value * const ownedBuffer = b.CreateAlignedMalloc(allocBytes, 64);
     b.CreateMemCpy(ownedBuffer, fileSource, fileBytes, 1);

@@ -18,6 +18,11 @@ class AlignedFileBuffer {
 public:
     AlignedFileBuffer();
     void load(const std::string & fileName, bool preferMMap = false);
+    // Loads the whole of an open file (left open), mapping it if useMMap (for a
+    // regular file read from its beginning, e.g., toolio::Input::useMMap), or
+    // reading it to its end: a pipe as well.  An empty input gives an empty
+    // buffer (getBuf() not null).  Returns false on a read error (errno).
+    bool load(int fd, bool useMMap);
     size_t getBufSize();
     char * getBuf();
     void release();

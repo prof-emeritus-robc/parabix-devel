@@ -114,6 +114,9 @@
 #include <re/unicode/resolve_properties.h>
 #include <re/unicode/boundaries.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
+#include <cerrno>
+#include <cstring>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/algo/normalization.h>
@@ -130,6 +133,8 @@ using namespace pablo;
 static cl::OptionCategory TconvOptions("Transform Options", "LDML transform options.");
 static cl::opt<std::string> TransformName(cl::Positional, cl::desc("<transform name>"), cl::cat(TconvOptions));
 static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input file>"), cl::cat(TconvOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory of CLDR transform files (default ~/cldr/common/transforms)"),
                                           cl::init(""), cl::cat(TconvOptions));
 static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML transform rules (plain tRule text) to parse and compile, applied "
@@ -284,7 +289,9 @@ static StreamSet * CaseMapBasis(PipelineBuilder & P, UCD::property_t prop, Strea
     return UTF8_Of(P, MappedU21);
 }
 
-typedef void (*TransformFunctionType)(uint32_t fd);
+//  (The transforms write to the standard output, which --output redirects:
+//  see openInputAndOutput.)
+typedef void (*TransformFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 //  The kernels of the direct pipeline of a transform, from the bytes of the
 //  input to those of the result.
@@ -334,29 +341,29 @@ static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * 
 }
 
 static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     StreamSet * const OutputBytes = directPipeline(P, t, ByteStream);
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
 static void listTransforms(const ldml::TransformRegistry & registry) {
     for (const ldml::TransformEntry & e : registry.entries()) {
-        llvm::outs() << e.canonicalName;
-        for (const std::string & a : e.aliases) llvm::outs() << "  " << a;
+        toolio::out() << e.canonicalName;
+        for (const std::string & a : e.aliases) toolio::out() << "  " << a;
         if (e.isBuiltIn()) {
-            llvm::outs() << "  [built-in]";
+            toolio::out() << "  [built-in]";
         } else {
-            llvm::outs() << "  [" << e.file << (e.direction == ldml::TransformDirection::Backward ? ", backward" : "") << "]";
+            toolio::out() << "  [" << e.file << (e.direction == ldml::TransformDirection::Backward ? ", backward" : "") << "]";
         }
-        if (e.internal) llvm::outs() << "  [internal]";
-        llvm::outs() << "\n";
+        if (e.internal) toolio::out() << "  [internal]";
+        toolio::out() << "\n";
     }
 }
 
@@ -825,7 +832,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step);
 static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearchReplace * sr = nullptr, std::string * reason = nullptr);
 
 static void printPlan(const std::string & label, const TransformAnalysis & a) {
-    llvm::outs() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
+    toolio::out() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
     for (const std::string & p : a.problems) {
         std::string shown = p;
         if (p.size() > 160) {
@@ -834,100 +841,100 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             const size_t reason = p.rfind("  (");
             shown = p.substr(0, cut) + " ... " + (reason == std::string::npos ? "" : p.substr(reason));
         }
-        llvm::outs() << "  problem: " << shown << "\n";
+        toolio::out() << "  problem: " << shown << "\n";
     }
-    if (a.plan.filter) llvm::outs() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
+    if (a.plan.filter) toolio::out() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
-            llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
+            toolio::out() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
                          << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "") << "\n";
             continue;
         }
         if (step.hasFrontLetters) {
             const ldml::FrontLetterRevisits & f = step.frontLetters;
-            llvm::outs() << "  front-letter revisits: mark " << printCodepoints(std::u32string(1, f.mark)) << ", "
+            toolio::out() << "  front-letter revisits: mark " << printCodepoints(std::u32string(1, f.mark)) << ", "
                          << f.upper.size() << " uppercase vowels, letters " << printCodepoints({f.lowerLetter, f.upperLetter})
                          << (f.iotaFirsts.empty() ? "" : ", with the marking of vowels before " + printCodepoints(std::u32string(1, f.iota)))
                          << ", " << f.revisits.size() << " characters revisited as vowels\n";
         }
         if (!step.markRunEditRules.empty()) {
-            llvm::outs() << "  mark run edits: " << step.markRunEditRules.size() << " rules, " << step.markRunKept.size() << " kept\n";
-            for (const ldml::ConversionRule * c : step.markRunEditRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
+            toolio::out() << "  mark run edits: " << step.markRunEditRules.size() << " rules, " << step.markRunKept.size() << " kept\n";
+            for (const ldml::ConversionRule * c : step.markRunEditRules) toolio::out() << "    " << ldml::printRule(c) << "\n";
         }
         if (!step.chainRevisitRules.empty()) {
-            llvm::outs() << "  chain revisits: " << step.chainRevisitRules.size() << " rules\n";
-            for (const ldml::ConversionRule * c : step.chainRevisitRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
+            toolio::out() << "  chain revisits: " << step.chainRevisitRules.size() << " rules\n";
+            for (const ldml::ConversionRule * c : step.chainRevisitRules) toolio::out() << "    " << ldml::printRule(c) << "\n";
         }
         if (!step.prefixRuns.empty()) {
-            llvm::outs() << "  prefix runs: " << step.prefixRuns.size() << " rules\n";
-            for (const ldml::ConversionRule * c : step.prefixRunRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
+            toolio::out() << "  prefix runs: " << step.prefixRuns.size() << " rules\n";
+            for (const ldml::ConversionRule * c : step.prefixRunRules) toolio::out() << "    " << ldml::printRule(c) << "\n";
             continue;
         }
-        llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups, "
+        toolio::out() << "  conversion group: " << step.subgroups.size() << " subgroups, "
                      << step.stringRules.size() << " string rules\n";
         std::string notByEngine;
         if (engineSearchReplace(step, nullptr, &notByEngine)) {
-            llvm::outs() << "    applied by the search and replace of the regular expression engine (where no filter applies)\n";
+            toolio::out() << "    applied by the search and replace of the regular expression engine (where no filter applies)\n";
         } else if (!notByEngine.empty()) {
-            llvm::outs() << "    not applied by the search and replace of the regular expression engine: " << notByEngine << "\n";
+            toolio::out() << "    not applied by the search and replace of the regular expression engine: " << notByEngine << "\n";
         }
         //  The overlaps of the string rules (see ldml::StringRuleOverlaps).
         const ldml::StringRuleOverlaps overlaps = ldml::analyzeStringRuleOverlaps(step);
         if (!overlaps.pairs.empty()) {
-            llvm::outs() << "    string rule overlaps: " << overlaps.pairs.size() << " pairs (" << overlaps.oneWay << " one-way, "
+            toolio::out() << "    string rule overlaps: " << overlaps.pairs.size() << " pairs (" << overlaps.oneWay << " one-way, "
                          << overlaps.twoWay << " two-way, " << overlaps.self << " self); ";
             if (overlaps.singlePass()) {
-                llvm::outs() << "single pass in " << std::max(overlaps.singlePassStages(), 1u) << " stages"
+                toolio::out() << "single pass in " << std::max(overlaps.singlePassStages(), 1u) << " stages"
                              << (overlaps.self ? " (with two-character self-overlaps)" : "") << "\n";
             } else {
                 if (overlaps.twoWay > 0) {
-                    llvm::outs() << "selected sequentially: two-way overlaps";
+                    toolio::out() << "selected sequentially: two-way overlaps";
                 } else if (overlaps.acyclicApartFromSelf) {
-                    llvm::outs() << "selected sequentially: self-overlaps (otherwise single pass in "
+                    toolio::out() << "selected sequentially: self-overlaps (otherwise single pass in "
                                  << std::max(overlaps.stagesApartFromSelf, 1u) << " stages)";
                 } else {
-                    llvm::outs() << "selected sequentially: cycle of " << overlaps.cycle.size() << " rules";
+                    toolio::out() << "selected sequentially: cycle of " << overlaps.cycle.size() << " rules";
                 }
-                llvm::outs() << "; " << overlaps.cyclicComponents << " cyclic components (" << overlaps.pairComponents
+                toolio::out() << "; " << overlaps.cyclicComponents << " cyclic components (" << overlaps.pairComponents
                              << " of 2-character rules, largest " << overlaps.largestComponent << " rules)"
                              << (overlaps.pairSelectable ? ": pair selectable" : "") << "\n";
             }
             for (size_t i = 0; i < overlaps.cycle.size(); i++) {
-                llvm::outs() << "      cycle: " << ldml::printRule(step.stringRules[overlaps.cycle[i]].rule) << "\n";
+                toolio::out() << "      cycle: " << ldml::printRule(step.stringRules[overlaps.cycle[i]].rule) << "\n";
             }
             for (const ldml::StringRuleOverlaps::Pair & pair : overlaps.pairs) {
                 const std::string outer = ldml::printRule(step.stringRules[pair.outer].rule);
                 const std::string inner = ldml::printRule(step.stringRules[pair.inner].rule);
                 switch (pair.kind) {
                     case ldml::StringRuleOverlaps::Kind::OneWay:
-                        llvm::outs() << "      overlap one-way: " << outer << "  →  " << inner << "\n"; break;
+                        toolio::out() << "      overlap one-way: " << outer << "  →  " << inner << "\n"; break;
                     case ldml::StringRuleOverlaps::Kind::TwoWay:
-                        llvm::outs() << "      overlap two-way: " << outer << "  ↔  " << inner << "\n"; break;
+                        toolio::out() << "      overlap two-way: " << outer << "  ↔  " << inner << "\n"; break;
                     case ldml::StringRuleOverlaps::Kind::Self:
-                        llvm::outs() << "      overlap self: " << outer << "\n"; break;
+                        toolio::out() << "      overlap self: " << outer << "\n"; break;
                 }
             }
         }
         printBeforeContextNotes(step);
         for (size_t r = 0; r < step.stringRules.size(); r++) {
-            llvm::outs() << "    string rule: " << ldml::printRule(step.stringRules[r].rule) << "\n";
+            toolio::out() << "    string rule: " << ldml::printRule(step.stringRules[r].rule) << "\n";
             if (r < step.stringPriority.size()) {
                 for (const ldml::ConversionRule * e : step.stringPriority[r]) {
-                    llvm::outs() << "      only where this does not match first: " << ldml::printRule(e) << "\n";
+                    toolio::out() << "      only where this does not match first: " << ldml::printRule(e) << "\n";
                 }
             }
         }
         for (size_t g = 0; g < step.subgroupPriority.size(); g++) {
             for (const ldml::ConversionRule * e : step.subgroupPriority[g]) {
-                llvm::outs() << "    single-character rules [" << step.subgroups[g].contextKey << "] only where this does not match first: "
+                toolio::out() << "    single-character rules [" << step.subgroups[g].contextKey << "] only where this does not match first: "
                              << ldml::printRule(e) << "\n";
             }
         }
         if (step.jointSelection) {
-            llvm::outs() << "    string rules and MultipleCaptureMultipleReplacement rules selected together\n";
+            toolio::out() << "    string rules and MultipleCaptureMultipleReplacement rules selected together\n";
         }
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-            llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
+            toolio::out() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
                          << " rules, matched together (" << set.rules.size() << ", starts by "
                          << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)"
                              : set.walkStarts ? "the engine, selected by the lengths of " + std::to_string(set.walkBranches.size()) + " walk branches"
@@ -938,27 +945,27 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
                          << (set.variants.empty() ? "" : ", " + std::to_string(set.variants.size()) + " variants by the character "
                              + std::to_string(set.selectorOffset) + " from the " + (set.selectorFromEnd ? "end" : "start"))
                          << ":\n";
-            for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
+            for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) toolio::out() << "      " << ldml::printRule(r.rule) << "\n";
         }
         for (const ldml::InsertionRule & ins : step.insertions) {
-            llvm::outs() << "    insertion rule: " << ldml::printRule(ins.rule) << "\n";
+            toolio::out() << "    insertion rule: " << ldml::printRule(ins.rule) << "\n";
         }
         if (!step.deferred.empty()) {
-            llvm::outs() << "    deferred rules (" << step.deferred.size() << ", " << step.copyCaptures.size()
+            toolio::out() << "    deferred rules (" << step.deferred.size() << ", " << step.copyCaptures.size()
                          << " captures copied, triggers " << printRanges(step.deferredTriggers) << "):\n";
             for (const ldml::DeferredRule & d : step.deferred) {
-                llvm::outs() << "      " << (d.selfReproducing ? "self-reproducing copy: " : d.capture >= 0 ? "copy: " : "")
+                toolio::out() << "      " << (d.selfReproducing ? "self-reproducing copy: " : d.capture >= 0 ? "copy: " : "")
                              << ldml::printRule(d.rule) << "\n";
             }
         }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
-            llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
+            toolio::out() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
             unsigned shown = 0;
             for (const ldml::CharMapping & m : s.mappings) {
-                if (shown++ == 3) {llvm::outs() << " ..."; break;}
-                llvm::outs() << (shown == 1 ? ": " : ", ") << printRanges(m.chars) << " -> " << printCodepoints(m.replacement);
+                if (shown++ == 3) {toolio::out() << " ..."; break;}
+                toolio::out() << (shown == 1 ? ": " : ", ") << printRanges(m.chars) << " -> " << printCodepoints(m.replacement);
             }
-            llvm::outs() << "\n";
+            toolio::out() << "\n";
         }
     }
 }
@@ -3112,7 +3119,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         FusedContexts before;
         if (s.engineBefore && fusedContexts(s.engineBefore, true, before, true) && convertedContextMatters(before, outcomes)) {
-            llvm::outs() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
+            toolio::out() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
         }
     }
     bool wholeGroup = false;
@@ -3124,15 +3131,15 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
                 && (step.captureReplacements.empty() || (!step.jointSelection && !step.sequentialSelection && needCoverage));
             wholeGroup |= (!step.stringOrder.empty() || needCoverage) && wholeGroupFits;
             if ((step.stringOrder.empty() && !needCoverage) || wholeGroupFits) {
-                llvm::outs() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
+                toolio::out() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
             } else {
-                llvm::outs() << "    warning: the before context of " << ldml::printRule(sr.rule)
+                toolio::out() << "    warning: the before context of " << ldml::printRule(sr.rule)
                              << " may match differently in the converted text\n";
             }
         }
     }
     if (wholeGroup && step.sequentialSelection) {
-        llvm::outs() << "    string matches selected sequentially between the " << ConvertedContextRounds + 1
+        toolio::out() << "    string matches selected sequentially between the " << ConvertedContextRounds + 1
                      << " rounds of matching before contexts against the converted text\n";
     }
     //  The contexts that are not fused (with unbounded repetitions) are matched
@@ -3191,7 +3198,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         }
         for (const ldml::PatternItem & item : items) changes |= !(item.chars & stringRuleChars).empty();
         if (changes) {
-            llvm::outs() << "    warning: the before context of [" << s.contextKey
+            toolio::out() << "    warning: the before context of [" << s.contextKey
                          << "] may match differently in the converted text\n";
         }
     }
@@ -4677,7 +4684,9 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         const std::vector<PabloAST *> basis = getInputStreamSet("U21");
-        std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> ahead(mConfig.lookahead() + 1);
+        //  (Optional and Star items of the tracked capture look one character
+        //  ahead, as the lookahead of U21 provides: at least 1.)
+        std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> ahead(std::max(1u, mConfig.lookahead()) + 1);
         auto cls = [&](unsigned k, const UCD::UnicodeSet & set) -> PabloAST * {
             if (!ahead[k]) {
                 std::vector<PabloAST *> bits(basis.size());
@@ -9606,15 +9615,15 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
 
 static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                   TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
     StreamSet * const Result = builder.transform(entry, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
@@ -9640,17 +9649,17 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
             rules += groupRules(step);
         }
     }
-    llvm::outs() << "kernel counts: " << entry->canonicalName << "\n";
+    toolio::out() << "kernel counts: " << entry->canonicalName << "\n";
     if (!a.implementable) {
-        llvm::outs() << "total: " << groups << " groups, " << rules << " rules\n";
+        toolio::out() << "total: " << groups << " groups, " << rules << " rules\n";
         return 2;
     }
-    llvm::outs().flush();   // (not to be written again by a process the driver forks)
+    toolio::out().flush();   // (not to be written again by a process the driver forks)
     CPUDriver driver("tconv");
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     const size_t base = P.getNumOfKernelCalls();
     RulePipelineBuilder builder(P, registry, analyzer);
@@ -9658,7 +9667,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     if (entry->canonicalName == "Any-CaseFold") {
         const size_t kernels = P.getNumOfKernelCalls();
         directPipeline(P, Transform::CaseFold, ByteStream);
-        llvm::outs() << "total: 0 groups, 0 rules, 0 group kernels, " << (P.getNumOfKernelCalls() - kernels)
+        toolio::out() << "total: 0 groups, 0 rules, 0 group kernels, " << (P.getNumOfKernelCalls() - kernels)
                      << " kernels (direct pipeline)\n";
         return 0;
     }
@@ -9667,10 +9676,10 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     size_t groupKernels = 0;
     for (size_t i = 0; i < builder.groupCounts().size(); i++) {
         const RulePipelineBuilder::GroupCount & g = builder.groupCounts()[i];
-        llvm::outs() << "group " << (i + 1) << ": " << g.rules << " rules, " << g.kernels << " kernels\n";
+        toolio::out() << "group " << (i + 1) << ": " << g.rules << " rules, " << g.kernels << " kernels\n";
         groupKernels += g.kernels;
     }
-    llvm::outs() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
+    toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                  << total << " kernels\n";
     return 0;
 }
@@ -9679,15 +9688,15 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
 //  given its already-computed analysis (see TransformAnalyzer::analyzeRulesFile).
 static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                                TransformAnalyzer & analyzer, const TransformAnalysis & a) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
     StreamSet * const Result = builder.applyAnalysis(a, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
@@ -9701,7 +9710,7 @@ static void applyToInput(const std::function<void (int)> & fn, int fd) {
     }
     std::string text;
     char buffer[1 << 16];
-    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
+    for (ssize_t n; (n = toolio_read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
     for (size_t pos = 0; pos < text.size(); ) {
         const size_t nl = text.find('\n', pos);
         const size_t end = nl == std::string::npos ? text.size() : nl;
@@ -9722,7 +9731,7 @@ static void applyToInput(const std::function<void (int)> & fn, int fd) {
         writer.join();
         close(fds[0]);
         if (nl == std::string::npos) break;
-        if (write(STDOUT_FILENO, "\n", 1) != 1) exit(1);
+        toolio_write(STDOUT_FILENO, "\n", 1);
         pos = nl + 1;
     }
 }
@@ -9811,16 +9820,51 @@ using Runner = std::function<void (int)>;
 static std::string readAll(int fd) {
     std::string text;
     char buffer[1 << 16];
-    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
+    for (ssize_t n; (n = toolio_read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
     return text;
 }
 
 static void writeAll(int fd, const std::string & text) {
     for (size_t i = 0; i < text.size(); ) {
         const ssize_t n = write(fd, text.data() + i, text.size() - i);
-        if (n <= 0) exit(1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            llvm::errs() << toolio::programName() << ": write error: " << std::strerror(errno) << "\n";
+            exit(1);
+        }
         i += static_cast<size_t>(n);
     }
+}
+
+//  The input of tconv, and the output: the standard output, which the
+//  transforms write (in stages through temporary redirections of it: see
+//  runOn and stagedRunner), redirected to the file of --output.
+static toolio::Input MainInput;
+
+static bool openInputAndOutput(const std::string & inputFile) {
+    if (!toolio::openInput(inputFile, MainInput) || !toolio::openOutput()) {
+        return false;
+    }
+    const int out = toolio::outputFD();
+    if (out != STDOUT_FILENO && dup2(out, STDOUT_FILENO) == -1) {
+        llvm::errs() << toolio::programName() << ": " << std::strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+}
+
+static int finishOutput() {
+    toolio::closeInput(MainInput);
+    return toolio::finishOutput() ? 0 : 1;
+}
+
+//  A compiled pipeline as a runner: the input it is given is mapped if it is
+//  the input of tconv and --mmap applies.
+static std::function<void (int)> pipelineRunner(TransformFunctionType fn) {
+    return [fn](int in) {
+        const bool useMMap = (in == MainInput.fd) && MainInput.useMMap;
+        fn(useMMap, static_cast<uint32_t>(in), STDOUT_FILENO);
+    };
 }
 
 //  While filteredRunner applies its stages to a run, the text before the run
@@ -9946,7 +9990,7 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
         part.plan.problems.clear();
         part.implementable = true;
         const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part);
-        stages.push_back([fn](int in) {fn(static_cast<uint32_t>(in));});
+        stages.push_back(pipelineRunner(fn));
         run.clear();
     };
     for (const ldml::TransformStep & step : a.plan.steps) {
@@ -9984,13 +10028,26 @@ static bool invokesICUBuiltIn(const ldml::TransformRegistry & registry, Transfor
     return false;
 }
 
+static int run(int argc, char *argv[]);
+
+//  The reports (--list-transforms, --plan, --kernel-counts, --revisit-report)
+//  and the transformed text go to the output: the standard output, or the
+//  file of --output.
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    const int status = run(argc, argv);
+    return toolio::finishOutput() ? status : 1;
+}
+
+static int run(int argc, char *argv[]) {
+    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     ldml::TransformRegistry registry;
     const std::string dir = TransformsDir.empty() ? ldml::defaultTransformDirectory() : TransformsDir;
     std::vector<std::string> warnings;
-    if (!registry.loadDirectory(dir, warnings)) {
+    // Without the default directory (no CLDR checkout), the built-in transforms
+    // are known: reported for a directory given, or a transform not found.
+    const bool dirLoaded = registry.loadDirectory(dir, warnings);
+    if (!dirLoaded && !TransformsDir.empty()) {
         llvm::errs() << "Warning: cannot read transform directory " << dir << "; only built-in transforms are known.\n";
     }
     if (ShowWarnings) {
@@ -10011,10 +10068,6 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             inputFile = TransformName;
-        }
-        if (inputFile.empty() && !ShowPlan) {
-            llvm::errs() << "Usage: " << argv[0] << " [options] --rules-file=<rules file> <input file>\n";
-            return 1;
         }
         std::vector<ldml::Rule *> parsed;
         try {
@@ -10062,20 +10115,11 @@ int main(int argc, char *argv[]) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
             }
-            const int fd = open(inputFile.c_str(), O_RDONLY);
-            if (LLVM_UNLIKELY(fd == -1)) {
-                llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
-                return 1;
-            }
-            applyToInput(icuRunner(t), fd);
-            close(fd);
-            return 0;
+            if (!openInputAndOutput(inputFile)) return 1;
+            applyToInput(icuRunner(t), MainInput.fd);
+            return finishOutput();
         }
-        const int fd = open(inputFile.c_str(), O_RDONLY);
-        if (LLVM_UNLIKELY(fd == -1)) {
-            llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
-            return 1;
-        }
+        if (!openInputAndOutput(inputFile)) return 1;
         CPUDriver driver("tconv");
         //  The built-ins ICU applies, as stages (see stagedTransformRunner).
         auto byICU = [&](const ldml::TransformStep & step) {return invokesICUBuiltIn(registry, analyzer, step);};
@@ -10086,19 +10130,17 @@ int main(int argc, char *argv[]) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
             }
-            applyToInput(runner, fd);
-            close(fd);
-            return 0;
+            applyToInput(runner, MainInput.fd);
+            return finishOutput();
         }
         TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
-        applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
-        close(fd);
-        return 0;
+        applyToInput(pipelineRunner(fn), MainInput.fd);
+        return finishOutput();
     }
 
-    if (TransformName.empty() || (InputFile.empty() && !ShowPlan && !KernelCounts && !RevisitReport)) {
-        llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> <input file>\n"
-                     << "       " << argv[0] << " [options] --rules-file=<rules file> <input file>\n"
+    if (TransformName.empty()) {
+        llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> [<input file>]\n"
+                     << "       " << argv[0] << " [options] --rules-file=<rules file> [<input file>]\n"
                      << "       " << argv[0] << " [options] --list-transforms\n";
         return 1;
     }
@@ -10106,6 +10148,9 @@ int main(int argc, char *argv[]) {
     const ldml::TransformEntry * entry = registry.lookup(TransformName);
     if (entry == nullptr) {
         llvm::errs() << "Error: unknown transform " << TransformName << "\n";
+        if (!dirLoaded) {
+            llvm::errs() << "(cannot read transform directory " << dir << "; only built-in transforms are known)\n";
+        }
         return 1;
     }
     if (KernelCounts) return printKernelCounts(registry, entry);
@@ -10115,7 +10160,7 @@ int main(int argc, char *argv[]) {
         for (const std::string & p : a.problems) {
             if (p.compare(0, 18, "rules not loaded: ") == 0) llvm::errs() << entry->canonicalName << ": " << p << "\n";
         }
-        for (const std::string & line : a.revisitReport) llvm::outs() << line << "\n";
+        for (const std::string & line : a.revisitReport) toolio::out() << line << "\n";
         return 0;
     }
     if (ShowPlan) {
@@ -10170,11 +10215,7 @@ int main(int argc, char *argv[]) {
     }
     if ((wholeICU || staged) && !tconv::ICUTransform::available()) return notImplemented(" (and tconv was built without ICU)");
 
-    const int fd = open(InputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << InputFile << " for processing.\n";
-        return 1;
-    }
+    if (!openInputAndOutput(InputFile)) return 1;
     CPUDriver driver("tconv");
     if (wholeICU) {
         std::string error;
@@ -10183,9 +10224,8 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(icuRunner(t), fd);
-        close(fd);
-        return 0;
+        applyToInput(icuRunner(t), MainInput.fd);
+        return finishOutput();
     }
     if (staged) {
         Runner runner;
@@ -10194,9 +10234,8 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(runner, fd);
-        close(fd);
-        return 0;
+        applyToInput(runner, MainInput.fd);
+        return finishOutput();
     }
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
     //  boundaries, provided by the rule pipeline.
@@ -10209,7 +10248,6 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::Remove;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
-    applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
-    close(fd);
-    return 0;
+    applyToInput(pipelineRunner(fn), MainInput.fd);
+    return finishOutput();
 }

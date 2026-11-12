@@ -43,6 +43,7 @@
 #include <re/unicode/resolve_properties.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fcntl.h>
 #include <iostream>
 #include <kernel/pipeline/driver/cpudriver.h>
@@ -62,7 +63,9 @@ using namespace pablo;
 //  These declarations are for command line processing.
 //  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory NFD_Options("Decompositon Options", "Decompositon Options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFD_Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(NFD_Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 //  Aliases for the Focused Transform Options (-reintegrate, -unmodified-filter).
 static cl::opt<bool> ByteMerging("ByteMerging", cl::desc("Same as -reintegrate=byte-spread"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> ByteReplace("ByteReplace", cl::desc("Same as -reintegrate=byte-replace"), cl::init(false), cl::cat(NFD_Options));
@@ -81,18 +84,19 @@ static cl::opt<bool> UseLayers("UseLayers", cl::desc("With -SeparatedPipelineSta
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
     P.SetStageLabel("source");
 
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     Selected_S2P(P, ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
 }
 
-typedef void (*SourceInputFunctionType)(StreamSetPtr &, StreamSetPtr &, uint32_t fd);
+typedef void (*SourceInputFunctionType)(StreamSetPtr &, StreamSetPtr &, uint32_t useMMap, uint32_t fd);
 
 SourceInputFunctionType source_input_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver,
                             Output<streamset_t>("ByteStream", 1, 8, ReturnedBuffer(1)),
                             Output<streamset_t>("BasisBits", 8, 1, ReturnedBuffer(1)),
+                            Input<uint32_t>("useMMap"),
                             Input<uint32_t>("inputFileDecriptor")
                             );
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
@@ -167,7 +171,7 @@ NFD_TransformFunctionType NFD_transform_pipeline(CPUDriver & driver) {
     return P.compile();
 }
 
-typedef void (*CombinedWorkFunctionType)(StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, uint32_t fd);
+typedef void (*CombinedWorkFunctionType)(StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, uint32_t useMMap, uint32_t fd);
 
 CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
     const bool bytes = ReintegratesBytes();
@@ -177,6 +181,7 @@ CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
                             // the source data in the form generate_output_pipeline expects
                             Output<streamset_t>("Source", bytes ? 1 : 8, bytes ? 8 : 1, ReturnedBuffer(1)),
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1)),
+                            Input<uint32_t>("useMMap"),
                             Input<uint32_t>("inputFileDecriptor")
                             );
     NFD_PipelineBuilder NFD_builder(P);
@@ -199,7 +204,7 @@ CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
     return P.compile();
 }
 
-typedef void (*OutputAssemblyFunctionType)(const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &);
+typedef void (*OutputAssemblyFunctionType)(const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, uint32_t outputFD);
 
 OutputAssemblyFunctionType generate_output_pipeline(CPUDriver & driver) {
     const bool bytes = ReintegratesBytes();
@@ -207,7 +212,8 @@ OutputAssemblyFunctionType generate_output_pipeline(CPUDriver & driver) {
                             Input<streamset_t>("WorkSelectionMask", 1, 1),
                             Input<streamset_t>("FinalWorkPlacementMask", 1, 1),
                             Input<streamset_t>("Source", bytes ? 1 : 8, bytes ? 8 : 1),
-                            Input<streamset_t>("TransformedBasis", 8, 1)
+                            Input<streamset_t>("TransformedBasis", 8, 1),
+                            Input<uint32_t>("outputFD")
                             );
     NFD_PipelineBuilder NFD_builder(P);
     const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
@@ -216,14 +222,14 @@ OutputAssemblyFunctionType generate_output_pipeline(CPUDriver & driver) {
                                                     P.getInputStreamSet("FinalWorkPlacementMask"),
                                                     bytes ? Source : nullptr, bytes ? nullptr : Source,
                                                     P.getInputStreamSet("TransformedBasis"));
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
-typedef void (*XfrmFunctionType)(uint32_t fd);
+typedef void (*XfrmFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 XfrmFunctionType generate_unitary_pipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDecriptor"), Input<uint32_t>("outputFD"));
     NFD_PipelineBuilder NFD_builder(P);
     const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
@@ -233,17 +239,16 @@ XfrmFunctionType generate_unitary_pipeline(CPUDriver & driver) {
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
     StreamSet * const OutputBytes = NFD.build(P, ByteStream, BasisBits);
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&NFD_Options, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
-        exit(-1);
+    codegen::ParseCommandLineOptions(argc, argv, {&NFD_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
     if (UseIndexedShiftBack) FilterViolations = true;
     if (SeparatedPipelineStages == 4 && (UseLayers || NFD_FocusOptions().layerAfter(FocusStage::Filter)) &&
@@ -259,17 +264,17 @@ int main(int argc, char *argv[]) {
         kernel::StreamSetPtr FinalWorkPlacementMask;
         kernel::StreamSetPtr Source;
         kernel::StreamSetPtr TransformedBasis;
-        working_stages(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis, fd);
-        close(fd);
+        working_stages(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis, in.useMMap, in.fd);
+        toolio::closeInput(in);
 
         OutputAssemblyFunctionType stage3 = generate_output_pipeline(driver);
-        stage3(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis);
+        stage3(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis, toolio::outputFD());
     } else if (SeparatedPipelineStages == 4) {
         SourceInputFunctionType stage0 = source_input_pipeline(driver);
         kernel::StreamSetPtr ByteStream;
         kernel::StreamSetPtr BasisBits;
-        stage0(ByteStream, BasisBits, fd);
-        close(fd);
+        stage0(ByteStream, BasisBits, in.useMMap, in.fd);
+        toolio::closeInput(in);
 
         NFD_FilterFunctionType stage1 = NFD_filter_pipeline(driver);
         kernel::StreamSetPtr WorkSelectionMask;
@@ -282,11 +287,11 @@ int main(int argc, char *argv[]) {
         stage2(WorkingBasis, TransformedBasis);
 
         OutputAssemblyFunctionType stage3 = generate_output_pipeline(driver);
-        stage3(WorkSelectionMask, FinalWorkPlacementMask, ReintegratesBytes() ? ByteStream : BasisBits, TransformedBasis);
+        stage3(WorkSelectionMask, FinalWorkPlacementMask, ReintegratesBytes() ? ByteStream : BasisBits, TransformedBasis, toolio::outputFD());
     } else {
         XfrmFunctionType fn = generate_unitary_pipeline(driver);
-        fn(fd);
-        close(fd);
+        fn(in.useMMap, in.fd, toolio::outputFD());
+        toolio::closeInput(in);
     }
-    return 0;
+    return toolio::finishOutput() ? 0 : 1;
 }

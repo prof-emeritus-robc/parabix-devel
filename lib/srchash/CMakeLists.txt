@@ -14,6 +14,4 @@ SRC
 NO_SOURCE_HASH
 )
 
-if(NOT ARTIFACT_MODE STREQUAL "Single")
-    target_link_libraries(srchash PRIVATE ${CMAKE_DL_LIBS})
-endif()
+target_link_libraries(srchash PRIVATE ${CMAKE_DL_LIBS})

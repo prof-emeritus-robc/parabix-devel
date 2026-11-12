@@ -15,6 +15,10 @@
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/raw_ostream.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/locale/encoding_utf.hpp>
@@ -29,37 +33,57 @@ namespace csv {
 cl::OptionCategory CSV_Options("CSV Processing Options", "Options to control parsing and field selection of input files");
 
 std::string inputFile;
-static cl::opt<std::string, true> inputFileOption(cl::location(inputFile), cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(csv::CSV_Options));
-
-// Although CSV files normally have column headers as the first line, 
-// we can provide them directly or from a file.
 bool HeaderSpecNamesFile;
 std::string HeaderSpec;
-static cl::opt<bool, true> HeaderSpecNamesFileOption("headers-from-file", cl::location(HeaderSpecNamesFile), cl::desc("Interpret headers parameter as file name with header line"), cl::init(false), cl::cat(CSV_Options));
-static cl::opt<std::string, true> HeaderSpecOption("headers", cl::location(HeaderSpec), cl::desc("CSV column headers (explicit string or filename"), cl::init(""), cl::cat(CSV_Options));
-
 char32_t FieldDelimiter;
-static cl::opt<std::string> FieldDelimiterOption("delimiter",
-	cl::desc("Delimiter to separate fields (default comma)"), cl::init(","),
-    cl::value_desc("Unicode character"), cl::cat(CSV_Options));
-static cl::alias DelimterA("d", cl::desc("Alias for --delimiter"), cl::aliasopt(FieldDelimiterOption), cl::NotHidden);
-static cl::opt<bool> TabDelimiter("tabs",
-	cl::desc("Use tabs as delimiter (overrides --delimiter)"), cl::init(false), cl::cat(CSV_Options));
-static cl::alias TabsA("t", cl::desc("Alias for --tabs"), cl::aliasopt(FieldDelimiterOption), cl::NotHidden);
-
 char32_t QuoteChar;
-static cl::opt<std::string> QuoteCharOption("quotechar",
-	cl::desc("Quote character (default double quote)"), cl::init("\""), 
-    cl::value_desc("Unicode character"), cl::cat(CSV_Options));
-static cl::alias QuoteA("q", cl::desc("Alias for --quotechar"), cl::aliasopt(QuoteCharOption), cl::NotHidden);
-
 bool ZeroIndexing;
-static cl::list<std::string> Columns("columns",
-                                     cl::desc("A comma-separated list of column names or indices"),
-                                     cl::CommaSeparated, cl::cat(csv::CSV_Options));
-//static cl::alias ColumnsA("c", cl::desc("Alias for --columns"), cl::aliasopt(Columns), cl::NotHidden);
-static cl::opt<bool, true> ZeroIndexingOption("zero", cl::location(ZeroIndexing), 
-	cl::desc("Use 0-based rather than 1-based indices for column numbers"), cl::init(false), cl::cat(csv::CSV_Options));
+
+namespace {
+
+// The CSV options, created by InitializeCommandLineInterface, so that only
+// the CSV tools have them (see RegisterFileSelectOptions in fileselect).
+struct CSVOptions {
+
+cl::opt<std::string, true> inputFileOption{cl::location(inputFile), cl::Positional, cl::desc("<input file>"), cl::cat(csv::CSV_Options)};
+
+// Although CSV files normally have column headers as the first line,
+// we can provide them directly or from a file.
+cl::opt<bool, true> HeaderSpecNamesFileOption{"headers-from-file", cl::location(HeaderSpecNamesFile), cl::desc("Interpret headers parameter as file name with header line"), cl::init(false), cl::cat(CSV_Options)};
+cl::opt<std::string, true> HeaderSpecOption{"headers", cl::location(HeaderSpec), cl::desc("CSV column headers (explicit string or filename"), cl::init(""), cl::cat(CSV_Options)};
+
+cl::opt<std::string> FieldDelimiterOption{"delimiter",
+	cl::desc("Delimiter to separate fields (default comma)"), cl::init(","),
+    cl::value_desc("Unicode character"), cl::cat(CSV_Options)};
+cl::alias DelimterA{"d", cl::desc("Alias for --delimiter"), cl::aliasopt(FieldDelimiterOption), cl::NotHidden};
+cl::opt<bool> TabDelimiter{"tabs",
+	cl::desc("Use tabs as delimiter (overrides --delimiter)"), cl::init(false), cl::cat(CSV_Options)};
+cl::alias TabsA{"t", cl::desc("Alias for --tabs"), cl::aliasopt(TabDelimiter), cl::NotHidden};
+
+cl::opt<std::string> QuoteCharOption{"quotechar",
+	cl::desc("Quote character (default double quote)"), cl::init("\""),
+    cl::value_desc("Unicode character"), cl::cat(CSV_Options)};
+cl::alias QuoteA{"q", cl::desc("Alias for --quotechar"), cl::aliasopt(QuoteCharOption), cl::NotHidden};
+
+cl::list<std::string> Columns{"columns",
+                              cl::desc("A comma-separated list of column names or indices"),
+                              cl::CommaSeparated, cl::cat(csv::CSV_Options)};
+//cl::alias ColumnsA{"c", cl::desc("Alias for --columns"), cl::aliasopt(Columns), cl::NotHidden};
+cl::opt<bool, true> ZeroIndexingOption{"zero", cl::location(ZeroIndexing),
+	cl::desc("Use 0-based rather than 1-based indices for column numbers"), cl::init(false), cl::cat(csv::CSV_Options)};
+
+};
+
+CSVOptions * Registered = nullptr;
+
+CSVOptions & registeredOptions() {
+    if (LLVM_UNLIKELY(Registered == nullptr)) {
+        report_fatal_error("CSV options used before csv::InitializeCommandLineInterface");
+    }
+    return *Registered;
+}
+
+} // anonymous namespace
 
 std::vector<std::string> parse_CSV_headers(std::string headerString) {
     std::vector<std::string> headers;
@@ -86,10 +110,33 @@ std::vector<std::string> read_CSV_headers(std::string filename) {
 
 const unsigned MaxHeaderSize = 24;
 
-std::vector<std::string> get_CSV_headers() {
+// The first line of an input, read from in.start (without moving its position).
+static std::vector<std::string> read_CSV_headers(const toolio::Input & in) {
+    std::string line1;
+    char buffer[4096];
+    for (off_t offset = static_cast<off_t>(in.start); ; ) {
+        const ssize_t n = pread(in.fd, buffer, sizeof(buffer), offset);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        const char * const end = static_cast<const char *>(std::memchr(buffer, '\n', static_cast<size_t>(n)));
+        if (end) {
+            line1.append(buffer, static_cast<size_t>(end - buffer));
+            break;
+        }
+        line1.append(buffer, static_cast<size_t>(n));
+        offset += n;
+    }
+    return parse_CSV_headers(line1);
+}
+
+std::vector<std::string> get_CSV_headers(const toolio::Input & in) {
 	std::vector<std::string> headers;
     if (csv::HeaderSpec == "") {
-        headers = csv::read_CSV_headers(csv::inputFile);
+        headers = csv::read_CSV_headers(in);
     } else if (csv::HeaderSpecNamesFile) {
         headers = csv::read_CSV_headers(csv::HeaderSpec);
     } else {
@@ -152,14 +199,14 @@ std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers) {
         }
     }
 	std::vector<unsigned> colNos;
-    if (csv::Columns.size() == 0) {
+    if (registeredOptions().Columns.size() == 0) {
         for (unsigned i = 0; i < headers.size(); i++) {
             colNos.push_back(i);
         }
     } else {
-        for (unsigned i = 0; i < csv::Columns.size(); i++) {
+        for (unsigned i = 0; i < registeredOptions().Columns.size(); i++) {
             //llvm::errs() << "csv::Columns[i] = " << csv::Columns[i] << "\n";
-            auto rg = getColumnRange(csv::Columns[i], headerMap);
+            auto rg = getColumnRange(registeredOptions().Columns[i], headerMap);
             if (rg.second >= headers.size()) {
                 llvm::report_fatal_error("Column number too large");
             }
@@ -199,20 +246,26 @@ const char32_t TAB = U'\t';
 
 void InitializeCommandLineInterface(int argc, char *argv[]) {
     llvm::install_fatal_error_handler(&csv_error_handler);
-    codegen::ParseCommandLineOptions(argc, argv, {&CSV_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    static CSVOptions opts;
+    Registered = &opts;
+    // (Registered here, not by static objects: the single library has this
+    // code in every tool.)
+    static toolio::RegisterInputOptions InputOptions;
+    static toolio::RegisterOutputOptions OutputOptions;
+    codegen::ParseCommandLineOptions(argc, argv, {&CSV_Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     // Set the delimiter and quote characters.
-    if (TabDelimiter) {
+    if (registeredOptions().TabDelimiter) {
         // --tabs or -t overrides field delimiter
         FieldDelimiter = TAB;
     } else {
-        std::u32string delimArg = boost::locale::conv::utf_to_utf<char32_t>(FieldDelimiterOption);
+        std::u32string delimArg = boost::locale::conv::utf_to_utf<char32_t>(registeredOptions().FieldDelimiterOption);
         if (delimArg.size() != 1) {
             report_fatal_error("Field Delimiter must be a single Unicode character");
         }
         FieldDelimiter = delimArg[0];
     }
-    std::u32string quoteArg = boost::locale::conv::utf_to_utf<char32_t>(QuoteCharOption);
+    std::u32string quoteArg = boost::locale::conv::utf_to_utf<char32_t>(registeredOptions().QuoteCharOption);
     if (quoteArg.size() != 1) {
         report_fatal_error("Quote Character must be a single Unicode character");
     }

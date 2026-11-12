@@ -21,6 +21,15 @@ namespace argv {
 // The file selection options, for ParseCommandLineOptions to show.
 extern llvm::cl::OptionCategory File_Select_Options;
 
+// Creates the file selection options (-r, -d, --include, ...).  A tool that
+// selects files constructs one before parsing its command line, e.g.
+//     static argv::RegisterFileSelectOptions FileSelectOptions;
+// Tools that do not, have none of these options, so that their names are
+// free for other uses (as with LLVM's codegen::RegisterCodeGenFlags).
+struct RegisterFileSelectOptions {
+    RegisterFileSelectOptions();
+};
+
 extern bool NoMessagesFlag;  // -s
     
 enum DevDirAction {Read, Skip, Recurse};
@@ -31,7 +40,6 @@ extern DevDirAction DirectoriesFlag;
 extern bool RecursiveFlag; 
 extern bool DereferenceRecursiveFlag; // -R
 
-extern bool MmapFlag; // -mmap
 
 // How a tool selects its files.
 struct FileSelectConfig {

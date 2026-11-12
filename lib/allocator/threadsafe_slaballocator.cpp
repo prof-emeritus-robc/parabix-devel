@@ -6,10 +6,10 @@ ThreadSafeSlabAllocator ThreadSafeSlabAllocator::__STATIC_PROCESS_THREAD_ALLOCAT
 void ThreadSafeSlabAllocator::AllocateNewSlab(const size_t required) noexcept {
     constexpr auto ALIGN_MASK = alignof(std::max_align_t) - 1;
     constexpr auto HEADER_SIZE = (sizeof(SlabNode) + ALIGN_MASK) & ~ALIGN_MASK;
-    const auto PAGE_SIZE = boost::interprocess::mapped_region::get_page_size();
-    assert ((SLAB_SIZE % PAGE_SIZE) == 0);
+    const auto pageSize = boost::interprocess::mapped_region::get_page_size();
+    assert ((SLAB_SIZE % pageSize) == 0);
     const auto size = ((required + HEADER_SIZE) + (SLAB_SIZE - 1)) & ~(SLAB_SIZE - 1);
-    uint8_t * const ptr = static_cast<uint8_t*>(std::aligned_alloc(PAGE_SIZE, size));
+    uint8_t * const ptr = static_cast<uint8_t*>(std::aligned_alloc(pageSize, size));
     SlabNode * const newSlab = reinterpret_cast<SlabNode*>(ptr);
     newSlab->Next = CurrentSlab;
     CurrentSlab = newSlab;

@@ -49,12 +49,16 @@ public:
     }
 protected:
     static void generatLinkExternalFunctions(KernelBuilder & b);
-    static void generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth);
+    // (readFunction: read, or toolio_read for FDSourceKernel, reading from
+    // what toolio reads ahead of a pipe)
+    static void generateDoSegmentMethod(KernelBuilder & b, const unsigned codeUnitWidth, llvm::StringRef readFunction = "read");
     static llvm::Value * generateExpectedOutputSizeMethod(KernelBuilder & b, const unsigned codeUnitWidth);
 private:
     const unsigned mCodeUnitWidth;
 };
 
+// Reads with toolio_read (toolchain/toolio.h): an input read ahead by toolio
+// is read from the data read ahead.
 class FDSourceKernel final : public SegmentOrientedKernel {
 public:
     FDSourceKernel(LLVMTypeSystemInterface & ts, Scalar * const useMMap, Scalar * const fd, StreamSet * const outputStream);

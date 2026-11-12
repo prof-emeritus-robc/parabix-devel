@@ -5,6 +5,8 @@
 
 #include <fcntl.h>
 #include <string>
+#include <cerrno>
+#include <cstring>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
 #include <kernel/core/kernel_builder.h>
@@ -17,6 +19,7 @@
 #include <kernel/unicode/normalization/normalization.h>
 #include <toolchain/fileutil.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamsetptr.h>
 
@@ -26,8 +29,9 @@ using namespace llvm;
 //  These declarations are for command line processing.
 //  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory NFC_Options("Composition Options", "Composition Options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFC_Options));
-static cl::opt<bool> PreferMMap("useMMap", cl::desc("Use mmap for file input, if possible"), cl::init(false), cl::cat(NFC_Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(NFC_Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> MultiStage("MultiStage", cl::desc("Use separate pipelines for the focus, transform and reintegration stages"), cl::init(false), cl::cat(NFC_Options));
 static cl::opt<bool> ByteFiltering("ByteFiltering", cl::desc("Use byte filtering for focused work (alias of -focus-filter=byte)"), cl::init(false), cl::cat(NFC_Options));
 
@@ -92,14 +96,15 @@ TransformStageFunctionType transform_stage_pipeline(CPUDriver & driver) {
     return P.compile();
 }
 
-typedef void (*FinalStageFunctionType)(const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &);
+typedef void (*FinalStageFunctionType)(const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, uint32_t outputFD);
 
 FinalStageFunctionType final_stage_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver,
                             Input<streamset_t>("ByteStream", 1, 8),
                             Input<streamset_t>("WorkSelectionMask", 1, 1),
                             Input<streamset_t>("ValidWorkMask", 1, 1),
-                            Input<streamset_t>("TransformedBasis", 8, 1)
+                            Input<streamset_t>("TransformedBasis", 8, 1),
+                            Input<uint32_t>("outputFD")
                             );
     const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
     StreamSet * const ByteStream = P.getInputStreamSet("ByteStream");
@@ -110,14 +115,14 @@ FinalStageFunctionType final_stage_pipeline(CPUDriver & driver) {
     StreamSet * const PlacementMask = NFC.validatedPlacement(P, BasisBits, WorkSelectionMask, P.getInputStreamSet("ValidWorkMask"));
     StreamSet * const OutputBytes = NFC.reintegrate(P, WorkSelectionMask, PlacementMask, ByteStream, BasisBits,
                                                     P.getInputStreamSet("TransformedBasis"));
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
-typedef void (*XfrmFunctionType)(const char * buffer, const size_t length);
+typedef void (*XfrmFunctionType)(const char * buffer, const size_t length, uint32_t outputFD);
 
 XfrmFunctionType generate_pipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<const char*>{"buffer"}, Input<size_t>{"length"});
+    auto P = CreatePipeline(driver, Input<const char*>{"buffer"}, Input<size_t>{"length"}, Input<uint32_t>("outputFD"));
     const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
@@ -141,26 +146,28 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
     } else {
         OutputBytes = NFC.build(P, ByteStream, BasisBits);
     }
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
     //  ParseCommandLineOptions uses the LLVM CommandLine processor, but we also add
     //  standard Parabix command line options such as -help, -ShowPablo and many others.
-    codegen::ParseCommandLineOptions(argc, argv, {&NFC_Options, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&NFC_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     if (MultiStage && !NFC_FocusOptions().Focus) {
         llvm::report_fatal_error("-MultiStage requires focus (not -NoFocus)");
     }
 
-    bool useMMap = PreferMMap && canMMap(inputFile);
-    AlignedFileBuffer buf;
-    buf.load(inputFile, useMMap);
-    size_t bytes_read = buf.getBufSize();
-    if (bytes_read <= 0) {
-        llvm::errs() << "Error: unable to read " << inputFile << " for processing.\n";
-        exit(-1);
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
+    AlignedFileBuffer buf;
+    if (!buf.load(in.fd, in.useMMap)) {
+        llvm::errs() << toolio::programName() << ": " << in.name << ": " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    toolio::closeInput(in);
 
     CPUDriver driver("NFC_function");
     if (MultiStage) {
@@ -174,11 +181,11 @@ int main(int argc, char *argv[]) {
         kernel::StreamSetPtr ValidWorkMask;
         focus_stage(ByteStream, WorkSelectionMask, FocusedBasis, buf.getBuf(), buf.getBufSize());
         transform_stage(FocusedBasis, TransformedBasis, ValidWorkMask);
-        final_stage(ByteStream, WorkSelectionMask, ValidWorkMask, TransformedBasis);
+        final_stage(ByteStream, WorkSelectionMask, ValidWorkMask, TransformedBasis, toolio::outputFD());
     } else {
         XfrmFunctionType fn = generate_pipeline(driver);
-        fn(buf.getBuf(), buf.getBufSize());
+        fn(buf.getBuf(), buf.getBufSize(), toolio::outputFD());
     }
     buf.release();
-    return 0;
+    return toolio::finishOutput() ? 0 : 1;
 }

@@ -20,6 +20,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <llvm/ADT/StringRef.h>
@@ -38,20 +39,23 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory u32u16Options("u32u16 Options", "Transcoding control options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(u32u16Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(u32u16Options));
 static cl::opt<std::string> OutputEncoding("encoding", cl::desc("Output encoding (default: UTF-16)"), cl::init("UTF-16"), cl::cat(u32u16Options));
 
-typedef void (*u32u16FunctionType)(uint32_t fd);
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
+
+typedef void (*u32u16FunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 u32u16FunctionType u32u16_gen (CPUDriver & driver, cc::ByteNumbering byteNumbering) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>("fd"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("fd"), Input<uint32_t>("outputFD"));
 
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const codeUnitStream = P.CreateStreamSet(1, 32);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, codeUnitStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, codeUnitStream);
 
     // Source buffers for transposed UTF-32 basis bits.
     StreamSet * const u32basis = P.CreateStreamSet(21);
@@ -88,12 +92,12 @@ u32u16FunctionType u32u16_gen (CPUDriver & driver, cc::ByteNumbering byteNumberi
     P.CreateKernelCall<UTF16assembly>(SMP4_0, deposit15_10, deposit9_0, u16final,
                                       u16basis);
     P.CreateKernelCall<P2S16Kernel>(u16basis, u16bytes, byteNumbering);
-    P.CreateKernelCall<StdOutKernel>(u16bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u16bytes);
     return reinterpret_cast<u32u16FunctionType>(P.compile());
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&u32u16Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&u32u16Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     cc::ByteNumbering byteNumbering = cc::ByteNumbering::BigEndian;
 
     if ((OutputEncoding == "UTF16LE") || (OutputEncoding == "UTF-16LE")) {
@@ -103,14 +107,13 @@ int main(int argc, char *argv[]) {
     } else if ((OutputEncoding != "UTF16") &&  (OutputEncoding != "UTF-16")) {
         llvm::report_fatal_error("Unsupported encoding.");
     }
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("u32u16");
     auto u32u16Function = u32u16_gen(driver, byteNumbering);
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        u32u16Function(fd);
-        close(fd);
-    }
-    return 0;
+    u32u16Function(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

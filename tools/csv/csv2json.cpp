@@ -43,6 +43,7 @@
 #include <grep/grep_kernel.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <pablo/pablo.h>
 #include <fcntl.h>
 #include <iostream>
@@ -64,7 +65,7 @@ using namespace pablo;
 
 static cl::opt<bool> TestDynamicRepeatingFile("dyn", cl::desc("Test Dynamic Repeating StreamSet"), cl::init(true), cl::cat(csv::CSV_Options), cl::Hidden);
 
-typedef void (*CSVFunctionType)(uint32_t fd);
+typedef void (*CSVFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 std::vector<std::string> JSONfieldPrefixes(std::vector<std::string> fieldNames) {
     std::vector<std::string> tmp;
@@ -373,14 +374,14 @@ void JSON_Value_Quoting(PipelineBuilder & P, StreamSet * BasisBits, StreamSet * 
 CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<std::string> & templateStrs) {
     // A Parabix program is build as a set of kernel calls called a pipeline.
     // A pipeline is construction using a Parabix driver object.
-    auto P = CreatePipeline(driver, Input<uint32_t>{"inputFileDecriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"inputFileDecriptor"}, Input<uint32_t>{"outputFD"});
     //  The program will use a file descriptor as an input.
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     // File data from mmap
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    //  ReadSourceKernel is a Parabix Kernel that produces a stream of bytes
-    //  from a file descriptor.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    //  FDSourceKernel is a Parabix Kernel that produces a stream of bytes
+    //  from a file descriptor, mapping the file into memory or reading it.
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     //  The Parabix basis bits representation is created by the Parabix S2P kernel.
@@ -501,7 +502,7 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<std::stri
 
     StreamSet * Instantiated = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(FinalBasis, Instantiated);
-    P.CreateKernelCall<StdOutKernel>(Instantiated);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), Instantiated);
     return P.compile();
 }
 
@@ -509,7 +510,13 @@ int main(int argc, char *argv[]) {
     llvm_shutdown_obj shutdown;
     csv::InitializeCommandLineInterface(argc, argv);
 
-    std::vector<std::string> headers = csv::get_CSV_headers();
+    //  The input is read twice (its first line for the headers), so the
+    //  standard input is copied to a temporary file if it is a pipe.
+    toolio::Input in;
+    if (!toolio::openSeekableInput(csv::inputFile, in) || !toolio::openOutput()) {
+        return csv::InternalFailureCode;
+    }
+    std::vector<std::string> headers = csv::get_CSV_headers(in);
 
     const auto templateStrs = JSONfieldPrefixes(headers);
     std::string templatePrologue = "[\n";
@@ -517,28 +524,21 @@ int main(int argc, char *argv[]) {
     CPUDriver driver("csv_function");
     //  Build and compile the Parabix pipeline by calling the Pipeline function above.
     CSVFunctionType fn = generatePipeline(driver, templateStrs);
-    //  The compile function "fn"  can now be used.   It takes a file
-    //  descriptor as an input, which is specified by the filename given by
-    //  the inputFile command line option.]
-
-    const int fd = open(csv::inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::report_fatal_error(llvm::StringRef("Cannot open ") + csv::inputFile);
-    } else {
-        #ifdef REPORT_PAPI_TESTS
-        papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
-        // papi::PapiCounter<3> jitExecution{{PAPI_FUL_ICY, PAPI_STL_CCY, PAPI_RES_STL}};
-        jitExecution.start();
-        #endif
-        //  Run the pipeline.
-        printf("%s", templatePrologue.c_str());
-        fflush(stdout);
-        fn(fd);
-        close(fd);
-        #ifdef REPORT_PAPI_TESTS
-        jitExecution.stop();
-        jitExecution.write(std::cerr);
-        #endif
-    }
-    return csv::SuccessExitCode;
+    //  The compiled function "fn" can now be used.  It takes whether to map
+    //  the input, and the input and output file descriptors.
+    #ifdef REPORT_PAPI_TESTS
+    papi::PapiCounter<4> jitExecution{{PAPI_L3_TCM, PAPI_L3_TCA, PAPI_TOT_INS, PAPI_TOT_CYC}};
+    // papi::PapiCounter<3> jitExecution{{PAPI_FUL_ICY, PAPI_STL_CCY, PAPI_RES_STL}};
+    jitExecution.start();
+    #endif
+    //  Run the pipeline, after the prologue (written before the pipeline writes)
+    toolio::out() << templatePrologue;
+    toolio::out().flush();
+    fn(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    #ifdef REPORT_PAPI_TESTS
+    jitExecution.stop();
+    jitExecution.write(std::cerr);
+    #endif
+    return toolio::finishOutput() ? csv::SuccessExitCode : csv::InternalFailureCode;
 }

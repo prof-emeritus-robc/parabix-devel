@@ -196,8 +196,8 @@ function(parabix_srchash_finalize)
     get_property(CODEGEN_LABELS GLOBAL PROPERTY PARABIX_SRCHASH_CODEGEN_LABELS)
     foreach(TGT ${TARGETS})
         if(TGT STREQUAL PARABIX_MONO_TARGET)
-            # The single artifact holds every module.
-            set(DEPS ${NAMES})
+            # The single artifact holds every module but those built apart.
+            get_property(DEPS GLOBAL PROPERTY PARABIX_SINGLE_MODULES)
         else()
             parabix_srchash_codegen_deps(DEPS ${TGT})
         endif()

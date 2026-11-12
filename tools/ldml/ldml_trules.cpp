@@ -51,8 +51,11 @@
 //      of insertion and the length of the captured text.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
+//  With --output=<file>, the reports are written to the file (- for the
+//  standard output); the messages go to the standard error.
 
 #include <ldml/transform_rules.h>
+#include <toolchain/toolio.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
@@ -140,30 +143,30 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
             }
         }
         const std::string printed = printRules(rules);
-        if (!quiet) std::cout << printed;
+        if (!quiet) toolio::stream() << printed;
         std::string reprinted;
         if (!reparses(printed, !exclusive, reprinted)) {
             std::cerr << label << ": round trip mismatch\n--- printed\n" << printed << "--- reprinted\n" << reprinted;
             return false;
         }
         if (quiet) {
-            std::cout << label << ": " << rules.size() << " rules OK";
+            toolio::stream() << label << ": " << rules.size() << " rules OK";
             if (exclusive) {
-                std::cout << " (" << stats.groups << " groups, " << stats.setsRewritten << " sets rewritten, "
+                toolio::stream() << " (" << stats.groups << " groups, " << stats.setsRewritten << " sets rewritten, "
                           << stats.classDefinitions << " class variables, " << stats.variableCopies << " variable copies)";
             }
             if (disambiguate) {
-                std::cout << " (overlaps " << dstats.overlapsBefore << " -> " << dstats.overlapsAfter << ", "
+                toolio::stream() << " (overlaps " << dstats.overlapsBefore << " -> " << dstats.overlapsAfter << ", "
                           << dstats.rulesSplit << " rules split into " << dstats.splitRules << ", "
                           << dstats.pairsResolved << " pairs resolved, " << dstats.pairsUnresolved << " unresolved, "
                           << dstats.rulesReplaced << " rules replaced by " << dstats.rulesAdded;
-                if (dstats.deletionClosures) std::cout << ", " << dstats.deletionClosures << " deletion closures";
-                std::cout << ")";
+                if (dstats.deletionClosures) toolio::stream() << ", " << dstats.deletionClosures << " deletion closures";
+                toolio::stream() << ")";
                 for (const auto & r : dstats.unresolvedReasons) {
-                    std::cout << "\n    unresolved: " << r.second << " " << r.first;
+                    toolio::stream() << "\n    unresolved: " << r.second << " " << r.first;
                 }
             }
-            std::cout << "\n";
+            toolio::stream() << "\n";
         }
         return true;
     } catch (const TransformRuleParseErrors & e) {
@@ -309,10 +312,10 @@ static void countNullableCaptures(const std::vector<std::string> & tRules, const
     n.forwardAdded = NullableCaptureElimination(fwd).size() - fwd.size();
     n.backwardAdded = NullableCaptureElimination(bwd).size() - bwd.size();
     if (n.captures + n.repeated > 0) {
-        std::cout << label << ": " << n.captures << " nullable captures in " << n.rules << " rules"
+        toolio::stream() << label << ": " << n.captures << " nullable captures in " << n.rules << " rules"
                   << " (+" << n.forwardAdded << " forward rules, +" << n.backwardAdded << " backward rules)";
-        if (n.repeated) std::cout << ", " << n.repeated << " within repetitions";
-        std::cout << "\n";
+        if (n.repeated) toolio::stream() << ", " << n.repeated << " within repetitions";
+        toolio::stream() << "\n";
         total.files++;
     }
     total.captures += n.captures;
@@ -439,12 +442,12 @@ static bool reportPartition(const std::vector<std::string> & tRules, const std::
         for (const auto & s : p.inlineSets) n.inlineDivided += s.classes.size() > 1;
     }
     const std::string error = verifyPartitions(partitions);
-    std::cout << label << ": " << partitions.size() << " groups, " << n.variables << " set variables (" << n.divided << " divided), "
+    toolio::stream() << label << ": " << partitions.size() << " groups, " << n.variables << " set variables (" << n.divided << " divided), "
               << n.inlineSets << " inline sets (" << n.inlineDivided << " divided), " << n.classes << " classes: "
               << n.literals << " literal characters, " << (n.classes - n.literals - n.generated - n.inlineClasses) << " existing variables, "
               << n.inlineClasses << " inline sets, " << n.generated << " new variables" << (error.empty() ? "" : "; ERROR: " + error) << "\n";
     total.groups += partitions.size();
-    if (!quiet) std::cout << printPartitions(partitions);
+    if (!quiet) toolio::stream() << printPartitions(partitions);
     total.variables += n.variables;
     total.divided += n.divided;
     total.inlineSets += n.inlineSets;
@@ -481,11 +484,11 @@ static void reportOverlaps(const std::vector<std::string> & tRules, const std::s
         const std::vector<RuleOverlap> overlaps = findRuleOverlaps(rules);
         n.overlaps = overlaps.size();
         if (n.rules == 0) continue;
-        std::cout << label << (e == Extract::Forward ? " forward: " : " backward: ") << n.rules << " rules, "
+        toolio::stream() << label << (e == Extract::Forward ? " forward: " : " backward: ") << n.rules << " rules, "
                   << n.pairs << " pairs, " << n.overlaps << " overlapping\n";
         if (!quiet) {
             for (const RuleOverlap & o : overlaps) {
-                std::cout << "    " << printRule(rules[o.earlier]) << "   |   " << printRule(rules[o.later]) << "\n";
+                toolio::stream() << "    " << printRule(rules[o.earlier]) << "   |   " << printRule(rules[o.later]) << "\n";
             }
         }
         total.rules += n.rules;
@@ -500,14 +503,14 @@ static void countTrivialCaptures(const std::vector<std::string> & tRules, const 
         TrivialCaptureStats stats;
         TrivialCaptureElimination(extract(rules, e), &stats);
         if (stats.candidates == 0) continue;
-        std::cout << label << (e == Extract::Forward ? " forward: " : " backward: ") << stats.candidates << " candidates, "
+        toolio::stream() << label << (e == Extract::Forward ? " forward: " : " backward: ") << stats.candidates << " candidates, "
                   << stats.transformed.size() << " transformed (" << stats.endPositionConflicts << " with end position conflicts), "
                   << stats.blockedByLaterRule << " blocked by later rules, " << stats.blockedWithinCapture << " blocked within captures\n";
-        for (const Rule * r : stats.transformed) std::cout << "    transformed: " << printRule(r) << "\n";
+        for (const Rule * r : stats.transformed) toolio::stream() << "    transformed: " << printRule(r) << "\n";
         for (const auto & b : stats.blocked) {
-            std::cout << "    blocked:     " << printRule(b.rule) << "\n";
-            for (const Rule * r : b.laterRules) std::cout << "        later rule may match at start: " << printRule(r) << "\n";
-            for (const Rule * r : b.withinRules) std::cout << "        rule may match within capture: " << printRule(r) << "\n";
+            toolio::stream() << "    blocked:     " << printRule(b.rule) << "\n";
+            for (const Rule * r : b.laterRules) toolio::stream() << "        later rule may match at start: " << printRule(r) << "\n";
+            for (const Rule * r : b.withinRules) toolio::stream() << "        rule may match within capture: " << printRule(r) << "\n";
         }
         total.candidates += stats.candidates;
         total.blockedByLaterRule += stats.blockedByLaterRule;
@@ -1381,7 +1384,7 @@ static void classifyRules(const std::vector<std::string> & tRules, const std::st
                 std::get<2>(s) = label;
             }
             if (!quiet) {
-                std::cout << label << " " << dir << "\t" << sig << (insertion.empty() ? "" : " | simple insertion: " + insertion)
+                toolio::stream() << label << " " << dir << "\t" << sig << (insertion.empty() ? "" : " | simple insertion: " + insertion)
                           << "\t" << printRule(r) << "\n";
             }
         }
@@ -1439,7 +1442,7 @@ static const EliminationTestCase insertionClassTestCases[] = {
 };
 
 static void reportRuleClasses(const RuleClassCounts & counts) {
-    std::cout << "Total: " << counts.rules << " conversion rules (forward and backward)\n";
+    toolio::stream() << "Total: " << counts.rules << " conversion rules (forward and backward)\n";
     for (const char * dim : {"text to replace", "captures", "capture order", "revisiting",
                              "simple insertion", "simple insertion: captured text", "SingleCaptureDoubleReplacement A (B) C → D $1 E",
                              "MultipleCaptureMultipleReplacement"}) {
@@ -1451,23 +1454,23 @@ static void reportRuleClasses(const RuleClassCounts & counts) {
                 (d.first == "forward" ? rows[c.first].first : rows[c.first].second) += c.second;
             }
         }
-        std::cout << "\n== " << dim << "\tforward\tbackward\ttotal\n";
+        toolio::stream() << "\n== " << dim << "\tforward\tbackward\ttotal\n";
         for (const auto & row : rows) {
-            std::cout << "  " << row.first << "\t" << row.second.first << "\t" << row.second.second
+            toolio::stream() << "  " << row.first << "\t" << row.second.first << "\t" << row.second.second
                       << "\t" << (row.second.first + row.second.second) << "\n";
         }
     }
     std::vector<std::pair<std::string, std::tuple<unsigned, std::string, std::string>>> sigs(counts.signatures.begin(), counts.signatures.end());
     std::stable_sort(sigs.begin(), sigs.end(), [](const auto & a, const auto & b) { return std::get<0>(a.second) > std::get<0>(b.second); });
-    std::cout << "\n== combined classes (text to replace | captures | capture order | revisiting): count, example\n";
+    toolio::stream() << "\n== combined classes (text to replace | captures | capture order | revisiting): count, example\n";
     for (const auto & s : sigs) {
-        std::cout << "  " << std::get<0>(s.second) << "\t" << s.first << "\n      e.g. " << std::get<1>(s.second)
+        toolio::stream() << "  " << std::get<0>(s.second) << "\t" << s.first << "\n      e.g. " << std::get<1>(s.second)
                   << "\t" << std::get<2>(s.second) << "\n";
     }
-    std::cout << "\n== SingleCaptureDoubleReplacement A (B) C → D $1 E: rules by file\n";
-    for (const auto & f : counts.patternFiles) std::cout << "  " << f.second << "\t" << f.first << "\n";
-    std::cout << "\n== MultipleCaptureMultipleReplacement: rules by file\n";
-    for (const auto & f : counts.multipleFiles) std::cout << "  " << f.second << "\t" << f.first << "\n";
+    toolio::stream() << "\n== SingleCaptureDoubleReplacement A (B) C → D $1 E: rules by file\n";
+    for (const auto & f : counts.patternFiles) toolio::stream() << "  " << f.second << "\t" << f.first << "\n";
+    toolio::stream() << "\n== MultipleCaptureMultipleReplacement: rules by file\n";
+    for (const auto & f : counts.multipleFiles) toolio::stream() << "  " << f.second << "\t" << f.first << "\n";
 }
 
 // The contexts of the first rule, for the regular expression engine
@@ -1767,11 +1770,25 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
-    std::cout << (count - failures) << "/" << count << " tests passed\n";
+    toolio::stream() << (count - failures) << "/" << count << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }
 
+static int run(int argc, char * argv[]);
+
 int main(int argc, char * argv[]) {
+    // The reports go to the output (toolio::stream()): the standard output,
+    // or the file of --output.
+    for (int i = 1; i < argc; i++) {
+        const std::string arg = argv[i];
+        if (arg.compare(0, 9, "--output=") == 0) toolio::setOutputFile(arg.substr(9));
+    }
+    if (!toolio::openOutput()) return 2;
+    const int status = run(argc, argv);
+    return toolio::finishOutput() ? status : 2;
+}
+
+static int run(int argc, char * argv[]) {
     bool xml = false;
     bool quiet = false;
     Extract e = Extract::All;
@@ -1801,6 +1818,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--count-nullable-captures") count = true;
         else if (arg == "--classify-after-contexts") classifyAfter = true;
         else if (arg == "--classify-rules") classifyRuleKinds = true;
+        else if (arg.compare(0, 9, "--output=") == 0) continue;   // (main)
         else files.push_back(arg);
     }
     if (files.empty()) {
@@ -1813,7 +1831,8 @@ int main(int argc, char * argv[]) {
                   << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --classify-after-contexts file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --classify-rules file ...\n"
-                  << "       " << argv[0] << " --self-test\n";
+                  << "       " << argv[0] << " --self-test\n"
+                  << "       (and --output=<file> for the reports)\n";
         return 2;
     }
     bool ok = true;
@@ -1853,12 +1872,12 @@ int main(int argc, char * argv[]) {
     if (classifyAfter) {
         // Classes: + supported, b unsupported (known limitation), c unsupported (other).
         for (const auto & c : afterCounts.rules) {
-            std::cout << c.second << "\t" << c.first << "\n";
+            toolio::stream() << c.second << "\t" << c.first << "\n";
         }
         for (const auto & c : afterCounts.examples) {
-            std::cout << "\n== " << c.first << " (" << c.second.size() << " distinct after contexts)\n";
+            toolio::stream() << "\n== " << c.first << " (" << c.second.size() << " distinct after contexts)\n";
             for (const auto & x : c.second) {
-                std::cout << "  " << x.first << "\t" << x.second << "\n";
+                toolio::stream() << "  " << x.first << "\t" << x.second << "\n";
             }
         }
     }
@@ -1866,24 +1885,24 @@ int main(int argc, char * argv[]) {
         reportRuleClasses(ruleClassCounts);
     }
     if (partition) {
-        std::cout << "Total: " << partitionTotal.groups << " groups, " << partitionTotal.variables << " set variables (" << partitionTotal.divided << " divided), "
+        toolio::stream() << "Total: " << partitionTotal.groups << " groups, " << partitionTotal.variables << " set variables (" << partitionTotal.divided << " divided), "
                   << partitionTotal.inlineSets << " inline sets (" << partitionTotal.inlineDivided << " divided), "
                   << partitionTotal.classes << " classes: " << partitionTotal.literals << " literal characters, "
                   << (partitionTotal.classes - partitionTotal.literals - partitionTotal.generated - partitionTotal.inlineClasses) << " existing variables, "
                   << partitionTotal.inlineClasses << " inline sets, " << partitionTotal.generated << " new variables\n";
     }
     if (overlaps) {
-        std::cout << "Total: " << overlapTotal.rules << " rules, " << overlapTotal.pairs << " pairs, "
+        toolio::stream() << "Total: " << overlapTotal.rules << " rules, " << overlapTotal.pairs << " pairs, "
                   << overlapTotal.overlaps << " overlapping\n";
     }
     if (countTrivial) {
-        std::cout << "Total: " << trivialTotal.candidates << " candidates, " << trivialTotal.transformed.size()
+        toolio::stream() << "Total: " << trivialTotal.candidates << " candidates, " << trivialTotal.transformed.size()
                   << " transformed (" << trivialTotal.endPositionConflicts << " with end position conflicts), "
                   << trivialTotal.blockedByLaterRule << " blocked by later rules, "
                   << trivialTotal.blockedWithinCapture << " blocked within captures\n";
     }
     if (count) {
-        std::cout << "Total: " << total.captures << " nullable captures in " << total.rules << " rules of "
+        toolio::stream() << "Total: " << total.captures << " nullable captures in " << total.rules << " rules of "
                   << total.files << " files (+" << total.forwardAdded << " forward rules, +"
                   << total.backwardAdded << " backward rules); " << total.repeated << " within repetitions\n";
     }

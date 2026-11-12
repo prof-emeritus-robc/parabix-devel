@@ -344,7 +344,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             b.CreateCondBr(needsRealloc, allocateNewBuffer, allocateNewBufferExit);
 
             b.SetInsertPoint(allocateNewBuffer);
-            Value * const allocedBytes = b.CreateRoundUpRational(mallocBytes, CBuilder::PAGE_SIZE);
+            Value * const allocedBytes = b.CreateRoundUpRational(mallocBytes, CBuilder::PageSize);
             b.CreateFree(existingBuffer);
             Value * const newBuffer = b.CreateAlignedMalloc(allocedBytes, blockSize);
             b.CreateAlignedStore(newBuffer, mallocedPtr, PtrTyABIAlignment);
@@ -438,7 +438,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
                 FixedArray<Value *, 2> fields;
                 fields[0] = retAddress;
                 fields[1] = mallocBytes;
-                b.CreateAggregateRet(fields.data(), 2);
+                b.CreateAggregateRet(fields);
             } else {
                 b.CreateRet(retAddress);
             }

@@ -201,6 +201,10 @@ bool openOutput() {
     return true;
 }
 
+bool outputRequested() {
+    return !OutputFileName.empty();
+}
+
 int outputFD() {
     OutputState & o = output();
     if (LLVM_UNLIKELY(o.finished)) {

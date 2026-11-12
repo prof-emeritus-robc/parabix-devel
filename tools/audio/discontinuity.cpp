@@ -15,6 +15,7 @@
 #include <kernel/streamutils/stream_select.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fcntl.h>
 #include <iostream>
 #include <kernel/pipeline/driver/cpudriver.h>
@@ -38,7 +39,7 @@ using namespace audio;
     P.captureByteData(#name, name)
 
 static cl::OptionCategory DemoOptions("Demo Options", "Demo control options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(DemoOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(DemoOptions));
 static cl::opt<int> threshold("t", cl::desc("Difference threshold"), cl::Required, cl::cat(DemoOptions));
 
 typedef void (*PipelineFunctionType)(StreamSetPtr & marker_1, StreamSetPtr & marker_2, int32_t fd);
@@ -75,26 +76,33 @@ PipelineFunctionType generatePipeline(BaseDriver &pxDriver, const unsigned int t
 
 int main(int argc, char *argv[])
 {
-    codegen::ParseCommandLineOptions(argc, argv, {&DemoOptions, codegen::codegen_flags()});
+    codegen::ParseCommandLineOptions(argc, argv, {&DemoOptions, &toolio::InputOutputOptions, codegen::codegen_flags()});
 
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in)) {
+        return 1;
+    }
+    const int fd = in.fd;
     CPUDriver driver("demo");
-    const int fd = open(inputFile.c_str(), O_RDONLY);
     unsigned int sampleRate = 0, numChannels = 1, bitsPerSample = 16, numSamples = 0;
     try
     {
         readWAVHeader(fd, numChannels, sampleRate, bitsPerSample, numSamples);
         lseek(fd, 44, SEEK_SET);
-        std::cout << "numChannels: " << numChannels << ", sampleRate: " << sampleRate << ", bitsPerSample: " << bitsPerSample << ", numSamples: " << numSamples << "\n";
+        llvm::errs() << "numChannels: " << numChannels << ", sampleRate: " << sampleRate << ", bitsPerSample: " << bitsPerSample << ", numSamples: " << numSamples << "\n";
     }
     catch (const std::exception &e)
     {
-        llvm::errs() << "Warning: cannot parse " << inputFile << " WAV header for processing. Processing file as text.\n";
-        lseek(fd, 0, SEEK_SET);
+        llvm::errs() << "Warning: cannot parse " << in.name << " WAV header for processing. Processing file as text.\n";
+        if (lseek(fd, 0, SEEK_SET) == -1) {
+            llvm::errs() << toolio::programName() << ": " << in.name << ": cannot be read again as text (a pipe)\n";
+            return 1;
+        }
     }
 
     auto fn = generatePipeline(driver, threshold, numChannels, bitsPerSample);
     StreamSetPtr wavStream, wavStream1;
     fn(wavStream, wavStream1, fd);
-    close(fd);
+    toolio::closeInput(in);
     return 0;
 }

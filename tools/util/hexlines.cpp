@@ -99,6 +99,7 @@
 #include <re/cc/cc_compiler_target.h>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <fcntl.h>
@@ -116,7 +117,9 @@ using namespace pablo;
 //  These declarations are for command line processing.
 //  See the LLVM CommandLine 2.0 Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory HexLinesOptions("hexlines Options", "hexlines control options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(HexLinesOptions));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(HexLinesOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> LowerHex("l", cl::desc("Use lower case hex output (default is upper case)."), cl::init(false), cl::cat(HexLinesOptions));
 
 //
@@ -201,18 +204,18 @@ void AddSpaces::generatePabloMethod() {
     writeOutputStreamSet("finalBasis", basis);
 }
 
-typedef void (*HexLinesFunctionType)(uint32_t fd);
+typedef void (*HexLinesFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 HexLinesFunctionType generatePipeline(CPUDriver & driver) {
     // A Parabix program is build as a set of kernel calls called a pipeline.
     // A pipeline is construction using a Parabix driver object.
-    auto P = CreatePipeline(driver, Input<uint32_t>{"inputFileDecriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"inputFileDecriptor"}, Input<uint32_t>{"outputFD"});
     //  The program will use a file descriptor as an input.
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    //  ReadSourceKernel is a Parabix Kernel that produces a stream of bytes
-    //  from a file descriptor.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    //  FDSourceKernel is a Parabix Kernel that produces a stream of bytes
+    //  from a file descriptor, mapping the file into memory or reading it.
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     //  The Parabix basis bits representation is created by the Parabix S2P kernel.
@@ -291,28 +294,27 @@ HexLinesFunctionType generatePipeline(CPUDriver & driver) {
     SHOW_BYTES(hexLines);
 
     //  The StdOut kernel writes a byte stream to standard output.
-    P.CreateKernelCall<StdOutKernel>(hexLines);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), hexLines);
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
     //  ParseCommandLineOptions uses the LLVM CommandLine processor, but we also add
     //  standard Parabix command line options such as -help, -ShowPablo and many others.
-    codegen::ParseCommandLineOptions(argc, argv, {&HexLinesOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&HexLinesOptions, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    //  The input file (the standard input if none, or -), and the output: the
+    //  standard output, or the file of --output.
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
+    }
     //  A CPU driver is capable of compiling and running Parabix programs on the CPU.
     CPUDriver driver("hexlines");
     //  Build and compile the Parabix pipeline by calling the Pipeline function above.
     HexLinesFunctionType fn = generatePipeline(driver);
-    //  The compile function "fn"  can now be used.   It takes a file
-    //  descriptor as an input, which is specified by the filename given by
-    //  the inputFile command line option.
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        //  Run the pipeline.
-        fn(fd);
-        close(fd);
-    }
-    return 0;
+    //  The compiled function "fn" can now be used.  It takes whether to map the
+    //  input, and the input and output file descriptors.
+    fn(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

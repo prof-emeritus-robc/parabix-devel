@@ -65,6 +65,8 @@ void closeInput(Input & in);
 // reports it and returns false.  Without --output (or a tool not registering
 // it), the standard output.
 bool openOutput();
+// Whether --output was given (for a tool whose output is optional).
+bool outputRequested();
 // The output file descriptor (opened by openOutput; exits on failure if it
 // was not called).
 int outputFD();

@@ -114,6 +114,9 @@
 #include <re/unicode/resolve_properties.h>
 #include <re/unicode/boundaries.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
+#include <cerrno>
+#include <cstring>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/algo/normalization.h>
@@ -130,6 +133,8 @@ using namespace pablo;
 static cl::OptionCategory TconvOptions("Transform Options", "LDML transform options.");
 static cl::opt<std::string> TransformName(cl::Positional, cl::desc("<transform name>"), cl::cat(TconvOptions));
 static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input file>"), cl::cat(TconvOptions));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory of CLDR transform files (default ~/cldr/common/transforms)"),
                                           cl::init(""), cl::cat(TconvOptions));
 static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML transform rules (plain tRule text) to parse and compile, applied "
@@ -284,7 +289,9 @@ static StreamSet * CaseMapBasis(PipelineBuilder & P, UCD::property_t prop, Strea
     return UTF8_Of(P, MappedU21);
 }
 
-typedef void (*TransformFunctionType)(uint32_t fd);
+//  (The transforms write to the standard output, which --output redirects:
+//  see openInputAndOutput.)
+typedef void (*TransformFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 //  The kernels of the direct pipeline of a transform, from the bytes of the
 //  input to those of the result.
@@ -334,15 +341,15 @@ static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * 
 }
 
 static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     SHOW_BYTES(ByteStream);
 
     StreamSet * const OutputBytes = directPipeline(P, t, ByteStream);
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
@@ -9606,15 +9613,15 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
 
 static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                   TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
     StreamSet * const Result = builder.transform(entry, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
@@ -9647,10 +9654,10 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     }
     llvm::outs().flush();   // (not to be written again by a process the driver forks)
     CPUDriver driver("tconv");
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     const size_t base = P.getNumOfKernelCalls();
     RulePipelineBuilder builder(P, registry, analyzer);
@@ -9679,15 +9686,15 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
 //  given its already-computed analysis (see TransformAnalyzer::analyzeRulesFile).
 static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                                TransformAnalyzer & analyzer, const TransformAnalysis & a) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
     StreamSet * const Result = builder.applyAnalysis(a, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
@@ -9722,7 +9729,7 @@ static void applyToInput(const std::function<void (int)> & fn, int fd) {
         writer.join();
         close(fds[0]);
         if (nl == std::string::npos) break;
-        if (write(STDOUT_FILENO, "\n", 1) != 1) exit(1);
+        toolio_write(STDOUT_FILENO, "\n", 1);
         pos = nl + 1;
     }
 }
@@ -9818,9 +9825,44 @@ static std::string readAll(int fd) {
 static void writeAll(int fd, const std::string & text) {
     for (size_t i = 0; i < text.size(); ) {
         const ssize_t n = write(fd, text.data() + i, text.size() - i);
-        if (n <= 0) exit(1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            llvm::errs() << toolio::programName() << ": write error: " << std::strerror(errno) << "\n";
+            exit(1);
+        }
         i += static_cast<size_t>(n);
     }
+}
+
+//  The input of tconv, and the output: the standard output, which the
+//  transforms write (in stages through temporary redirections of it: see
+//  runOn and stagedRunner), redirected to the file of --output.
+static toolio::Input MainInput;
+
+static bool openInputAndOutput(const std::string & inputFile) {
+    if (!toolio::openInput(inputFile, MainInput) || !toolio::openOutput()) {
+        return false;
+    }
+    const int out = toolio::outputFD();
+    if (out != STDOUT_FILENO && dup2(out, STDOUT_FILENO) == -1) {
+        llvm::errs() << toolio::programName() << ": " << std::strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+}
+
+static int finishOutput() {
+    toolio::closeInput(MainInput);
+    return toolio::finishOutput() ? 0 : 1;
+}
+
+//  A compiled pipeline as a runner: the input it is given is mapped if it is
+//  the input of tconv and --mmap applies.
+static std::function<void (int)> pipelineRunner(TransformFunctionType fn) {
+    return [fn](int in) {
+        const bool useMMap = (in == MainInput.fd) && MainInput.useMMap;
+        fn(useMMap, static_cast<uint32_t>(in), STDOUT_FILENO);
+    };
 }
 
 //  While filteredRunner applies its stages to a run, the text before the run
@@ -9946,7 +9988,7 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
         part.plan.problems.clear();
         part.implementable = true;
         const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part);
-        stages.push_back([fn](int in) {fn(static_cast<uint32_t>(in));});
+        stages.push_back(pipelineRunner(fn));
         run.clear();
     };
     for (const ldml::TransformStep & step : a.plan.steps) {
@@ -9985,7 +10027,7 @@ static bool invokesICUBuiltIn(const ldml::TransformRegistry & registry, Transfor
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     ldml::TransformRegistry registry;
     const std::string dir = TransformsDir.empty() ? ldml::defaultTransformDirectory() : TransformsDir;
@@ -10011,10 +10053,6 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             inputFile = TransformName;
-        }
-        if (inputFile.empty() && !ShowPlan) {
-            llvm::errs() << "Usage: " << argv[0] << " [options] --rules-file=<rules file> <input file>\n";
-            return 1;
         }
         std::vector<ldml::Rule *> parsed;
         try {
@@ -10062,20 +10100,11 @@ int main(int argc, char *argv[]) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
             }
-            const int fd = open(inputFile.c_str(), O_RDONLY);
-            if (LLVM_UNLIKELY(fd == -1)) {
-                llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
-                return 1;
-            }
-            applyToInput(icuRunner(t), fd);
-            close(fd);
-            return 0;
+            if (!openInputAndOutput(inputFile)) return 1;
+            applyToInput(icuRunner(t), MainInput.fd);
+            return finishOutput();
         }
-        const int fd = open(inputFile.c_str(), O_RDONLY);
-        if (LLVM_UNLIKELY(fd == -1)) {
-            llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
-            return 1;
-        }
+        if (!openInputAndOutput(inputFile)) return 1;
         CPUDriver driver("tconv");
         //  The built-ins ICU applies, as stages (see stagedTransformRunner).
         auto byICU = [&](const ldml::TransformStep & step) {return invokesICUBuiltIn(registry, analyzer, step);};
@@ -10086,19 +10115,17 @@ int main(int argc, char *argv[]) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
             }
-            applyToInput(runner, fd);
-            close(fd);
-            return 0;
+            applyToInput(runner, MainInput.fd);
+            return finishOutput();
         }
         TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
-        applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
-        close(fd);
-        return 0;
+        applyToInput(pipelineRunner(fn), MainInput.fd);
+        return finishOutput();
     }
 
-    if (TransformName.empty() || (InputFile.empty() && !ShowPlan && !KernelCounts && !RevisitReport)) {
-        llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> <input file>\n"
-                     << "       " << argv[0] << " [options] --rules-file=<rules file> <input file>\n"
+    if (TransformName.empty()) {
+        llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> [<input file>]\n"
+                     << "       " << argv[0] << " [options] --rules-file=<rules file> [<input file>]\n"
                      << "       " << argv[0] << " [options] --list-transforms\n";
         return 1;
     }
@@ -10170,11 +10197,7 @@ int main(int argc, char *argv[]) {
     }
     if ((wholeICU || staged) && !tconv::ICUTransform::available()) return notImplemented(" (and tconv was built without ICU)");
 
-    const int fd = open(InputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        llvm::errs() << "Error: cannot open " << InputFile << " for processing.\n";
-        return 1;
-    }
+    if (!openInputAndOutput(InputFile)) return 1;
     CPUDriver driver("tconv");
     if (wholeICU) {
         std::string error;
@@ -10183,9 +10206,8 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(icuRunner(t), fd);
-        close(fd);
-        return 0;
+        applyToInput(icuRunner(t), MainInput.fd);
+        return finishOutput();
     }
     if (staged) {
         Runner runner;
@@ -10194,9 +10216,8 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(runner, fd);
-        close(fd);
-        return 0;
+        applyToInput(runner, MainInput.fd);
+        return finishOutput();
     }
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
     //  boundaries, provided by the rule pipeline.
@@ -10209,7 +10230,6 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::Remove;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
-    applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
-    close(fd);
-    return 0;
+    applyToInput(pipelineRunner(fn), MainInput.fd);
+    return finishOutput();
 }

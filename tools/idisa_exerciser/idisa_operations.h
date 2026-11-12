@@ -36,7 +36,7 @@ class OperationConfig {
     static constexpr const char *testOutputIdent = "test_output";
     static constexpr const char *expectedOutputIdent = "expected_output";
     static constexpr const char *failureCountIdent = "failure_count";
-    static constexpr const char *outputFilenameIdent = "output_filename";
+    static constexpr const char *outputFDIdent = "output_fd";
 
     explicit OperationConfig(llvm::StringRef description, llvm::StringRef identifier, unsigned fieldWidth)
         : mDescription(description.str() + " x i" + std::to_string(fieldWidth)),
@@ -61,9 +61,11 @@ class OperationConfig {
         return *mPipelineBuilder;
     }
     kernel::StreamSet *getOutputStream() const { return mTestOutput; }
-    void setOutputFilename(llvm::StringRef outputFilename) {
+    // The file descriptor the output of the operation is written to (by an
+    // FDSinkKernel reading the pipeline input scalar outputFDIdent).
+    void setOutputFD(int fd) {
         assert(!mExecuteFunc);
-        mOutputFilename = outputFilename.str();
+        mOutputFD = fd;
     }
 
     bool isStdinGrabbed() const { return mStdinGrabbed; }
@@ -86,7 +88,7 @@ class OperationConfig {
 
     unsigned mFieldWidth;
     std::vector<kernel::StreamSet *> mOperandSSs;
-    std::string mOutputFilename;
+    int mOutputFD = -1;
     kernel::StreamSet *mTestOutput;
     kernel::StreamSet *mExpectedOutput;
 

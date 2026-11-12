@@ -30,6 +30,7 @@
 #include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <fileselect/file_select.h>
 #include <fcntl.h>
 #include <iomanip>
@@ -49,16 +50,18 @@ static cl::OptionCategory ufFlags("Command Flags", "ufilter options");
 
 static cl::opt<std::string> CC_expr(cl::Positional, cl::desc("<Unicode character class expression>"), cl::Required, cl::cat(ufFlags));
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"),  cl::cat(ufFlags));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-typedef void (*UFiltertFunctionType)(uint32_t fd);
+typedef void (*UFiltertFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 UFiltertFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fileDescriptor"}, Input<uint32_t>{"outputFD"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
 
@@ -67,7 +70,7 @@ UFiltertFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
     SHOW_BYTES(ByteStream);
 
     //  Read the file into the ByteStream.
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
 
     //  Create a set of 8 parallel streams of 1-bit units (bits).
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
@@ -99,13 +102,13 @@ UFiltertFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
 
     SHOW_BYTES(FilteredBytes);
 
-    P.CreateKernelCall<StdOutKernel>(FilteredBytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), FilteredBytes);
 
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&ufFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&ufFlags, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     CPUDriver driver("ufilter");
 
     UFiltertFunctionType fnPtr = nullptr;
@@ -121,27 +124,11 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        if (errno == EACCES) {
-            std::cerr << "ufilter: " << inputFile << ": Permission denied.\n";
-        }
-        else if (errno == ENOENT) {
-            std::cerr << "ufilter: " << inputFile << ": No such file.\n";
-        }
-        else {
-            std::cerr << "ufilter: " << inputFile << ": Failed.\n";
-        }
-        exit(1);
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
-    struct stat sb;
-    if (stat(inputFile.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::cerr << "ufilter: " << inputFile << ": Is a directory.\n";
-        close(fd);
-        exit(1);
-    }
-
-    fnPtr(fd);
-    close(fd);
-    return 0;
+    fnPtr(in.useMMap, in.fd, toolio::outputFD());
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

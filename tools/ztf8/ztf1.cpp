@@ -20,6 +20,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <kernel/streamutils/streams_merge.h>
@@ -37,21 +38,23 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory ztf1Options("ztf1 Options", "ztf1 options.");
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(ztf1Options));
+static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::cat(ztf1Options));
+static toolio::RegisterInputOptions InputOptions;
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> Decompression("d", cl::desc("Decompress from ZTF-1 to UTF08."), cl::cat(ztf1Options), cl::init(false));
 static cl::alias DecompressionAlias("decompress", cl::desc("Alias for -d"), cl::aliasopt(Decompression));
 
-typedef void (*ztf1FunctionType)(uint32_t fd);
+typedef void (*ztf1FunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 ztf1FunctionType ztf1_compression_gen (CPUDriver & driver, std::shared_ptr<PabloParser> parser, std::shared_ptr<SourceFile> ztf1PabloSrc) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"outputFD"});
 
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const codeUnitStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, codeUnitStream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, codeUnitStream);
 
     StreamSet * const u8basis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(codeUnitStream, u8basis);
@@ -73,18 +76,18 @@ ztf1FunctionType ztf1_compression_gen (CPUDriver & driver, std::shared_ptr<Pablo
     FilterByMask(P, compression_mask, u8basis, ztf_basis);
     StreamSet * const ZTF_bytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(ztf_basis, ZTF_bytes);
-    P.CreateKernelCall<StdOutKernel>(ZTF_bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), ZTF_bytes);
     return P.compile();
 }
 
 ztf1FunctionType ztf1_decompression_gen (CPUDriver & driver, std::shared_ptr<PabloParser> parser, std::shared_ptr<SourceFile> ztf1PabloSrc) {
 
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fd"});
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fd"}, Input<uint32_t>{"outputFD"});
     Scalar * const fileDescriptor = P.getInputScalar("fd");
 
     // Source data
     StreamSet * const ztf1stream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ztf1stream);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ztf1stream);
     StreamSet * const ztf1basis = P.CreateStreamSet(8);
     P.CreateKernelCall<S2PKernel>(ztf1stream, ztf1basis);
 
@@ -119,12 +122,12 @@ ztf1FunctionType ztf1_decompression_gen (CPUDriver & driver, std::shared_ptr<Pab
         );
     StreamSet * const u8bytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(u8basis, u8bytes);
-    P.CreateKernelCall<StdOutKernel>(u8bytes);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), u8bytes);
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&ztf1Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&ztf1Options, &toolio::InputOutputOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     
     CPUDriver driver("ztf1");
     auto em = ErrorManager::Create();
@@ -133,18 +136,17 @@ int main(int argc, char *argv[]) {
     if (ztf1Source == nullptr) {
         std::cerr << "pablo-parser: error loading pablo source file: ztf1.pablo\n";
     }
-    const int fd = open(inputFile.c_str(), O_RDONLY);
-    if (LLVM_UNLIKELY(fd == -1)) {
-        errs() << "Error: cannot open " << inputFile << " for processing. Skipped.\n";
-    } else {
-        if (Decompression) {
-            auto ztf1DecompressionFunction = ztf1_decompression_gen(driver, parser, ztf1Source);
-            ztf1DecompressionFunction(fd);
-        } else {
-            auto ztf1CompressionFunction = ztf1_compression_gen(driver, parser, ztf1Source);
-            ztf1CompressionFunction(fd);
-        }
-        close(fd);
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
+        return 1;
     }
-    return 0;
+    if (Decompression) {
+        auto ztf1DecompressionFunction = ztf1_decompression_gen(driver, parser, ztf1Source);
+        ztf1DecompressionFunction(in.useMMap, in.fd, toolio::outputFD());
+    } else {
+        auto ztf1CompressionFunction = ztf1_compression_gen(driver, parser, ztf1Source);
+        ztf1CompressionFunction(in.useMMap, in.fd, toolio::outputFD());
+    }
+    toolio::closeInput(in);
+    return toolio::finishOutput() ? 0 : 1;
 }

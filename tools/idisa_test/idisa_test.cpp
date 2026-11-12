@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
@@ -36,7 +37,8 @@ static cl::opt<int> TestFieldWidth(cl::Positional, cl::desc("Test field width (d
 
 static cl::opt<std::string> Operand1TestFile(cl::Positional, cl::desc("Operand 1 data file."), cl::Required, cl::cat(testFlags));
 static cl::opt<std::string> Operand2TestFile(cl::Positional, cl::desc("Operand 2 data file."), cl::Required, cl::cat(testFlags));
-static cl::opt<std::string> TestOutputFile("o", cl::desc("Test output file."), cl::cat(testFlags));
+// --output: write the results (in hex) to a file (- for the standard output)
+static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(testFlags));
 static cl::opt<int> ShiftMask("ShiftMask", cl::desc("Mask applied to the shift operand (2nd operand) of simd_sllv, srlv, srav, rotl, rotr"), cl::init(0));
 static cl::opt<int> Immediate("immediate", cl::desc("Immediate value for mvmd_dslli"), cl::init(1));
@@ -502,7 +504,7 @@ int32_t openFile(const std::string & fileName, llvm::raw_ostream & msgstrm) {
     }
 }
 
-typedef size_t (*IDISAtestFunctionType)(uint32_t fd1, uint32_t fd2, const char * outputFileName);
+typedef size_t (*IDISAtestFunctionType)(uint32_t fd1, uint32_t fd2, uint32_t outputFD);
 
 inline StreamSet * readHexToBinary(PipelineBuilder & P, const std::string & fd) {
     StreamSet * const hexStream = P.CreateStreamSet(1, 8);
@@ -525,7 +527,7 @@ inline StreamSet * applyShiftMask(kernel::PipelineBuilder & P, StreamSet * input
 IDISAtestFunctionType pipelineGen(CPUDriver & driver) {
 
     auto P = CreatePipeline(driver,
-                            Input<uint32_t>{"operand1FileDecriptor"}, Input<uint32_t>{"operand2FileDecriptor"}, Input<const char *>{"outputFileName"},
+                            Input<uint32_t>{"operand1FileDecriptor"}, Input<uint32_t>{"operand2FileDecriptor"}, Input<uint32_t>{"outputFD"},
                             Output<size_t>{"totalFailures"});
 
     StreamSet * Operand1BitStream = readHexToBinary(P, "operand1FileDecriptor");
@@ -543,18 +545,20 @@ IDISAtestFunctionType pipelineGen(CPUDriver & driver) {
                                                  , Operand1BitStream, Operand2BitStream, ResultBitStream
                                                  , ExpectedResultBitStream, P.getOutputScalar("totalFailures"));
 
-    if (!TestOutputFile.empty()) {
+    if (toolio::outputRequested()) {
         StreamSet * ResultHexStream = P.CreateStreamSet(1, 8);
         P.CreateKernelCall<BinaryToHex>(ResultBitStream, ResultHexStream);
-        Scalar * outputFileName = P.getInputScalar("outputFileName");
-        P.CreateKernelCall<FileSink>(outputFileName, ResultHexStream);
+        P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), ResultHexStream);
     }
 
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&testFlags, codegen::codegen_flags()});
+    codegen::ParseCommandLineOptions(argc, argv, {&testFlags, &toolio::InputOutputOptions, codegen::codegen_flags()});
+    if (toolio::outputRequested() && !toolio::openOutput()) {
+        return 1;
+    }
     CPUDriver driver("idisa_test");
     // only shift ops need the operand2 limit; elsewhere it strips sign bits the tests need
     const bool isShiftOp = TestOperation == "simd_sllv" || TestOperation == "simd_srlv"
@@ -573,7 +577,8 @@ int main(int argc, char *argv[]) {
 
     std::chrono::steady_clock::time_point execStart, execEnd;
     if (ReportTiming) execStart = std::chrono::steady_clock::now();
-    const size_t failure_count = idisaTestFunction(fd1, fd2, TestOutputFile.ValueStr.data());
+    const int outputFD = toolio::outputRequested() ? toolio::outputFD() : -1;
+    const size_t failure_count = idisaTestFunction(fd1, fd2, static_cast<uint32_t>(outputFD));
     if (ReportTiming) execEnd = std::chrono::steady_clock::now();
 
     if (!QuietMode) {
@@ -592,5 +597,8 @@ int main(int argc, char *argv[]) {
 
     close(fd1);
     close(fd2);
+    if (!toolio::finishOutput()) {
+        return 1;
+    }
     return failure_count > 0;
 }

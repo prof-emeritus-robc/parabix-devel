@@ -8,6 +8,7 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/util/hex_convert.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/toolio.h>
 
 #include "idisa_operations.h"
 
@@ -24,8 +25,8 @@ cl::list<string> OperationArgs(cl::ConsumeAfter, cl::desc("[operation args..]"))
 
 cl::OptionCategory ExerciserFlags("C. Command Flags");
 
-cl::opt<string> OperationOutputFile("output", cl::value_desc("output"),
-                                    cl::desc("Write the output of the operation to a file."), cl::cat(ExerciserFlags));
+// --output: write the output of the operation to a file (- for the standard output)
+static toolio::RegisterOutputOptions OutputOptions;
 cl::opt<bool> OperationOutputHex("x", cl::desc("Write the output as a hex dump."), cl::cat(ExerciserFlags));
 
 cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(ExerciserFlags));
@@ -58,7 +59,7 @@ int main(int argc, char *argv[]) {
 
     string overview =
         "Exercise an IDISA operation implementation, by comparing to a scalar reference or by timing runs.";
-    codegen::ParseCommandLineOptions(argc, argv, {&ExerciserFlags, codegen::codegen_flags()}, overview);
+    codegen::ParseCommandLineOptions(argc, argv, {&ExerciserFlags, &toolio::InputOutputOptions, codegen::codegen_flags()}, overview);
 
     // Disable caching, if we're doing testing it's almost certainly a hazard -- also, it breaks our method for figuring
     // out which builder was used for compilation
@@ -76,11 +77,11 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     // I don't have a better dummy sink than file output right now, so I guess we permit this
-    // if (!OperationOutputFile.empty() && (WarmupCount != 0)) {
+    // if (toolio::outputRequested() && (WarmupCount != 0)) {
     //     WarmupCount.error("Output can only be recorded if repeat count is 1, with no warmup.");
     //     return 2;
     // }
-    // if (!OperationOutputFile.empty() && (RepeatCount != 1)) {
+    // if (toolio::outputRequested() && (RepeatCount != 1)) {
     //     RepeatCount.error("Output can only be recorded if repeat count is 1, with no warmup.");
     //     return 2;
     // }
@@ -98,7 +99,10 @@ int main(int argc, char *argv[]) {
     if (operationConfig->configurePipelineFromArgs(OperationArgs, !DisableChecks)) {
         return 2;
     }
-    if (!OperationOutputFile.empty()) {
+    if (toolio::outputRequested()) {
+        if (!toolio::openOutput()) {
+            return 2;
+        }
         StreamSet *convertedOutput = operationConfig->getOutputStream();
         PipelineBuilder &p = operationConfig->getPipelineBuilder();
         if (OperationOutputHex) {
@@ -106,9 +110,8 @@ int main(int argc, char *argv[]) {
             p.CreateKernelCall<BinaryToHex>(convertedOutput, outputAsHex);
             convertedOutput = outputAsHex;
         }
-        Scalar *outputFilename = p.getInputScalar(OperationConfig::outputFilenameIdent);
-        p.CreateKernelCall<FileSink>(outputFilename, convertedOutput);
-        operationConfig->setOutputFilename(OperationOutputFile);
+        p.CreateKernelCall<FDSinkKernel>(p.getInputScalar(OperationConfig::outputFDIdent), convertedOutput);
+        operationConfig->setOutputFD(toolio::outputFD());
     }
 
     chrono::steady_clock::time_point compileStart;
@@ -225,5 +228,5 @@ int main(int argc, char *argv[]) {
             outs() << "\n";
         }
     }
-    return 0;
+    return toolio::finishOutput() ? 0 : 2;
 }

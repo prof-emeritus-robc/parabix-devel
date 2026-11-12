@@ -31,7 +31,8 @@ crash_report() {
         -o "thread backtrace all" \
         -o "disassemble --pc --count 12" \
         -o "register read" \
-        -o "image lookup --address \$pc" \
+        -o "image lookup --verbose --address \$pc" \
+        -o "source list --address \$pc --count 30" \
         -- "$@" 2>&1 | tail -150
 }
 

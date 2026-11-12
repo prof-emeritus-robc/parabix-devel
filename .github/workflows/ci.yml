@@ -5,7 +5,8 @@
 # is the daily schedule (no runs on push or pull request), and a scheduled
 # run is skipped when master has not changed since the last scheduled run.
 # A run can also be started by hand (Actions tab, "Run workflow"), of all
-# jobs or one kind: gh workflow run ci.yml -f only=freebsd
+# jobs or one kind, and with another build type:
+#   gh workflow run ci.yml -f only=freebsd -f build_type=RelWithDebInfo
 #
 # Jobs (all on GitHub's standard runners, free for public repositories):
 #   linux-x64, linux-arm64, macos   development build (ARTIFACT_MODE=Multiple), all tests
@@ -29,6 +30,11 @@ on:
         type: choice
         options: [all, linux, macos, install, freebsd]
         default: all
+      build_type:
+        description: "CMAKE_BUILD_TYPE (RelWithDebInfo: source lines in the FreeBSD crash report)"
+        type: choice
+        options: [Release, RelWithDebInfo]
+        default: Release
 
 concurrency:
   group: ci
@@ -96,7 +102,7 @@ jobs:
           restore-keys: ccache-${{ matrix.name }}-
       - name: Configure
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/lib/llvm-18 \
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build_type || 'Release' }} -DLLVM_PATH=/usr/lib/llvm-18 \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -127,7 +133,7 @@ jobs:
           restore-keys: ccache-macos-
       - name: Configure
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH="$(brew --prefix llvm)" \
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build_type || 'Release' }} -DLLVM_PATH="$(brew --prefix llvm)" \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
@@ -162,7 +168,7 @@ jobs:
           restore-keys: ccache-install-
       - name: Configure (System scope, /usr/local, /var/cache/parabix)
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/lib/llvm-18 \
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ inputs.build_type || 'Release' }} -DLLVM_PATH=/usr/lib/llvm-18 \
                 -DARTIFACT_MODE=Single -DPARABIX_INSTALL_SCOPE=System \
                 -DPARABIX_PACKAGE_MAINTAINER="Parabix CI" \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
@@ -228,7 +234,7 @@ jobs:
           prepare: |
             pkg install -y cmake ninja llvm18 boost-libs icu python3 bash
           run: |
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/local/llvm18
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ inputs.build_type || 'Release' }} -DLLVM_PATH=/usr/local/llvm18
             cmake --build build -- -k 0
             if ! ctest --test-dir build --output-on-failure -j 4; then
               sh .github/scripts/freebsd-crash-report.sh build

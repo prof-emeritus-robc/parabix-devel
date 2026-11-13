@@ -14,6 +14,8 @@
 #include <kernel/streamutils/until_n.h>
 #include <kernel/unicode/utf8_support.h>
 #include <pablo/pablo.h>
+#include <toolchain/fileutil.h>
+#include <unistd.h>
 
 using namespace pablo;
 
@@ -159,6 +161,16 @@ size_t UTF8_ErrorOffset(const char * text, size_t length) {
         i += n + 1;
     }
     return length;
+}
+
+bool UTF8_FileError(int fd, bool useMMap, size_t & offset) {
+    if (lseek(fd, 0, SEEK_SET) != 0) return false;
+    AlignedFileBuffer buf;
+    if (!buf.load(fd, useMMap)) return false;
+    offset = UTF8_ErrorOffset(buf.getBuf(), buf.getBufSize());
+    const bool error = offset < buf.getBufSize();
+    buf.release();
+    return error;
 }
 
 }

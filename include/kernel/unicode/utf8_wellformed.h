@@ -39,5 +39,9 @@ void WellFormedUTF8(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result,
 //  The offset of the first maximal ill-formed subpart of UTF-8 text (length if
 //  none): for a tool to report the error of the Abort mode.
 size_t UTF8_ErrorOffset(const char * text, size_t length);
+//  Whether the input of a file descriptor, read again from its start (a
+//  regular file), has ill-formed UTF-8, and the offset of the first error
+//  (false if it cannot be read again).
+bool UTF8_FileError(int fd, bool useMMap, size_t & offset);
 
 }

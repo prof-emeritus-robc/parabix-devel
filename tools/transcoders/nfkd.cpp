@@ -10,6 +10,8 @@
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/basis/s2p_kernel.h>
+#include <kernel/basis/p2s_kernel.h>
+#include <kernel/unicode/utf8_wellformed.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/streamutils/focused_transform.h>
@@ -29,12 +31,33 @@ static toolio::RegisterInputOptions InputOptions;
 static toolio::RegisterOutputOptions OutputOptions;
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 
+//  The source: the input made well-formed UTF-8 (see kernel::WellFormedUTF8 and
+//  --utf8-errors), as basis bits and bytes.
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
     P.SetStageLabel("source");
-    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
-    Selected_S2P(P, ByteStream, BasisBits);
+    StreamSet * const InputBytes = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, InputBytes);
+    StreamSet * const InputBasis = P.CreateStreamSet(8, 1);
+    Selected_S2P(P, InputBytes, InputBasis);
+    WellFormedUTF8(P, InputBasis, BasisBits);
+    P.CreateKernelCall<P2SKernel>(BasisBits, ByteStream);
     SHOW_BIXNUM(BasisBits);
 }
+
+//  With --utf8-errors=abort-on-error, the input is processed up to its first
+//  ill-formed UTF-8: the error is reported, with its offset.
+static bool reportUTF8Abort(size_t offset, const std::string & name) {
+    llvm::errs() << toolio::programName() << ": " << name << ": ill-formed UTF-8 at byte " << offset
+                 << ": the input after it is not processed (--utf8-errors=abort-on-error)\n";
+    return true;
+}
+
+static bool reportUTF8Abort(const toolio::Input & in) {
+    size_t offset = 0;
+    return codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort && UTF8_FileError(in.fd, in.useMMap, offset) &&
+           reportUTF8Abort(offset, in.name);
+}
+
 
 typedef void (*XfrmFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
@@ -62,6 +85,7 @@ int main(int argc, char *argv[]) {
     CPUDriver driver("NFKD_function");
     XfrmFunctionType fn = generate_NFKD_pipeline(driver);
     fn(in.useMMap, in.fd, toolio::outputFD());
+    const bool aborted = reportUTF8Abort(in);
     toolio::closeInput(in);
-    return toolio::finishOutput() ? 0 : 1;
+    return (toolio::finishOutput() && !aborted) ? 0 : 1;
 }

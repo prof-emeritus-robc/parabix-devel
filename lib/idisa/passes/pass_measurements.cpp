@@ -45,7 +45,7 @@ void PassMeasurements::endTimerCallback(llvm::StringRef PassId, llvm::Any IR, co
     }
     assert (td.MeasurementIndex < Measurements.size());
     PassMeasurement & CM = Measurements[td.MeasurementIndex];
-    assert (PassId.equals(CM.Name));
+    assert (PassId.size() == CM.Name.size() && PassId.compare(CM.Name) == 0);
     uint64_t mean = 0;
     if (LLVM_LIKELY(total > td.InnerCycleCount)) {
         mean = total - td.InnerCycleCount;

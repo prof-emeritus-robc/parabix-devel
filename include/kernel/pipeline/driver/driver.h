@@ -69,20 +69,6 @@ public:
         return *mContext;
     }
 
-    enum class EmittedOutputOption {
-        ObjectCode
-        , ASM
-    };
-
-    static llvm::Error compile(kernel::KernelBuilder & b,
-                               kernel::Kernel::SelectedOptimizationPasses & passes,
-                               llvm::TargetMachine * const TM,
-                               llvm::PassInstrumentationCallbacks * const PIC,
-                               llvm::raw_pwrite_stream & emittedOutput,
-                               const EmittedOutputOption emittedOutputOption,
-                               std::unique_ptr<llvm::raw_svector_ostream> &UnoptimizedIROutput,
-                               std::unique_ptr<llvm::raw_svector_ostream> &OptimizedIROutput);
-
     static void runAllOptimizationPasses(kernel::KernelBuilder & b,
                                          kernel::Kernel::SelectedOptimizationPasses & passes,
                                          llvm::TargetMachine * const TM,

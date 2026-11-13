@@ -26,7 +26,11 @@
 #include <llvm/CodeGen/MachineSSAUpdater.h>
 #include <llvm/CodeGen/LiveVariables.h>
 #include <llvm/CodeGen/LiveIntervals.h>
+#if LLVM_VERSION_MAJOR <= 18
 #include <llvm/CodeGen/MachineValueType.h>
+#else
+#include <llvm/CodeGenTypes/MachineValueType.h>
+#endif
 #include <llvm/CodeGen/MachineLoopInfo.h>
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/CodeGen/TargetRegisterInfo.h>
@@ -704,7 +708,11 @@ bool FunctionSnippetTokenReplacerPass::subsituteCodeFragment(const Function * F,
             MF.insert(ip, newBB);
         }
 
-        auto & MBPI = getAnalysis<MachineBranchProbabilityInfo>();
+        #if LLVM_VERSION_MAJOR < 19
+        const auto &MBPI = getAnalysis<MachineBranchProbabilityInfo>();
+        #else
+        const auto &MBPI = getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();
+        #endif
 
         for (unsigned i = 0; i < (n - 1); ++i) {
             MachineBasicBlock * cur = getBasicBlock(BB[i]);
@@ -1117,8 +1125,11 @@ const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Module * M,
 }
 
 void FunctionSnippetTokenReplacerPass::getAnalysisUsage(AnalysisUsage & AU) const {
-  //  AU.addRequired<MachineModuleInfoWrapperPass>();
+    #if LLVM_VERSION_MAJOR < 19
     AU.addRequired<MachineBranchProbabilityInfo>();
+    #else
+    AU.addRequired<MachineBranchProbabilityInfoWrapperPass>();
+    #endif
     MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -1141,8 +1152,6 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
     // TODO: CallFunctionByToken should be placed into IDISA_Builder itself.
 
     // TODO: it isn't enough to check if its in the module. We need a user in the current function that Builder b is pointed to.
-
-    CallInst * calleeRetVal = nullptr;
 
     Function * snippetFunction = Mod->getFunction(nm.str());
     if (snippetFunction == nullptr) {

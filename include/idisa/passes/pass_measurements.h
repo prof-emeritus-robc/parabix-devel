@@ -86,8 +86,8 @@ struct MeasurementMapKey {
 
     }
 
-    bool operator==(const MeasurementMapKey &Other) const {
-        return (Other.Index == Index) && Other.Name.equals(Name);
+    bool operator==(const MeasurementMapKey & Other) const {
+        return (Other.Index == Index) && (Other.Name.size() == Name.size()) && Other.Name.compare(Name) == 0;
     }
 
 };
@@ -188,29 +188,29 @@ struct PassMeasurements {
 
 private:
 
-    struct MeasurementMapKeyHash {
-        std::size_t operator()(const MeasurementMapKey & k) const {
-            const auto a = llvm::DenseMapInfo<uint64_t>::getHashValue(k.Index);
-            const auto b = llvm::DenseMapInfo<llvm::StringRef>::getHashValue(k.Name);
-            return llvm::detail::combineHashValue(a, b);
-        }
-    };
-
-    struct MeasurementMapKeyEquals {
-        bool operator()(const MeasurementMapKey & A, const MeasurementMapKey & B) const {
-            return (A.Index == B.Index) && A.Name.equals(B.Name);
-        }
-    };
-
     struct StringRefHash {
         std::size_t operator()(const llvm::StringRef & k) const {
             return llvm::DenseMapInfo<llvm::StringRef>::getHashValue(k);
         }
     };
 
+    struct MeasurementMapKeyHash {
+        std::size_t operator()(const MeasurementMapKey & k) const {
+            const auto a = llvm::DenseMapInfo<uint64_t>::getHashValue(k.Index);
+            const auto b = StringRefHash()(k.Name);
+            return llvm::detail::combineHashValue(a, b);
+        }
+    };
+
     struct StringRefEqual {
         bool operator()(const llvm::StringRef & A, const llvm::StringRef & B) const noexcept {
-            return A.equals(B);
+            return A.size() == B.size() && A.compare(B) == 0;
+        }
+    };
+
+    struct MeasurementMapKeyEquals {
+        bool operator()(const MeasurementMapKey & A, const MeasurementMapKey & B) const {
+            return (A.Index == B.Index) && StringRefEqual()(A.Name, B.Name);
         }
     };
 

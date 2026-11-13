@@ -1268,33 +1268,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             Value * const scalar = getScalar(sharedLayout, mSharedHandle, k, sharedTy, actualType);
             addToScalarFieldMap(binding.getName(), scalar, binding.getType(), actualType);
 
-
-//            Value * positionInt = b.CreatePtrToInt(scalar, intPtrTy);
-//            const auto align = CBuilder::getAlignOf(DL, actualType);
-//            Constant * alignInt = ConstantInt::get(intPtrTy, align);
-//            Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
-
-//            SmallVector<char, 256> tmp;
-//            raw_svector_ostream sharedStr(tmp);
-
-//            const auto lastGood = (k > 2) ? (k - 2) : 0;
-
-
-
-//            for (auto i = lastGood; i <= k; ++i) {
-//                sharedStr << '\n';
-//                sharedTy->getStructElementType(i)->print(sharedStr);
-//            }
-
-
-//            b.CreateAssert (correctAlign, "%" PRIu64 " %s.%s is misaligned %" PRIx64 " align=%" PRIu64 " :%s",
-//                            b.getSize(k),
-//                            b.GetString(mTarget->getName()),
-//                            b.GetString(binding.getName()),
-//                            positionInt, alignInt,
-//                            b.GetString(sharedStr.str())
-//                            );
-
             #ifndef NDEBUG
             mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::Internal, k)));
             #endif
@@ -1336,32 +1309,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
                 scalar = getScalar(sharedLayout, mSharedHandle, k, sharedTy, scalarType);
 
-//                Value * positionInt = b.CreatePtrToInt(scalar, intPtrTy);
-//                const auto align = CBuilder::getAlignOf(DL, scalarType);
-//                Constant * alignInt = ConstantInt::get(intPtrTy, align);
-//                Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
-
-//                SmallVector<char, 256> tmp;
-//                raw_svector_ostream sharedStr(tmp);
-
-//                const auto lastGood = (k > 2) ? (k - 2) : 0;
-
-
-
-//                for (auto i = lastGood; i <= k; ++i) {
-//                    sharedStr << '\n';
-//                    sharedTy->getStructElementType(i)->print(sharedStr);
-//                }
-
-
-//                b.CreateAssert (correctAlign, "%" PRIu64 " %s.%s is misaligned %" PRIx64 " align=%" PRIu64 " :%s",
-//                                b.getSize(k),
-//                                b.GetString(mTarget->getName()),
-//                                b.GetString(binding.getName()),
-//                                positionInt, alignInt,
-//                                b.GetString(sharedStr.str())
-//                                );
-
                 #ifndef NDEBUG
                 mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::Internal, k)));
                 #endif
@@ -1394,33 +1341,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 #ifndef NDEBUG
                 mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::ThreadLocal, k)));
                 #endif
-
-//                Value * positionInt = b.CreatePtrToInt(scalar, intPtrTy);
-//                const auto align = CBuilder::getAlignOf(DL, scalarType);
-//                Constant * alignInt = ConstantInt::get(intPtrTy, align);
-//                Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
-
-//                SmallVector<char, 256> tmp;
-//                raw_svector_ostream stateStr(tmp);
-
-//                const auto lastGood = (k > 2) ? (k - 2) : 0;
-
-
-
-//                for (auto i = lastGood; i <= k; ++i) {
-//                    stateStr << '\n';
-//                    threadLocalTy->getStructElementType(i)->print(stateStr);
-//                }
-
-
-//                b.CreateAssert (correctAlign, "%" PRIu64 " %s.%s is misaligned %" PRIx64 " align=%" PRIu64 " :%s",
-//                                b.getSize(k),
-//                                b.GetString(mTarget->getName()),
-//                                b.GetString(binding.getName()),
-//                                positionInt, alignInt,
-//                                b.GetString(stateStr.str())
-//                                );
-
 
                 if (LLVM_UNLIKELY(options == InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars)) {
 

@@ -61,6 +61,61 @@ including the transforms it uses.
   its users have grown since the table was generated. These are changes on
   master, not shape groups.
 
+## Run-time performance
+
+**Setup.** Each transform was run with `tconv -thread-num=4` on 8 MB of input,
+one run at a time on an otherwise idle machine (Apple M3, 4 performance
+cores):
+
+- NumericPinyin-Latin: random numeric pinyin text.
+- The am-* transforms: the Amharic sources of the CLDR test files, repeated.
+
+Measurements:
+
+- **Cold:** the first run with an empty object cache (a fresh
+  `-object-cache-salt`), so it includes JIT compilation.
+- **Warm:** the median of 5 runs with the kernels cached.
+- **Start-up:** the same warm run on an empty input. Every run plans the
+  rules again, and with shape groups also counts the kernels of both plans.
+- **Net:** warm minus start-up, the time spent on the 8 MB.
+
+The output of each transform is identical with and without shape groups.
+
+| Transform | cold: regular / shape groups | warm: regular / shape groups (boundaries) / **shape groups** | start-up: regular / shape groups | net: regular / **shape groups** |
+|---|---:|---:|---:|---:|
+| NumericPinyin-Latin | 16.7 s / **5.7 s** | 0.575 / 0.474 / **0.460** s | 0.146 / 0.145 s | 0.43 / **0.32** s (−27%) |
+| am-am_FONIPA | 6.9 s / **2.3 s** | 0.164 / 0.269 / **0.179** s | 0.095 / 0.121 s | 0.069 / **0.058** s (−16%) |
+| am-ar | 24.8 s / **18.6 s** | 0.693 / 1.620 / **0.836** s | 0.494 / 0.653 s | 0.20 / **0.18** s (−8%) |
+| am-fa | 36.4 s / **29.1 s** | 12.71 / 1.43 / **0.68** s | 12.61 / 0.48 s | 0.10 / 0.20 s (noisy) |
+| am-chr | 16.1 s / **8.5 s** | 0.264 / 0.752 / **0.374** s | 0.122 / 0.245 s | 0.14 / **0.13** s (−9%) |
+
+- **JIT compilation is 3× faster** for the transforms using shape groups
+  themselves: 16.7 → 5.7 s and 6.9 → 2.3 s. It is 25–45% faster for the
+  transforms that use them (am-ar, am-fa, am-chr), as these have fewer
+  kernels to compile.
+- **Phase boundaries.** The first version put a pipeline phase boundary after
+  each engine pass. That kept the passes from running together, and the
+  shape-group pipelines were then up to 2.8× slower than the regular ones
+  (the "boundaries" column). The boundaries had been added while
+  investigating the failure of pipelines with many passes, and did not fix
+  it. They are now off by default (`--shape-phase-boundaries` restores them).
+- **Processing (net)** is faster with shape groups wherever it can be
+  measured: −27% for NumericPinyin-Latin, and −8% to −16% for the am-*
+  transforms.
+- **Start-up** is the remaining cost: +0.03 to +0.16 s, for planning the
+  shape groups and building both candidate pipelines to count their kernels,
+  on every run. For short inputs this outweighs the processing saving
+  (am-chr, warm: 0.264 → 0.374 s). Caching the choice per transform, or
+  counting kernels without building the pipelines, would remove most of it.
+- **am-fa's regular pipeline spends 12.6 s at start-up** on every run, even
+  on an empty input, with every kernel served from the object cache. Its
+  planning takes 0.09 s and its pipeline graph builds in 0.3 s
+  (`--kernel-counts`), so the time goes into setting up the pipeline at run
+  time: probably the pipeline compiler's analysis of this particular graph.
+  That is a problem of the regular path; with shape groups am-am_FONIPA's
+  segment is different and start-up takes 0.48 s. Its net times are within
+  the noise of that 12.6 s.
+
 ## Segments where both plans were counted
 
 33 transforms have segments with both plans. Shape groups were chosen in 2
@@ -144,5 +199,5 @@ contexts, `e { (tone) r → r &f($1)` and the bare `(tone) → &f($1)`.
   and is now rejected at once. Ordering the rules (by first characters,
   inner characters and literal prefixes) would make such groups cheap to
   analyze; that is not yet done.
-- Kernel counts are not timings: the effect on run time has not been
-  measured.
+- Kernel counts are not timings; see "Run-time performance" above for the
+  measurements.

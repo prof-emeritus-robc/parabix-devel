@@ -163,6 +163,11 @@ static cl::opt<bool> ShowShapeGroups("shape-groups",
                                      cl::desc("Report the conversion groups of the transform planned as search and replace "
                                               "passes by the shapes of their results (see ldml/shape_groups.h) and exit"),
                                      cl::init(false), cl::cat(TconvOptions));
+//  (Off by default: the boundaries keep the passes from running together,
+//  which slows them, see doc/ldml-shape-groups-report.md.)
+static cl::opt<bool> ShapePhaseBoundaries("shape-phase-boundaries",
+                                          cl::desc("With --apply-shape-groups, a pipeline phase boundary after each pass"),
+                                          cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ApplyShapeGroups("apply-shape-groups",
                                       cl::desc("Apply the transform by the search and replace passes of its shape group "
                                                "plans (see --shape-groups), where they are all implementable"),
@@ -9366,14 +9371,12 @@ StreamSet * RulePipelineBuilder::applyShapeGroups(const TransformAnalyzer::Shape
 }
 
 StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeStep & step, StreamSet * U21, bool outermost) {
-    //  (Each pass in a phase of its own: the rates of the streams of many
-    //  passes in one phase, each filtering and spreading the text, are beyond
-    //  the analysis of the pipeline's rates.)
+    //  (A phase boundary after each pass only with --shape-phase-boundaries.)
     auto searchReplace = [&](const PreparedSearchReplace & sr, StreamSet * text) {
         RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, text});
         StreamSet * const result = mP.CreateStreamSet(21);
         engine.searchReplaceCodeUnitsPipeline(sr, result);
-        mP.InsertPhaseBoundary();
+        if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
         return result;
     };
     const size_t kernels = mP.getNumOfKernelCalls();
@@ -9385,7 +9388,7 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
             continue;
         }
         for (const ldml::TransformStep & s : step.maps[i].steps) U21 = conversionGroup(s, U21);
-        mP.InsertPhaseBoundary();
+        if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
     }
     for (const ldml::TransformStep & s : step.markMap.steps) U21 = conversionGroup(s, U21);
     if (outermost && rules > 0) mGroupCounts.push_back({rules, mP.getNumOfKernelCalls() - kernels});

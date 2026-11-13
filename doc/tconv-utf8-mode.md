@@ -26,21 +26,32 @@ kernels of the pipeline used (`mode: UTF-8`).
 
 ## What UTF-8 mode supports
 
-- **Context-free character maps.** A conversion group whose rules are all
-  single-character rules without contexts: each character of a set is
-  replaced by a string of any length, possibly empty (`utf8CharMap`).
+- **Character maps.** A conversion group whose rules are all
+  single-character rules (`utf8CharMap`): each character of a set is replaced
+  by a string of any length, possibly empty.
+- **Contexts on those maps.** The rules may have contexts, provided two
+  conditions hold:
+  - the engine can match the rule with its contexts on UTF-8 code units, and
+  - the group's own conversions cannot change what its before contexts see,
+    since ICU matches them against the converted text (see
+    `convertedContextMatters`).
+
+  The positions where the contexts hold come from the engine (see
+  "Contexts" below).
 - **Transform rules** without filters, invoking `Any-Null` or transforms in
   UTF-8 mode.
 
 Anything else puts a transform in Unicode mode:
 - a filter;
 - string, capture, insertion or deferred rules;
-- contexts;
+- contexts that are not sequences of sets, that see the converted text, or
+  that the engine cannot match;
 - other built-ins;
 - segments applied by shape groups;
 - `--utf8-errors=abort-on-error`.
 
-18 CLDR-defined transforms are in UTF-8 mode: Publishing-Any, Geor-Latn,
+19 CLDR-defined transforms are in UTF-8 mode: Thai-ThaiSemi (contexts),
+Publishing-Any, Geor-Latn,
 Syrc-Latn, Cans-Latn, Ethi-Latn/Williamson, Fullwidth-Halfwidth,
 ThaiLogical-Latin, ThaiSemi-Thai, ASCII-Latin, Pinyin-NumericPinyin,
 NumericPinyin-Pinyin, Ethi-sgw_Ethi/Gurage_2013, and the Devanagari,
@@ -84,6 +95,33 @@ Those bytes are changed by XOR.
 A map whose characters all keep their lengths, applied to well-formed text,
 takes two kernels: the classes and the in-place changes.
 
+**Contexts.** For each subgroup with contexts, tconv matches the pattern
+`(?<=before) [chars] (?=after)` with the regular expression engine on the
+UTF-8 basis bits (`RE_context{&cc::UTF8, Basis}`, `utf8Applies`). The engine
+chooses its mode: byte mode, UTF-8 indexed, or Unicode indexed. Unicode
+indexing is always used with `drop-bad-characters`, so that the characters
+around dropped input become adjacent. The marks of all the subgroups are
+ORed and given to `UTF8_CharMapPipeline`, which maps a contextual character
+only where its last byte is marked.
+
+To place the marks, tconv queries the engine's plan, `planRE(prepared,
+&cc::UTF8)` (`RE_Plan` in `include/kernel/re/regexp_engine.h`), which the
+engine computes without building a pipeline. The plan gives:
+- the mode as compiled (`modeName()`);
+- the offset of the match marks (`matchOffset`), in code units, or in
+  characters with Unicode indexing, when the marks are mapped to last bytes
+  through `getU8Index`;
+- whether the starts of matches are found by reversal;
+- the precondition failures.
+
+tconv uses the plan to decide whether a rule with contexts can be in UTF-8
+mode, and `--plan` reports the engine's mode for each context:
+
+```
+  mode: UTF-8
+    contexts [$thai { } $thai] matched by the engine in byte mode
+```
+
 **Ill-formed input** is handled by the first character map of a pipeline, as
 the decoding in Unicode mode handles it (`codegen::UTF8Errors`).
 `UTF8_structure` finds the maximal ill-formed subparts. With the default
@@ -101,13 +139,13 @@ investigated further.
 
 ## Results
 
-**Correctness.** On 400 random lines per transform, all 18 transforms give
+**Correctness.** On 400 random lines per transform, all 19 transforms give
 output identical to Unicode mode. The lines mix the characters of each
 transform's rule file, ASCII, 2-, 3- and 4-byte characters, combining marks
 and ill-formed sequences. They were checked with both treatments of
 ill-formed input, and the output is identical to ICU's on the same text.
 Publishing-Any passes its 46 CLDR test cases. `QA/tconv_utf8_mode_test.py`
-(ctest `tconv_utf8_mode_test`) checks five of the transforms in both modes
+(ctest `tconv_utf8_mode_test`) checks six of the transforms, Thai-ThaiSemi among them, in both modes
 and both error treatments.
 
 **Time.** Measured on 128 MB of well-formed text (the characters of each
@@ -121,6 +159,7 @@ rule file and ASCII), `-thread-num=4`, median of 5 warm runs:
 | Fullwidth-Halfwidth | 0.174 s | 0.225 s | −23% |
 | InterIndic-Bengali | 0.188 s | 0.246 s | −23% |
 | Devanagari-InterIndic | 0.153 s | 0.189 s | −19% |
+| Thai-ThaiSemi (contexts) | 0.145 s | 0.237 s | −39% |
 
 Each of these maps counts 13 kernels in UTF-8 mode, most of them for the
 handling of ill-formed input, which needs deletion and insertion. Without
@@ -136,9 +175,13 @@ slower for Fullwidth-Halfwidth.
   kernels of a same-length map. A check that the text is well-formed, with
   the general path taken only where it is not, could leave such maps their
   two kernels.
+- **Engine plans.** `RE_Plan` is a first step towards plans of the engine
+  that clients query before building: for example, the strategies for the
+  starts of matches and the walks of captures, and the kernels a pattern
+  would take. tconv could then choose between implementations by their
+  costs, as it does now by counting kernels.
 - **More patterns:**
   - string rules, from the string matching of the regular expression
     engine in byte mode;
-  - single-character rules with contexts of sets;
   - the normalization built-ins that already have UTF-8 pipelines.
 - **Filters,** as masks over code units.

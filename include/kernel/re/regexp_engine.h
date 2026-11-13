@@ -164,6 +164,38 @@ struct PreconditionFailure {
 std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
                                                     const cc::Alphabet * sourceEncoding = &cc::UTF8);
 
+//
+// The plan of the engine for a prepared RE on a source of an encoding: how its
+// pipeline methods compile the RE for its goal, without building a pipeline,
+// for clients that need to know before they build one (e.g. tconv choosing
+// between implementations, or reporting how a pattern is matched).
+//   - lengthAlphabet, codeUnitAlphabet: the alphabets as compiled (byte mode:
+//     UTF-8/UTF-8; UTF-8 indexed: Unicode lengths over UTF-8 code units;
+//     Unicode indexed: Unicode/Unicode, see RE_Mode);
+//   - compiled: the RE after the mode passes, as compiled;
+//   - matchOffset: the marks of matchSearchPipeline are this many positions
+//     after the last position of each match (e.g. for a trailing lookahead
+//     not looked ahead by name): positions of code units, or, with Unicode
+//     indexing of a UTF-8 source (codeUnitAlphabet Unicode), of characters,
+//     which RE_PipelineBuilder::getU8Index maps to their last code units;
+//   - startsByReversal: the starts of the matches found by reversal (the
+//     MatchStarts goal);
+//   - failures: the preconditions that do not hold (see checkPreconditions).
+//
+struct RE_Plan {
+    const cc::Alphabet * lengthAlphabet = nullptr;
+    const cc::Alphabet * codeUnitAlphabet = nullptr;
+    re::RE * compiled = nullptr;
+    unsigned matchOffset = 0;
+    bool startsByReversal = false;
+    std::vector<PreconditionFailure> failures;
+    bool feasible() const {return failures.empty();}
+    // "byte", "UTF-8 indexed" or "Unicode indexed".
+    std::string modeName() const;
+};
+
+RE_Plan planRE(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding = &cc::UTF8);
+
 // A report of the failures, one per line.
 std::string preconditionReport(const std::vector<PreconditionFailure> & failures);
 

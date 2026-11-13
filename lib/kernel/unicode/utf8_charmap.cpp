@@ -121,24 +121,45 @@ struct Plan {
 //  (after which they are inserted).
 class UTF8_CharMapApply final : public PabloKernel {
 public:
-    UTF8_CharMapApply(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Classes, Plan plan, Errors errors,
+    //  (With Applies, the characters of the class Contextual (the last of the
+    //  classes) are mapped only where Applies marks their last bytes.)
+    UTF8_CharMapApply(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Classes, StreamSet * Applies, Plan plan, Errors errors,
                       StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts)
-    : PabloKernel(ts, "UTF8_CharMapApply_" + getStringHash(plan.signature()) +
-                      (errors == Errors::Replace ? "_r" : errors == Errors::Drop ? "_d" : "") + (Keep ? "_k" : "") + (Inserts ? "_i" : ""),
-                  {Binding{"basis", Basis, FixedRate(1), LookAhead(3)}, Binding{"classes", Classes}},
+    : PabloKernel(ts, "UTF8_CharMapApply_" + getStringHash(plan.signature()) + "_" + std::to_string(Classes->getNumElements()) +
+                      (errors == Errors::Replace ? "_r" : errors == Errors::Drop ? "_d" : "") + (Keep ? "_k" : "") + (Inserts ? "_i" : "") +
+                      (Applies ? "_c" : ""),
+                  [&] {
+                      Bindings in{Binding{"basis", Basis, FixedRate(1), LookAhead(3)}, Binding{"classes", Classes}};
+                      if (Applies) in.emplace_back("applies", Applies, FixedRate(1), LookAhead(3));
+                      return in;
+                  }(),
                   [&] {
                       Bindings out{Binding{"translated", Translated}};
                       if (Keep) out.emplace_back("keep", Keep);
                       if (Inserts) out.emplace_back("inserts", Inserts);
                       return out;
                   }()),
-      mPlan(std::move(plan)), mErrors(errors), mKeep(Keep != nullptr), mInserts(Inserts != nullptr) {}
+      mPlan(std::move(plan)), mErrors(errors), mKeep(Keep != nullptr), mInserts(Inserts != nullptr), mApplies(Applies != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         const std::vector<PabloAST *> basis = getInputStreamSet("basis");
         const std::vector<PabloAST *> classes = getInputStreamSet("classes");
-        PabloAST * const mapped = classes[0];
+        PabloAST * mapped = classes[0];
+        if (mApplies) {
+            // The contextual characters where Applies marks their last bytes
+            // (L - 1 bytes ahead of the first byte of a character of length L).
+            Var * const applies = getInputStreamVar("applies");
+            PabloAST * const at = pb.createExtract(applies, pb.getInteger(0));
+            PabloAST * const contextual = classes.back();
+            PabloAST * const prefix = pb.createAnd(basis[7], basis[6]);
+            PabloAST * const prefix34 = pb.createAnd(prefix, basis[5]);
+            PabloAST * holds = pb.createAnd(pb.createNot(basis[7]), at);
+            holds = pb.createOr(holds, pb.createAnd(pb.createAnd(prefix, pb.createNot(basis[5])), pb.createLookahead(at, 1)));
+            holds = pb.createOr(holds, pb.createAnd(pb.createAnd(prefix34, pb.createNot(basis[4])), pb.createLookahead(at, 2)));
+            holds = pb.createOr(holds, pb.createAnd(pb.createAnd(prefix34, basis[4]), pb.createLookahead(at, 3)));
+            mapped = pb.createOr(pb.createAnd(mapped, pb.createNot(contextual)), pb.createAnd(contextual, holds));
+        }
         // The bytes changed in place.
         std::vector<PabloAST *> translated;
         for (unsigned b = 0; b < 8; b++) {
@@ -221,6 +242,7 @@ private:
     const Errors mErrors;
     const bool mKeep;
     const bool mInserts;
+    const bool mApplies;
 };
 
 //  The bytes of the tails written at the positions inserted (zeroes) after
@@ -254,7 +276,8 @@ private:
 
 }
 
-StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis, bool wellFormed) {
+StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis, bool wellFormed,
+                                 const UCD::UnicodeSet & contextual, StreamSet * Applies) {
     const Errors errors = (wellFormed || (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort)) ? Errors::None
                           : (codegen::UTF8Errors == codegen::UTF8ErrorMode::DropBadInput) ? Errors::Drop : Errors::Replace;
     if (map.empty() && (errors == Errors::None)) return Basis;
@@ -318,6 +341,8 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
         if (c.empty) sets[plan.emptyIndex()].insert(c.cp);
         for (unsigned k = 0; k < plan.tailBits; k++) if ((c.tail >> k) & 1) sets[plan.tailIndex() + k].insert(c.cp);
     }
+    // (The contextual characters, the last class.)
+    if (Applies) sets.push_back(contextual);
     std::vector<re::CC *> ccs;
     for (const UCD::UnicodeSet & s : sets) ccs.push_back(re::makeCC(s, &cc::Unicode));
     StreamSet * const Classes = P.CreateStreamSet(ccs.size());
@@ -330,7 +355,7 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
     StreamSet * const Translated = P.CreateStreamSet(8);
     StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
     StreamSet * Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
-    P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, plan, errors, Translated, Keep, Inserts);
+    P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, Applies, plan, errors, Translated, Keep, Inserts);
     SHOW_BIXNUM(Translated);
     Basis = Translated;
     if (deletes) {

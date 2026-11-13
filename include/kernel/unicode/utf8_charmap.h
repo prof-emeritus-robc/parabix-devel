@@ -39,6 +39,11 @@ namespace kernel {
 //
 using UTF8_CharMap = std::vector<std::pair<UCD::UnicodeSet, std::u32string>>;
 
-StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis, bool wellFormed = false);
+//  With Applies, the characters of contextual (characters of rules with
+//  contexts) are mapped only where Applies marks their last bytes: the matches
+//  of the rules with their contexts, as the regular expression engine marks
+//  them on UTF-8 code units.
+StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis, bool wellFormed = false,
+                                 const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * Applies = nullptr);
 
 }

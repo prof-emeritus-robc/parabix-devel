@@ -3444,6 +3444,36 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
     return modeFailures(prepared, sourceEncoding, byReversal);
 }
 
+//  (As modeFailures, keeping the RE as transformed.)
+RE_Plan planRE(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding) {
+    if (const auto * mpx = dyn_cast_or_null<cc::MultiplexedAlphabet>(sourceEncoding)) {
+        sourceEncoding = mpx->getSourceAlphabet();
+    }
+    RE_Plan plan;
+    plan.lengthAlphabet = &cc::Unicode;
+    plan.codeUnitAlphabet = &cc::Unicode;
+    if ((sourceEncoding != &cc::Unicode) && (prepared.mode.indexAlphabet == &cc::UTF8)) {
+        plan.lengthAlphabet = prepared.mode.lengthAlphabet;
+        plan.codeUnitAlphabet = &cc::UTF8;
+    }
+    QuietREPrinting quiet;
+    ModeTransformation M(plan.lengthAlphabet, plan.codeUnitAlphabet);
+    M.mAllowReversal = prepared.options.reversal;
+    plan.compiled = M.transform(prepared.re, prepared.options.goal);
+    plan.failures = M.failures(plan.compiled, prepared.options.goal);
+    plan.startsByReversal = M.mStartsByReversal;
+    // (The marks of an RE kernel, see RE_Kernel::makeOutputBindings: with an
+    // index stream in the UTF-8 indexed mode.)
+    const bool indexed = (plan.lengthAlphabet == &cc::Unicode) && (plan.codeUnitAlphabet == &cc::UTF8);
+    plan.matchOffset = re::grepOffset(plan.compiled, indexed);
+    return plan;
+}
+
+std::string RE_Plan::modeName() const {
+    if (codeUnitAlphabet == &cc::Unicode) return "Unicode indexed";
+    return (lengthAlphabet == &cc::UTF8) ? "byte" : "UTF-8 indexed";
+}
+
 std::string preconditionReport(const std::vector<PreconditionFailure> & failures) {
     std::string report;
     for (const PreconditionFailure & f : failures) {

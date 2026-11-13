@@ -9415,13 +9415,23 @@ static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformR
 //  without contexts, each character of a set replaced by a string (the
 //  characters replaced by themselves left out); false, with the reason, if
 //  it is not.
-static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap & map, std::string & reason) {
+//
+//  Single-character rules with contexts are supported where the regular
+//  expression engine matches them, with their contexts, on the UTF-8 code
+//  units (see utf8Applies), and their before contexts do not depend on the
+//  conversions of the group (as ICU matches them against the converted text,
+//  see convertedContextMatters): their subgroups (contextual) and characters
+//  (contextualChars).
+static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap & map, std::string & reason,
+                        std::vector<const ldml::CharMapSubgroup *> * contextual = nullptr, UCD::UnicodeSet * contextualChars = nullptr) {
     map.clear();
+    if (contextual) contextual->clear();
+    if (contextualChars) *contextualChars = UCD::UnicodeSet();
     if (step.kind != ldml::TransformStep::Kind::Conversion) {
         reason = "not a conversion group";
         return false;
     }
-    auto other = [&](bool present, const char * what) {
+    auto other = [&](bool present, const std::string & what) {
         if (present && reason.empty()) reason = what;
     };
     reason.clear();
@@ -9435,8 +9445,28 @@ static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap &
     other(step.hasFrontLetters || step.frontLettersEnd, "front-letter revisits");
     for (const auto & p : step.subgroupPriority) other(!p.empty(), "single-character rules with priorities");
     UCD::UnicodeSet covered;
+    std::vector<ConversionOutcome> outcomes;
+    bool outcomesKnown = false;
     for (const ldml::CharMapSubgroup & g : step.subgroups) {
-        other(g.before != nullptr || g.after != nullptr, "single-character rules with contexts");
+        const bool contexts = g.engineBefore != nullptr || g.engineAfter != nullptr;
+        if (contexts) {
+            FusedContexts before, after;
+            if (!outcomesKnown) {
+                outcomes = conversionOutcomes(step);
+                outcomesKnown = true;
+            }
+            if (!fusedContexts(g.engineBefore, true, before)) {
+                other(true, "single-character rules with before contexts that are not sequences of sets");
+            } else if (convertedContextMatters(before, outcomes)) {
+                other(true, "single-character rules with before contexts matched against the converted text");
+            } else {
+                UCD::UnicodeSet chars;
+                for (const ldml::CharMapping & m : g.mappings) chars = chars + m.chars;
+                const RE_Plan plan = planRE(prepareRE(contextPattern(g.engineBefore, g.engineAfter, {re::makeCC(chars, &cc::Unicode)}),
+                                                      engineOptions()), &cc::UTF8);
+                if (!plan.feasible()) other(true, "single-character rules with contexts not matched by the engine: " + plan.failures.front().reason);
+            }
+        }
         for (const ldml::CharMapping & m : g.mappings) {
             UCD::UnicodeSet chars = m.chars - UCD::UnicodeSet(DeletionMark);
             if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
@@ -9444,9 +9474,49 @@ static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap &
             other(chars.intersects(covered), "characters of several subgroups");
             covered = covered + chars;
             map.emplace_back(chars, m.replacement);
+            if (contexts && contextualChars) *contextualChars = *contextualChars + chars;
         }
+        if (contexts && contextual) contextual->push_back(&g);
     }
     return reason.empty();
+}
+
+//  The positions where the single-character rules with contexts of a group
+//  apply (see utf8CharMap): their matches with their contexts, by the regular
+//  expression engine on the UTF-8 code units (in its UTF-8 modes), marked at
+//  the last byte of each character.
+static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml::CharMapSubgroup *> & contextual, StreamSet * Basis) {
+    StreamSet * applies = nullptr;
+    for (const ldml::CharMapSubgroup * g : contextual) {
+        UCD::UnicodeSet chars;
+        for (const ldml::CharMapping & m : g->mappings) chars = chars + m.chars;
+        const PreparedRE prepared = prepareRE(contextPattern(g->engineBefore, g->engineAfter, {re::makeCC(chars, &cc::Unicode)}),
+                                              engineOptions());
+        StreamSet * matches = P.CreateStreamSet(1);
+        RE_PipelineBuilder engine(P, RE_context{&cc::UTF8, Basis});
+        engine.matchSearchPipeline(prepared, matches);
+        //  (The marks as the engine places them, see RE_Plan: matchOffset
+        //  positions after the last unit, of code units or, with Unicode
+        //  indexing, of characters, mapped to their last code units.)
+        const RE_Plan plan = planRE(prepared, &cc::UTF8);
+        if (plan.matchOffset > 0) {
+            StreamSet * const shifted = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftBack>(matches, shifted, plan.matchOffset);
+            matches = shifted;
+        }
+        if (engine.usesUnicodeIndexing()) {
+            StreamSet * const atBytes = P.CreateStreamSet(1);
+            SpreadByMask(P, engine.getU8Index(), matches, atBytes);
+            matches = atBytes;
+        }
+        if (applies) {
+            StreamSet * const both = P.CreateStreamSet(1);
+            OrCombine(P, applies, matches, both);
+            matches = both;
+        }
+        applies = matches;
+    }
+    return applies;
 }
 
 const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEntry * entry) {
@@ -9509,9 +9579,14 @@ static StreamSet * utf8Transform(PipelineBuilder & P, const ldml::TransformRegis
         }
         kernel::UTF8_CharMap map;
         std::string reason;
-        if (!utf8CharMap(step, map, reason)) llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
+        std::vector<const ldml::CharMapSubgroup *> contextual;
+        UCD::UnicodeSet contextualChars;
+        if (!utf8CharMap(step, map, reason, &contextual, &contextualChars)) {
+            llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
+        }
         const size_t kernels = P.getNumOfKernelCalls();
-        Basis = kernel::UTF8_CharMapPipeline(P, map, Basis, wellFormed);
+        StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(P, contextual, Basis);
+        Basis = kernel::UTF8_CharMapPipeline(P, map, Basis, wellFormed, contextualChars, applies);
         wellFormed = true;
         if (groupCounts && groupRules(step) > 0) groupCounts->push_back({groupRules(step), P.getNumOfKernelCalls() - kernels});
     }
@@ -10749,6 +10824,21 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
     const TransformAnalyzer::Mode & m = analyzer.mode(entry);
     if (m.utf8) {
         toolio::out() << "  mode: UTF-8" << (UTF8Mode ? "" : " (not used: --utf8-mode=0)") << "\n";
+        //  (The single-character rules with contexts of its own groups, and
+        //  how the engine matches them, see RE_Plan.)
+        for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+            kernel::UTF8_CharMap map;
+            std::string reason;
+            std::vector<const ldml::CharMapSubgroup *> contextual;
+            if (step.kind != ldml::TransformStep::Kind::Conversion || !utf8CharMap(step, map, reason, &contextual)) continue;
+            for (const ldml::CharMapSubgroup * g : contextual) {
+                UCD::UnicodeSet chars;
+                for (const ldml::CharMapping & mp : g->mappings) chars = chars + mp.chars;
+                const RE_Plan plan = planRE(prepareRE(contextPattern(g->engineBefore, g->engineAfter, {re::makeCC(chars, &cc::Unicode)}),
+                                                      engineOptions()), &cc::UTF8);
+                toolio::out() << "    contexts [" << g->contextKey << "] matched by the engine in " << plan.modeName() << " mode\n";
+            }
+        }
     } else {
         toolio::out() << "  mode: Unicode: " << m.reason << "\n";
     }

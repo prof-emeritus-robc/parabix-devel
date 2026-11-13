@@ -26,6 +26,9 @@ UTF8 = {
     "Ethi-sgw_Ethi/Gurage_2013": "\U0001E7ED\U0001E7EE\U0001E7F0\U0001E7F1",
     "NumericPinyin-Pinyin": "12345",
     "Fullwidth-Halfwidth": "ガギグゲゴアイウエオ、。",
+    # a single-character rule with contexts ($thai { ' ' } $thai), matched by
+    # the regular expression engine on the UTF-8 code units
+    "Thai-ThaiSemi": "กขคง    ",
 }
 UNICODE = ["Hira-Latn"]
 OTHER = "aZ 09.,é€中😀𐍈\u0301"

@@ -103,6 +103,7 @@
 #include <re/cc/cc_compiler_target.h>
 #include <ucd/utf/transchar.h>
 #include <ldml/transform_plan.h>
+#include <ldml/shape_groups.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
@@ -158,6 +159,14 @@ static cl::opt<bool> RevisitReport("revisit-report", cl::desc("Report each rule 
                                    "applying to its text to revisit (one JSON object per line), and exit"), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
                               cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> ShowShapeGroups("shape-groups",
+                                     cl::desc("Report the conversion groups of the transform planned as search and replace "
+                                              "passes by the shapes of their results (see ldml/shape_groups.h) and exit"),
+                                     cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> ApplyShapeGroups("apply-shape-groups",
+                                      cl::desc("Apply the transform by the search and replace passes of its shape group "
+                                               "plans (see --shape-groups), where they are all implementable"),
+                                      cl::init(false), cl::cat(TconvOptions));
 //  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
 //  are computed by kernels of their own, as the cost of compiling a kernel of
 //  classes of scattered characters grows faster than their number (for Hani-Latn,
@@ -388,6 +397,47 @@ public:
     //  Analyze rules not tied to a registry entry (e.g. from --rules-file), as
     //  the forward rules of an ad hoc transform.
     TransformAnalysis analyzeRulesFile(const std::vector<ldml::Rule *> & parsed);
+    //  The rules of a transform (its forward rules, after capture
+    //  simplification and order disambiguation, with their function calls
+    //  kept) and the shape group plans of its conversion groups, in order:
+    //  the steps, each a transform rule or a plan.
+    struct ShapeStep {
+        const ldml::TransformRule * transform = nullptr;
+        ldml::ShapeGroupPlan plan;
+        //  The passes as prepared for the engine, and their failures; a
+        //  character map planned as rules (see ldml::planTransform).
+        std::vector<PreparedSearchReplace> prepared;
+        std::vector<std::vector<PreconditionFailure>> failures;
+        std::vector<ldml::TransformPlan> maps;
+        //  The marks of the deferred calls and their arguments replaced by
+        //  their values: string rules (M a → value), planned as rules.
+        ldml::TransformPlan markMap;
+        std::string markMapProblem;
+    };
+    std::vector<ShapeStep> shapeGroups(const ldml::TransformEntry * entry);
+    //  The shape group plans of a transform (cached), and whether the transform
+    //  can be applied by them (see --apply-shape-groups): every conversion
+    //  group planned, its passes accepted by the engine and its deferred calls
+    //  evaluated, no filters, and the transforms invoked implemented.
+    struct ShapeGroups {
+        std::vector<ShapeStep> steps;
+        bool applicable = false;
+        std::string reason;
+    };
+    const ShapeGroups & shapeGroupsOf(const ldml::TransformEntry * entry);
+    //  The choice, for each segment of a transform (the conversion groups
+    //  between consecutive transform rules), between its regular plan and its
+    //  shape groups (see --apply-shape-groups): the shape groups where they are
+    //  implementable and take fewer kernels.  The segments correspond where the
+    //  two plans have the same transform rules and no filters (aligned).
+    struct ShapeChoice {
+        bool aligned = false;
+        std::vector<bool> useShapes;                        // for each segment
+        std::vector<std::vector<ShapeStep>> shapeSegments;  // the shape groups of each segment
+        std::vector<size_t> regularKernels, shapeKernels;   // of each segment (if both apply)
+        bool any() const {return std::find(useShapes.begin(), useShapes.end(), true) != useShapes.end();}
+    };
+    std::map<std::string, ShapeChoice> mShapeChoices;
 private:
     //  The common analysis of a set of parsed rules (trivial and nullable
     //  capture elimination, order disambiguation, planning, and checking the
@@ -402,6 +452,7 @@ private:
     const ldml::TransformRegistry & mRegistry;
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
+    std::map<std::string, ShapeGroups> mShapeGroups;
 };
 
 static std::string readFile(const std::string & path) {
@@ -460,6 +511,203 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
     }
     mInProgress.erase(name);
     return mResults.emplace(name, std::move(a)).first->second;
+}
+
+std::vector<TransformAnalyzer::ShapeStep> TransformAnalyzer::shapeGroups(const ldml::TransformEntry * entry) {
+    const std::vector<ldml::Rule *> parsed = ldml::parseTransformRules(ldml::extractTRules(readFile(entry->file)));
+    std::vector<ldml::Rule *> rules = entry->direction == ldml::TransformDirection::Forward
+                                      ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+    rules = ldml::RemoveUnreferencedCaptures(rules);
+    rules = ldml::TrivialCaptureElimination(rules);
+    rules = ldml::NullableCaptureElimination(rules);
+    rules = ldml::DisambiguateOrder(rules);
+    const ldml::FunctionEvaluator evaluate = [&](const ldml::TransformID & t, const UCD::UnicodeSet & chars,
+                                                 std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                                                 UCD::UnicodeSet & unchanged, std::string & reason) {
+        return evaluateFunction(t, chars, groups, unchanged, reason);
+    };
+    std::vector<ShapeStep> steps;
+    std::vector<const ldml::ConversionRule *> group;
+    auto flush = [&] {
+        if (group.empty()) return;
+        steps.emplace_back();
+        ShapeStep & step = steps.back();
+        step.plan = ldml::planShapeGroup(group, &evaluate);
+        group.clear();
+        if (!step.plan.implementable()) return;
+        for (const ldml::ShapePass & p : step.plan.passes) {
+            if (p.map) {
+                step.prepared.emplace_back();
+                std::vector<ldml::Rule *> rules;
+                for (const ldml::ConversionRule * r : p.rules) rules.push_back(const_cast<ldml::ConversionRule *>(r));
+                step.maps.push_back(ldml::planTransform(rules));
+                step.failures.emplace_back();
+                if (!step.maps.back().implementable()) {
+                    step.failures.back().push_back(PreconditionFailure{re::RE_Goal::SearchReplace, nullptr,
+                                                   "the character map is not implementable: " + step.maps.back().problems.front()});
+                }
+                continue;
+            }
+            RE_ModeOptions opts;
+            opts.forceUnicodeIndexing = true;
+            opts.reversal = false;
+            step.prepared.push_back(prepareSearchReplace(p.search, p.replacement, opts));
+            step.failures.push_back(checkPreconditions(step.prepared.back(), &cc::Unicode));
+            step.maps.emplace_back();
+        }
+        std::vector<ldml::Rule *> markRules;
+        for (const ldml::DeferredCall & call : step.plan.calls) {
+            for (const auto & v : call.values) {
+                std::vector<re::RE *> value;
+                for (const char32_t c : v.second) value.push_back(re::makeCC(static_cast<UCD::codepoint_t>(c), &cc::Unicode));
+                re::RE * const text = re::makeSeq({re::makeCC(call.mark, &cc::Unicode), re::makeCC(v.first, &cc::Unicode)});
+                markRules.push_back(ldml::makeConversionRule(ldml::makeRuleSide(text), ldml::Direction::Forward,
+                                                             ldml::makeRuleSide(re::makeSeq(value.begin(), value.end()))));
+            }
+        }
+        if (!markRules.empty()) {
+            step.markMap = ldml::planTransform(markRules);
+            if (!step.markMap.implementable()) step.markMapProblem = step.markMap.problems.front();
+        }
+    };
+    for (const ldml::Rule * r : rules) {
+        if (const ldml::ConversionRule * c = dyn_cast<ldml::ConversionRule>(r)) {
+            group.push_back(c);
+        } else if (const ldml::TransformRule * t = dyn_cast<ldml::TransformRule>(r)) {
+            flush();
+            steps.emplace_back();
+            steps.back().transform = t;
+        } else if (isa<ldml::FilterRule>(r)) {
+            flush();
+            steps.emplace_back();
+            steps.back().plan.problems.push_back("a filter rule (not supported by shape groups)");
+        } else if (!isa<ldml::VariableDefinitionRule>(r)) {
+            flush();
+        }
+    }
+    flush();
+    return steps;
+}
+
+const TransformAnalyzer::ShapeGroups & TransformAnalyzer::shapeGroupsOf(const ldml::TransformEntry * entry) {
+    const std::string & name = entry->canonicalName;
+    auto f = mShapeGroups.find(name);
+    if (f != mShapeGroups.end()) return f->second;
+    ShapeGroups g;
+    try {
+        g.steps = shapeGroups(entry);
+        g.applicable = true;
+    } catch (const std::exception & e) {
+        g.reason = std::string("rules not loaded: ") + e.what();
+    }
+    for (const ShapeStep & step : g.steps) {
+        if (!g.applicable) break;
+        if (step.transform) {
+            const ldml::TransformEntry * used = mRegistry.lookup(step.transform->getForwardID().getText());
+            if (step.transform->getForwardFilter()) {
+                g.reason = "a transform rule with a filter";
+            } else if (used == nullptr) {
+                g.reason = "an unknown transform " + step.transform->getForwardID().getText();
+            } else if (!analyze(used).implementable) {
+                g.reason = "a transform invoked that is not implemented: " + used->canonicalName;
+            }
+        } else if (!step.plan.implementable()) {
+            g.reason = step.plan.problems.front();
+        } else {
+            for (const std::vector<PreconditionFailure> & fs : step.failures) {
+                if (!fs.empty()) g.reason = "a pass not accepted by the engine: " + fs.front().reason;
+            }
+            for (const ldml::DeferredCall & call : step.plan.calls) {
+                if (!call.evaluated) g.reason = "a function call not evaluated: &" + call.function.getText();
+            }
+            if (!step.markMapProblem.empty()) g.reason = "the values of the deferred calls not implementable: " + step.markMapProblem;
+        }
+        g.applicable = g.reason.empty();
+    }
+    return mShapeGroups.emplace(name, std::move(g)).first->second;
+}
+
+//  The shape group plans of a transform (see TransformAnalyzer::shapeGroups):
+//  for each pass, its search pattern and replacement (in the syntax of the
+//  regular expression parser and of re::parseReplacement), whether the
+//  engine's search and replace accepts them, and the values of the deferred
+//  calls.  0 if all the conversion groups are implementable.
+static int printShapeGroups(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
+    TransformAnalyzer analyzer(registry);
+    std::vector<TransformAnalyzer::ShapeStep> steps;
+    try {
+        steps = analyzer.shapeGroups(entry);
+    } catch (const std::exception & e) {
+        llvm::errs() << entry->canonicalName << ": " << e.what() << "\n";
+        return 2;
+    }
+    auto codepoints = [](const std::u32string & s) {
+        std::string out;
+        for (const char32_t c : s) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%sU+%04X", out.empty() ? "" : " ", static_cast<unsigned>(c));
+            out += buf;
+        }
+        return out.empty() ? std::string("(deleted)") : out;
+    };
+    bool all = true;
+    toolio::out() << entry->canonicalName << " (" << entry->file << "): shape groups\n";
+    for (const TransformAnalyzer::ShapeStep & step : steps) {
+        if (step.transform) {
+            toolio::out() << "  transform " << step.transform->getForwardID().getText() << "\n";
+            continue;
+        }
+        const ldml::ShapeGroupPlan & plan = step.plan;
+        size_t rules = 0;
+        for (const ldml::ShapePass & p : plan.passes) rules += p.rules.size();
+        toolio::out() << "  conversion group: " << plan.passes.size() << " passes, " << rules << " rules\n";
+        for (const std::string & problem : plan.problems) toolio::out() << "    problem: " << problem << "\n";
+        all = all && plan.implementable();
+        if (!plan.implementable()) continue;
+        for (size_t i = 0; i < plan.passes.size(); i++) {
+            const ldml::ShapePass & p = plan.passes[i];
+            toolio::out() << "    pass " << (i + 1) << ": " << p.shape << ", " << p.rules.size() << " rules";
+            for (const size_t g : p.guards) toolio::out() << ", yields to pass " << (g + 1);
+            if (p.contexts) toolio::out() << ", before contexts as in the converted text";
+            toolio::out() << "\n";
+            for (const ldml::ConversionRule * r : p.rules) toolio::out() << "      rule: " << ldml::printRule(r) << "\n";
+            if (p.map) {
+                for (const PreconditionFailure & f : step.failures[i]) toolio::out() << "      character map: " << f.reason << "\n";
+                if (step.failures[i].empty()) toolio::out() << "      character map: implementable\n";
+                all = all && step.failures[i].empty();
+                continue;
+            }
+            std::string reason;
+            const std::string search = ldml::regexSyntax(p.search, &reason);
+            toolio::out() << "      search: " << (search.empty() ? "(no syntax: " + reason + ")" : search) << "\n";
+            toolio::out() << "      replacement: " << ldml::replacementSyntax(p.replacement) << "\n";
+            const std::vector<PreconditionFailure> & failures = step.failures[i];
+            if (failures.empty()) {
+                toolio::out() << "      engine: accepted\n";
+            } else {
+                all = false;
+                for (const PreconditionFailure & f : failures) toolio::out() << "      engine: not accepted: " << f.reason << "\n";
+            }
+        }
+        for (const ldml::DeferredCall & call : plan.calls) {
+            char mark[16];
+            snprintf(mark, sizeof(mark), "U+%04X", static_cast<unsigned>(call.mark));
+            toolio::out() << "    deferred call &" << call.function.getText() << ": mark " << mark;
+            if (!call.evaluated) {
+                toolio::out() << ", not evaluated\n";
+                continue;
+            }
+            toolio::out() << "\n";
+            for (const auto & v : call.values) {
+                toolio::out() << "      value " << codepoints(std::u32string(1, v.first)) << " -> " << codepoints(v.second) << "\n";
+            }
+        }
+        if (!step.markMapProblem.empty()) {
+            all = false;
+            toolio::out() << "    values not implementable: " << step.markMapProblem << "\n";
+        }
+    }
+    return all ? 0 : 2;
 }
 
 //  The value of a transform, as planned, on a single character: through its
@@ -6327,6 +6575,13 @@ public:
     : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
+    StreamSet * applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21);
+    //  The passes of a conversion group planned by shapes (with its group
+    //  count, if outermost).
+    StreamSet * applyShapeStep(const TransformAnalyzer::ShapeStep & step, StreamSet * U21, bool outermost);
+    //  The segments of the transform being applied that are applied by their
+    //  shape groups (see TransformAnalyzer::ShapeChoice), if any.
+    const TransformAnalyzer::ShapeChoice * mShapeChoice = nullptr;
     // Apply an already-analyzed plan (e.g. of an ad hoc --rules-file transform,
     // not tied to a registry entry) to U21.
     StreamSet * applyAnalysis(const TransformAnalysis & a, StreamSet * U21);
@@ -8987,11 +9242,154 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     return result;
 }
 
+//  The choice of plans for the segments of a transform (see
+//  TransformAnalyzer::ShapeChoice), computed once: the kernels of each
+//  segment, by each plan, are counted in a pipeline of their own (built, not
+//  compiled).
+static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                                          const ldml::TransformEntry * entry) {
+    auto f = analyzer.mShapeChoices.find(entry->canonicalName);
+    if (f != analyzer.mShapeChoices.end()) return f->second;
+    TransformAnalyzer::ShapeChoice choice;
+    const TransformAnalysis & a = analyzer.analyze(entry);
+    const TransformAnalyzer::ShapeGroups & groups = analyzer.shapeGroupsOf(entry);
+    //  The segments of each plan, by their transform rules.
+    std::vector<std::string> regularTransforms, shapeTransforms;
+    std::vector<std::vector<const ldml::TransformStep *>> regularSegments(1);
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            regularTransforms.push_back(step.transform.getText() + (step.filter ? " (filtered)" : ""));
+            regularSegments.emplace_back();
+        } else {
+            regularSegments.back().push_back(&step);
+        }
+    }
+    choice.shapeSegments.resize(1);
+    bool filters = a.plan.filter != nullptr;
+    for (const TransformAnalyzer::ShapeStep & step : groups.steps) {
+        if (step.transform) {
+            shapeTransforms.push_back(step.transform->getForwardID().getText() + (step.transform->getForwardFilter() ? " (filtered)" : ""));
+            choice.shapeSegments.emplace_back();
+        } else {
+            for (const std::string & p : step.plan.problems) filters |= p.compare(0, 13, "a filter rule") == 0;
+            choice.shapeSegments.back().push_back(step);
+        }
+    }
+    choice.aligned = a.implementable && !filters && regularTransforms == shapeTransforms;
+    choice.useShapes.assign(choice.shapeSegments.size(), false);
+    if (!choice.aligned) return analyzer.mShapeChoices.emplace(entry->canonicalName, std::move(choice)).first->second;
+    static std::unique_ptr<CPUDriver> counting;
+    if (!counting) counting = std::make_unique<CPUDriver>("tconv-counting");
+    auto count = [&](const std::function<void (RulePipelineBuilder &, StreamSet *)> & build) {
+        auto P = CreatePipeline(*counting, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
+        StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
+        StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+        const size_t base = P.getNumOfKernelCalls();
+        RulePipelineBuilder builder(P, registry, analyzer);
+        builder.omitICUBuiltIns();
+        build(builder, U21);
+        return P.getNumOfKernelCalls() - base;
+    };
+    choice.regularKernels.assign(choice.shapeSegments.size(), 0);
+    choice.shapeKernels.assign(choice.shapeSegments.size(), 0);
+    for (size_t k = 0; k < choice.shapeSegments.size(); k++) {
+        const std::vector<TransformAnalyzer::ShapeStep> & shapes = choice.shapeSegments[k];
+        bool implementable = !shapes.empty();
+        for (const TransformAnalyzer::ShapeStep & step : shapes) {
+            implementable = implementable && step.plan.implementable() && step.markMapProblem.empty();
+            for (const auto & fs : step.failures) implementable = implementable && fs.empty();
+            for (const ldml::DeferredCall & call : step.plan.calls) implementable = implementable && call.evaluated;
+        }
+        if (!implementable) continue;
+        TransformAnalysis segment;
+        segment.implementable = true;
+        for (const ldml::TransformStep * s : regularSegments[k]) segment.plan.steps.push_back(*s);
+        choice.regularKernels[k] = count([&](RulePipelineBuilder & b, StreamSet * U21) {b.applyAnalysis(segment, U21);});
+        choice.shapeKernels[k] = count([&](RulePipelineBuilder & b, StreamSet * U21) {
+            for (const TransformAnalyzer::ShapeStep & step : shapes) U21 = b.applyShapeStep(step, U21, false);
+        });
+        choice.useShapes[k] = choice.shapeKernels[k] < choice.regularKernels[k];
+    }
+    return analyzer.mShapeChoices.emplace(entry->canonicalName, std::move(choice)).first->second;
+}
+
 StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21) {
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
     const TransformAnalysis & a = mAnalyzer.analyze(entry);
+    if (ApplyShapeGroups) {
+        //  (A transform the regular plan does not implement, by its shape
+        //  groups; otherwise, segment by segment, the plan with fewer kernels.)
+        if (!a.implementable) {
+            assert (mAnalyzer.shapeGroupsOf(entry).applicable);
+            return applyShapeGroups(mAnalyzer.shapeGroupsOf(entry), U21);
+        }
+        //  (Not within a filter: the passes of the engine apply to the whole
+        //  text, and the marks of the deferred calls are outside the filter.)
+        const TransformAnalyzer::ShapeChoice & choice = shapeChoice(mRegistry, mAnalyzer, entry);
+        if (choice.any() && !activeMask()) {
+            const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
+            mShapeChoice = &choice;
+            U21 = applyAnalysis(a, U21);
+            mShapeChoice = outer;
+            return U21;
+        }
+    }
     assert (a.implementable);
-    return applyAnalysis(a, U21);
+    const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
+    mShapeChoice = nullptr;
+    U21 = applyAnalysis(a, U21);
+    mShapeChoice = outer;
+    return U21;
+}
+
+//  A transform applied by its shape group plans (see --apply-shape-groups):
+//  its transform rules, and for each conversion group, its passes, each a
+//  search and replace of the engine, then the marks of its deferred calls and
+//  their arguments replaced by their values.  A character map, and the
+//  replacement of the marks (string rules M a → value), are planned as rules
+//  (ldml::planTransform) and applied as conversion groups.
+StreamSet * RulePipelineBuilder::applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21) {
+    const bool outermost = mDepth++ == 0;
+    const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
+    mShapeChoice = nullptr;
+    for (const TransformAnalyzer::ShapeStep & step : groups.steps) {
+        if (step.transform) {
+            U21 = transform(mRegistry.lookup(step.transform->getForwardID().getText()), U21);
+            continue;
+        }
+        U21 = applyShapeStep(step, U21, outermost);
+    }
+    mShapeChoice = outer;
+    mDepth--;
+    return U21;
+}
+
+StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeStep & step, StreamSet * U21, bool outermost) {
+    //  (Each pass in a phase of its own: the rates of the streams of many
+    //  passes in one phase, each filtering and spreading the text, are beyond
+    //  the analysis of the pipeline's rates.)
+    auto searchReplace = [&](const PreparedSearchReplace & sr, StreamSet * text) {
+        RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, text});
+        StreamSet * const result = mP.CreateStreamSet(21);
+        engine.searchReplaceCodeUnitsPipeline(sr, result);
+        mP.InsertPhaseBoundary();
+        return result;
+    };
+    const size_t kernels = mP.getNumOfKernelCalls();
+    size_t rules = 0;
+    for (const ldml::ShapePass & p : step.plan.passes) rules += p.rules.size();
+    for (size_t i = 0; i < step.plan.passes.size(); i++) {
+        if (!step.plan.passes[i].map) {
+            U21 = searchReplace(step.prepared[i], U21);
+            continue;
+        }
+        for (const ldml::TransformStep & s : step.maps[i].steps) U21 = conversionGroup(s, U21);
+        mP.InsertPhaseBoundary();
+    }
+    for (const ldml::TransformStep & s : step.markMap.steps) U21 = conversionGroup(s, U21);
+    if (outermost && rules > 0) mGroupCounts.push_back({rules, mP.getNumOfKernelCalls() - kernels});
+    return U21;
 }
 
 //  The deferred rules of a group (see ldml::DeferredRule and DeferredPlan).
@@ -9572,7 +9970,22 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mNextDeletedRunEnds = nullptr;
     mNextDeletedRunAfter = nullptr;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
+    //  The segments applied by their shape groups (see TransformAnalyzer::
+    //  ShapeChoice): their shape groups in place of their conversion groups.
+    const TransformAnalyzer::ShapeChoice * const choice = mShapeChoice;
+    mShapeChoice = nullptr;
+    size_t segment = 0;
+    std::vector<bool> applied(choice ? choice->useShapes.size() : 0, false);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            segment++;
+        } else if (choice && choice->useShapes[segment]) {
+            if (!applied[segment]) {
+                for (const TransformAnalyzer::ShapeStep & s : choice->shapeSegments[segment]) U21 = applyShapeStep(s, U21, outermost);
+                applied[segment] = true;
+            }
+            continue;
+        }
         //  (The positions of the runs deleted by prefix runs, for the step after
         //  them, past :: Null ;.)
         const bool null = step.kind == ldml::TransformStep::Kind::Transform && !step.filter
@@ -9604,6 +10017,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
         }
     }
     if (a.plan.filter) popFilter();
+    mShapeChoice = choice;
     mDeletedRunEnds = deletedRunEnds;
     mNextDeletedRunEnds = nextDeletedRunEnds;
     mDeletedRunAfter = deletedRunAfter;
@@ -9643,14 +10057,34 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     TransformAnalyzer analyzer(registry);
     const TransformAnalysis & a = analyzer.analyze(entry);
     size_t groups = 0, rules = 0;
+    //  (With --apply-shape-groups: the transform by its shape groups, if the
+    //  regular plan does not implement it; otherwise its segments by the plan
+    //  with fewer kernels, see shapeChoice.  The groups and rules are then
+    //  those built.)
+    const bool byShapeGroups = ApplyShapeGroups && !entry->isBuiltIn() && !a.implementable
+                               && analyzer.shapeGroupsOf(entry).applicable;
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Conversion && groupRules(step) > 0) {
             groups++;
             rules += groupRules(step);
         }
     }
-    toolio::out() << "kernel counts: " << entry->canonicalName << "\n";
-    if (!a.implementable) {
+    toolio::out() << "kernel counts: " << entry->canonicalName << (byShapeGroups ? " (by shape groups)" : "") << "\n";
+    if (ApplyShapeGroups && !entry->isBuiltIn()) {
+        if (!analyzer.shapeGroupsOf(entry).applicable) {
+            toolio::out() << "not entirely by shape groups: " << analyzer.shapeGroupsOf(entry).reason << "\n";
+        }
+        if (a.implementable) {
+            const TransformAnalyzer::ShapeChoice & choice = shapeChoice(registry, analyzer, entry);
+            if (!choice.aligned) toolio::out() << "segments not aligned: regular plan\n";
+            for (size_t k = 0; choice.aligned && k < choice.useShapes.size(); k++) {
+                if (choice.shapeKernels[k] == 0 && choice.regularKernels[k] == 0) continue;
+                toolio::out() << "segment " << (k + 1) << ": regular " << choice.regularKernels[k] << " kernels, shape groups "
+                              << choice.shapeKernels[k] << " kernels: " << (choice.useShapes[k] ? "shape groups" : "regular") << "\n";
+            }
+        }
+    }
+    if (!a.implementable && !byShapeGroups) {
         toolio::out() << "total: " << groups << " groups, " << rules << " rules\n";
         return 2;
     }
@@ -9673,6 +10107,11 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     }
     builder.transform(entry, U21);
     const size_t total = P.getNumOfKernelCalls() - base;
+    if (ApplyShapeGroups) {
+        groups = builder.groupCounts().size();
+        rules = 0;
+        for (const RulePipelineBuilder::GroupCount & g : builder.groupCounts()) rules += g.rules;
+    }
     size_t groupKernels = 0;
     for (size_t i = 0; i < builder.groupCounts().size(); i++) {
         const RulePipelineBuilder::GroupCount & g = builder.groupCounts()[i];
@@ -10163,6 +10602,13 @@ static int run(int argc, char *argv[]) {
         for (const std::string & line : a.revisitReport) toolio::out() << line << "\n";
         return 0;
     }
+    if (ShowShapeGroups) {
+        if (entry->isBuiltIn()) {
+            llvm::errs() << "Error: " << entry->canonicalName << " is a built-in transform\n";
+            return 1;
+        }
+        return printShapeGroups(registry, entry);
+    }
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);
@@ -10194,8 +10640,13 @@ static int run(int argc, char *argv[]) {
     //  The transform applied by ICU (see --use-ICU): all of it, by its name or
     //  as tconv does not implement its own rules, or only the transforms its
     //  rules invoke that ICU applies (in stages with the rest).
-    const bool implemented = impl != implementedTransforms.end() || analyzer.analyze(entry).implementable;
-    bool wholeICU = icu->selected(entry, TransformName) || (entry->isBuiltIn() && isICUBuiltIn(entry->canonicalName));
+    //  (With --apply-shape-groups, a transform the regular plan does not
+    //  implement may be applied by its shape groups; one it does is applied
+    //  with its segments chosen by kernels, see shapeChoice.)
+    const bool byShapeGroups = ApplyShapeGroups && !entry->isBuiltIn() && !analyzer.analyze(entry).implementable
+                               && analyzer.shapeGroupsOf(entry).applicable;
+    const bool implemented = impl != implementedTransforms.end() || analyzer.analyze(entry).implementable || byShapeGroups;
+    bool wholeICU = !byShapeGroups && (icu->selected(entry, TransformName) || (entry->isBuiltIn() && isICUBuiltIn(entry->canonicalName)));
     if (!wholeICU && !implemented && (entry->isBuiltIn() || !ownProblems(analyzer.analyze(entry)).empty())) {
         if (icu->off) return notImplemented("");
         wholeICU = true;
@@ -10207,7 +10658,7 @@ static int run(int argc, char *argv[]) {
                || (!icu->off && (used == nullptr || !analyzer.analyze(used).implementable));
     };
     bool staged = false;
-    if (!wholeICU && !entry->isBuiltIn()) {
+    if (!wholeICU && !entry->isBuiltIn() && !byShapeGroups) {
         for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
             staged |= step.kind == ldml::TransformStep::Kind::Transform && byICU(step);
         }

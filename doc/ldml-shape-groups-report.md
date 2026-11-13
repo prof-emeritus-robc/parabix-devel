@@ -1,0 +1,148 @@
+# Shape groups in tconv: kernel counts and correctness
+
+How `tconv --apply-shape-groups` changes the pipelines of the CLDR transforms,
+compared with the regular plans and with
+[ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md) (generated at
+`d97c03f75`).  Measured on 2026-11-13 with tconv built from master
+(`3d56b029b`) plus the uncommitted shape-group work; CLDR transforms in
+`~/cldr/common/transforms`, test data in `~/cldr/testData/transforms`.
+
+## What shape groups are
+
+A conversion group is planned as search-and-replace passes of the regular
+expression engine, one per *shape* of the rules' results (see
+`include/ldml/shape_groups.h`):
+
+- The rules with the same result shape are matched together. The search
+  pattern is a branch-reset alternation of their source sides, and the
+  replacement is the shared shape.
+- Function calls (`&T($k)`) are deferred: the replacement writes a mark before
+  the argument, and the marks are mapped to the function's values at the end,
+  as one string-rule group.
+- Rules that map single characters to literal text, without contexts, form
+  one character-map pass, planned by `ldml::planTransform`.
+- Ordering between shapes is arranged by guards (`(?<!…)`) and pass order.
+- Before contexts read the converted text through a closure over the deleted
+  characters, for example `(?<=\p{letter}(?:\x{FDD9}5|5)*)`.
+
+`tconv --shape-groups <transform>` prints the plan; `--apply-shape-groups`
+applies it.
+
+**Per-segment choice.** A *segment* is the run of conversion groups between
+consecutive `::X` transform rules. When the regular plan and the shape groups
+have the same transform rules and no filters, each segment uses whichever
+plan builds fewer kernels. The counting is done in a scratch pipeline that is
+built but never compiled.
+
+Shape groups are not used inside a filter: the engine passes apply to the
+whole text, and the marks lie outside the filter. A transform that the
+regular plan cannot implement is applied entirely by its shape groups, if
+they are implementable.
+
+## Transforms whose pipelines change
+
+Kernel counts are from `tconv --kernel-counts`. "Group kernels" counts the
+transform's own conversion groups. "Kernels" counts the whole transform,
+including the transforms it uses.
+
+| Transform | group kernels: table / regular / **shape groups** | kernels: table / regular / **shape groups** | change | CLDR tests vs ICU | random text vs ICU |
+|---|---:|---:|---:|---|---|
+| NumericPinyin-Latin | 699 / 699 / **188** | 848 / 848 / **337** | −60% | (no test file) | identical (300 lines) |
+| am-am_FONIPA | 516 / 538 / **190** | 516 / 538 / **190** | −65% | am-fonipa-t-am: 607 cases, 0 differ (0 from expected) | identical |
+| am-ar (uses am-am_FONIPA) | 4 / 4 / 4 | 816 / 816 / **468** | −43% | ar-t-am: 54 cases, 0 differ (0 from expected) | identical |
+| am-fa (uses am-am_FONIPA) | 0 / 0 / 0 | 762 / 785 / **437** | −44% | fa-t-am: 54 cases, 0 differ (0 from expected) | identical |
+| am-chr (uses am-am_FONIPA) | 0 / 0 / 0 | 777 / 799 / **451** | −44% | output identical to the regular plan's (see notes) | identical |
+
+- **NumericPinyin-Latin:** the regular plan expands `&NumericPinyin-Pinyin($3)`
+  into 5 variants of each of 15 rules (75 rules). The shape groups keep the
+  15 rules in 3 passes, plus one mark-mapping group.
+- **am-am_FONIPA:** the saving is all in its second segment, 487 → 139 kernels.
+- **Regular counts that differ from the table:** am-am_FONIPA (516 → 538) and
+  its users have grown since the table was generated. These are changes on
+  master, not shape groups.
+
+## Segments where both plans were counted
+
+33 transforms have segments with both plans. Shape groups were chosen in 2
+segments:
+
+| Transform | segment | regular | shape groups | chosen |
+|---|---:|---:|---:|---|
+| NumericPinyin-Latin | 2 | 699 | 188 | shape groups |
+| am-am_FONIPA | 2 | 487 | 139 | shape groups |
+| Any-Accents | 2 | 10 | 720 | regular |
+| rm_SURSILV-rm_FONIPA_SURSILV | 3 | 13 | 420 | regular |
+| ro-ro_FONIPA | 4 | 13 | 357 | regular |
+| und_FONIPA-chr | 3, 5 | 31, 16 | 137, 30 | regular |
+| my-my_FONIPA | 2, 7, 8 | 26, 26, 10 | 37, 92, 39 | regular |
+| es_FONIPA-es_419_FONIPA | 1 | 16 | 25 | regular |
+| nv-nv_FONIPA | 4 | 15 | 19 | regular |
+| Han-Latin/Names | 1 | 19 | 20 | regular |
+
+In the other 23 transforms the counts tie, so the regular plan stays. They
+are mostly character maps (Georgian-Latin, Fullwidth-Halfwidth, Cans-Latn,
+Syrc-Latn, the Pinyin pair, Accents-Any, Publishing-Any and others), which
+both plans build with the same machinery.
+
+**Pattern.** Shape groups win where the regular plan multiplies rules into
+variants, or builds many sets of capture rules. They lose where a group
+splits into many small shapes, since each pass is a whole engine
+search-and-replace pipeline. Choosing the cheaper plan per segment keeps
+every count above at or below the regular plan.
+
+## Where shape groups do not apply
+
+Problems that stop a transform with conversion groups from being planned
+entirely by shape groups:
+
+| Reason | transforms |
+|---|---:|
+| a filter rule (not supported) | 71 |
+| more than one shape with before contexts | 19 |
+| a shape whose matches may begin within another's, ending elsewhere | 16 |
+| a shape applied after another, with an after context | 13 |
+| a result with text to revisit or a cursor | 13 |
+| a shape with before contexts, applied after others, with an after context | 8 |
+| rules that may match at the same position | 5 |
+| a before context of more than one set, against the converted text | 4 |
+| too many rules for the pairwise analyses (`n(n−1)/2` > 200,000) | 4 |
+| a transform rule with a filter | 4 |
+| analyses of pairs of rules over budget (200,000) | 3 |
+| a shape that may match the text written by an earlier shape | 3 |
+| a pass not accepted by the engine | 2 |
+| shapes whose matches may begin within each other's | 1 |
+
+**Example:** Latin-NumericPinyin (forward) has two shapes with before
+contexts, `e { (tone) r → r &f($1)` and the bare `(tone) → &f($1)`.
+
+## Notes and limits
+
+- **Correctness checks.** Each changed transform was run on 300 lines of
+  random text, built from the characters of its rule file, and on its CLDR
+  test file where one exists. Both were compared with ICU (`tconv
+  --use-ICU='.*'`).
+  - An earlier round used `--use-ICU=1`. That option takes a regular
+    expression over transform names, and `1` matches none, so those runs
+    compared tconv against its own regular pipeline. All results here are
+    against ICU.
+- **am-chr.** Run with all its test cases as lines of one text, tconv differs
+  from ICU on 52 of 53 cases. The regular plan does exactly the same, and the
+  coverage table, which runs each case as its own text, records 0/53
+  failures. This is not a shape-group difference.
+- **Bopo-Latn.** It invokes NumericPinyin-Latin within a filter. Shape groups
+  are not used there: before that restriction, the marks inside the filter
+  were left unmapped. On random text both plans differ from ICU in the same
+  way: ICU leaves the tone digits where tconv applies them. This is a
+  separate, existing issue.
+- **Number of passes.** Pipelines with more than about 24 chained engine
+  passes fail to build, either in the rate analysis (`boost::bad_rational`)
+  or by exhausting virtual address space. Phase boundaries between the passes
+  do not help. The per-segment choice avoids such plans, since they always
+  have more kernels.
+- **Planning time.** The pairwise rule analyses are limited to 200,000 per
+  group. The 7,718-rule Amharic geminate word list used to take many minutes
+  and is now rejected at once. Ordering the rules (by first characters,
+  inner characters and literal prefixes) would make such groups cheap to
+  analyze; that is not yet done.
+- Kernel counts are not timings: the effect on run time has not been
+  measured.

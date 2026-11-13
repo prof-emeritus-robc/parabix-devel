@@ -285,8 +285,96 @@ bool characterMapRule(const RuleInfo & info, CharSetAnalysis & sets) {
 }
 
 // The largest number of analyses of pairs of rules (RuleOverlapAnalysis) in
-// the plan of a group: a few seconds at most.
+// the plan of a group: a few seconds at most.  Only the pairs that may meet
+// the necessary conditions of the analyses are analyzed (see SetIndex).
 constexpr size_t MaxShapePairAnalyses = 200000;
+
+// The largest number of passes of a group: pipelines of more search and
+// replace passes of the engine fail to build (and would take more kernels
+// than the regular plan).
+constexpr size_t MaxShapePasses = 24;
+
+// An index of sets of characters (the leading characters of rules, or the
+// characters within their texts, see RuleOverlapAnalysis::Leading): the items
+// whose sets meet a set, without testing each item.  The code points are
+// divided into the intervals between the bounds of the ranges of the sets,
+// each of which a set includes entirely or not at all; an item is listed in
+// the intervals of its set, unless they are many (a wide set, tested
+// directly).  An item may meet any set (e.g. a rule whose text and after
+// context may be empty).
+class SetIndex {
+public:
+    void add(const UCD::UnicodeSet & set, bool any = false) {
+        mSets.push_back(set);
+        mAny.push_back(any);
+    }
+    void build() {
+        std::vector<UCD::codepoint_t> bounds;
+        for (const UCD::UnicodeSet & set : mSets) {
+            for (const auto & range : set) {
+                bounds.push_back(range.first);
+                bounds.push_back(range.second + 1);
+            }
+        }
+        std::sort(bounds.begin(), bounds.end());
+        bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
+        mBounds = std::move(bounds);
+        mMembers.assign(mBounds.size(), {});
+        for (size_t i = 0; i < mSets.size(); i++) {
+            if (mAny[i]) continue;
+            std::vector<size_t> intervals;
+            for (const auto & range : mSets[i]) {
+                for (size_t k = interval(range.first); (k < mBounds.size()) && (mBounds[k] <= range.second); k++) {
+                    intervals.push_back(k);
+                    if (intervals.size() > MaxIntervals) break;
+                }
+                if (intervals.size() > MaxIntervals) break;
+            }
+            if (intervals.size() > MaxIntervals) {
+                mWide.push_back(i);
+            } else {
+                for (size_t k : intervals) mMembers[k].push_back(i);
+            }
+        }
+    }
+    // The items meeting q (all of them with all), in order.
+    std::vector<size_t> meeting(const UCD::UnicodeSet & q, bool all = false) const {
+        std::vector<size_t> found;
+        if (all) {
+            for (size_t i = 0; i < mSets.size(); i++) found.push_back(i);
+            return found;
+        }
+        std::vector<bool> seen(mSets.size(), false);
+        auto take = [&](size_t i) {
+            if (!seen[i]) {
+                seen[i] = true;
+                found.push_back(i);
+            }
+        };
+        for (const auto & range : q) {
+            for (size_t k = interval(range.first); (k < mBounds.size()) && (mBounds[k] <= range.second); k++) {
+                for (size_t i : mMembers[k]) take(i);
+            }
+        }
+        for (size_t i : mWide) if (mSets[i].intersects(q)) take(i);
+        for (size_t i = 0; i < mSets.size(); i++) if (mAny[i]) take(i);
+        std::sort(found.begin(), found.end());
+        return found;
+    }
+private:
+    static constexpr size_t MaxIntervals = 64;
+    // The interval of a code point (the last bound not after it; the first
+    // interval for a code point before every bound).
+    size_t interval(UCD::codepoint_t cp) const {
+        const auto f = std::upper_bound(mBounds.begin(), mBounds.end(), cp);
+        return (f == mBounds.begin()) ? 0 : static_cast<size_t>(f - mBounds.begin() - 1);
+    }
+    std::vector<UCD::UnicodeSet> mSets;
+    std::vector<bool> mAny;
+    std::vector<UCD::codepoint_t> mBounds;
+    std::vector<std::vector<size_t>> mMembers;
+    std::vector<size_t> mWide;
+};
 
 ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules, const FunctionEvaluator * evaluate) {
     ShapeGroupPlan plan;
@@ -341,13 +429,19 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
     }
     if (!plan.problems.empty()) return plan;
 
+    // The passes: one for each shape (all the character map rules, one).
+    {
+        std::set<std::string> distinct;
+        for (const RuleInfo & info : infos) distinct.insert(info.shape);
+        if (distinct.size() > MaxShapePasses) {
+            problem("too many shapes for the passes of shape groups: " + std::to_string(distinct.size()) +
+                    " (at most " + std::to_string(MaxShapePasses) + ")");
+            return plan;
+        }
+    }
+
     // The rules must match at different positions.  (The analyses of pairs of
     // rules are limited: see MaxShapePairAnalyses.)
-    const size_t n = infos.size();
-    if (n * (n - 1) / 2 > MaxShapePairAnalyses) {
-        problem("too many rules for the analyses of shape groups: " + std::to_string(n) + " rules");
-        return plan;
-    }
     RuleOverlapAnalysis analysis;
     size_t analyses = 0;
     bool exhausted = false;
@@ -369,14 +463,28 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
                                std::to_string(MaxShapePairAnalyses) + ")");
         return exhausted;
     };
+    // The leading characters of the rules, and the characters within their
+    // texts, indexed: only the pairs of rules meeting the necessary conditions
+    // of the analyses are analyzed (see RuleOverlapAnalysis::Leading).
+    std::vector<RuleOverlapAnalysis::Leading> leading;
+    std::vector<UCD::UnicodeSet> inner;
+    SetIndex leadingIndex;
+    for (const RuleInfo & info : infos) {
+        leading.push_back(analysis.leading(info.rule));
+        inner.push_back(analysis.within(info.rule));
+        leadingIndex.add(leading.back().chars, leading.back().mayBeEmpty);
+    }
+    leadingIndex.build();
     for (size_t i = 0; i < infos.size(); i++) {
-        for (size_t j = i + 1; j < infos.size(); j++) {
-            if (overlaps.mayOverlap(infos[i].rule, infos[j].rule)) {
+        for (size_t j : leadingIndex.meeting(leading[i].chars, leading[i].mayBeEmpty)) {
+            if ((j > i) && overlaps.mayOverlap(infos[i].rule, infos[j].rule)) {
                 problem("rules that may match at the same position: " + printRule(infos[i].rule) + "  |  " +
                         printRule(infos[j].rule));
                 return plan;
             }
+            if (exhausted) break;
         }
+        if (outOfBudget()) return plan;
     }
 
     // The deferred calls, by function.
@@ -421,6 +529,7 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
     std::vector<ShapePass> shapes;
     std::map<std::string, size_t> shapeOf;
     std::vector<std::vector<const RuleInfo *>> shapeInfos;
+    std::vector<size_t> shapeOfRule;       // the shape of each rule (by index in infos)
     for (const RuleInfo & info : infos) {
         auto f = shapeOf.find(info.shape);
         if (f == shapeOf.end()) {
@@ -432,6 +541,7 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
         }
         shapes[f->second].rules.push_back(info.rule);
         shapeInfos[f->second].push_back(&info);
+        shapeOfRule.push_back(f->second);
         if (info.rule->getLeftSide()->hasBeforeContext()) shapes[f->second].contexts = true;
     }
     const size_t S = shapes.size();
@@ -456,7 +566,7 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
 
     // The text written by a rule (marks for the calls), as the text of a rule
     // (for the overlap analysis).
-    auto written = [&](const RuleInfo & info) {
+    auto writtenText = [&](const RuleInfo & info) {
         std::vector<re::RE *> items;
         for (const ResultItem & item : info.items) {
             if (item.kind == ResultItem::Kind::Literal) {
@@ -470,6 +580,32 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
         }
         return makeConversionRule(makeRuleSide(re::makeSeq(items.begin(), items.end())), Direction::Forward,
                                   makeRuleSide(re::makeSeq()));
+    };
+    // The texts written, by rule, and indexed by their leading characters and
+    // the characters within them.
+    std::vector<const ConversionRule *> written;
+    std::vector<RuleOverlapAnalysis::Leading> writtenLeading;
+    SetIndex writtenLeadingIndex, writtenWithinIndex;
+    for (const RuleInfo & info : infos) {
+        written.push_back(writtenText(info));
+        writtenLeading.push_back(analysis.leading(written.back()));
+        writtenLeadingIndex.add(writtenLeading.back().chars, writtenLeading.back().mayBeEmpty);
+        writtenWithinIndex.add(analysis.within(written.back()));
+    }
+    writtenLeadingIndex.build();
+    writtenWithinIndex.build();
+    // The rules whose written texts a rule b may match (mayOverlap(b, w),
+    // mayMatchWithin(b, w) or mayMatchWithin(w, b)), by the indexes.
+    auto writtenMet = [&](const RuleOverlapAnalysis::Leading & lb, const UCD::UnicodeSet & within) {
+        std::vector<size_t> found = writtenLeadingIndex.meeting(lb.chars + within, lb.mayBeEmpty);
+        for (size_t k : writtenWithinIndex.meeting(lb.chars, lb.mayBeEmpty)) found.push_back(k);
+        std::sort(found.begin(), found.end());
+        found.erase(std::unique(found.begin(), found.end()), found.end());
+        return found;
+    };
+    auto mayMatchWritten = [&](const ConversionRule * b, size_t a) {
+        const ConversionRule * const w = written[a];
+        return overlaps.mayOverlap(b, w) || overlaps.mayMatchWithin(b, w) || overlaps.mayMatchWithin(w, b);
     };
 
     // The shapes without before contexts: the yields between them.
@@ -485,24 +621,32 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
             contextShape = x;
         }
     }
-    auto within = [&](size_t x, size_t y) {      // a match of x may begin within one of y
-        for (const RuleInfo * a : shapeInfos[x]) {
-            for (const RuleInfo * b : shapeInfos[y]) {
-                if (overlaps.mayMatchWithin(a->rule, b->rule)) return true;
-            }
+    // The pairs of shapes (x, y) without before contexts such that a match of
+    // x may begin within one of y: by the pairs of their rules (a, b) such
+    // that a may match within b, among those whose leading characters (of a)
+    // meet the characters within the text (of b).
+    std::set<std::pair<size_t, size_t>> withinPairs;
+    for (size_t b = 0; b < infos.size(); b++) {
+        const size_t y = shapeOfRule[b];
+        if (shapes[y].contexts || inner[b].empty()) continue;
+        for (size_t a : leadingIndex.meeting(inner[b])) {
+            const size_t x = shapeOfRule[a];
+            if ((x == y) || shapes[x].contexts || withinPairs.count({x, y})) continue;
+            if (overlaps.mayMatchWithin(infos[a].rule, infos[b].rule)) withinPairs.insert({x, y});
+            if (exhausted) break;
         }
-        return false;
-    };
+        if (outOfBudget()) return plan;
+    }
     std::vector<std::vector<size_t>> yieldsTo(S);
     std::vector<std::vector<size_t>> appliedAfter(S);   // (the character map, after the shapes it may lie within)
-    for (size_t x : plain) {
-        for (size_t y : plain) {
-            if ((x == y) || !within(x, y)) continue;
+    for (const auto & xy : withinPairs) {
+        const size_t x = xy.first, y = xy.second;
+        {
             if (shapes[x].map) {
                 appliedAfter[x].push_back(y);
                 continue;
             }
-            if (within(y, x)) {
+            if (withinPairs.count({y, x})) {
                 problem("shapes whose matches may begin within each other's: " + shapes[x].shape + "  |  " + shapes[y].shape);
                 continue;
             }
@@ -526,50 +670,56 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
     if (outOfBudget() || !plan.problems.empty()) return plan;
     // The order of the passes: a shape before those it yields to (in the
     // order of the first rules, as far as possible).
+    // (A shape is placed when no unplaced shape yields to it, nor must be
+    // applied before it: the first such shape, each time.)
     std::vector<size_t> order;
-    std::vector<bool> placed(S, false);
-    while (order.size() < plain.size()) {
-        bool progress = false;
-        for (size_t x : plain) {
-            if (placed[x]) continue;
-            // x may be placed when no unplaced shape yields to it, nor must
-            // be applied before it.
-            bool ready = true;
-            for (size_t z : plain) {
-                if (!placed[z] && (z != x) && ((std::find(yieldsTo[z].begin(), yieldsTo[z].end(), x) != yieldsTo[z].end()) ||
-                                              (std::find(appliedAfter[x].begin(), appliedAfter[x].end(), z) != appliedAfter[x].end()))) {
-                    ready = false;
-                }
+    {
+        std::vector<std::vector<size_t>> later(S);      // the shapes to place after each
+        std::vector<size_t> waiting(S, 0);              // the shapes to place before each
+        for (size_t z : plain) {
+            for (size_t x : yieldsTo[z]) {
+                later[z].push_back(x);
+                waiting[x]++;
             }
-            if (!ready) continue;
-            order.push_back(x);
-            placed[x] = true;
-            progress = true;
-            break;
         }
-        if (!progress) {
+        for (size_t x : plain) {
+            for (size_t z : appliedAfter[x]) {
+                later[z].push_back(x);
+                waiting[x]++;
+            }
+        }
+        std::set<size_t> ready;
+        for (size_t x : plain) if (waiting[x] == 0) ready.insert(x);
+        while (!ready.empty()) {
+            const size_t x = *ready.begin();
+            ready.erase(ready.begin());
+            order.push_back(x);
+            for (size_t z : later[x]) if (--waiting[z] == 0) ready.insert(z);
+        }
+        if (order.size() < plain.size()) {
             problem("shapes yielding to one another in a cycle");
             return plan;
         }
     }
     // A shape applied after another may not match the text it writes, and
     // reads no text after its matches.
-    for (size_t i = 0; i < order.size(); i++) {
-        for (size_t j = i + 1; j < order.size(); j++) {
-            for (const RuleInfo * b : shapeInfos[order[j]]) {
-                if (b->rule->getLeftSide()->hasAfterContext()) {
-                    problem("a shape applied after another, with an after context: " + printRule(b->rule));
-                }
-                for (const RuleInfo * a : shapeInfos[order[i]]) {
-                    const ConversionRule * const w = written(*a);
-                    if (overlaps.mayOverlap(b->rule, w) || overlaps.mayMatchWithin(b->rule, w) ||
-                            overlaps.mayMatchWithin(w, b->rule)) {
-                        problem("a shape that may match the text written by a shape applied before it: " +
-                                printRule(b->rule) + "  in the text of  " + printRule(a->rule));
-                    }
-                }
-            }
+    std::vector<size_t> passOfShape(S, S);
+    for (size_t i = 0; i < order.size(); i++) passOfShape[order[i]] = i;
+    for (size_t b = 0; b < infos.size(); b++) {
+        const size_t j = passOfShape[shapeOfRule[b]];
+        if ((j == S) || (j == 0)) continue;
+        if (infos[b].rule->getLeftSide()->hasAfterContext()) {
+            problem("a shape applied after another, with an after context: " + printRule(infos[b].rule));
         }
+        for (size_t a : writtenMet(leading[b], inner[b])) {
+            if (passOfShape[shapeOfRule[a]] >= j) continue;
+            if (mayMatchWritten(infos[b].rule, a)) {
+                problem("a shape that may match the text written by a shape applied before it: " +
+                        printRule(infos[b].rule) + "  in the text of  " + printRule(infos[a].rule));
+            }
+            if (exhausted) break;
+        }
+        if (outOfBudget()) return plan;
     }
 
     if (outOfBudget() || !plan.problems.empty()) return plan;
@@ -703,18 +853,24 @@ ShapeGroupPlan planShapeGroup(const std::vector<const ConversionRule *> & rules,
         // Its matches may not contain the start of a match of an earlier pass,
         // nor match the text the earlier passes write.
         for (const ConversionRule * b : asApplied) {
-            for (size_t x : plain) {
-                for (const RuleInfo * a : shapeInfos[x]) {
-                    const ConversionRule * const w = written(*a);
-                    if (overlaps.mayMatchWithin(a->rule, b)) {
-                        problem("a match of an earlier pass may begin within " + printRule(b));
-                    }
-                    if (overlaps.mayOverlap(b, w) || overlaps.mayMatchWithin(b, w) || overlaps.mayMatchWithin(w, b)) {
-                        problem("a shape with before contexts that may match the text written by an earlier pass: " +
-                                printRule(b) + "  in the text of  " + printRule(a->rule));
-                    }
+            const RuleOverlapAnalysis::Leading lb = analysis.leading(b);
+            const UCD::UnicodeSet within = analysis.within(b);
+            for (size_t a : leadingIndex.meeting(within)) {
+                if (shapes[shapeOfRule[a]].contexts || within.empty()) continue;
+                if (overlaps.mayMatchWithin(infos[a].rule, b)) {
+                    problem("a match of an earlier pass may begin within " + printRule(b));
                 }
+                if (exhausted) break;
             }
+            for (size_t a : writtenMet(lb, within)) {
+                if (shapes[shapeOfRule[a]].contexts) continue;
+                if (mayMatchWritten(b, a)) {
+                    problem("a shape with before contexts that may match the text written by an earlier pass: " +
+                            printRule(b) + "  in the text of  " + printRule(infos[a].rule));
+                }
+                if (exhausted) break;
+            }
+            if (outOfBudget()) return plan;
         }
         if (outOfBudget()) return plan;
         c.search = searchOf(contextShape, befores);

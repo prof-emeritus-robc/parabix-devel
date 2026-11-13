@@ -58,6 +58,12 @@
 //  takes precedence over another shape; where a match of the map may lie
 //  within a match of another shape, the map is applied after that shape (not
 //  guarded), which requires that it may not match the text that shape writes.
+//
+//  The analyses of pairs of rules (RuleOverlapAnalysis) are made only for the
+//  pairs that may meet their necessary conditions (the rules indexed by their
+//  leading characters and the characters within their texts), and limited in
+//  number; a group of more than 24 shapes is not planned (its pipeline of
+//  passes would fail to build).
 
 #pragma once
 

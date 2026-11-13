@@ -169,25 +169,28 @@ every count above at or below the regular plan.
 
 ## Where shape groups do not apply
 
-Problems that stop a transform with conversion groups from being planned
-entirely by shape groups:
+The first reason why a transform is not applied entirely by shape groups, as
+`tconv --kernel-counts` reports it, for each CLDR-defined transform for which
+one is given (regenerated after rule ordering, see "Planning time" below; the
+earlier version of this table counted only transforms with conversion groups
+of their own, so the counts are not comparable):
 
 | Reason | transforms |
 |---|---:|
-| a filter rule (not supported) | 71 |
-| more than one shape with before contexts | 19 |
-| a shape whose matches may begin within another's, ending elsewhere | 16 |
-| a shape applied after another, with an after context | 13 |
-| a result with text to revisit or a cursor | 13 |
-| a shape with before contexts, applied after others, with an after context | 8 |
+| a filter rule (not supported) | 187 |
+| too many shapes for the passes (more than 24) | 32 |
+| a shape applied after another, with an after context | 22 |
+| a result with text to revisit or a cursor | 16 |
+| a shape whose matches may begin within another's, ending elsewhere | 11 |
+| a shape with before contexts, applied after others, with an after context | 10 |
+| more than one shape with before contexts | 8 |
+| a transform rule with a filter | 5 |
 | rules that may match at the same position | 5 |
 | a before context of more than one set, against the converted text | 4 |
-| too many rules for the pairwise analyses (`n(n−1)/2` > 200,000) | 4 |
-| a transform rule with a filter | 4 |
-| analyses of pairs of rules over budget (200,000) | 3 |
-| a shape that may match the text written by an earlier shape | 3 |
+| a shape that may match the text written by a shape applied before it | 3 |
 | a pass not accepted by the engine | 2 |
-| shapes whose matches may begin within each other's | 1 |
+
+No group exceeds the analyses of pairs of rules any more.
 
 **Example:** Latin-NumericPinyin (forward) has two shapes with before
 contexts, `e { (tone) r → r &f($1)` and the bare `(tone) → &f($1)`.
@@ -216,10 +219,29 @@ contexts, `e { (tone) r → r &f($1)` and the bare `(tone) → &f($1)`.
   or by exhausting virtual address space. Phase boundaries between the passes
   do not help. The per-segment choice avoids such plans, since they always
   have more kernels.
-- **Planning time.** The pairwise rule analyses are limited to 200,000 per
-  group. The 7,718-rule Amharic geminate word list used to take many minutes
-  and is now rejected at once. Ordering the rules (by first characters,
-  inner characters and literal prefixes) would make such groups cheap to
-  analyze; that is not yet done.
+- **Planning time.** Only the pairs of rules that may meet the necessary
+  conditions of the overlap analyses are analyzed. The rules are indexed by
+  their leading characters, those their text and after context may begin
+  with, and by the characters that may follow a position within their texts
+  (`RuleOverlapAnalysis::leading` and `within`, and `SetIndex` in
+  `lib/ldml/shape_groups.cpp`):
+  - two rules may match at the same position only if their leading
+    characters meet;
+  - a rule may match within another only if its leading characters meet the
+    characters within the other's text.
+
+  The yields between shapes and the order of the passes come from these
+  pairs too, instead of all pairs of shapes. The limit of 200,000 analyses
+  per group stays, but no group reaches it now: the blanket rejection of
+  groups of more than about 630 rules is gone. Jpan-Latn's 4,119 rules (one
+  character map) and Latin-ASCII's 846 are planned, and Hani-Latn's 1,404
+  are analyzed to a problem of their own; with every pair analyzed, all
+  three exceed the limit. All other plans are the same with and without the
+  index. A group of more than 24 shapes (passes) is rejected before any
+  analysis, as such pipelines fail to build and take more kernels than the
+  regular plans: 71 groups, among them the 7,718-rule Amharic geminate list
+  (also filtered) and Hans-Hant's 1,188 shapes. Planning all the transforms'
+  shape groups takes 25 s, as before; the rest of the time is parsing and
+  the regular analysis.
 - Kernel counts are not timings; see "Run-time performance" above for the
   measurements.

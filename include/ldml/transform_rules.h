@@ -527,6 +527,24 @@ public:
     // May rule s match at a position strictly within the text matched by
     // the text to replace of rule r, when r matches?
     bool mayMatchWithin(const ConversionRule * s, const ConversionRule * r);
+    // Necessary conditions of these, cheap to test (e.g. to index the rules
+    // of a group by them, and analyze only the pairs that meet them):
+    //   mayOverlap(r1, r2) only if leading(r1) and leading(r2) may meet;
+    //   mayMatchWithin(s, r) only if leading(s) may meet within(r).
+    // The leading characters of a rule: those its text to replace followed
+    // by its after context may begin with, unless it may be empty (then it
+    // meets any set).
+    struct Leading {
+        UCD::UnicodeSet chars;
+        bool mayBeEmpty = false;
+        bool meets(const UCD::UnicodeSet & s) const {return mayBeEmpty || chars.intersects(s);}
+        bool meets(const Leading & other) const {return mayBeEmpty || other.mayBeEmpty || chars.intersects(other.chars);}
+    };
+    Leading leading(const ConversionRule * r);
+    // The characters that may follow a position strictly within a match of
+    // the text to replace of a rule (none if it matches one character at
+    // most).
+    UCD::UnicodeSet within(const ConversionRule * r);
 private:
     struct Impl;
     std::unique_ptr<Impl> mImpl;

@@ -59,6 +59,7 @@ private:
     Marker compileCodeUnitCharacter(Seq::const_iterator current, unsigned span, Marker marker);
     Marker compileAlt(Alt * alt, Marker base);
     Marker compileAssertion(Assertion * a, Marker marker);
+    Marker compileAssertionBody(Assertion * a, Marker marker);
     Marker compileRep(int LB, int UB, RE * repeated, Marker marker);
     Marker compileDiff(Diff * diff, Marker marker);
     Marker compileIntersect(Intersect * x, Marker marker);
@@ -74,6 +75,12 @@ private:
     Marker compileEnd(Marker marker);
 
     PabloAST * getCompiledCC(CC * cc);
+    // The positions of characters matched, restricted to the text mask
+    // outside the contexts (see RE_Compiler::setTextMask).
+    PabloAST * inText(PabloAST * matched) {
+        if ((mMain.mTextMask == nullptr) || (mMain.mContextDepth > 0)) return matched;
+        return mPB.createAnd(matched, mMain.mTextMask, "inText");
+    }
 
     PabloAST * NextCharacter(Marker marker, PabloBuilder & pb);
     PabloAST * NextCodeUnitStream(Marker marker, PabloBuilder & pb);
@@ -184,7 +191,7 @@ Marker RE_Block_Compiler::process(RE * const re, Marker marker) {
 
 Marker RE_Block_Compiler::compileAny(Marker marker) {
     PabloAST * nextPos = NextCharacter(marker, mPB);
-    return Marker(mPB.createAnd(nextPos, mMain.mMatchable, "Any"));
+    return Marker(inText(mPB.createAnd(nextPos, mMain.mMatchable, "Any")));
 }
 
 Marker RE_Block_Compiler::compileCC(CC * const cc, Marker marker) {
@@ -210,7 +217,7 @@ Marker RE_Block_Compiler::compileCC(CC * const cc, Marker marker) {
     } else {
         nextPos = NextCharacter(marker, mPB);
     }
-    return Marker(mPB.createAnd(nextPos, ccStrm, "cc_" + cc->canonicalName()));
+    return Marker(inText(mPB.createAnd(nextPos, ccStrm, "cc_" + cc->canonicalName())));
 }
 
 Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
@@ -288,7 +295,8 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
         if (adv > 0) {
             extFinal = mPB.createIndexedAdvance(extFinal, mMain.mIndexStream, adv);
         }
-        return Marker(mPB.createAnd(extFinal, marker.stream(), "la_" + nameString), marker.position());
+        PabloAST * const matched = mPB.createAnd(extFinal, marker.stream(), "la_" + nameString);
+        return Marker((externalLength > 0) ? inText(matched) : matched, marker.position());
     }
     if (marker.stream() == mMain.mIndexStream) {
         // We are at the beginning of a regular expression;
@@ -297,7 +305,8 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
         if (ext.offset() > 0) {
             return Marker(ext.stream(), Position::AtNextChar);
         }
-        return Marker(mPB.createAnd(mMain.mMatchable, ext.stream()));
+        PabloAST * const matched = mPB.createAnd(mMain.mMatchable, ext.stream());
+        return Marker((ext.maxLength() > 0) ? inText(matched) : matched);
     }
     if (externalLength != ext.maxLength()) {
         llvm::report_fatal_error(llvm::StringRef("Variable length external not in initial position:  ")  + nameString);
@@ -309,7 +318,8 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
     }
     PabloAST * extStream = mPB.createAnd(nextPos, ext.stream(), "ext_" + nameString);
     if (ext.offset() == 0) {
-        return Marker(mPB.createAnd(mMain.mMatchable, extStream));
+        PabloAST * const matched = mPB.createAnd(mMain.mMatchable, extStream);
+        return Marker((externalLength > 0) ? inText(matched) : matched);
     }
     return Marker(extStream, Position::AtNextChar);
 }
@@ -437,6 +447,16 @@ Marker RE_Block_Compiler::compileAlt(Alt * const alt, const Marker base) {
 }
 
 Marker RE_Block_Compiler::compileAssertion(Assertion * const a, Marker marker) {
+    // (A positive lookaround is a context: its characters are not restricted
+    // to the text mask, see RE_Compiler::setTextMask.)
+    const bool context = (a->getSense() == Assertion::Sense::Positive);
+    if (context) mMain.mContextDepth++;
+    Marker result = compileAssertionBody(a, marker);
+    if (context) mMain.mContextDepth--;
+    return result;
+}
+
+Marker RE_Block_Compiler::compileAssertionBody(Assertion * const a, Marker marker) {
     RE * asserted = a->getAsserted();
     if (a->getKind() == Assertion::Kind::LookBehind) {
         Marker lookback = compile(asserted);
@@ -858,7 +878,10 @@ Marker RE_Block_Compiler::expandUpperBound(RE * const repeated, const int ub, Ma
 Marker RE_Block_Compiler::processUnboundedRep(RE * const repeated, Marker marker) {
     // always use PostPosition markers for unbounded repetition.
     PabloAST * base = NextCharacter(marker, mPB);
-    if (Name * n = dyn_cast<Name>(repeated)) {
+    // (A string class matched by the streams of its occurrences, but within
+    // the text mask, by its definition: see RE_Compiler::setTextMask.)
+    Name * const n = dyn_cast<Name>(repeated);
+    if (n && !((mMain.mTextMask != nullptr) && (mMain.mContextDepth == 0) && n->getDefinition())) {
         auto f = mMain.mStringClassMap.find(n->getFullName());
         if (f != mMain.mStringClassMap.end()) {
             // A run of occurrences of the string class from base, ending just

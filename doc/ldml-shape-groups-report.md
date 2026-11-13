@@ -35,10 +35,22 @@ have the same transform rules and no filters, each segment uses whichever
 plan builds fewer kernels. The counting is done in a scratch pipeline that is
 built but never compiled.
 
-Shape groups are not used inside a filter: the engine passes apply to the
-whole text, and the marks lie outside the filter. A transform that the
-regular plan cannot implement is applied entirely by its shape groups, if
-they are implementable.
+**Within a filter.** A transform invoked within a filter (e.g. by a
+transform with a global filter) uses its shape groups too. The filter's mask
+is the engine's *text mask* (`RE_context::textMask`): the text a match covers
+must lie within the filter, while its contexts (positive lookarounds) see the
+whole text, as in ICU, which applies a filtered transform to each run of the
+filter's characters. The engine's analyses are those of the pattern as given;
+the RE compiler restricts the characters matched outside positive lookarounds
+to the mask (`RE_Compiler::setTextMask`), as do the kernels of string
+classes and chain stars. The filter masks are carried through each
+replacement, so the text it writes, including the marks of deferred calls,
+stays within the filter. Not supported within a mask (`textMaskFailures`):
+starts of matches found by reversal, and negative lookaheads of variable
+length. A transform with a filter of its own still uses its regular plan.
+
+A transform that the regular plan cannot implement is applied entirely by its
+shape groups, if they are implementable.
 
 ## Transforms whose pipelines change
 
@@ -117,6 +129,15 @@ The output of each transform is identical with and without shape groups.
   segment is different and start-up takes 0.48 s. Its net times are within
   the noise of that 12.6 s.
 
+**Bopo-Latn** invokes NumericPinyin-Latin within its filter
+`[ˇˉ-ˋ˙ㄅ-ㄩ]`: 969 → 465 kernels with its shape groups. Its output is
+identical to the regular plan's on 400 lines of random Bopomofo, tone marks,
+Latin letters and digits, except for 2 lines where the regular plan changes
+or matches characters outside the filter: for `ㄧ˙5` it deletes the `5`
+after the filter's `yi5` (`yi`, shape groups `yi5`), and for `ㄗ˙ㄊ3` it
+applies the tone of the `3` outside the filter (`zǐt3`, shape groups
+`zit3`). (Real ICU applies no tones in Bopo-Latn at all; see the notes.)
+
 ## Segments where both plans were counted
 
 33 transforms have segments with both plans. Shape groups were chosen in 2
@@ -185,11 +206,11 @@ contexts, `e { (tone) r → r &f($1)` and the bare `(tone) → &f($1)`.
   from ICU on 52 of 53 cases. The regular plan does exactly the same, and the
   coverage table, which runs each case as its own text, records 0/53
   failures. This is not a shape-group difference.
-- **Bopo-Latn.** It invokes NumericPinyin-Latin within a filter. Shape groups
-  are not used there: before that restriction, the marks inside the filter
-  were left unmapped. On random text both plans differ from ICU in the same
-  way: ICU leaves the tone digits where tconv applies them. This is a
-  separate, existing issue.
+- **Bopo-Latn.** It invokes NumericPinyin-Latin within a filter (see "Within
+  a filter" above). On random text both plans differ from ICU: ICU leaves
+  the tone digits where tconv applies them, although ICU's filters otherwise
+  behave as tconv's (text converted within a filter stays within it). This is
+  a separate, existing issue.
 - **Number of passes.** Pipelines with more than about 24 chained engine
   passes fail to build, either in the rate analysis (`boost::bad_rational`)
   or by exhausting virtual address space. Phase boundaries between the passes

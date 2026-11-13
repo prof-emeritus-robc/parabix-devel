@@ -72,6 +72,19 @@ struct RE_context {
     //  of the positions of the source; for a source of Unicode (or of the codes
     //  of a multiplexed alphabet of it) only.
     std::vector<std::pair<std::string, ExternalStream>> externals = {};
+    //  The positions the text of a match may cover (for a source of Unicode,
+    //  with full Unicode indexing): the characters a pattern matches, other
+    //  than those of its positive lookarounds (its contexts, which match the
+    //  whole source), must be at positions of textMask, as if the source were
+    //  divided into the runs of textMask, with the rest of the source as their
+    //  context (e.g. a filter of a transform).  The characters of negative
+    //  lookarounds are restricted as well (they are matches that must not be
+    //  there, e.g. X+(?!X)).  The analyses of the pattern (the preconditions,
+    //  and the strategies for the starts of matches and the walks of captures)
+    //  are those of the pattern as given: a match restricted to the runs is a
+    //  match of the pattern in the text of the runs.  See textMaskFailures for
+    //  what this does not support.
+    kernel::StreamSet * textMask = nullptr;
 };
 
 struct RE_ModeOptions {
@@ -181,6 +194,12 @@ PreparedSearchReplace prepareSearchReplace(re::RE * search, re::RE * replacement
 // fixed lengths moved back: each referred to just before a capture kept in
 // place that precedes it, and rotated back to it in each match (see
 // ReferencePlan in regexp_engine.cpp).
+// What a search and replace with a text mask (see RE_context) does not
+// support, beyond its preconditions: starts of matches found by reversal or by
+// a lookahead chain with a string class, and negative lookaheads of variable
+// length (whose starts are found by kernels other than the RE compiler's).
+std::vector<PreconditionFailure> textMaskFailures(const PreparedSearchReplace & sr);
+
 std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr,
                                                     const cc::Alphabet * sourceEncoding = &cc::UTF8);
 
@@ -212,6 +231,9 @@ public:
     
     void setCombiningStream(kernel::StreamSet * combiningStream, RE_CombiningType k);
 
+    // The positions the text of a match may cover (see RE_context::textMask).
+    void setTextMask(kernel::StreamSet * textMask) {mTextMask = textMask;}
+
 private:
     const cc::Alphabet * mCodeUnitAlphabet;
     kernel::StreamSet * mCodeUnitStream;
@@ -227,6 +249,7 @@ private:
     Alphabets mAlphabets;
     ExternalNameMap mExternals;
     std::vector<std::string> mSpanNames;
+    kernel::StreamSet * mTextMask = nullptr;
 };
 
 class RE_Kernel : public pablo::PabloKernel {
@@ -353,11 +376,13 @@ public:
     // occurrences that include a region follow are excluded.
     // With guards (see re::parseGuardedStringClass), an occurrence of
     // strings[i] counts only where none of guards[i] follows it (within the
-    // region).
+    // region).  With a text mask (see RE_context::textMask), the occurrences
+    // (and those of the guards) are those at positions of the mask only.
     StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
                       kernel::StreamSet * basis, kernel::StreamSet * fillStartsEnds,
                       kernel::StreamSet * follows = nullptr,
-                      std::vector<std::vector<std::vector<re::CC *>>> guards = {});
+                      std::vector<std::vector<std::vector<re::CC *>>> guards = {},
+                      kernel::StreamSet * textMask = nullptr);
     bool hasSignature() const override { return true; }
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
@@ -366,6 +391,7 @@ private:
     const std::vector<std::vector<re::CC *>> mStrings;
     const std::vector<std::vector<std::vector<re::CC *>>> mGuards;
     const bool mHasFollows;
+    const bool mHasTextMask;
     const std::string mSignature;
 };
 
@@ -625,7 +651,13 @@ public:
     // The text with the matches replaced, as for searchReplacePipeline, but
     // as the basis bits of the code units of the source (codeUnits: 8 streams
     // for UTF-8, 21 for a source of Unicode codepoints, see RE_context).
-    void searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, kernel::StreamSet * codeUnits);
+    // With masks (streams of the source, each of which must be 1 throughout
+    // every match replaced, e.g. the masks of filters the matches lie in),
+    // resultMasks: the masks at the positions of the result, 1 at the text
+    // the replacements insert, and otherwise the bit of the source position
+    // kept there.
+    void searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, kernel::StreamSet * codeUnits,
+                                        kernel::StreamSet * masks = nullptr, kernel::StreamSet * resultMasks = nullptr);
 
     // The captures named (see re::capturesByName) in the matches replaced by
     // searchReplacePipeline, for clients that transform captured text
@@ -802,7 +834,8 @@ protected:
         kernel::StreamSet * replaced = nullptr;
     };
     ReplacedText replaceMatches(const PreparedSearchReplace & sr, bool follows, bool replaced,
-                                kernel::StreamSet * result);
+                                kernel::StreamSet * result, kernel::StreamSet * masks = nullptr,
+                                kernel::StreamSet * resultMasks = nullptr);
 
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);

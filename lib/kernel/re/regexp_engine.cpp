@@ -147,7 +147,7 @@ RE * multiplexedCodeUnits(RE * re, const cc::MultiplexedAlphabet * mpx, const Ex
 // such as (?<=^), without match regions): the code units are then an input
 // (unused), which gives the kernel the length of the text.
 bool RE_Kernel::needsTextInput(RE_CompilerContext & ctxt, RE * re) {
-    if (ctxt.mMatchStarts || ctxt.mIndexStream || ctxt.mCombiningType != RE_CombiningType::None) return false;
+    if (ctxt.mMatchStarts || ctxt.mIndexStream || ctxt.mTextMask || ctxt.mCombiningType != RE_CombiningType::None) return false;
     std::set<std::string> localExternals;
     std::set<std::string> localAlphabets;
     gatherExternals(re, localExternals, localAlphabets);
@@ -184,6 +184,9 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
     }
     if (ctxt.mIndexStream) {
         sigstrm << "+X";
+    }
+    if (ctxt.mTextMask) {
+        sigstrm << "+M";
     }
     std::set<std::string> localExternals;
     std::set<std::string> localAlphabets;
@@ -256,6 +259,9 @@ Bindings RE_Kernel::makeInputBindings(RE_CompilerContext & ctxt, RE * re) {
     if (ctxt.mIndexStream) {
         externalBindings.emplace_back("mIndexing", ctxt.mIndexStream);
     }
+    if (ctxt.mTextMask) {
+        externalBindings.emplace_back("mTextMask", ctxt.mTextMask);
+    }
     for (auto & a : ctxt.mAlphabets) {
         auto alphaName = a.first->getName();
         //llvm::errs() << "alphaName: " << alphaName << " count = " << localAlphabets.count(alphaName) << "\n";
@@ -317,6 +323,9 @@ void RE_Kernel::generatePabloMethod() {
     if (mContext.mIndexStream) {
         PabloAST * idxStrm = pb.createExtract(getInputStreamVar("mIndexing"), pb.getInteger(0));
         re_compiler.setIndexing(&cc::Unicode, idxStrm);
+    }
+    if (mContext.mTextMask) {
+        re_compiler.setTextMask(pb.createExtract(getInputStreamVar("mTextMask"), pb.getInteger(0)));
     }
     for (auto & e : mContext.mExternals) {
         auto name = e.first;
@@ -585,20 +594,23 @@ static std::string stringClassSignature(const std::vector<std::vector<re::CC *>>
 
 StringClassKernel::StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
                                      StreamSet * basis, StreamSet * fillStartsEnds, StreamSet * follows,
-                                     StringGuards guards)
-: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis, guards) + (follows ? "_f" : "")),
+                                     StringGuards guards, StreamSet * textMask)
+: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis, guards) + (follows ? "_f" : "")
+                                                         + (textMask ? "_m" : "")),
               [&] {
                   const unsigned la = maxStringLength(strings, guards) - 1;
                   Bindings inputs;
                   inputs.emplace_back("basis", basis, FixedRate(1), LookAhead(la));
                   if (follows) inputs.emplace_back("follows", follows, FixedRate(1), LookAhead(la));
+                  if (textMask) inputs.emplace_back("textMask", textMask, FixedRate(1), LookAhead(la));
                   return inputs;
               }(),
               {Binding{"fillStartsEnds", fillStartsEnds}}),
   mStrings(std::move(strings)),
   mGuards(std::move(guards)),
   mHasFollows(follows != nullptr),
-  mSignature(stringClassSignature(mStrings, basis, mGuards) + (follows ? "_f" : "")) {
+  mHasTextMask(textMask != nullptr),
+  mSignature(stringClassSignature(mStrings, basis, mGuards) + (follows ? "_f" : "") + (textMask ? "_m" : "")) {
 }
 
 void StringClassKernel::generatePabloMethod() {
@@ -612,6 +624,13 @@ void StringClassKernel::generatePabloMethod() {
         for (PabloAST * b : basis) ahead.push_back(v == 0 ? b : pb.createLookahead(b, v));
         compilers.emplace_back(std::make_unique<cc::Parabix_CC_Compiler>(ahead));
     }
+    // A character class at offset v (within the text mask, with one).
+    PabloAST * const textMask = mHasTextMask ? getInputStreamSet("textMask")[0] : nullptr;
+    auto charAt = [&](unsigned v, re::CC * cc) {
+        PabloAST * const c = compilers[v]->compileCC(cc, pb);
+        if (textMask == nullptr) return c;
+        return pb.createAnd(c, (v == 0) ? textMask : pb.createLookahead(textMask, v));
+    };
     // The positions with no region follow within the next v + 1 positions.
     std::vector<PabloAST *> followFree;
     if (mHasFollows) {
@@ -629,7 +648,7 @@ void StringClassKernel::generatePabloMethod() {
     for (const auto & str : mStrings) {
         PabloAST * start = pb.createInFile(pb.createOnes());
         for (unsigned k = 0; k < str.size(); ++k) {
-            start = pb.createAnd(start, compilers[k]->compileCC(str[k], pb));
+            start = pb.createAnd(start, charAt(k, str[k]));
         }
         if (mHasFollows) {
             start = pb.createAnd(start, followFree[str.size() - 1]);
@@ -640,7 +659,7 @@ void StringClassKernel::generatePabloMethod() {
             for (const auto & guard : mGuards[i]) {
                 PabloAST * follows = pb.createInFile(pb.createOnes());
                 for (unsigned k = 0; k < guard.size(); ++k) {
-                    follows = pb.createAnd(follows, compilers[str.size() + k]->compileCC(guard[k], pb));
+                    follows = pb.createAnd(follows, charAt(static_cast<unsigned>(str.size() + k), guard[k]));
                 }
                 if (mHasFollows) {
                     follows = pb.createAnd(follows, followFree[str.size() + guard.size() - 1]);
@@ -1472,10 +1491,23 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
             }
             addExternal(e.first, x);
         }
+        //  The text mask (likewise).
+        if (StreamSet * mask = mSourceContext.textMask) {
+            if (sourceCodes) llvm::report_fatal_error("RE_PipelineBuilder: a text mask requires a source of Unicode");
+            if (mTextExtended) {
+                StreamSet * const extended = mPB.CreateStreamSet(1, 1);
+                mPB.CreateKernelCall<ExtendByOne>(mask, extended);
+                mask = extended;
+            }
+            mCtxt.setTextMask(mask);
+        }
         mUsesUnicodeIndexing = true;
         mFinalMatchStarts = matchStarts;
         mFinalMatchFollows = matchFollows;
         return;
+    }
+    if (mSourceContext.textMask) {
+        llvm::report_fatal_error("RE_PipelineBuilder: a text mask requires a source of Unicode");
     }
     if (!mSourceContext.externals.empty()) {
         llvm::report_fatal_error("RE_PipelineBuilder: externals of the client are for a source of Unicode only");
@@ -1676,6 +1708,23 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         compileProperty(pe);
         return;
     }
+    //  A positive lookaround is a context, compiled without the text mask (see
+    //  RE_context::textMask); the starts of a negative lookahead of variable
+    //  length are not found by the RE compiler (see textMaskFailures).
+    StreamSet * const textMask = mCtxt.mTextMask;
+    if (textMask && isa<Assertion>(defn)) {
+        Assertion * const a = cast<Assertion>(defn);
+        if (a->getSense() == Assertion::Sense::Positive) {
+            mCtxt.mTextMask = nullptr;
+            compileExternal(n);
+            mCtxt.mTextMask = textMask;
+            return;
+        }
+        const auto r = getLengthRange(a->getAsserted(), mCtxt.mLengthAlphabet);
+        if ((a->getKind() == Assertion::Kind::LookAhead) && (r.first != r.second)) {
+            llvm::report_fatal_error("RE_PipelineBuilder: a negative lookahead of variable length within a text mask");
+        }
+    }
     if (name.compare(0, ReversedLookaheadPrefix.size(), ReversedLookaheadPrefix) == 0) {
         // A lookahead matched by reversal (see ReversedLookaheadNamer): the
         // starts of the matches of its asserted RE, at their first characters.
@@ -1791,9 +1840,13 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
             std::vector<StreamSet *> classes;
             std::vector<bool> negated;
             for (Assertion * la : seg->assertions) {
+                // (A positive lookahead, a context, without the text mask.)
+                StreamSet * const textMask = mCtxt.mTextMask;
+                if (la->getSense() == Assertion::Sense::Positive) mCtxt.mTextMask = nullptr;
                 prepareExternals(la->getAsserted());
                 StreamSet * const Y = mPB.CreateStreamSet(1);
                 mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, la->getAsserted(), Y);
+                mCtxt.mTextMask = textMask;
                 classes.push_back(Y);
                 negated.push_back(la->getSense() == Assertion::Sense::Negative);
             }
@@ -1834,7 +1887,7 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
                 StringGuards guards;
                 for (const auto & g : seg->guards) guards.push_back(codeUnitStrings(g));
                 mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(seg->strings), codeUnitBasis(), fillStartsEnds,
-                                                        mCtxt.mMatchFollows, std::move(guards));
+                                                        mCtxt.mMatchFollows, std::move(guards), mCtxt.mTextMask);
             }
             StreamSet * const index = mPB.CreateStreamSet(1);
             StreamSet * const good = mPB.CreateStreamSet(1);
@@ -2056,12 +2109,24 @@ void RE_PipelineBuilder::compileClasses(const std::vector<CC *> & ccs, StreamSet
 StreamSet * RE_PipelineBuilder::classStream(RE * re, CC * cc) {
     // The class may already be an external (e.g. a property), whose kernel
     // must then be the one used.
+    StreamSet * strm = nullptr;
     if (Name * const n = dyn_cast<Name>(re)) {
         auto f = mCtxt.mExternals.find(n->getFullName());
-        if (f != mCtxt.mExternals.end()) return f->second.extStream;
+        if (f != mCtxt.mExternals.end()) strm = f->second.extStream;
     }
-    StreamSet * const strm = mPB.CreateStreamSet(1);
-    compileClasses(std::vector<re::CC *>{cc}, strm);
+    if (strm == nullptr) {
+        strm = mPB.CreateStreamSet(1);
+        compileClasses(std::vector<re::CC *>{cc}, strm);
+    }
+    // Within a text mask, the positions of the class in the text of matches
+    // (classStream is used for the classes of the stars of chains, outside
+    // their contexts; a chain within a positive lookahead is compiled without
+    // the text mask, see compileExternal).
+    if (mCtxt.mTextMask) {
+        StreamSet * const masked = mPB.CreateStreamSet(1);
+        AndCombine(mPB, strm, mCtxt.mTextMask, masked);
+        strm = masked;
+    }
     return strm;
 }
 
@@ -2433,7 +2498,8 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
             strm = classStream(f->re, f->cc);
         } else {
             strm = mPB.CreateStreamSet(3);
-            mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(f->strings), codeUnitBasis(), strm, mCtxt.mMatchFollows);
+            mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(f->strings), codeUnitBasis(), strm, mCtxt.mMatchFollows,
+                                                    StringGuards{}, mCtxt.mTextMask);
         }
         finalSteps.push_back(ChainCoverage::Final{f->kind, strm});
     }
@@ -4184,6 +4250,30 @@ void reportFailures(const std::vector<PreconditionFailure> & failures) {
 
 }
 
+std::vector<PreconditionFailure> textMaskFailures(const PreparedSearchReplace & sr) {
+    std::vector<PreconditionFailure> failures;
+    const RE_Goal goal = sr.search.options.goal;
+    QuietREPrinting quiet;
+    ModeTransformation M(&cc::Unicode, &cc::Unicode);
+    M.mAllowReversal = sr.search.options.reversal;
+    RE * const transformed = M.transform(sr.search.re, goal);
+    if (!M.failures(transformed, goal).empty()) return failures;   // (reported by checkPreconditions)
+    if (M.mStartsByReversal) {
+        failures.push_back(PreconditionFailure{goal, transformed, "the starts of matches found by reversal, within a text mask"});
+    }
+    std::set<re::Name *> names;
+    re::gatherNames(transformed, names);
+    for (re::Name * n : names) {
+        const Assertion * const a = dyn_cast_or_null<Assertion>(n->getDefinition());
+        if (!a || (a->getSense() != Assertion::Sense::Negative) || (a->getKind() != Assertion::Kind::LookAhead)) continue;
+        const auto r = getLengthRange(a->getAsserted(), &cc::Unicode);
+        if (r.first != r.second) {
+            failures.push_back(PreconditionFailure{goal, n, "a negative lookahead of variable length, within a text mask"});
+        }
+    }
+    return failures;
+}
+
 std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr, const cc::Alphabet * sourceEncoding) {
     std::vector<PreconditionFailure> failures = checkPreconditions(sr.search, sourceEncoding);
     for (PreconditionFailure & f : searchReplaceFailures(sr)) failures.push_back(std::move(f));
@@ -4280,8 +4370,26 @@ void RE_PipelineBuilder::captureSpansPipeline(const PreparedSearchReplace & sr, 
     mPB.CreateKernelCall<CaptureSpans>(marks, spans);
 }
 
+//  Masks carried through a replacement (see searchReplaceCodeUnitsPipeline):
+//  1 at the positions inserted (where the spread mask is 0).
+class MarkInsertedPositions final : public pablo::PabloKernel {
+public:
+    MarkInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Masks, StreamSet * Marked)
+    : PabloKernel(ts, "MarkInsertedPositions" + std::to_string(Masks->getNumElements()),
+                  {Binding{"SpreadMask", SpreadMask}, Binding{"Masks", Masks}}, {Binding{"Marked", Marked}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
+        std::vector<PabloAST *> masks = getInputStreamSet("Masks");
+        for (PabloAST *& m : masks) m = pb.createOr(m, inserted);
+        writeOutputStreamSet("Marked", masks);
+    }
+};
+
 RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const PreparedSearchReplace & sr, bool follows,
-                                                                    bool replaced, StreamSet * result) {
+                                                                    bool replaced, StreamSet * result,
+                                                                    StreamSet * masks, StreamSet * resultMasks) {
     if (sr.search.options.goal != RE_Goal::SearchReplace) {
         llvm::report_fatal_error("search and replace: the search pattern must be prepared with prepareSearchReplace");
     }
@@ -4325,6 +4433,13 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     StreamSet * marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
     const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
     StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
+    // The masks carried (at the positions of the text, extended as it is).
+    // (Rotations only move text within matches, where the masks are 1.)
+    if (masks && mTextExtended) {
+        StreamSet * const extended = mPB.CreateStreamSet(masks->getNumElements(), 1);
+        mPB.CreateKernelCall<ExtendByOne>(masks, extended);
+        masks = extended;
+    }
     // The captures moved back rotated into place, in each selected match
     // (within the match: its coverage and the positions kept outside the
     // matches are unchanged), with the marks of the captures after the
@@ -4432,6 +4547,11 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
         };
         text = spread(text);
         keep = spread(keep);
+        if (masks) {
+            StreamSet * const marked = mPB.CreateStreamSet(masks->getNumElements());
+            mPB.CreateKernelCall<MarkInsertedPositions>(spreadMask, spread(masks), marked);
+            masks = marked;
+        }
         flags = spread(flags);
         if (resultFollows) resultFollows = spread(resultFollows);
         if (resultReplaced) resultReplaced = spread(resultReplaced);
@@ -4452,6 +4572,12 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     }
     ReplacedText r;
     r.text = filtered(text, result);
+    if (masks) {
+        if (resultMasks == nullptr || resultMasks->getNumElements() != masks->getNumElements()) {
+            llvm::report_fatal_error("searchReplaceCodeUnitsPipeline: the result masks must have the streams of the masks");
+        }
+        filtered(masks, resultMasks);
+    }
     if (resultFollows) r.follows = filtered(resultFollows, nullptr);
     if (resultReplaced) r.replaced = filtered(resultReplaced, nullptr);
     return r;
@@ -4485,8 +4611,9 @@ void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr,
     if (replaced) mPB.CreateKernelCall<StreamSelect>(replaced, Select(r.replaced, {0}));
 }
 
-void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, StreamSet * codeUnits) {
-    replaceMatches(sr, false, false, codeUnits);
+void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, StreamSet * codeUnits,
+                                                        StreamSet * masks, StreamSet * resultMasks) {
+    replaceMatches(sr, false, false, codeUnits, masks, resultMasks);
 }
 
 RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {

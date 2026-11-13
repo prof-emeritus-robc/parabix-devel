@@ -417,6 +417,14 @@ public:
         //  character map planned as rules (see ldml::planTransform).
         std::vector<PreparedSearchReplace> prepared;
         std::vector<std::vector<PreconditionFailure>> failures;
+        //  What the engine does not support for the passes within a filter,
+        //  where the text of their matches is restricted to it (see
+        //  RE_context::textMask and textMaskFailures).
+        std::vector<std::vector<PreconditionFailure>> failuresInFilter;
+        bool appliesInFilter() const {
+            for (const auto & fs : failuresInFilter) if (!fs.empty()) return false;
+            return true;
+        }
         std::vector<ldml::TransformPlan> maps;
         //  The marks of the deferred calls and their arguments replaced by
         //  their values: string rules (M a → value), planned as rules.
@@ -445,6 +453,14 @@ public:
         std::vector<std::vector<ShapeStep>> shapeSegments;  // the shape groups of each segment
         std::vector<size_t> regularKernels, shapeKernels;   // of each segment (if both apply)
         bool any() const {return std::find(useShapes.begin(), useShapes.end(), true) != useShapes.end();}
+        //  Whether the segments chosen apply within a filter as well.
+        bool appliesInFilter() const {
+            for (size_t k = 0; k < useShapes.size(); k++) {
+                if (!useShapes[k]) continue;
+                for (const ShapeStep & s : shapeSegments[k]) if (!s.appliesInFilter()) return false;
+            }
+            return true;
+        }
     };
     std::map<std::string, ShapeChoice> mShapeChoices;
 private:
@@ -551,6 +567,7 @@ std::vector<TransformAnalyzer::ShapeStep> TransformAnalyzer::shapeGroups(const l
                 for (const ldml::ConversionRule * r : p.rules) rules.push_back(const_cast<ldml::ConversionRule *>(r));
                 step.maps.push_back(ldml::planTransform(rules));
                 step.failures.emplace_back();
+                step.failuresInFilter.emplace_back();
                 if (!step.maps.back().implementable()) {
                     step.failures.back().push_back(PreconditionFailure{re::RE_Goal::SearchReplace, nullptr,
                                                    "the character map is not implementable: " + step.maps.back().problems.front()});
@@ -562,6 +579,7 @@ std::vector<TransformAnalyzer::ShapeStep> TransformAnalyzer::shapeGroups(const l
             opts.reversal = false;
             step.prepared.push_back(prepareSearchReplace(p.search, p.replacement, opts));
             step.failures.push_back(checkPreconditions(step.prepared.back(), &cc::Unicode));
+            step.failuresInFilter.push_back(textMaskFailures(step.prepared.back()));
             step.maps.emplace_back();
         }
         std::vector<ldml::Rule *> markRules;
@@ -681,6 +699,9 @@ static bool printShapeStep(const TransformAnalyzer::ShapeStep & step) {
         } else {
             all = false;
             for (const PreconditionFailure & f : failures) toolio::out() << "      engine: not accepted: " << f.reason << "\n";
+        }
+        for (const PreconditionFailure & f : step.failuresInFilter[i]) {
+            toolio::out() << "      engine, within a filter: not accepted: " << f.reason << "\n";
         }
     }
     for (const ldml::DeferredCall & call : plan.calls) {
@@ -9372,10 +9393,10 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
             assert (mAnalyzer.shapeGroupsOf(entry).applicable);
             return applyShapeGroups(mAnalyzer.shapeGroupsOf(entry), U21);
         }
-        //  (Not within a filter: the passes of the engine apply to the whole
-        //  text, and the marks of the deferred calls are outside the filter.)
+        //  (Within a filter, where the engine supports its passes within it, see
+        //  RulePipelineBuilder::applyShapeStep.)
         const TransformAnalyzer::ShapeChoice & choice = shapeChoice(mRegistry, mAnalyzer, entry);
-        if (choice.any() && !activeMask()) {
+        if (choice.any() && (!activeMask() || choice.appliesInFilter())) {
             const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
             mShapeChoice = &choice;
             U21 = applyAnalysis(a, U21);
@@ -9415,10 +9436,43 @@ StreamSet * RulePipelineBuilder::applyShapeGroups(const TransformAnalyzer::Shape
 
 StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeStep & step, StreamSet * U21, bool outermost) {
     //  (A phase boundary after each pass only with --shape-phase-boundaries.)
-    auto searchReplace = [&](const PreparedSearchReplace & sr, StreamSet * text) {
-        RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, text});
+    //  Within a filter, as in ICU, the text a rule matches lies within the
+    //  filter (in a run of its characters), while its contexts match the whole
+    //  text (see pushFilter): the active mask is the text mask of the engine
+    //  (see RE_context::textMask).  The masks of the filters are carried
+    //  through the replacement: the text the replacements write is within them.
+    auto searchReplace = [&](size_t i, StreamSet * text) {
+        StreamSet * const mask = activeMask();
+        RE_context context{&cc::Unicode, text};
+        if (mask) {
+            if (!step.failuresInFilter[i].empty()) {
+                llvm::report_fatal_error(llvm::StringRef("tconv: a pass of shape groups not applicable within a filter: ")
+                                         + step.failuresInFilter[i].front().reason);
+            }
+            context.textMask = mask;
+        }
+        RE_PipelineBuilder engine(mP, context);
         StreamSet * const result = mP.CreateStreamSet(21);
-        engine.searchReplaceCodeUnitsPipeline(sr, result);
+        if (!mask) {
+            engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result);
+        } else {
+            //  (Every match lies within each mask.)
+            StreamSet * masks = mMasks.front();
+            if (mMasks.size() > 1) {
+                masks = mP.CreateStreamSet(mMasks.size());
+                mP.CreateKernelCall<CollectStreams>(mMasks, masks);
+            }
+            StreamSet * const resultMasks = mP.CreateStreamSet(mMasks.size());
+            engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result, masks, resultMasks);
+            for (size_t k = 0; k < mMasks.size(); k++) {
+                if (mMasks.size() == 1) {
+                    mMasks[k] = resultMasks;
+                    break;
+                }
+                mMasks[k] = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<StreamSelect>(mMasks[k], Select(resultMasks, {static_cast<unsigned>(k)}));
+            }
+        }
         if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
         return result;
     };
@@ -9427,7 +9481,7 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
     for (const ldml::ShapePass & p : step.plan.passes) rules += p.rules.size();
     for (size_t i = 0; i < step.plan.passes.size(); i++) {
         if (!step.plan.passes[i].map) {
-            U21 = searchReplace(step.prepared[i], U21);
+            U21 = searchReplace(i, U21);
             continue;
         }
         for (const ldml::TransformStep & s : step.maps[i].steps) U21 = conversionGroup(s, U21);
@@ -10677,12 +10731,14 @@ static int run(int argc, char *argv[]) {
                 }
                 return 0;
             }
-            //  (The transforms invoked, without filters, by their shape groups.)
+            //  (The transforms invoked by their shape groups, within filters
+            //  where their passes apply within them.)
             auto note = [&](const ldml::TransformStep & step) -> std::string {
                 const ldml::TransformEntry * used = registry.lookup(step.transform.getText());
-                if (step.filter || a.plan.filter || used == nullptr || used->isBuiltIn()) return "";
+                if (used == nullptr || used->isBuiltIn()) return "";
                 if (!analyzer.analyze(used).implementable) return analyzer.shapeGroupsOf(used).applicable ? " (by its shape groups)" : "";
                 const TransformAnalyzer::ShapeChoice & c = shapeChoice(registry, analyzer, used);
+                if ((step.filter || a.plan.filter) && !c.appliesInFilter()) return "";
                 std::string segments;
                 for (size_t k = 0; c.aligned && k < c.useShapes.size(); k++) {
                     if (c.useShapes[k]) segments += (segments.empty() ? "" : ", ") + std::to_string(k + 1);

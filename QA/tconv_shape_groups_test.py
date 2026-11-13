@@ -32,6 +32,21 @@ TEXT = [
     "shuang1 chuang2 kuai4 lüe4 jiong3 zhuan4 yue4 er2 ri4 yi1 wu3",
 ] + ["zhong1wen2 " * 400]       # a line of several blocks
 
+# Bopo-Latn applies NumericPinyin-Latin within its filter (Bopomofo and tone
+# marks), by its shape groups: the text of their matches lies within the
+# filter, while contexts see the whole text (see RE_context::textMask).  The
+# characters outside the filter (here the Latin text and the digits) are not
+# changed, nor matched: ㄧ˙ is yi5, whose 5 is deleted but not the one after
+# it; and the tone digit after ㄗ˙ㄊ is outside the filter.
+FILTERED = "Bopo-Latn"
+FILTERED_CASES = [
+    ("ㄋㄧˇ ㄏㄠˇ ma3 ㄇㄚˇ", "nǐ hǎo ma3 mǎ"),
+    ("ㄧ˙5", "yi5"),
+    ("ㄗ˙ㄊ3", "zit3"),
+    ("ㄓㄨㄥ ㄨㄣˊ hao3", "zhōng wén hao3"),
+    ("nü3ㄌㄩˋ", "nü3lǜ"),
+]
+
 
 def plan(tconv):
     """The passes (search, replacement) and the values of the marked calls."""
@@ -125,6 +140,23 @@ def main():
             if g != w:
                 failures += 1
                 print("FAIL --apply-shape-groups line %d:\n  got:      %r\n  expected: %r" % (i + 1, g[:200], w[:200]))
+        # The shape groups within a filter.
+        counts = subprocess.run([tconv, "--plan", FILTERED], capture_output=True).stdout.decode("utf-8")
+        if "NumericPinyin-Latin (segment 2 by shape groups" not in counts:
+            failures += 1
+            print("FAIL: %s does not apply NumericPinyin-Latin by its shape groups:\n%s" % (FILTERED, counts[:500]))
+        path = os.path.join(tmp, "filtered.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(c + "\n" for c, _ in FILTERED_CASES))
+        run = subprocess.run([tconv, FILTERED, path], capture_output=True)
+        got = run.stdout.decode("utf-8").split("\n")
+        if run.returncode != 0 or run.stderr:
+            failures += 1
+            print("FAIL: tconv %s: exit %d %s" % (FILTERED, run.returncode, run.stderr.decode()[:300]))
+        for i, (source, expected) in enumerate(FILTERED_CASES):
+            if i >= len(got) or got[i] != expected:
+                failures += 1
+                print("FAIL %s %r:\n  got:      %r\n  expected: %r" % (FILTERED, source, got[i] if i < len(got) else None, expected))
     if failures:
         sys.exit(1)
     print("tconv_shape_groups_test: all tests passed")

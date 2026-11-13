@@ -146,6 +146,15 @@ class RE_Compiler {
                 const cc::Alphabet * codeUnitAlphabet = &cc::UTF8);
 
     void setIndexing(const cc::Alphabet * indexingAlphabet, pablo::PabloAST * idxStream);
+
+    //
+    // The positions the text of a match may cover: the characters matched by
+    // the RE, other than those within positive lookarounds (its contexts),
+    // are restricted to the positions of textMask (e.g. a filter in which the
+    // matches lie).  The characters of negative lookarounds are restricted as
+    // well: they are matches that must not be there (e.g. X+(?!X)).
+    //
+    void setTextMask(pablo::PabloAST * textMask) {mTextMask = textMask;}
     
     //
     // The CCs (character classes) within a regular expression are generally
@@ -185,6 +194,8 @@ private:
     std::vector<std::unique_ptr<cc::CC_Compiler>>   mAlphabetCompilers;
     pablo::PabloAST *                               mWhileTest;
     int                                             mStarDepth;
+    pablo::PabloAST *                               mTextMask = nullptr;
+    unsigned                                        mContextDepth = 0;  // within positive lookarounds
     ExternalNameMap                                 mExternalNameMap;
     std::map<std::string, StringClassStreams>       mStringClassMap;
 };

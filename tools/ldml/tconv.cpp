@@ -157,7 +157,8 @@ static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
     cl::init(8), cl::cat(TconvOptions));
 static cl::opt<bool> RevisitReport("revisit-report", cl::desc("Report each rule with text to revisit, how it is composed and the rules "
                                    "applying to its text to revisit (one JSON object per line), and exit"), cl::cat(TconvOptions));
-static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
+static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit "
+                                       "(with --apply-shape-groups, the plan chosen for each segment)"),
                               cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowShapeGroups("shape-groups",
                                      cl::desc("Report the conversion groups of the transform planned as search and replace "
@@ -169,9 +170,12 @@ static cl::opt<bool> ShapePhaseBoundaries("shape-phase-boundaries",
                                           cl::desc("With --apply-shape-groups, a pipeline phase boundary after each pass"),
                                           cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ApplyShapeGroups("apply-shape-groups",
-                                      cl::desc("Apply the transform by the search and replace passes of its shape group "
-                                               "plans (see --shape-groups), where they are all implementable"),
-                                      cl::init(false), cl::cat(TconvOptions));
+                                      cl::desc("Apply each segment of a transform by the search and replace passes of its "
+                                               "shape group plans (see --shape-groups) where they take fewer kernels than the "
+                                               "regular plan, and a transform the regular plan does not implement by its shape "
+                                               "groups, if they are implementable (default on; --apply-shape-groups=0 for the "
+                                               "regular plan only)"),
+                                      cl::init(true), cl::cat(TconvOptions));
 //  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
 //  are computed by kernels of their own, as the cost of compiling a kernel of
 //  classes of scattered characters grows faster than their number (for Hani-Latn,
@@ -632,20 +636,12 @@ const TransformAnalyzer::ShapeGroups & TransformAnalyzer::shapeGroupsOf(const ld
     return mShapeGroups.emplace(name, std::move(g)).first->second;
 }
 
-//  The shape group plans of a transform (see TransformAnalyzer::shapeGroups):
-//  for each pass, its search pattern and replacement (in the syntax of the
-//  regular expression parser and of re::parseReplacement), whether the
-//  engine's search and replace accepts them, and the values of the deferred
-//  calls.  0 if all the conversion groups are implementable.
-static int printShapeGroups(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
-    TransformAnalyzer analyzer(registry);
-    std::vector<TransformAnalyzer::ShapeStep> steps;
-    try {
-        steps = analyzer.shapeGroups(entry);
-    } catch (const std::exception & e) {
-        llvm::errs() << entry->canonicalName << ": " << e.what() << "\n";
-        return 2;
-    }
+//  A conversion group planned by shape groups (see TransformAnalyzer::
+//  shapeGroups): for each pass, its search pattern and replacement (in the
+//  syntax of the regular expression parser and of re::parseReplacement),
+//  whether the engine's search and replace accepts them, and the values of the
+//  deferred calls.  False if the group is not implementable.
+static bool printShapeStep(const TransformAnalyzer::ShapeStep & step) {
     auto codepoints = [](const std::u32string & s) {
         std::string out;
         for (const char32_t c : s) {
@@ -656,61 +652,77 @@ static int printShapeGroups(const ldml::TransformRegistry & registry, const ldml
         return out.empty() ? std::string("(deleted)") : out;
     };
     bool all = true;
+    const ldml::ShapeGroupPlan & plan = step.plan;
+    size_t rules = 0;
+    for (const ldml::ShapePass & p : plan.passes) rules += p.rules.size();
+    toolio::out() << "  conversion group: " << plan.passes.size() << " passes, " << rules << " rules\n";
+    for (const std::string & problem : plan.problems) toolio::out() << "    problem: " << problem << "\n";
+    if (!plan.implementable()) return false;
+    for (size_t i = 0; i < plan.passes.size(); i++) {
+        const ldml::ShapePass & p = plan.passes[i];
+        toolio::out() << "    pass " << (i + 1) << ": " << p.shape << ", " << p.rules.size() << " rules";
+        for (const size_t g : p.guards) toolio::out() << ", yields to pass " << (g + 1);
+        if (p.contexts) toolio::out() << ", before contexts as in the converted text";
+        toolio::out() << "\n";
+        for (const ldml::ConversionRule * r : p.rules) toolio::out() << "      rule: " << ldml::printRule(r) << "\n";
+        if (p.map) {
+            for (const PreconditionFailure & f : step.failures[i]) toolio::out() << "      character map: " << f.reason << "\n";
+            if (step.failures[i].empty()) toolio::out() << "      character map: implementable\n";
+            all = all && step.failures[i].empty();
+            continue;
+        }
+        std::string reason;
+        const std::string search = ldml::regexSyntax(p.search, &reason);
+        toolio::out() << "      search: " << (search.empty() ? "(no syntax: " + reason + ")" : search) << "\n";
+        toolio::out() << "      replacement: " << ldml::replacementSyntax(p.replacement) << "\n";
+        const std::vector<PreconditionFailure> & failures = step.failures[i];
+        if (failures.empty()) {
+            toolio::out() << "      engine: accepted\n";
+        } else {
+            all = false;
+            for (const PreconditionFailure & f : failures) toolio::out() << "      engine: not accepted: " << f.reason << "\n";
+        }
+    }
+    for (const ldml::DeferredCall & call : plan.calls) {
+        char mark[16];
+        snprintf(mark, sizeof(mark), "U+%04X", static_cast<unsigned>(call.mark));
+        toolio::out() << "    deferred call &" << call.function.getText() << ": mark " << mark;
+        if (!call.evaluated) {
+            all = false;
+            toolio::out() << ", not evaluated\n";
+            continue;
+        }
+        toolio::out() << "\n";
+        for (const auto & v : call.values) {
+            toolio::out() << "      value " << codepoints(std::u32string(1, v.first)) << " -> " << codepoints(v.second) << "\n";
+        }
+    }
+    if (!step.markMapProblem.empty()) {
+        all = false;
+        toolio::out() << "    values not implementable: " << step.markMapProblem << "\n";
+    }
+    return all;
+}
+
+//  The shape group plans of a transform (see printShapeStep).  0 if all the
+//  conversion groups are implementable.
+static int printShapeGroups(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
+    TransformAnalyzer analyzer(registry);
+    std::vector<TransformAnalyzer::ShapeStep> steps;
+    try {
+        steps = analyzer.shapeGroups(entry);
+    } catch (const std::exception & e) {
+        llvm::errs() << entry->canonicalName << ": " << e.what() << "\n";
+        return 2;
+    }
+    bool all = true;
     toolio::out() << entry->canonicalName << " (" << entry->file << "): shape groups\n";
     for (const TransformAnalyzer::ShapeStep & step : steps) {
         if (step.transform) {
             toolio::out() << "  transform " << step.transform->getForwardID().getText() << "\n";
             continue;
         }
-        const ldml::ShapeGroupPlan & plan = step.plan;
-        size_t rules = 0;
-        for (const ldml::ShapePass & p : plan.passes) rules += p.rules.size();
-        toolio::out() << "  conversion group: " << plan.passes.size() << " passes, " << rules << " rules\n";
-        for (const std::string & problem : plan.problems) toolio::out() << "    problem: " << problem << "\n";
-        all = all && plan.implementable();
-        if (!plan.implementable()) continue;
-        for (size_t i = 0; i < plan.passes.size(); i++) {
-            const ldml::ShapePass & p = plan.passes[i];
-            toolio::out() << "    pass " << (i + 1) << ": " << p.shape << ", " << p.rules.size() << " rules";
-            for (const size_t g : p.guards) toolio::out() << ", yields to pass " << (g + 1);
-            if (p.contexts) toolio::out() << ", before contexts as in the converted text";
-            toolio::out() << "\n";
-            for (const ldml::ConversionRule * r : p.rules) toolio::out() << "      rule: " << ldml::printRule(r) << "\n";
-            if (p.map) {
-                for (const PreconditionFailure & f : step.failures[i]) toolio::out() << "      character map: " << f.reason << "\n";
-                if (step.failures[i].empty()) toolio::out() << "      character map: implementable\n";
-                all = all && step.failures[i].empty();
-                continue;
-            }
-            std::string reason;
-            const std::string search = ldml::regexSyntax(p.search, &reason);
-            toolio::out() << "      search: " << (search.empty() ? "(no syntax: " + reason + ")" : search) << "\n";
-            toolio::out() << "      replacement: " << ldml::replacementSyntax(p.replacement) << "\n";
-            const std::vector<PreconditionFailure> & failures = step.failures[i];
-            if (failures.empty()) {
-                toolio::out() << "      engine: accepted\n";
-            } else {
-                all = false;
-                for (const PreconditionFailure & f : failures) toolio::out() << "      engine: not accepted: " << f.reason << "\n";
-            }
-        }
-        for (const ldml::DeferredCall & call : plan.calls) {
-            char mark[16];
-            snprintf(mark, sizeof(mark), "U+%04X", static_cast<unsigned>(call.mark));
-            toolio::out() << "    deferred call &" << call.function.getText() << ": mark " << mark;
-            if (!call.evaluated) {
-                toolio::out() << ", not evaluated\n";
-                continue;
-            }
-            toolio::out() << "\n";
-            for (const auto & v : call.values) {
-                toolio::out() << "      value " << codepoints(std::u32string(1, v.first)) << " -> " << codepoints(v.second) << "\n";
-            }
-        }
-        if (!step.markMapProblem.empty()) {
-            all = false;
-            toolio::out() << "    values not implementable: " << step.markMapProblem << "\n";
-        }
+        all = printShapeStep(step) && all;
     }
     return all ? 0 : 2;
 }
@@ -1084,7 +1096,14 @@ static std::string printRanges(const UCD::UnicodeSet & set) {
 static void printBeforeContextNotes(const ldml::TransformStep & step);
 static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearchReplace * sr = nullptr, std::string * reason = nullptr);
 
-static void printPlan(const std::string & label, const TransformAnalysis & a) {
+//  The plan of a transform: its problems, filter and steps.  With a choice
+//  of plans for its segments (see TransformAnalyzer::ShapeChoice, with
+//  --apply-shape-groups), the kernels of each segment by each plan, and the
+//  shape groups of the segments applied by them in place of their conversion
+//  groups.
+static void printPlan(const std::string & label, const TransformAnalysis & a,
+                      const TransformAnalyzer::ShapeChoice * choice = nullptr,
+                      const std::function<std::string (const ldml::TransformStep &)> & transformNote = nullptr) {
     toolio::out() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
     for (const std::string & p : a.problems) {
         std::string shown = p;
@@ -1097,10 +1116,34 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         toolio::out() << "  problem: " << shown << "\n";
     }
     if (a.plan.filter) toolio::out() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
+    if (choice && !choice->aligned) {
+        toolio::out() << "  shape groups not applied: the segments of the two plans do not correspond (filters, or different transform rules)\n";
+    }
+    if (choice && !choice->aligned) choice = nullptr;
+    size_t segment = 0;
+    std::vector<bool> started(choice ? choice->useShapes.size() : 0, false);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) segment++;
+        //  (The plan chosen for a segment, at its first conversion group.)
+        if (choice && step.kind != ldml::TransformStep::Kind::Transform && !started[segment]) {
+            started[segment] = true;
+            const size_t regular = choice->regularKernels[segment], shapes = choice->shapeKernels[segment];
+            if (choice->useShapes[segment]) {
+                toolio::out() << "  segment " << (segment + 1) << ": by shape groups (" << shapes << " kernels; regular plan "
+                              << regular << " kernels)\n";
+                for (const TransformAnalyzer::ShapeStep & s : choice->shapeSegments[segment]) printShapeStep(s);
+            } else if (regular > 0 || shapes > 0) {
+                toolio::out() << "  segment " << (segment + 1) << ": by the regular plan (" << regular << " kernels; shape groups "
+                              << shapes << " kernels)\n";
+            } else {
+                toolio::out() << "  segment " << (segment + 1) << ": by the regular plan (shape groups not implementable)\n";
+            }
+        }
+        if (choice && step.kind != ldml::TransformStep::Kind::Transform && choice->useShapes[segment]) continue;
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             toolio::out() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
-                         << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "") << "\n";
+                         << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "")
+                         << (transformNote ? transformNote(step) : "") << "\n";
             continue;
         }
         if (step.hasFrontLetters) {
@@ -10615,8 +10658,48 @@ static int run(int argc, char *argv[]) {
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);
-        printPlan(entry->canonicalName + (!entry->isBuiltIn() ? " (" + entry->file + ")"
-                                          : isICUBuiltIn(entry->canonicalName) ? " (built-in, applied by ICU)" : " (built-in)"), a);
+        const std::string label = entry->canonicalName + (!entry->isBuiltIn() ? " (" + entry->file + ")"
+                                  : isICUBuiltIn(entry->canonicalName) ? " (built-in, applied by ICU)" : " (built-in)");
+        //  With --apply-shape-groups, the plan applied (see RulePipelineBuilder::
+        //  transform): by the shape groups, for a transform the regular plan
+        //  does not implement; otherwise, segment by segment.
+        if (ApplyShapeGroups && !entry->isBuiltIn()) {
+            const TransformAnalyzer::ShapeGroups & groups = analyzer.shapeGroupsOf(entry);
+            if (!a.implementable && groups.applicable) {
+                toolio::out() << label << ": implementable by shape groups (the regular plan is not)\n";
+                for (const std::string & p : a.problems) toolio::out() << "  regular plan problem: " << p << "\n";
+                for (const TransformAnalyzer::ShapeStep & step : groups.steps) {
+                    if (step.transform) {
+                        toolio::out() << "  transform " << step.transform->getForwardID().getText() << "\n";
+                    } else {
+                        printShapeStep(step);
+                    }
+                }
+                return 0;
+            }
+            //  (The transforms invoked, without filters, by their shape groups.)
+            auto note = [&](const ldml::TransformStep & step) -> std::string {
+                const ldml::TransformEntry * used = registry.lookup(step.transform.getText());
+                if (step.filter || a.plan.filter || used == nullptr || used->isBuiltIn()) return "";
+                if (!analyzer.analyze(used).implementable) return analyzer.shapeGroupsOf(used).applicable ? " (by its shape groups)" : "";
+                const TransformAnalyzer::ShapeChoice & c = shapeChoice(registry, analyzer, used);
+                std::string segments;
+                for (size_t k = 0; c.aligned && k < c.useShapes.size(); k++) {
+                    if (c.useShapes[k]) segments += (segments.empty() ? "" : ", ") + std::to_string(k + 1);
+                }
+                const bool several = segments.find(',') != std::string::npos;
+                return segments.empty() ? "" : std::string(several ? " (segments " : " (segment ") + segments + " by shape groups, see its --plan)";
+            };
+            if (a.implementable) {
+                printPlan(label, a, &shapeChoice(registry, analyzer, entry), note);
+                if (!groups.applicable) toolio::out() << "  (not entirely by shape groups: " << groups.reason << ")\n";
+                return 0;
+            }
+            printPlan(label, a);
+            toolio::out() << "  not by shape groups: " << groups.reason << "\n";
+            return 2;
+        }
+        printPlan(label, a);
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),

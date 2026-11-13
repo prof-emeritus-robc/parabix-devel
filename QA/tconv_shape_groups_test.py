@@ -9,8 +9,8 @@
 #  with icgrep --replace to the text in NFD, the deferred function calls
 #  (their marks and arguments) replaced by their values, and the result (in
 #  NFC) compared with ICU's (tconv --use-ICU=.*, if tconv is built with ICU),
-#  or else with tconv's; and so is tconv --apply-shape-groups, which applies
-#  the same passes itself.  (Skipped without the CLDR transforms.)
+#  or else with tconv's regular plan (--apply-shape-groups=0); and so is tconv
+#  --apply-shape-groups (the default), which applies the same passes itself.  (Skipped without the CLDR transforms.)
 #
 #  tconv_shape_groups_test.py <tconv binary> <icgrep binary>
 
@@ -102,8 +102,8 @@ def main():
         with open(path, "w", encoding="utf-8") as f:
             f.write("".join(l + "\n" for l in TEXT))
         reference = []
-        for icu in ("--use-ICU=.*", None):
-            argv = [tconv] + ([icu] if icu else []) + [TRANSFORM, path]
+        for icu in ("--use-ICU=.*", "--apply-shape-groups=0"):
+            argv = [tconv, icu, TRANSFORM, path]
             run = subprocess.run(argv, capture_output=True)
             if run.returncode == 0:
                 reference = run.stdout.decode("utf-8").split("\n")[:len(TEXT)]

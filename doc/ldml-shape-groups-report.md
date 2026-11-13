@@ -26,7 +26,8 @@ expression engine, one per *shape* of the rules' results (see
   characters, for example `(?<=\p{letter}(?:\x{FDD9}5|5)*)`.
 
 `tconv --shape-groups <transform>` prints the plan; `--apply-shape-groups`
-applies it.
+applies it. It is on by default; `--apply-shape-groups=0` uses the regular
+plan only. `tconv --plan` shows the plan chosen for each segment.
 
 **Per-segment choice.** A *segment* is the run of conversion groups between
 consecutive `::X` transform rules. When the regular plan and the shape groups

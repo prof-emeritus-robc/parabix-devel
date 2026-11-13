@@ -13,7 +13,6 @@
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/stream_select.h>
 #include <kernel/unicode/charclasses.h>
-#include <kernel/unicode/utf8_support.h>
 #include <pablo/pablo.h>
 #include <re/adt/re_cc.h>
 #include <re/alphabet/alphabet.h>
@@ -63,12 +62,6 @@ PabloAST * numberAt(PabloBuilder & pb, const std::vector<PabloAST *> & bits, uns
     return is;
 }
 
-//  The handling of ill-formed code units (see codegen::UTF8Errors), by the
-//  first character map of a text: none (the text is well-formed, or the code
-//  units are copied), each maximal ill-formed subpart replaced by U+FFFD, or
-//  deleted.
-enum class Errors {None, Replace, Drop};
-
 //  The plan of a character map.  Each character mapped keeps, in place, as
 //  many of its bytes as its replacement has (up to all of them), changed by
 //  XOR to the bytes of the replacement; the bytes of the character beyond are
@@ -86,8 +79,6 @@ enum class Errors {None, Replace, Drop};
 //      character longer than its nonempty replacement);
 //    - Empty: the characters deleted (an empty replacement), if any;
 //    - the bits of the number of the tail inserted (0: none).
-//  An ill-formed subpart replaced by U+FFFD (EF BF BD) keeps its first byte,
-//  set to EF, with the tail BF BD (the last tail).
 struct Plan {
     unsigned changeBytes = 0;   // the bytes changed in place: at most 4
     unsigned deleteBits = 0;
@@ -123,10 +114,10 @@ class UTF8_CharMapApply final : public PabloKernel {
 public:
     //  (With Applies, the characters of the class Contextual (the last of the
     //  classes) are mapped only where Applies marks their last bytes.)
-    UTF8_CharMapApply(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Classes, StreamSet * Applies, Plan plan, Errors errors,
+    UTF8_CharMapApply(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Classes, StreamSet * Applies, Plan plan,
                       StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts)
     : PabloKernel(ts, "UTF8_CharMapApply_" + getStringHash(plan.signature()) + "_" + std::to_string(Classes->getNumElements()) +
-                      (errors == Errors::Replace ? "_r" : errors == Errors::Drop ? "_d" : "") + (Keep ? "_k" : "") + (Inserts ? "_i" : "") +
+                      (Keep ? "_k" : "") + (Inserts ? "_i" : "") +
                       (Applies ? "_c" : ""),
                   [&] {
                       Bindings in{Binding{"basis", Basis, FixedRate(1), LookAhead(3)}, Binding{"classes", Classes}};
@@ -139,7 +130,7 @@ public:
                       if (Inserts) out.emplace_back("inserts", Inserts);
                       return out;
                   }()),
-      mPlan(std::move(plan)), mErrors(errors), mKeep(Keep != nullptr), mInserts(Inserts != nullptr), mApplies(Applies != nullptr) {}
+      mPlan(std::move(plan)), mKeep(Keep != nullptr), mInserts(Inserts != nullptr), mApplies(Applies != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -203,26 +194,6 @@ protected:
         };
         std::vector<PabloAST *> tail;
         for (unsigned k = 0; k < mPlan.tailBits; k++) tail.push_back(atLast(classes[mPlan.tailIndex() + k]));
-        if (mErrors != Errors::None) {
-            // The maximal ill-formed subparts (of at most 3 bytes), from their
-            // first bytes to their last.
-            const UTF8_Structure u = UTF8_structure(pb, basis, true);
-            PabloAST * const second = pb.createAdvance(pb.createAnd(u.errorInitial, pb.createNot(u.errorFinal)), 1);
-            PabloAST * const third = pb.createAdvance(pb.createAnd(second, pb.createNot(u.errorFinal)), 1);
-            deleted = pb.createOr3(deleted, second, third);
-            if (mErrors == Errors::Drop) {
-                deleted = pb.createOr(deleted, u.errorInitial);
-            } else {
-                for (unsigned b = 0; b < 8; b++) {
-                    translated[b] = ((0xEF >> b) & 1) ? pb.createOr(translated[b], u.errorInitial)
-                                                      : pb.createAnd(translated[b], pb.createNot(u.errorInitial));
-                }
-                const unsigned last = static_cast<unsigned>(mPlan.tails.size());     // (BF BD)
-                for (unsigned k = 0; k < mPlan.tailBits; k++) {
-                    if ((last >> k) & 1) tail[k] = pb.createOr(tail[k], u.errorInitial);
-                }
-            }
-        }
         writeOutputStreamSet("translated", translated);
         if (mKeep) writeOutputStreamSet("keep", std::vector<PabloAST *>{pb.createInFile(pb.createNot(deleted))});
         if (mInserts) {
@@ -239,7 +210,6 @@ protected:
     }
 private:
     const Plan mPlan;
-    const Errors mErrors;
     const bool mKeep;
     const bool mInserts;
     const bool mApplies;
@@ -276,11 +246,9 @@ private:
 
 }
 
-StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis, bool wellFormed,
+StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis,
                                  const UCD::UnicodeSet & contextual, StreamSet * Applies) {
-    const Errors errors = (wellFormed || (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort)) ? Errors::None
-                          : (codegen::UTF8Errors == codegen::UTF8ErrorMode::DropBadInput) ? Errors::Drop : Errors::Replace;
-    if (map.empty() && (errors == Errors::None)) return Basis;
+    if (map.empty()) return Basis;
     // Each character mapped: the changes of its bytes in place, the number of
     // bytes to delete, and the tail inserted.
     struct Change {
@@ -324,10 +292,6 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
         }
         mapped = mapped + m.first;
     }
-    if (errors == Errors::Replace) {
-        plan.tails.push_back("\xBF\xBD");     // (U+FFFD after EF, see Plan)
-        maxTail = std::max(maxTail, 2u);
-    }
     plan.deleteBits = bitsFor(maxDelete);
     plan.tailBits = bitsFor(static_cast<unsigned>(plan.tails.size()));
     plan.insertBits = bitsFor(maxTail);
@@ -350,12 +314,12 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
     SHOW_BIXNUM(Classes);
     // The characters changed in place; the positions kept, and the
     // insertions, where bytes are deleted or inserted.
-    const bool deletes = (maxDelete > 0) || plan.empty || (errors != Errors::None);
+    const bool deletes = (maxDelete > 0) || plan.empty;
     const bool inserts = !plan.tails.empty();
     StreamSet * const Translated = P.CreateStreamSet(8);
     StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
     StreamSet * Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
-    P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, Applies, plan, errors, Translated, Keep, Inserts);
+    P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, Applies, plan, Translated, Keep, Inserts);
     SHOW_BIXNUM(Translated);
     Basis = Translated;
     if (deletes) {

@@ -251,6 +251,19 @@ void FieldCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value
     std::vector<Value *> maskVec = streamutils::loadInputSelectionsBlock(b, {mMaskOp}, blockOffsetPhi);
     std::vector<Value *> input = streamutils::loadInputSelectionsBlock(b, mInputOps, blockOffsetPhi);
 
+    // The fast path: with nothing to delete in the block (its mask all ones),
+    // the fields are the input fields.
+    BasicBlock * const fastBlock = b.CreateBasicBlock("fastBlock");
+    BasicBlock * const generalBlock = b.CreateBasicBlock("generalBlock");
+    BasicBlock * const blockDone = b.CreateBasicBlock("blockDone");
+    b.CreateCondBr(b.bitblock_any(b.simd_not(maskVec[0])), generalBlock, fastBlock);
+    b.SetInsertPoint(fastBlock);
+    for (unsigned j = 0; j < input.size(); ++j) {
+        b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi, input[j]);
+    }
+    b.CreateBr(blockDone);
+    b.SetInsertPoint(generalBlock);
+
     if (b.hasFeature(IDISA::Feature::AVX_BMI2)) {
         Type * fieldTy = b.getIntNTy(mFW);
         const unsigned fieldsPerBlock = b.getBitBlockWidth()/mFW;
@@ -278,8 +291,10 @@ void FieldCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value
             b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi, output[j]);
         }
     }
+    b.CreateBr(blockDone);
+    b.SetInsertPoint(blockDone);
     Value * nextBlk = b.CreateAdd(blockOffsetPhi, b.getSize(1));
-    blockOffsetPhi->addIncoming(nextBlk, processLoopBody);
+    blockOffsetPhi->addIncoming(nextBlk, blockDone);
     Value * moreToDo = b.CreateICmpNE(nextBlk, numOfStrides);
     b.CreateLikelyCondBr(moreToDo, processLoopBody, exit);
 
@@ -397,6 +412,9 @@ void StreamCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Valu
     Constant * BLOCK_MASK = ConstantInt::get(fwTy, b.getBitBlockWidth() - 1);
 
     BasicBlock * const segmentLoop = b.CreateBasicBlock("segmentLoop");
+    BasicBlock * const fastStride = b.CreateBasicBlock("fastStride");
+    BasicBlock * const generalStride = b.CreateBasicBlock("generalStride");
+    BasicBlock * const strideDone = b.CreateBasicBlock("strideDone");
     BasicBlock * const segmentDone = b.CreateBasicBlock("segmentDone");
     BasicBlock * const writePartialData = b.CreateBasicBlock("writePartialData");
     BasicBlock * const segmentExit = b.CreateBasicBlock("segmentExit");
@@ -445,6 +463,31 @@ void StreamCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Valu
     for (unsigned i = 0; i < mStreamCount; i++) {
         pendingData[i] = pendingDataPhi[i];
     }
+    //
+    // The fast path: with no pending items (the output aligned with the input,
+    // as when nothing has been deleted) and nothing to delete in the stride
+    // (its extraction mask all ones), the stride is copied as it is.
+    {
+        Value * anyDeleted = b.CreateICmpNE(pendingItemsPhi, ConstantInt::get(fwTy, 0));
+        for (unsigned blk = 0; blk < strideBlocks; blk++) {
+            Value * const mask = b.loadInputStreamBlock("extractionMask", ZERO, b.CreateAdd(inputOffsetPhi, b.getSize(blk)));
+            anyDeleted = b.CreateOr(anyDeleted, b.bitblock_any(b.simd_not(mask)));
+        }
+        b.CreateCondBr(anyDeleted, generalStride, fastStride);
+    }
+    b.SetInsertPoint(fastStride);
+    for (unsigned blk = 0; blk < strideBlocks; blk++) {
+        Value * const in = b.CreateAdd(inputOffsetPhi, b.getSize(blk));
+        Value * const out = b.CreateAdd(outputOffsetPhi, b.getSize(blk));
+        for (unsigned i = 0; i < mStreamCount; i++) {
+            b.storeOutputStreamBlock("compressedOutput", b.getInt32(i), out,
+                                     b.loadInputStreamBlock("sourceStreamSet", b.getInt32(i), in));
+        }
+    }
+    Value * const fastInputOffset = b.CreateAdd(inputOffsetPhi, b.getSize(strideBlocks));
+    Value * const fastOutputOffset = b.CreateAdd(outputOffsetPhi, b.getSize(strideBlocks));
+    b.CreateBr(strideDone);
+    b.SetInsertPoint(generalStride);
     SmallVector<Value *, 8> offsets(strideBlocks);
     SmallVector<Value *, 8> currentFieldMask(strideBlocks);
     SmallVector<Value *, 8> pendingFieldIdx(strideBlocks);
@@ -593,18 +636,39 @@ void StreamCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Valu
             pendingData[i] = b.bitCast(b.CreateSelect(doesFit[blk], pendingOutput[i], outputFields[i]));
         }
     }
+    BasicBlock * const generalStrideEnd = b.GetInsertBlock();
+    b.CreateBr(strideDone);
     //
-    // Prepare Phi nodes for the next stride.trid
+    // Prepare Phi nodes for the next stride: from the fast path (no pending
+    // items, no pending data) or the general one.
     //
-    pendingItemsPhi->addIncoming(pendingItems[strideBlocks], segmentLoop);
-    inputOffsetPhi->addIncoming(inputOffset[strideBlocks], segmentLoop);
-    outputOffsetPhi->addIncoming(outputOffset[strideBlocks], segmentLoop);
+    b.SetInsertPoint(strideDone);
+    PHINode * const nextPendingItems = b.CreatePHI(fwTy, 2);
+    nextPendingItems->addIncoming(ConstantInt::get(fwTy, 0), fastStride);
+    nextPendingItems->addIncoming(pendingItems[strideBlocks], generalStrideEnd);
+    PHINode * const nextInputOffset = b.CreatePHI(sizeTy, 2);
+    nextInputOffset->addIncoming(fastInputOffset, fastStride);
+    nextInputOffset->addIncoming(inputOffset[strideBlocks], generalStrideEnd);
+    PHINode * const nextOutputOffset = b.CreatePHI(sizeTy, 2);
+    nextOutputOffset->addIncoming(fastOutputOffset, fastStride);
+    nextOutputOffset->addIncoming(outputOffset[strideBlocks], generalStrideEnd);
     for (unsigned i = 0; i < mStreamCount; i++) {
-        pendingDataPhi[i]->addIncoming(pendingData[i], segmentLoop);
+        PHINode * const next = b.CreatePHI(pendingDataPhi[i]->getType(), 2);
+        next->addIncoming(Constant::getNullValue(pendingDataPhi[i]->getType()), fastStride);
+        next->addIncoming(pendingData[i], generalStrideEnd);
+        pendingData[i] = next;
+    }
+    pendingItems[strideBlocks] = nextPendingItems;
+    outputOffset[strideBlocks] = nextOutputOffset;
+    pendingItemsPhi->addIncoming(nextPendingItems, strideDone);
+    inputOffsetPhi->addIncoming(nextInputOffset, strideDone);
+    outputOffsetPhi->addIncoming(nextOutputOffset, strideDone);
+    for (unsigned i = 0; i < mStreamCount; i++) {
+        pendingDataPhi[i]->addIncoming(pendingData[i], strideDone);
     }
     //
     // Now continue the loop if there are more blocks to process.
-    Value * moreToDo = b.CreateICmpNE(inputOffset[strideBlocks], numOfBlocks);
+    Value * moreToDo = b.CreateICmpNE(nextInputOffset, numOfBlocks);
     b.CreateCondBr(moreToDo, segmentLoop, segmentDone);
 
     b.SetInsertPoint(segmentDone);

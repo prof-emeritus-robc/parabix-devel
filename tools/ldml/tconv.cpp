@@ -89,6 +89,7 @@
 #include <kernel/unicode/normalization/normalization.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_charmap.h>
+#include <kernel/unicode/utf8_wellformed.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/UCD_property_kernel.h>
@@ -9565,16 +9566,14 @@ const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEnt
 
 //  A transform in UTF-8 mode (see TransformAnalyzer::mode) applied to the
 //  basis bits of UTF-8 code units.
-//  The ill-formed code units of the text are handled by the first character
-//  map (as by the decoding of UTF-8 in Unicode mode, see codegen::UTF8Errors):
-//  the text is then well-formed.
+//  (On well-formed text, see utf8TransformText.)
 static StreamSet * utf8Transform(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                 const ldml::TransformEntry * entry, StreamSet * Basis, bool & wellFormed,
+                                 const ldml::TransformEntry * entry, StreamSet * Basis,
                                  std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
     if (entry->isBuiltIn()) return Basis;   // (Any-Null)
     for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
-            Basis = utf8Transform(P, registry, analyzer, registry.lookup(step.transform.getText()), Basis, wellFormed);
+            Basis = utf8Transform(P, registry, analyzer, registry.lookup(step.transform.getText()), Basis);
             continue;
         }
         kernel::UTF8_CharMap map;
@@ -9586,22 +9585,19 @@ static StreamSet * utf8Transform(PipelineBuilder & P, const ldml::TransformRegis
         }
         const size_t kernels = P.getNumOfKernelCalls();
         StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(P, contextual, Basis);
-        Basis = kernel::UTF8_CharMapPipeline(P, map, Basis, wellFormed, contextualChars, applies);
-        wellFormed = true;
+        Basis = kernel::UTF8_CharMapPipeline(P, map, Basis, contextualChars, applies);
         if (groupCounts && groupRules(step) > 0) groupCounts->push_back({groupRules(step), P.getNumOfKernelCalls() - kernels});
     }
     return Basis;
 }
 
-//  A transform in UTF-8 mode on the UTF-8 code units of a text (whose
-//  ill-formed code units are handled, if no character map did).
+//  A transform in UTF-8 mode on the UTF-8 code units of a text, made
+//  well-formed first, as decoding UTF-8 does in Unicode mode (see
+//  kernel::WellFormedUTF8 and codegen::UTF8Errors).
 static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                      const ldml::TransformEntry * entry, StreamSet * Basis,
                                      std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
-    bool wellFormed = false;
-    Basis = utf8Transform(P, registry, analyzer, entry, Basis, wellFormed, groupCounts);
-    if (!wellFormed) Basis = kernel::UTF8_CharMapPipeline(P, {}, Basis);
-    return Basis;
+    return utf8Transform(P, registry, analyzer, entry, kernel::WellFormedUTF8(P, Basis), groupCounts);
 }
 
 static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,

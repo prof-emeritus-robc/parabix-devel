@@ -716,9 +716,10 @@ bool planPathsWalk(const std::vector<std::vector<WalkItem>> & paths, const std::
         CaptureWalk::Boundary boundary;
         if (forward) forward = segmentSteps(paths, from, to, walk.steps);
         bool fromEnd = true, walkBack = sameBack;
-        long least = LONG_MAX;
+        long least = LONG_MAX, leastAfter = LONG_MAX;
         for (size_t b = 0; b < B; b++) {
             const size_t i = at[b][k];
+            leastAfter = std::min(leastAfter, prefixMin[b].back() - prefixMin[b][i]);
             fromEnd = fromEnd && (suffix[b][i + 1] >= 0) && (suffix[b][i + 1] == suffix[0][at[0][k] + 1]);
             walkBack = walkBack && (back[b][i] >= 0) && (back[b][i] == back[0][at[0][k]]) && (prefixMin[b][i] > 0);
             least = std::min(least, prefixMin[b][i]);
@@ -744,6 +745,7 @@ bool planPathsWalk(const std::vector<std::vector<WalkItem>> & paths, const std::
         } else {
             found[j].follow = boundary;
             found[j].close = at[0][k];
+            found[j].suffixMinLength = static_cast<int>(leastAfter);
         }
     }
     if (!sameBack) walk.backSteps.clear();
@@ -762,6 +764,29 @@ std::map<std::string, std::vector<Capture *>> allCapturesByName(RE * re) {
     std::map<std::string, std::vector<Capture *>> captures;
     AllCaptureCollector(captures).inspectRE(re);
     return captures;
+}
+
+bool captureCharacterSets(RE * search, const std::string & name, std::vector<UCD::UnicodeSet> & positions) {
+    positions.clear();
+    const auto captures = allCapturesByName(search);
+    const auto f = captures.find(name);
+    if (f == captures.end()) return false;
+    bool first = true;
+    for (Capture * const c : f->second) {
+        const auto range = getLengthRange(c, &cc::Unicode);
+        std::vector<UCD::UnicodeSet> p;
+        if ((range.first != range.second) || !fixedPositions(c->getCapturedRE(), p) ||
+            (p.size() != static_cast<size_t>(range.first))) return false;
+        if (first) {
+            positions = std::move(p);
+            first = false;
+        } else if (p.size() != positions.size()) {
+            return false;
+        } else {
+            for (size_t k = 0; k < p.size(); k++) positions[k] = positions[k] + p[k];
+        }
+    }
+    return true;
 }
 
 std::vector<Reference *> unresolvedReferences(RE * replacement, RE * search) {
@@ -898,6 +923,10 @@ bool planCaptureWalk(RE * search, const std::vector<std::string> & captures, Cap
     std::vector<bool> seen(names.size(), false);
     bool forward = true;
     long prefixMin = 0;
+    long totalMin = 0;
+    for (const WalkItem & item : items) {
+        if (item.mark < 0) totalMin += getLengthRange(item.re, &cc::Unicode).first;
+    }
     for (size_t i = 0; i < n; i++) {
         RE * const r = items[i].re;
         if (items[i].mark >= 0) {
@@ -927,6 +956,7 @@ bool planCaptureWalk(RE * search, const std::vector<std::string> & captures, Cap
             } else {
                 found[j].follow = b;
                 found[j].close = i;
+                found[j].suffixMinLength = static_cast<int>(std::min<long>(totalMin - prefixMin, INT_MAX));
             }
             continue;
         }

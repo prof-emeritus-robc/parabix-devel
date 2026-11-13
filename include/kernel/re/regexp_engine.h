@@ -176,8 +176,11 @@ PreparedSearchReplace prepareSearchReplace(re::RE * search, re::RE * replacement
 // reference of the replacement must be to a capture of the search pattern,
 // and a capture that does not match one string only (which is folded into
 // the literal text) must have unique boundaries found by a re::CaptureWalk,
-// the references being in the order of the captures in the search pattern,
-// each capture referred to once and not within another.
+// each capture referred to once and not within another, and the references
+// in the order of the captures in the search pattern, but for captures of
+// fixed lengths moved back: each referred to just before a capture kept in
+// place that precedes it, and rotated back to it in each match (see
+// ReferencePlan in regexp_engine.cpp).
 std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr,
                                                     const cc::Alphabet * sourceEncoding = &cc::UTF8);
 

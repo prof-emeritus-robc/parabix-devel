@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace cc { class Alphabet; }
+namespace UCD { class UnicodeSet; }
 
 namespace re {
 
@@ -35,6 +36,12 @@ std::map<std::string, Capture *> capturesByName(RE * re);
 
 // All the captures of an RE, by name, in order.
 std::map<std::string, std::vector<Capture *>> allCapturesByName(RE * re);
+
+// The characters at each position of the captures of a name in a search
+// pattern (all those of the name, as in the alternatives of a branch reset
+// group), if each matches a fixed number of characters, the same for all, each
+// of a set: the union of their sets at each position (in Unicode code points).
+bool captureCharacterSets(RE * search, const std::string & name, std::vector<UCD::UnicodeSet> & positions);
 
 // The references of a replacement to captures that the search pattern does
 // not have (a precondition of search and replace: there must be none).
@@ -113,6 +120,7 @@ struct CaptureWalk {
         unsigned open = 0;          // the positions of the capture among the items of the
         unsigned close = 0;         // search pattern (for the order of captures)
         int prefixMinLength = 0;    // the minimum length of the match before the capture
+        int suffixMinLength = 0;    // the minimum length of the match after the capture
     };
     std::vector<Step> steps;
     std::vector<Step> backSteps;                // from the end of the match, back

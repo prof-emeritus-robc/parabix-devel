@@ -3649,6 +3649,184 @@ protected:
     }
 };
 
+// A rotation of a capture moved back (see ReferencePlan).  The capture moved
+// is carried back either as the basis bits of its text, or, if the characters
+// at each of its positions are of a small set (chars: the characters of each
+// position, in order), multiplexed: as the bits of the index of its character
+// in the set of its position (bits streams, as many as the largest set
+// needs; none if each set has one character).
+struct Rotation {
+    unsigned moved;                     // the reference moved
+    unsigned destination;               // the reference before which it is moved
+    unsigned length;
+    unsigned advance;                   // the positions F is shifted forward before it is shifted back
+    std::vector<unsigned> shifted;      // the references of the captures rotated forward
+    std::vector<std::vector<UCD::codepoint_t>> chars;   // empty: the basis is carried
+    unsigned bits = 0;
+    bool multiplexed() const {return !chars.empty();}
+    std::string signature() const {
+        std::string s = std::to_string(destination) + "_" + std::to_string(moved) + "_" + std::to_string(length) + "_" +
+                        std::to_string(advance) + "_";
+        for (unsigned x : shifted) s += std::to_string(x) + ",";
+        if (multiplexed()) {
+            std::string c;
+            for (const auto & p : chars) {
+                for (const UCD::codepoint_t cp : p) c += std::to_string(cp) + ",";
+                c += "|";
+            }
+            s += "_m" + std::to_string(bits) + "_" + c;
+        }
+        return s;
+    }
+};
+
+// The largest number of characters of a position of a capture carried
+// multiplexed (decoded one by one at its destination).
+constexpr size_t MaxMultiplexedChars = 64;
+
+// The rotation of a capture moved back in each selected match: the capture
+// moved (F: from the start of capture Moved to its follow, of Length
+// characters) goes before the positions S from the start of capture
+// Destination to the start of the capture moved, which go forward by Length.
+// F is shifted forward by Advance positions (A), then back by Length
+// positions of an index, the positions not in S shifted forward by A
+// (IndexedShiftBack, applied Length times, to all the streams carried at
+// once): it lands Length - A positions before S, and is shifted forward by
+// Length - A, as S is by Length.  The positions F passes through are in the
+// text: the A - 1 positions after F are in the match, or its follow, and the
+// Length - A positions before S in the match (see planReferences).
+//
+// RotationPrepare: the index (Index) and the streams carried (Carried: the
+// text of F, or its multiplexed codes); Marks: the starts and follows of the
+// captures (two streams per capture).
+class RotationPrepare final : public pablo::PabloKernel {
+public:
+    RotationPrepare(LLVMTypeSystemInterface & ts, const Rotation & r,
+                    StreamSet * Marks, StreamSet * Text, StreamSet * Index, StreamSet * Carried)
+    : PabloKernel(ts, "RotationPrepare" + std::to_string(Marks->getNumElements()) + "_" +
+                      std::to_string(Text->getNumElements()) + "_" + getStringHash(r.signature()),
+                  {Binding{"Marks", Marks}, Binding{"Text", Text}},
+                  [&] {
+                      Bindings outputs{Binding{"Index", Index}};
+                      if (Carried) outputs.emplace_back("Carried", Carried);
+                      return outputs;
+                  }()),
+      mRotation(r), mCarried(Carried != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> marks = getInputStreamSet("Marks");
+        const std::vector<PabloAST *> text = getInputStreamSet("Text");
+        const unsigned d = mRotation.destination, m = mRotation.moved;
+        const unsigned A = mRotation.advance;
+        auto ahead = [&](PabloAST * x) {return (A == 0) ? x : pb.createAdvance(x, A);};
+        PabloAST * const S = captureCoverage(pb, marks[2 * d], marks[2 * m]);
+        writeOutputStreamSet("Index", std::vector<PabloAST *>{pb.createInFile(pb.createNot(ahead(S)))});
+        if (!mCarried) return;
+        std::vector<PabloAST *> carried;
+        if (!mRotation.multiplexed()) {
+            PabloAST * const F = captureCoverage(pb, marks[2 * m], marks[2 * m + 1]);
+            for (PabloAST * t : text) carried.push_back(ahead(pb.createAnd(t, F)));
+        } else {
+            // The code of the character at position i of F: its index in chars[i].
+            cc::Parabix_CC_Compiler_Builder ccc(text);
+            carried.assign(mRotation.bits, pb.createZeroes());
+            PabloAST * at = marks[2 * m];
+            for (size_t i = 0; i < mRotation.chars.size(); i++) {
+                if (i > 0) at = pb.createAdvance(at, 1);
+                const std::vector<UCD::codepoint_t> & set = mRotation.chars[i];
+                for (unsigned j = 0; j < mRotation.bits; j++) {
+                    UCD::UnicodeSet withBit;
+                    for (size_t k = 0; k < set.size(); k++) if ((k >> j) & 1) withBit.insert(set[k]);
+                    if (withBit.empty()) continue;
+                    PabloAST * const chars = ccc.compileCC(makeCC(std::move(withBit), &cc::Unicode), pb);
+                    carried[j] = pb.createOr(carried[j], pb.createAnd(at, chars));
+                }
+            }
+            for (PabloAST *& x : carried) x = ahead(x);
+        }
+        writeOutputStreamSet("Carried", carried);
+    }
+private:
+    const Rotation mRotation;
+    const bool mCarried;
+};
+
+// RotationMerge: the text rotated (Rotated), given the streams carried back
+// (Back), and the marks of the captures after the rotation (RotatedMarks):
+// those of the captures in S (the destination and the captures shifted) go
+// forward by Length, and the capture moved takes the place of the start of S.
+// Multiplexed, the characters of the capture moved are decoded from their
+// codes at its new positions.
+class RotationMerge final : public pablo::PabloKernel {
+public:
+    RotationMerge(LLVMTypeSystemInterface & ts, const Rotation & r, StreamSet * Marks, StreamSet * Text,
+                  StreamSet * Back, StreamSet * Rotated, StreamSet * RotatedMarks)
+    : PabloKernel(ts, "RotationMerge" + std::to_string(Marks->getNumElements()) + "_" +
+                      std::to_string(Text->getNumElements()) + "_" + getStringHash(r.signature()),
+                  [&] {
+                      Bindings inputs{Binding{"Marks", Marks}, Binding{"Text", Text}};
+                      if (Back) inputs.emplace_back("Back", Back);
+                      return inputs;
+                  }(),
+                  {Binding{"Rotated", Rotated}, Binding{"RotatedMarks", RotatedMarks}}),
+      mRotation(r), mBack(Back != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> marks = getInputStreamSet("Marks");
+        const std::vector<PabloAST *> text = getInputStreamSet("Text");
+        std::vector<PabloAST *> back;
+        if (mBack) back = getInputStreamSet("Back");
+        const unsigned d = mRotation.destination, m = mRotation.moved, L = mRotation.length;
+        auto forward = [&](PabloAST * x) {return (L == 0) ? x : pb.createAdvance(x, L);};
+        // (F, carried back, the rest of the way.)
+        const unsigned rest = L - mRotation.advance;
+        auto rejoin = [&](PabloAST * x) {return (rest == 0) ? x : pb.createAdvance(x, rest);};
+        PabloAST * const S = captureCoverage(pb, marks[2 * d], marks[2 * m]);
+        PabloAST * const F = captureCoverage(pb, marks[2 * m], marks[2 * m + 1]);
+        PabloAST * const unchanged = pb.createNot(pb.createOr(S, F));
+        std::vector<PabloAST *> rotated;
+        for (size_t b = 0; b < text.size(); b++) {
+            PabloAST * r = pb.createOr(pb.createAnd(text[b], unchanged), forward(pb.createAnd(text[b], S)));
+            if (!mRotation.multiplexed()) r = pb.createOr(r, rejoin(back[b]));
+            rotated.push_back(r);
+        }
+        if (mRotation.multiplexed()) {
+            // The codes at the new positions of the capture moved (from the
+            // start of S), decoded.
+            std::vector<PabloAST *> code;
+            for (PabloAST * x : back) code.push_back(rejoin(x));
+            PabloAST * at = marks[2 * d];
+            for (size_t i = 0; i < mRotation.chars.size(); i++) {
+                if (i > 0) at = pb.createAdvance(at, 1);
+                const std::vector<UCD::codepoint_t> & set = mRotation.chars[i];
+                for (size_t k = 0; k < set.size(); k++) {
+                    PabloAST * hit = at;
+                    for (unsigned j = 0; j < mRotation.bits; j++) {
+                        hit = pb.createAnd(hit, ((k >> j) & 1) ? code[j] : pb.createNot(code[j]));
+                    }
+                    for (size_t b = 0; b < rotated.size(); b++) {
+                        if ((set[k] >> b) & 1) rotated[b] = pb.createOr(rotated[b], hit);
+                    }
+                }
+            }
+        }
+        std::vector<PabloAST *> newMarks(marks);
+        for (unsigned x : mRotation.shifted) {
+            newMarks[2 * x] = forward(marks[2 * x]);
+            newMarks[2 * x + 1] = forward(marks[2 * x + 1]);
+        }
+        newMarks[2 * m] = marks[2 * d];
+        newMarks[2 * m + 1] = forward(marks[2 * d]);
+        writeOutputStreamSet("Rotated", rotated);
+        writeOutputStreamSet("RotatedMarks", newMarks);
+    }
+private:
+    const Rotation mRotation;
+    const bool mBack;
+};
+
 // A literal piece of a replacement, inserted before an anchor of a match: its
 // start, its follow (the position after its last code unit), or the start of
 // a capture, possibly only where that is (or is not) the follow of the match.
@@ -3798,6 +3976,157 @@ bool replacementPieces(const PreparedSearchReplace & sr, std::vector<std::u32str
     return true;
 }
 
+// The references of a replacement (as given by replacementPieces), as kept
+// in place or moved back.  The captures kept are in the order of the search
+// pattern.  A capture moved has a fixed length L (on every path of the search
+// pattern, in characters), and is referred to just before a capture kept that
+// precedes it in the search pattern (its destination): in each selected match,
+// the capture moved is rotated back over the positions from the start of its
+// destination to its own start (see RotationMerge), after which the references
+// are in the order of the captures in the text, and replaced in place.  The
+// regions rotated (from a destination to its capture moved) must be disjoint.
+// The capture moved passes through positions of the text around the region
+// (see RotationPrepare): first forward by A = min(L, 1 + the least length of
+// the match after it), into the match and its follow, then back to L - A
+// positions before the destination, which must have that many characters of
+// the match before it (with L = 1, none).  The
+// references must be to distinct captures, not within one another.  Of the
+// choices of the captures kept, the one keeping the most.
+struct ReferencePlan {
+    std::vector<Rotation> rotations;    // in their order in the text
+};
+
+bool planReferences(const PreparedSearchReplace & sr, const std::vector<std::string> & references,
+                    const re::CaptureWalk & walk, ReferencePlan & plan, std::string & reason) {
+    const size_t n = references.size();
+    plan.rotations.clear();
+    const re::CaptureWalk::CaptureBoundaries * const c = walk.captures.data();
+    // (a, b): the capture of reference a before that of reference b.
+    auto before = [&](size_t a, size_t b) {return c[a].close < c[b].open;};
+    for (size_t a = 0; a < n; a++) {
+        for (size_t b = a + 1; b < n; b++) {
+            if (!before(a, b) && !before(b, a)) {
+                reason = "the references must be to distinct captures, each referred to once and not within "
+                         "another: copying captured text is not yet supported";
+                return false;
+            }
+        }
+    }
+    // Whether the references of a set (a mask) are in the order of their captures.
+    auto inOrder = [&](uint64_t set) {
+        long last = -1;
+        for (size_t a = 0; a < n; a++) {
+            if (((set >> a) & 1) == 0) continue;
+            if ((last >= 0) && !before(static_cast<size_t>(last), a)) return false;
+            last = static_cast<long>(a);
+        }
+        return true;
+    };
+    const uint64_t all = (n >= 64) ? ~uint64_t{0} : ((uint64_t{1} << n) - 1);
+    if (inOrder(all)) return true;
+    const std::string unsupported =
+        "the references must be to captures in their order in the search pattern, but for captures of fixed "
+        "lengths moved back, each referred to just before a capture kept in place that precedes it, over "
+        "disjoint regions, with enough characters of the match around them (as many before the destination "
+        "and after the capture moved, but one, as the capture has): other reorderings of captured text are "
+        "not yet supported";
+    if (n > 16) {
+        reason = unsupported;
+        return false;
+    }
+    // The fixed lengths of the captures (-1: variable).
+    const auto captures = re::allCapturesByName(sr.search.re);
+    std::vector<int> fixed(n, -1);
+    for (size_t a = 0; a < n; a++) {
+        const auto f = captures.find(references[a]);
+        if (f == captures.end()) continue;
+        int lgth = -1;
+        bool same = true;
+        for (Capture * const cap : f->second) {
+            const auto range = getLengthRange(cap, &cc::Unicode);
+            if (lgth < 0) lgth = range.first;
+            same = same && (range.first == range.second) && (range.first == lgth);
+        }
+        if (same) fixed[a] = lgth;
+    }
+    // The rotations for a set of references kept, if they apply.
+    auto rotationsFor = [&](uint64_t kept, std::vector<Rotation> & rotations) {
+        rotations.clear();
+        if (!inOrder(kept)) return false;
+        // The references in the order of their captures in the text.
+        std::vector<unsigned> order(n);
+        for (unsigned a = 0; a < n; a++) order[a] = a;
+        std::sort(order.begin(), order.end(), [&](unsigned x, unsigned y) {return c[x].open < c[y].open;});
+        std::vector<bool> touched(n, false);
+        for (unsigned a = 0; a < n; a++) {
+            if ((kept >> a) & 1) continue;
+            if (fixed[a] < 0) return false;
+            unsigned d = a + 1;
+            while ((d < n) && (((kept >> d) & 1) == 0)) d++;
+            if ((d == n) || !before(d, a)) return false;
+            // F goes forward by A (through the positions after it in the
+            // match, and its follow), then back to Length - A positions before
+            // the destination, in the match.
+            const int A = std::min(fixed[a], 1 + c[a].suffixMinLength);
+            if (c[d].prefixMinLength < fixed[a] - A) return false;
+            rotations.push_back(Rotation{a, d, static_cast<unsigned>(fixed[a]), static_cast<unsigned>(A), {}});
+        }
+        // Applied in the order of the text, over disjoint regions.
+        std::sort(rotations.begin(), rotations.end(),
+                  [&](const Rotation & x, const Rotation & y) {return c[x.moved].open < c[y.moved].open;});
+        for (Rotation & r : rotations) {
+            const auto pos = [&](unsigned x) {return std::find(order.begin(), order.end(), x) - order.begin();};
+            const auto from = pos(r.destination), to = pos(r.moved);
+            for (auto k = from; k <= to; k++) {
+                if (touched[order[k]]) return false;
+                touched[order[k]] = true;
+            }
+            r.shifted.assign(order.begin() + from, order.begin() + to);
+            order.erase(order.begin() + to);
+            order.insert(order.begin() + from, r.moved);
+        }
+        for (unsigned a = 0; a < n; a++) {
+            if (order[a] != a) return false;
+        }
+        return true;
+    };
+    bool found = false;
+    unsigned bestKept = 0;
+    std::vector<Rotation> rotations;
+    for (uint64_t kept = 0; kept <= all; kept++) {
+        const unsigned count = __builtin_popcountll(kept);
+        if ((found && (count <= bestKept)) || !rotationsFor(kept, rotations)) continue;
+        found = true;
+        bestKept = count;
+        plan.rotations = rotations;
+    }
+    if (!found) {
+        reason = unsupported;
+        return false;
+    }
+    // The captures moved carried multiplexed, where their sets are small.
+    for (Rotation & r : plan.rotations) {
+        std::vector<UCD::UnicodeSet> sets;
+        if (!re::captureCharacterSets(sr.search.re, references[r.moved], sets) || (sets.size() != r.length)) continue;
+        std::vector<std::vector<UCD::codepoint_t>> chars;
+        size_t largest = 0;
+        for (const UCD::UnicodeSet & set : sets) {
+            chars.emplace_back();
+            for (const auto & range : set) {
+                for (UCD::codepoint_t cp = range.first; (cp <= range.second) && (chars.back().size() <= MaxMultiplexedChars); cp++) {
+                    chars.back().push_back(cp);
+                }
+            }
+            largest = std::max(largest, chars.back().size());
+        }
+        if (largest > MaxMultiplexedChars) continue;
+        r.chars = std::move(chars);
+        r.bits = 0;
+        while ((size_t{1} << r.bits) < largest) r.bits++;
+    }
+    return true;
+}
+
 // The preconditions of a search and replace other than those of the search
 // pattern as compiled (see ModeTransformation::failures).
 std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchReplace & sr) {
@@ -3833,14 +4162,9 @@ std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchRepla
         if (!planCaptureWalk(search, references, walk, construct, reason, sr.search.options.reversal)) {
             failures.push_back(PreconditionFailure{goal, construct, reason});
         } else {
-            for (size_t j = 0; j + 1 < walk.captures.size(); j++) {
-                if (walk.captures[j].close >= walk.captures[j + 1].open) {
-                    failures.push_back(PreconditionFailure{goal, sr.replacement,
-                                       "the references must be to captures in their order in the search pattern, "
-                                       "each referred to once and not within another: moving or copying captured "
-                                       "text is not yet supported"});
-                    break;
-                }
+            ReferencePlan plan;
+            if (!planReferences(sr, references, walk, plan, reason)) {
+                failures.push_back(PreconditionFailure{goal, sr.replacement, reason});
             }
         }
         if ((sr.search.mode.lengthAlphabet != &cc::Unicode) || (sr.search.mode.indexAlphabet != &cc::Unicode)) {
@@ -3974,6 +4298,12 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
         std::string reason;
         planCaptureWalk(sr.search.re, references, walk, construct, reason, sr.search.options.reversal);
     }
+    // The captures moved back (see ReferencePlan).
+    ReferencePlan plan;
+    if (n > 0) {
+        std::string reason;
+        planReferences(sr, references, walk, plan, reason);
+    }
     // With references, a piece may be inserted before the follow of a
     // match, which must be a position of the text: without match regions,
     // the text is extended by one.
@@ -3992,7 +4322,31 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
         llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
     }
-    StreamSet * const marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
+    StreamSet * marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
+    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
+    StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
+    // The captures moved back rotated into place, in each selected match
+    // (within the match: its coverage and the positions kept outside the
+    // matches are unchanged), with the marks of the captures after the
+    // rotation: the references are then in the order of the captures.
+    for (const Rotation & r : plan.rotations) {
+        // The streams carried back: the basis bits of the text, or the codes
+        // of the characters (none if each position has one character).
+        const unsigned carried = r.multiplexed() ? r.bits : text->getNumElements();
+        StreamSet * const index = mPB.CreateStreamSet(1);
+        StreamSet * back = (carried > 0) ? mPB.CreateStreamSet(carried) : nullptr;
+        mPB.CreateKernelCall<RotationPrepare>(r, marks, text, index, back);
+        for (unsigned k = 0; back && (k < r.length); k++) {
+            StreamSet * const shifted = mPB.CreateStreamSet(carried);
+            mPB.CreateKernelCall<IndexedShiftBack>(index, back, shifted);
+            back = shifted;
+        }
+        StreamSet * const rotated = mPB.CreateStreamSet(text->getNumElements());
+        StreamSet * const rotatedMarks = mPB.CreateStreamSet(marks->getNumElements());
+        mPB.CreateKernelCall<RotationMerge>(r, marks, text, back, rotated, rotatedMarks);
+        text = rotated;
+        marks = rotatedMarks;
+    }
     // Each match is deleted but for the captures referenced, which stay in
     // place, and each literal piece is inserted before an anchor: piece j
     // before the start of the capture of reference j, and the last piece
@@ -4006,7 +4360,6 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     // it is that of its own match.  (The start of a capture whose prefix is
     // nullable may be the start of its match, and the follow of the previous
     // match: its pieces are inserted after those of the previous match.)
-    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
     auto codeUnits = [&](const std::u32string & s) {
         std::vector<unsigned> units;
         if (utf8) {
@@ -4062,7 +4415,6 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     if (mCtxt.mMultiplexed) {
         llvm::report_fatal_error("RE_PipelineBuilder: the text of a replacement needs the codepoints, not a multiplexed basis");
     }
-    StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
     StreamSet * resultFollows = follows ? mCtxt.mMatchFollows : nullptr;
     StreamSet * resultReplaced = matchedFollows;
     // The blocks of slots inserted and filled.

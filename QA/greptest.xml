@@ -1379,6 +1379,16 @@ ab3c
 abz9
 abd
 </datafile>
+<datafile id="branch_reset">ab
+cd
+ax
+abe
+cde
+zz
+aab
+cdee
+aee
+</datafile>
 <grepcase regexp="x(?=[a-z]*+\p{Nd})" datafile="lookahead_chain_assertions" greplines="5 6 10"/>
 <grepcase regexp="x(?=[a-z]*+\p{Nd})" datafile="lookahead_chain_assertions" flags="-i" greplines="5 6 10"/>
 <grepcase regexp="a(?=b*(?!b)c)" datafile="lookahead_chain_assertions" greplines="2 4 7"/>
@@ -1394,4 +1404,11 @@ abd
 <grepcase regexp="a(?=b*(?!c)$)" datafile="lookahead_chain_assertions" greplines="8"/>
 <grepcase regexp="a(?=b*(?!c)$)" datafile="lookahead_chain_assertions" flags="-i" greplines="8"/>
 
+<grepcase regexp="(?|(a)b|(c)d)" datafile="branch_reset" greplines="1 2 4 5 7 8"/>
+<grepcase regexp="(?|(a)(b)|(c)(d))(e)" datafile="branch_reset" greplines="4 5 8"/>
+<grepcase regexp="(?|a|c)d" datafile="branch_reset" greplines="2 5 8"/>
+<grepcase regexp="x(?|)" datafile="branch_reset" greplines="3"/>
+<grepcase regexp="(?|(a)(?|(a)|(c))b)" datafile="branch_reset" greplines="7"/>
+<grepcase regexp="(?|(a)|(c)(d))(e)\3" datafile="branch_reset" greplines="8 9"/>
+<grepcase regexp="(a)\1(?|(b)|(c))" datafile="branch_reset" greplines="7"/>
 </greptest>

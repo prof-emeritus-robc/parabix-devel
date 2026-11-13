@@ -61,7 +61,23 @@ CASES = [
     ("x[a-z0-9]*([a-z]\\d+);", "[$1]", "x[a-z0-9]*([a-z][0-9]+);", "[\\1]"),
     ("([a-z0-9]*[a-z])(\\d+)-([a-z]+);", "$1.$2.$3", "([a-z0-9]*[a-z])([0-9]+)-([a-z]+);", "\\1.\\2.\\3"),
     ("([a-z0-9é]*é)\\d+;", "<$1>", "([a-z0-9é]*é)[0-9]+;", "<\\1>"),
+    # Branch reset groups: the alternatives number their captures alike.  (Python's
+    # re has no branch reset: its replacement takes the groups of the alternative
+    # matched, see reset.)
+    ("(?|(a)(b)|(c)(d))", "[$1|$2]", "(?:(a)(b)|(c)(d))", lambda m: "[%s|%s]" % reset(m, 2)),
+    ("(?|([a-z]+)@|#([a-z0-9]+);)", "<$1>", "(?:([a-z]+)@|#([a-z0-9]+);)", lambda m: "<%s>" % reset(m, 1)),
+    ("(?|(é)([0-9]+)|([a-z]{2})([0-9]+));", "<$1|$2>",
+     "(?:(é)([0-9]+)|([a-z]{2})([0-9]+));", lambda m: "<%s|%s>" % reset(m, 2)),
 ]
+
+
+def reset(m, n):
+    """The n groups of the alternative matched by m (of alternatives of n groups each)."""
+    groups = m.groups()
+    for k in range(0, len(groups), n):
+        if groups[k] is not None:
+            return tuple(groups[k:k + n])
+    return (None,) * n
 
 # (icgrep pattern, icgrep replacement, a part of the expected error)
 REJECTED = [
@@ -72,6 +88,8 @@ REJECTED = [
     ("([a-z]+)@([a-z]+)\\.", "$2$1", "in their order"),
     ("([a-z]+)@", "$1$1", "in their order"),
     ("(?:(a)|b)c", "$1", "no unique binding"),
+    ("(?|(a)|b)c", "$1", "no unique binding"),
+    ("(?|([a-z]+)([a-z]+)@|(#)([0-9]);)", "$1", "is not found"),
     ("([a-z])+@", "$1", "no unique binding"),
     ("#([a-z0-9]*)([0-9]+);", "$1", "is not found"),
     ("([a-z0-9]*[a-z])[a-z0-9]+;", "$1", "is not found"),     # not maximal backward either

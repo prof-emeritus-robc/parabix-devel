@@ -29,6 +29,11 @@ UTF8 = {
     # a single-character rule with contexts ($thai { ' ' } $thai), matched by
     # the regular expression engine on the UTF-8 code units
     "Thai-ThaiSemi": "กขคง    ",
+    # normalizations (NFD, a map, NFC), Any-Lower (Final_Sigma), and a
+    # filter with normalizations within it
+    "Accents-Any": "éüñÅốệ\u0301\u0308\u0323",
+    "lt-Lower": "ĮĖĄÌÍĨIJΣΑΒσς\u0307\u0300",
+    "Deva-Beng": "कखगघचजटडतदनपबमयरलवशसह़ािीुूेैोौं\u0301",
 }
 UNICODE = ["Hira-Latn"]
 OTHER = "aZ 09.,é€中😀𐍈\u0301"

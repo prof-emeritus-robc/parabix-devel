@@ -9520,6 +9520,8 @@ static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml
     return applies;
 }
 
+static bool utf8BuiltIn(const std::string & name);
+
 const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEntry * entry) {
     const std::string name = entry->canonicalName;
     auto f = mModes.find(name);
@@ -9533,7 +9535,7 @@ const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEnt
         }
     };
     if (entry->isBuiltIn()) {
-        if (name != "Any-Null") unicode("the built-in " + name);
+        if (!utf8BuiltIn(name)) unicode("the built-in " + name);
         return mModes.emplace(name, std::move(m)).first->second;
     }
     //  (The decoding of UTF-8 stops at an error, with --utf8-errors=abort-on-error.)
@@ -9541,14 +9543,11 @@ const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEnt
     mModes.emplace(name, Mode{false, "a transform invoking itself"});     // (while in progress)
     const TransformAnalysis & a = analyze(entry);
     if (!a.implementable) unicode("not implemented by tconv's own rules");
-    if (a.plan.filter) unicode("a filter");
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (!m.utf8) break;
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             const ldml::TransformEntry * used = mRegistry.lookup(step.transform.getText());
-            if (step.filter) {
-                unicode("a transform rule with a filter: " + step.transform.getText());
-            } else if (used == nullptr) {
+            if (used == nullptr) {
                 unicode("an unknown transform " + step.transform.getText());
             } else if (!mode(used).utf8) {
                 unicode("invokes " + used->canonicalName + " (" + mode(used).reason + ")");
@@ -9566,29 +9565,279 @@ const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEnt
 
 //  A transform in UTF-8 mode (see TransformAnalyzer::mode) applied to the
 //  basis bits of UTF-8 code units.
-//  (On well-formed text, see utf8TransformText.)
-static StreamSet * utf8Transform(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                 const ldml::TransformEntry * entry, StreamSet * Basis,
-                                 std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
-    if (entry->isBuiltIn()) return Basis;   // (Any-Null)
-    for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+//  The pipeline of a transform in UTF-8 mode (see TransformAnalyzer::mode),
+//  on the basis bits of the UTF-8 code units of a well-formed text (see
+//  utf8TransformText).
+class UTF8PipelineBuilder {
+public:
+    UTF8PipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                        std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
+    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
+    StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
+private:
+    StreamSet * builtIn(const std::string & name, StreamSet * Basis);
+    StreamSet * normalization(const std::string & name, StreamSet * Basis);
+    StreamSet * maskedNormalization(const std::string & name, StreamSet * Basis);
+    StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
+    //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
+    //  masks of the filters in effect (the innermost last, within the ones
+    //  before it), over the bytes of the characters each selects, kept in step
+    //  with the text as bytes are deleted and inserted.
+    void pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis);
+    void popFilter() {mMasks.pop_back();}
+    std::vector<StreamSet *> * masks() {return mMasks.empty() ? nullptr : &mMasks;}
+    std::vector<StreamSet *> mMasks;
+    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count);
+    PipelineBuilder & mP;
+    const ldml::TransformRegistry & mRegistry;
+    TransformAnalyzer & mAnalyzer;
+    std::vector<std::pair<size_t, size_t>> * mGroupCounts;
+    unsigned mDepth = 0;
+};
+
+StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * Basis) {
+    if (entry->isBuiltIn()) return builtIn(entry->canonicalName, Basis);
+    const bool outermost = mDepth++ == 0;
+    const TransformAnalysis & a = mAnalyzer.analyze(entry);
+    if (a.plan.filter) pushFilter(a.plan.filterSet, Basis);
+    for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
-            Basis = utf8Transform(P, registry, analyzer, registry.lookup(step.transform.getText()), Basis);
-            continue;
+            if (step.filter) pushFilter(step.filterSet, Basis);
+            Basis = transform(mRegistry.lookup(step.transform.getText()), Basis);
+            if (step.filter) popFilter();
+        } else {
+            Basis = conversionGroup(step, Basis, outermost);
         }
-        kernel::UTF8_CharMap map;
-        std::string reason;
-        std::vector<const ldml::CharMapSubgroup *> contextual;
-        UCD::UnicodeSet contextualChars;
-        if (!utf8CharMap(step, map, reason, &contextual, &contextualChars)) {
-            llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
-        }
-        const size_t kernels = P.getNumOfKernelCalls();
-        StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(P, contextual, Basis);
-        Basis = kernel::UTF8_CharMapPipeline(P, map, Basis, contextualChars, applies);
-        if (groupCounts && groupRules(step) > 0) groupCounts->push_back({groupRules(step), P.getNumOfKernelCalls() - kernels});
     }
+    if (a.plan.filter) popFilter();
+    mDepth--;
     return Basis;
+}
+
+StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count) {
+    kernel::UTF8_CharMap map;
+    std::string reason;
+    std::vector<const ldml::CharMapSubgroup *> contextual;
+    UCD::UnicodeSet contextualChars;
+    if (!utf8CharMap(step, map, reason, &contextual, &contextualChars)) {
+        llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
+    }
+    const size_t kernels = mP.getNumOfKernelCalls();
+    StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(mP, contextual, Basis);
+    Basis = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextualChars, applies, masks());
+    if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
+    return Basis;
+}
+
+//  The built-in transforms of UTF-8 mode (see utf8BuiltIn).
+static bool utf8BuiltIn(const std::string & name) {
+    return name == "Any-Null" || name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" ||
+           name == "Any-Lower" || name == "Any-Upper";
+}
+
+StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
+    if (name == "Any-Null") return Basis;
+    if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
+        return mMasks.empty() ? normalization(name, Basis) : maskedNormalization(name, Basis);
+    }
+    if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
+    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " not in UTF-8 mode"));
+}
+
+//  The normalization forms, focused (as in the nfd, nfkd and nfc tools), from
+//  the basis bits and the bytes of the text.
+StreamSet * UTF8PipelineBuilder::normalization(const std::string & name, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    NFD_PipelineBuilder NFD_builder(P);
+    StreamSet * bytes = BytesOf(P, Basis);
+    if (name == "Any-NFD") return BasisOf(P, NFD_Bytes(P, NFD_builder, bytes, Basis));
+    if (name == "Any-NFKD") return BasisOf(P, NFKD_Bytes(P, NFD_builder, bytes, Basis));
+    if (name == "Any-NFKC") {
+        bytes = NFKD_Bytes(P, NFD_builder, bytes, Basis);
+        Basis = BasisOf(P, bytes);
+    }
+    return BasisOf(P, NFC_Bytes(P, bytes, Basis));
+}
+
+//  The bytes of the characters marked at their first bytes (Firsts), within
+//  Outer if given.
+class UTF8_CharSpans final : public pablo::PabloKernel {
+public:
+    UTF8_CharSpans(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Firsts, StreamSet * Outer, StreamSet * Spans)
+    : PabloKernel(ts, std::string("UTF8_CharSpans") + (Outer ? "_o" : ""),
+                  [&] {
+                      Bindings in{Binding{"basis", Basis}, Binding{"firsts", Firsts}};
+                      if (Outer) in.emplace_back("outer", Outer);
+                      return in;
+                  }(),
+                  {Binding{"spans", Spans}}),
+      mOuter(Outer != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const f = getInputStreamSet("firsts")[0];
+        PabloAST * const prefix = pb.createAnd(basis[7], basis[6]);
+        PabloAST * const prefix34 = pb.createAnd(prefix, basis[5]);
+        PabloAST * const prefix4 = pb.createAnd(prefix34, basis[4]);
+        PabloAST * spans = pb.createOr(f, pb.createAdvance(pb.createAnd(f, prefix), 1));
+        spans = pb.createOr3(spans, pb.createAdvance(pb.createAnd(f, prefix34), 2), pb.createAdvance(pb.createAnd(f, prefix4), 3));
+        if (mOuter) spans = pb.createAnd(spans, getInputStreamSet("outer")[0]);
+        writeOutputStreamSet("spans", std::vector<PabloAST *>{spans});
+    }
+private:
+    const bool mOuter;
+};
+
+//  The barriers of normalization within a filter in UTF-8 mode (as BarrierMark
+//  in Unicode mode, see RulePipelineBuilder::barrierNormalization): for each
+//  length of UTF-8 sequence, a starter without a decomposition that composes
+//  with no character, so that a character outside the filter is replaced in
+//  place by the barrier of its length.
+static const UCD::codepoint_t UTF8_Barriers[4] = {0x0000, 0x0080, 0xFDD0, 0x1FFFE};
+
+//  The basis with the bytes of the characters outside Selected replaced by
+//  those of the barrier of the same length.
+class UTF8_ReplaceUnselected final : public pablo::PabloKernel {
+public:
+    UTF8_ReplaceUnselected(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Selected, StreamSet * Replaced)
+    : PabloKernel(ts, "UTF8_ReplaceUnselected", {Binding{"basis", Basis}, Binding{"selected", Selected}}, {Binding{"replaced", Replaced}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const unselected = pb.createInFile(pb.createNot(getInputStreamSet("selected")[0]));
+        PabloAST * const prefix = pb.createAnd(basis[7], basis[6]);
+        PabloAST * const prefix34 = pb.createAnd(prefix, basis[5]);
+        PabloAST * const leads[4] = {pb.createNot(basis[7]), pb.createAnd(prefix, pb.createNot(basis[5])),
+                                     pb.createAnd(prefix34, pb.createNot(basis[4])), pb.createAnd(prefix34, basis[4])};
+        std::vector<PabloAST *> barrier(8, pb.createZeroes());
+        for (unsigned L = 1; L <= 4; L++) {
+            const std::string bytes = [&] {
+                std::string b;
+                const UCD::codepoint_t c = UTF8_Barriers[L - 1];
+                if (L == 1) b += static_cast<char>(c);
+                else if (L == 2) {b += static_cast<char>(0xC0 | (c >> 6)); b += static_cast<char>(0x80 | (c & 0x3F));}
+                else if (L == 3) {b += static_cast<char>(0xE0 | (c >> 12)); b += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); b += static_cast<char>(0x80 | (c & 0x3F));}
+                else {b += static_cast<char>(0xF0 | (c >> 18)); b += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+                      b += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); b += static_cast<char>(0x80 | (c & 0x3F));}
+                return b;
+            }();
+            for (unsigned j = 0; j < L; j++) {
+                PabloAST * const at = j ? pb.createAdvance(leads[L - 1], j) : leads[L - 1];
+                for (unsigned b = 0; b < 8; b++) {
+                    if ((static_cast<unsigned char>(bytes[j]) >> b) & 1) barrier[b] = pb.createOr(barrier[b], at);
+                }
+            }
+        }
+        for (unsigned b = 0; b < 8; b++) basis[b] = pb.createSel(unselected, barrier[b], basis[b]);
+        writeOutputStreamSet("replaced", basis);
+    }
+};
+
+void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    StreamSet * const firsts = P.CreateStreamSet(1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(filter, &cc::Unicode)}, Basis, firsts,
+                                          pablo::BitMovementMode::LookAhead);
+    StreamSet * const spans = P.CreateStreamSet(1);
+    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.empty() ? nullptr : mMasks.back(), spans);
+    mMasks.push_back(spans);
+}
+
+//  A normalization within a filter, as in Unicode mode (see RulePipelineBuilder::
+//  barrierNormalization): each run of the characters of the filter normalized by
+//  itself, the characters outside it (and any barrier in the text) replaced in
+//  place by the barriers of their lengths, and restored after the normalization,
+//  which keeps the barriers in order; the masks are kept in step.
+StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    UCD::UnicodeSet barrierSet;
+    for (UCD::codepoint_t c : UTF8_Barriers) barrierSet.insert(c);
+    auto barrierSpans = [&](StreamSet * basis) {
+        StreamSet * const firsts = P.CreateStreamSet(1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(barrierSet, &cc::Unicode)}, basis, firsts,
+                                              pablo::BitMovementMode::LookAhead);
+        StreamSet * const spans = P.CreateStreamSet(1);
+        P.CreateKernelCall<UTF8_CharSpans>(basis, firsts, nullptr, spans);
+        return spans;
+    };
+    StreamSet * const notBarriers = P.CreateStreamSet(1);
+    Invert(P, barrierSpans(Basis), notBarriers);
+    StreamSet * const selected = P.CreateStreamSet(1);
+    AndCombine(P, mMasks.back(), notBarriers, selected);
+    StreamSet * const unselected = P.CreateStreamSet(1);
+    Invert(P, selected, unselected);
+    StreamSet * const Work = P.CreateStreamSet(8);
+    P.CreateKernelCall<UTF8_ReplaceUnselected>(Basis, selected, Work);
+    StreamSet * const Normalized = normalization(name, Work);
+    StreamSet * const barriers = barrierSpans(Normalized);
+    StreamSet * const others = P.CreateStreamSet(1);
+    Invert(P, barriers, others);
+    //  The bytes of the characters replaced, at the bytes of the barriers.
+    StreamSet * const outside = P.CreateStreamSet(8);
+    FilterByMask(P, unselected, Basis, outside);
+    StreamSet * const restored = P.CreateStreamSet(8);
+    SpreadByMask(P, barriers, outside, restored);
+    StreamSet * const kept = P.CreateStreamSet(8);
+    ZeroByMask(P, others, Normalized, kept);
+    StreamSet * const result = P.CreateStreamSet(8);
+    OrCombine(P, kept, restored, result);
+    //  The masks hold at the normalized characters, and keep their values at
+    //  the barriers.
+    for (StreamSet *& m : mMasks) {
+        StreamSet * const outer = P.CreateStreamSet(1);
+        FilterByMask(P, unselected, m, outer);
+        StreamSet * const spread = P.CreateStreamSet(1);
+        SpreadByMask(P, barriers, outer, spread);
+        StreamSet * const combined = P.CreateStreamSet(1);
+        OrCombine(P, spread, others, combined);
+        m = combined;
+    }
+    return result;
+}
+
+//  The full case mapping of a string override property (lc or uc): each
+//  character that changes (Changes_When_Lowercased or _Uppercased) mapped to
+//  its value.
+static const kernel::UTF8_CharMap & fullCaseMap(UCD::property_t prop) {
+    static std::map<UCD::property_t, kernel::UTF8_CharMap> maps;
+    auto f = maps.find(prop);
+    if (f != maps.end()) return f->second;
+    auto * obj = llvm::cast<UCD::StringOverridePropertyObject>(UCD::getPropertyObject(prop));
+    const UCD::property_t changes = (prop == UCD::lc) ? UCD::CWL : UCD::CWU;
+    const UCD::UnicodeSet changed = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(changes))->GetCodepointSet(UCD::Binary_ns::Y);
+    std::map<std::u32string, UCD::UnicodeSet> byValue;
+    for (const auto & range : changed) {
+        for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
+            const std::u32string value = obj->GetU32StringValue(cp);
+            if (value.size() == 1 && value[0] == cp) continue;
+            byValue[value].insert(cp);
+        }
+    }
+    kernel::UTF8_CharMap map;
+    for (auto & v : byValue) map.emplace_back(std::move(v.second), v.first);
+    return maps.emplace(prop, std::move(map)).first->second;
+}
+
+//  Any-Lower: as in Unicode mode (RulePipelineBuilder::builtIn), the Final_Sigma
+//  context of Σ (finalSigmaPlan: Σ → ς where its rule applies, with its contexts
+//  matched by the engine; Σ → σ is the lc mapping's), then the lc mapping.
+//  Any-Upper: the uc mapping.
+StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet * Basis) {
+    if (name == "Any-Lower") {
+        for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
+            for (const ldml::CharMapSubgroup & g : step.subgroups) {
+                for (const ldml::CharMapping & m : g.mappings) {
+                    if (m.replacement != std::u32string(1, U'ς')) continue;
+                    StreamSet * const applies = utf8Applies(mP, {&g}, Basis);
+                    Basis = kernel::UTF8_CharMapPipeline(mP, {{m.chars, m.replacement}}, Basis, m.chars, applies, masks());
+                }
+            }
+        }
+    }
+    return kernel::UTF8_CharMapPipeline(mP, fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis, UCD::UnicodeSet(),
+                                        nullptr, masks());
 }
 
 //  A transform in UTF-8 mode on the UTF-8 code units of a text, made
@@ -9597,7 +9846,8 @@ static StreamSet * utf8Transform(PipelineBuilder & P, const ldml::TransformRegis
 static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                      const ldml::TransformEntry * entry, StreamSet * Basis,
                                      std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
-    return utf8Transform(P, registry, analyzer, entry, kernel::WellFormedUTF8(P, Basis), groupCounts);
+    UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
+    return builder.transform(entry, kernel::WellFormedUTF8(P, Basis));
 }
 
 static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,

@@ -38,25 +38,34 @@ kernels of the pipeline used (`mode: UTF-8`).
 
   The positions where the contexts hold come from the engine (see
   "Contexts" below).
-- **Transform rules** without filters, invoking `Any-Null` or transforms in
-  UTF-8 mode.
+- **Transform rules** invoking transforms in UTF-8 mode.
+- **Built-ins:** `Any-Null`, the normalizations `Any-NFD`, `Any-NFKD`,
+  `Any-NFC` and `Any-NFKC`, and the case mappings `Any-Lower` and
+  `Any-Upper` (see "Normalizations and case mappings").
+- **Filters,** global or on transform rules (see "Filters").
 
 Anything else puts a transform in Unicode mode:
-- a filter;
 - string, capture, insertion or deferred rules;
 - contexts that are not sequences of sets, that see the converted text, or
   that the engine cannot match;
-- other built-ins;
+- other built-ins (`Any-FCD`, `Any-FCC`, `Any-Title`, the hex transforms,
+  `Any-Remove`);
 - segments applied by shape groups;
 - `--utf8-errors=abort-on-error`.
 
-19 CLDR-defined transforms are in UTF-8 mode: Thai-ThaiSemi (contexts),
-Publishing-Any, Geor-Latn,
-Syrc-Latn, Cans-Latn, Ethi-Latn/Williamson, Fullwidth-Halfwidth,
-ThaiLogical-Latin, ThaiSemi-Thai, ASCII-Latin, Pinyin-NumericPinyin,
-NumericPinyin-Pinyin, Ethi-sgw_Ethi/Gurage_2013, and the Devanagari,
-Gujarati and Malayalam to InterIndic and InterIndic to Bengali, Gujarati and
-Oriya maps.
+38 CLDR-defined transforms are in UTF-8 mode:
+- **Character maps:** Publishing-Any, Geor-Latn, Syrc-Latn, Cans-Latn,
+  Ethi-Latn/Williamson, Fullwidth-Halfwidth, ThaiLogical-Latin,
+  ThaiSemi-Thai, ASCII-Latin, Pinyin-NumericPinyin, NumericPinyin-Pinyin,
+  Ethi-sgw_Ethi/Gurage_2013, and the Devanagari, Gujarati and Malayalam to
+  InterIndic and InterIndic to Bengali, Gujarati and Oriya maps.
+- **Contexts:** Thai-ThaiSemi.
+- **Normalizations and case mappings:** Accents-Any, az-Upper, tr-Upper,
+  lt-Lower, kk-kk_FONIPA.
+- **Filters** (most also normalizing within them): Deva-Beng, Deva-Gujr,
+  Deva-Orya, Gujr-Beng, Gujr-Orya, Mlym-Beng, Mlym-Gujr, Mlym-Orya,
+  Hebr-Latn, am_Ethi-am_Brai, ka-ka_Latn/BGN, ka-ka_Latn/BGN_1981,
+  sgw_Ethi-Ethi/Gurage_2013, yo-yo_BJ.
 
 ## The UTF-8 character map
 
@@ -122,8 +131,11 @@ mode, and `--plan` reports the engine's mode for each context:
     contexts [$thai { } $thai] matched by the engine in byte mode
 ```
 
-**Ill-formed input** is handled by the first character map of a pipeline, as
-the decoding in Unicode mode handles it (`codegen::UTF8Errors`).
+**Ill-formed input** is handled before the steps, by the UTF-8
+well-formedness library (`kernel::WellFormedUTF8`,
+`include/kernel/unicode/utf8_wellformed.h`), as the decoding in Unicode mode
+handles it (`codegen::UTF8Errors`); its kernels have fast paths for
+well-formed text. The details below describe the earlier, built-in handling.
 `UTF8_structure` finds the maximal ill-formed subparts. With the default
 `use-replacement-char`, the first byte of each subpart is set to EF in place
 and the rest of the subpart deleted, and the tail BF BD is inserted, giving
@@ -137,19 +149,63 @@ check, xch's UTF-8 path differed from its `-U21` path on some translations
 that lengthen characters (for example `-src=a -tgt=𐍈`); this was not
 investigated further.
 
+## Normalizations and case mappings
+
+- **Normalizations.** `Any-NFD`, `Any-NFKD`, `Any-NFC` and `Any-NFKC` are the
+  focused UTF-8 normalizations of `kernel/unicode/normalization`, as in the
+  nfd, nfkd and nfc tools. They take the basis bits and the bytes (P2S) of
+  the text, and give bytes (S2P).
+- **Any-Lower.** As in Unicode mode, the Final_Sigma rule comes first: Σ
+  becomes ς where the rule of `finalSigmaPlan` applies, its contexts matched
+  by the engine. Then comes the full lowercase mapping (`lc`) as a character
+  map: each character of Changes_When_Lowercased mapped to its value.
+- **Any-Upper.** The `uc` mapping, from Changes_When_Uppercased.
+
+## Filters
+
+A filter is a mask over the bytes of the characters it selects (their first
+bytes by lookahead, extended over their lengths, within the enclosing
+filter's mask). The masks of the filters in effect are kept in step with the
+text: each character map filters them with its deletions and spreads them
+with its insertions, and the bytes inserted after a character take its
+mask. As in Unicode mode (`RulePipelineBuilder::pushFilter`):
+- a character map applies only within the innermost mask;
+- contexts, matched by the engine, see the whole text;
+- a normalization within a filter normalizes each run of the filter's
+  characters by itself.
+
+**Normalization within a filter.** Unicode mode replaces each character
+outside the filter by a barrier codepoint, U+FDD0, which is never reordered
+or composed. In UTF-8 the replacement must keep the character's length, so
+there is a barrier for each length: U+0000, U+0080, U+FDD0 and U+1FFFE, all
+starters without decompositions that compose with nothing. The characters
+outside the filter, and any barrier in the text, are replaced in place by
+their barriers, and the text is normalized. The original bytes are then
+restored at the bytes of the barriers, which the normalization keeps in
+order. The masks are restored the same way.
+
 ## Results
 
-**Correctness.** On 400 random lines per transform, all 19 transforms give
+**Correctness.** On 400 random lines per transform, all 38 transforms give
 output identical to Unicode mode. The lines mix the characters of each
 transform's rule file, ASCII, 2-, 3- and 4-byte characters, combining marks
 and ill-formed sequences. They were checked with both treatments of
 ill-formed input, and the output is identical to ICU's on the same text.
-Publishing-Any passes its 46 CLDR test cases. `QA/tconv_utf8_mode_test.py`
-(ctest `tconv_utf8_mode_test`) checks six of the transforms, Thai-ThaiSemi among them, in both modes
+The 14 CLDR test files of the transforms in UTF-8 mode give the same results
+as Unicode mode and ICU. All match their expected results except
+ka-ka_Latn/BGN's 215 discrepant cases, where the test data disagrees with
+the rules and ICU. Normalization within filters was stressed on 600 lines
+per transform for the 11 transforms that do it (and for Accents-Any and
+lt-Lower). The text was dense with combining marks and nuktas next to
+filtered characters, with decomposed and precomposed letters and the barrier
+characters themselves, and the output was identical to Unicode mode and ICU. `QA/tconv_utf8_mode_test.py`
+(ctest `tconv_utf8_mode_test`) checks nine of the transforms (Thai-ThaiSemi,
+Accents-Any, lt-Lower and Deva-Beng among them) in both modes
 and both error treatments.
 
 **Time.** Measured on 128 MB of well-formed text (the characters of each
-rule file and ASCII), `-thread-num=4`, median of 5 warm runs:
+rule file and ASCII), `-thread-num=4`, median of 5 warm runs (the first
+rows before the well-formedness library, the others with it):
 
 | Transform | UTF-8 mode | Unicode mode | change |
 |---|---:|---:|---:|
@@ -160,6 +216,11 @@ rule file and ASCII), `-thread-num=4`, median of 5 warm runs:
 | InterIndic-Bengali | 0.188 s | 0.246 s | −23% |
 | Devanagari-InterIndic | 0.153 s | 0.189 s | −19% |
 | Thai-ThaiSemi (contexts) | 0.145 s | 0.237 s | −39% |
+| yo-yo_BJ (filter, NFC) | 0.288 s | 0.726 s | −60% |
+| Accents-Any (NFD, map, NFC) | 0.647 s | 0.893 s | −28% |
+| lt-Lower (Any-Lower) | 0.975 s | 1.338 s | −27% |
+| Deva-Beng (filter, NFD, NFC) | 0.914 s | 1.125 s | −19% |
+| Hebr-Latn (filter) | 1.396 s | 1.568 s | −11% |
 
 Each of these maps counts 13 kernels in UTF-8 mode, most of them for the
 handling of ill-formed input, which needs deletion and insertion. Without
@@ -180,8 +241,9 @@ slower for Fullwidth-Halfwidth.
   starts of matches and the walks of captures, and the kernels a pattern
   would take. tconv could then choose between implementations by their
   costs, as it does now by counting kernels.
-- **More patterns:**
-  - string rules, from the string matching of the regular expression
-    engine in byte mode;
-  - the normalization built-ins that already have UTF-8 pipelines.
-- **Filters,** as masks over code units.
+- **More patterns:** string rules (85 of the transforms invoking a
+  normalization have them), and contexts that see the converted text (51).
+  These are the main blockers left.
+- **NFD on dense text.** The focused UTF-8 NFD is slower than the codepoint
+  NFD where most characters change (0.42 s against 0.29 s on 128 MB of
+  accented text); not yet investigated.

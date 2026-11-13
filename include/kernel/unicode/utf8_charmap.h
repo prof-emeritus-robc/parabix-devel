@@ -39,7 +39,12 @@ using UTF8_CharMap = std::vector<std::pair<UCD::UnicodeSet, std::u32string>>;
 //  contexts) are mapped only where Applies marks their last bytes: the matches
 //  of the rules with their contexts, as the regular expression engine marks
 //  them on UTF-8 code units.
+//  Within filters (Masks: the bytes of the characters of each filter in effect,
+//  the innermost last), the characters are mapped only within the innermost,
+//  and the masks are kept in step with the text: the bytes inserted after a
+//  character have its mask.
 StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis,
-                                 const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * Applies = nullptr);
+                                 const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * Applies = nullptr,
+                                 std::vector<StreamSet *> * Masks = nullptr);
 
 }

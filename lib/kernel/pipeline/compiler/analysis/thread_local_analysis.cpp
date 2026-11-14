@@ -1247,6 +1247,20 @@ void PipelineAnalysis::updateInterPartitionThreadLocalBuffers() {
 
         const auto producer = parent(streamSet, mBufferGraph);
         const auto partId = KernelPartitionId[producer];
+        // A BoundedRate output of a kernel with a FixedRate Deferred input may be written for input
+        // held back from prior segments (see getHeldBackDeferredOutputItems), which needs space beyond
+        // the segment that a thread-local buffer does not provide.
+        if (LLVM_UNLIKELY(mBufferGraph[in_edge(streamSet, mBufferGraph)].getRate().isBounded())) {
+            bool heldBack = false;
+            for (const auto input : make_iterator_range(in_edges(producer, mBufferGraph))) {
+                const BufferPort & ip = mBufferGraph[input];
+                heldBack |= (ip.isDeferred() && ip.getRate().isFixed());
+            }
+            if (heldBack) {
+                bn.Locality = BufferLocality::GloballyShared;
+                continue;
+            }
+        }
         for (const auto input : make_iterator_range(out_edges(streamSet, mBufferGraph))) {
             const auto consumer = target(input, mBufferGraph);
             // A consumer with a LookBehind reads items of the prior segment, which another

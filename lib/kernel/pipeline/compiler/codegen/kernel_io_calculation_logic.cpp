@@ -185,6 +185,9 @@ no_static_max:
                 // (which getWritableOutputItems leaves free)
                 required = b.CreateAdd(required, b.getSize(port.ProvisionalOverflow));
             }
+            if (Value * const heldBack = getHeldBackDeferredOutputItems(b, port)) {
+                required = b.CreateAdd(required, heldBack);
+            }
             ensureSufficientOutputSpace(b, port, streamSet, produced, required, getWritableOutputItems(b, port), true);
         }
     }
@@ -1630,6 +1633,46 @@ void PipelineCompiler::ensureSufficientOutputSpace(KernelBuilder & b, const Buff
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getHeldBackDeferredOutputItems
+ *
+ * A kernel with a Deferred input may hold back input items that it has processed (its processed count passes
+ * them) without releasing them (its deferred processed count does not), and produce the output for them in a
+ * later invocation.  The upper bound of a BoundedRate output therefore applies to the held-back items as well as
+ * to the items of the current invocation: e.g., a BoundedRate(0,1) output never has more items than its input.
+ * Returns the output space required for the held-back items of the FixedRate Deferred inputs (the maximum over
+ * them), or nullptr if this output is not BoundedRate or the kernel has no such input.
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PipelineCompiler::getHeldBackDeferredOutputItems(KernelBuilder & b, const BufferPort & outputPort) {
+    const ProcessingRate & outputRate = outputPort.getRate();
+    if (LLVM_LIKELY(!outputRate.isBounded())) {
+        return nullptr;
+    }
+    Value * heldBackOutput = nullptr;
+    for (const auto input : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
+        const BufferPort & inputPort = mBufferGraph[input];
+        PHINode * const deferred = mCurrentProcessedDeferredItemCountPhi[inputPort.Port];
+        if (deferred == nullptr) {
+            continue;
+        }
+        const ProcessingRate & inputRate = inputPort.getRate();
+        if (LLVM_UNLIKELY(!inputRate.isFixed())) {
+            continue;
+        }
+        Value * const processed = mCurrentProcessedItemCountPhi[inputPort.Port]; assert (processed);
+        Value * const heldBack = b.CreateSub(processed, deferred);
+        Value * const items = b.CreateCeilUMulRational(heldBack, outputRate.getUpperBound() / inputRate.getRate());
+        heldBackOutput = heldBackOutput ? b.CreateUMax(heldBackOutput, items) : items;
+    }
+    #ifdef PRINT_DEBUG_MESSAGES
+    if (heldBackOutput) {
+        const auto prefix = makeBufferName(mKernelId, outputPort.Port);
+        debugPrint(b, prefix + "_heldBackDeferredOutput = %" PRIu64, heldBackOutput);
+    }
+    #endif
+    return heldBackOutput;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief getNumOfWritableStrides
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::getNumOfWritableStrides(KernelBuilder & b,
@@ -1650,6 +1693,10 @@ Value * PipelineCompiler::getNumOfWritableStrides(KernelBuilder & b,
         if (LLVM_UNLIKELY(isProvisionalStrideKernel())) {
             // reserve space for the provisional stride
             writable = b.CreateUnsignedSaturatingSub(writable, strideLength);
+        }
+        if (Value * const heldBack = getHeldBackDeferredOutputItems(b, port)) {
+            // reserve space for the output of held-back deferred input
+            writable = b.CreateUnsignedSaturatingSub(writable, heldBack);
         }
         numOfStrides = b.CreateUDiv(writable, strideLength);
     }
@@ -2362,8 +2409,10 @@ void PipelineCompiler::splatMultiStepPartialSumValues(KernelBuilder & b) {
 
         Value * const splat = b.simd_fill(fw, total);
         Value * const mask = b.mvmd_sll(fw, ConstantInt::getAllOnesValue(vecTy), offset);
+        // The total replaces the lanes from offset on: they may hold stale data (e.g., of a
+        // thread-local buffer reused from a prior segment), which must not be or'ed into it.
         Value * const maskedSplat = b.CreateAnd(splat, mask);
-        Value * const mergedValue = b.CreateOr(baseValue, maskedSplat);
+        Value * const mergedValue = b.CreateOr(b.CreateAnd(baseValue, b.CreateNot(mask)), maskedSplat);
         b.CreateBlockAlignedStore(mergedValue, vecAddr);
         for (unsigned k = 1; k <= spanLength; ++k) {
             Value * const ptr = b.CreateGEP(vecTy, vecAddr, b.getSize(k));

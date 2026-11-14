@@ -348,6 +348,7 @@ public:
     Value * getAccessibleInputItems(KernelBuilder & b, const BufferPort & inputPort);
     Value * getNumOfAccessibleStrides(KernelBuilder & b, const BufferPort & inputPort, Value * const numOfLinearStrides);
     Value * getWritableOutputItems(KernelBuilder & b, const BufferPort & outputPort, const bool force = false);
+    Value * getHeldBackDeferredOutputItems(KernelBuilder & b, const BufferPort & outputPort);
     Value * getNumOfWritableStrides(KernelBuilder & b, const BufferPort & port, Value * const numOfLinearStrides);
     bool isProvisionalStrideKernel() const {
         return ProvisionalStrideKernel.test(mKernelId);

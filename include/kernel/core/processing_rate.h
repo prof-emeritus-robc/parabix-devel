@@ -161,6 +161,12 @@ inline ProcessingRate FixedRate(const ProcessingRate::Rational rate = Processing
     return ProcessingRate(ProcessingRate::KindId::Fixed, rate, rate);
 }
 
+// A BoundedRate output of a kernel with a FixedRate Deferred input is bounded with
+// respect to the input items held back by the kernel (processed but not yet released
+// by its deferred processed count) as well as the items of the current invocation.
+// The pipeline provides output space for both, so the kernel may write the output for
+// held-back input in a later invocation: e.g., a BoundedRate(0,1) output is never
+// longer than the input, though one invocation may write more than its strides' worth.
 inline ProcessingRate BoundedRate(const unsigned lower, const unsigned upper) {
     if (lower == upper) {
         return FixedRate(lower);

@@ -70,14 +70,22 @@ void CSV_RecordParser::generatePabloMethod() {
 class CSV_FieldParser : public PabloKernel {
 public:
     CSV_FieldParser(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData,
-                    StreamSet * fieldStarts, StreamSet * fieldFollows)
-        : PabloKernel(ts, "CSVparser",
-                      {Binding{"csvCCs", csvCCs},
-                       Binding{"quotedData", quotedData}},
+                    StreamSet * delimiterMarks, StreamSet * fieldStarts, StreamSet * fieldFollows)
+        : PabloKernel(ts, delimiterMarks ? "CSVparser_delimiterMarks" : "CSVparser",
+                      inputBindings(csvCCs, quotedData, delimiterMarks),
                       {Binding{"fieldStarts", fieldStarts},
-                       Binding{"fieldFollows", fieldFollows}}) {}
+                       Binding{"fieldFollows", fieldFollows}}),
+          mHasDelimiterMarks(delimiterMarks != nullptr) {}
 protected:
+    static Bindings inputBindings(StreamSet * csvCCs, StreamSet * quotedData, StreamSet * delimiterMarks) {
+        Bindings inputs{Binding{"csvCCs", csvCCs}, Binding{"quotedData", quotedData}};
+        if (delimiterMarks) {
+            inputs.emplace_back("delimiterMarks", delimiterMarks);
+        }
+        return inputs;
+    }
     void generatePabloMethod() override;
+    const bool mHasDelimiterMarks;
 };
 
 void CSV_FieldParser::generatePabloMethod() {
@@ -86,24 +94,26 @@ void CSV_FieldParser::generatePabloMethod() {
     std::vector<PabloAST *> quotedData = getInputStreamSet("quotedData");
     PabloAST * unquoted = pb.createNot(quotedData[0]);
     PabloAST * recordMarks = pb.createAnd(csvMarks[markLF], unquoted);
-    PabloAST * fieldFollows = pb.createAnd(pb.createOr(csvMarks[markComma], csvMarks[markCR]), unquoted);
+    PabloAST * delimiters = mHasDelimiterMarks ? getInputStreamSet("delimiterMarks")[0] : csvMarks[markComma];
+    PabloAST * fieldFollows = pb.createAnd(pb.createOr(delimiters, csvMarks[markCR]), unquoted);
     // In the event that CSV records are terminated by bare LF and not CRLF, we update
     // fieldFollows to include this case.
     PabloAST * bareLF = pb.createAnd(pb.createNot(pb.createAdvance(csvMarks[markCR], 1)), recordMarks);
     fieldFollows = pb.createOr(fieldFollows, bareLF);
-    PabloAST * fieldFinals = pb.createAnd(pb.createOr(csvMarks[markComma], csvMarks[markLF]), unquoted);
+    PabloAST * fieldFinals = pb.createAnd(pb.createOr(delimiters, csvMarks[markLF]), unquoted);
     PabloAST * fieldStarts = pb.createInFile(pb.createNot(pb.createAdvance(pb.createNot(fieldFinals), 1)));
     pb.createAssign(pb.createExtract(getOutputStreamVar("fieldStarts"), pb.getInteger(0)), fieldStarts);
     pb.createAssign(pb.createExtract(getOutputStreamVar("fieldFollows"), pb.getInteger(0)), fieldFollows);
 }
 
 CSV_Parser::CSV_Parser(PipelineBuilder & P, codepoint_t quoteCp, codepoint_t separatorCp) :
-    mPB(P), mQuoteCp(quoteCp), mSeparatorCp(separatorCp), mCsvCCs(nullptr), mQuotedData(nullptr),
+    mPB(P), mQuoteCp(quoteCp), mSeparatorCp(separatorCp), mCsvCCs(nullptr), mDelimiterMarks(nullptr), mQuotedData(nullptr),
     mFieldStarts(nullptr), mFieldFollows(nullptr), mLineEnds(nullptr) {
 
     }
 
-void CSV_Parser::setSource(StreamSet * basis) {
+void CSV_Parser::setSource(StreamSet * basis, StreamSet * delimiterMarks) {
+    mDelimiterMarks = delimiterMarks;
     mQuotedData = nullptr;
     mLineEnds = nullptr;
     mFieldStarts = nullptr;
@@ -139,7 +149,7 @@ StreamSet * CSV_Parser::getFieldStarts() {
     if (mFieldStarts == nullptr) {
         mFieldStarts = mPB.CreateStreamSet(1);
         mFieldFollows = mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mFieldStarts, mFieldFollows);
+        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mDelimiterMarks, mFieldStarts, mFieldFollows);
     }
     return mFieldStarts;
 }
@@ -147,7 +157,7 @@ StreamSet * CSV_Parser::getFieldFollows() {
     if (mFieldFollows == nullptr) {
         mFieldStarts = mPB.CreateStreamSet(1);
         mFieldFollows = mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mFieldStarts, mFieldFollows);
+        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mDelimiterMarks, mFieldStarts, mFieldFollows);
     }
     return mFieldFollows;
 }

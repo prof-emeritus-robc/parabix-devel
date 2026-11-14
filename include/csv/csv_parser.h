@@ -48,7 +48,10 @@ class CSV_Parser {
 public:
     CSV_Parser(PipelineBuilder & P, codepoint_t quoteCp, codepoint_t separatorCp);
 
-    void setSource(StreamSet * basis);
+    //  With delimiterMarks, a stream marking the field delimiters (one position
+    //  each, outside quotes), fields are separated at those marks rather than
+    //  at the code units of the delimiter character.
+    void setSource(StreamSet * basis, StreamSet * delimiterMarks = nullptr);
     StreamSet * getCsvCCs();
     StreamSet * getQuotedData();
     StreamSet * getLineEnds();
@@ -60,6 +63,7 @@ private:
     codepoint_t mQuoteCp;
     codepoint_t mSeparatorCp;
     StreamSet * mCsvCCs;
+    StreamSet * mDelimiterMarks;
     StreamSet * mQuotedData;
     StreamSet * mFieldStarts;
     StreamSet * mFieldFollows;

@@ -8,6 +8,8 @@
 #include <vector>
 #include <csv/csv_cmdline.h>
 #include <csv/csv_parser.h>
+#include <kernel/unicode/charclasses.h>
+#include <re/adt/re_cc.h>
 #include <json/json_support.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
@@ -139,6 +141,52 @@ void CSVdataFieldMask::generatePabloMethod() {
     }
     PabloAST * toKeep = pb.createInFile(pb.createNot(toDelete));
     pb.createAssign(pb.createExtract(getOutputStreamVar("toKeep"), pb.getInteger(0)), toKeep);
+}
+
+//
+//  DelimiterToComma
+//
+//  For a field delimiter other than a comma: each delimiter outside quotes
+//  (delimiterStarts marks the first of its delimiterLength code units) becomes
+//  the comma separating JSON members.  Its first code unit is translated to a
+//  comma and marked in delimiterMarks, and its other code units are removed
+//  from toKeep.  The later parsing stages separate fields at delimiterMarks, so
+//  that commas in the data are not taken as delimiters.
+//
+class DelimiterToComma : public PabloKernel {
+public:
+    DelimiterToComma(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * delimiterStarts,
+                     StreamSet * quotedData, StreamSet * toKeep, unsigned delimiterLength,
+                     StreamSet * translatedBasis, StreamSet * delimiterMarks, StreamSet * keepMask)
+        : PabloKernel(ts, "DelimiterToComma_" + std::to_string(delimiterLength),
+                      {Binding{"basis", basis}, Binding{"delimiterStarts", delimiterStarts},
+                       Binding{"quotedData", quotedData}, Binding{"toKeep", toKeep}},
+                      {Binding{"translatedBasis", translatedBasis}, Binding{"delimiterMarks", delimiterMarks},
+                       Binding{"keepMask", keepMask}})
+    , mDelimiterLength(delimiterLength) {}
+protected:
+    void generatePabloMethod() override;
+    const unsigned mDelimiterLength;
+};
+
+void DelimiterToComma::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    std::vector<PabloAST *> basis = getInputStreamSet("basis");
+    PabloAST * unquoted = pb.createNot(getInputStreamSet("quotedData")[0]);
+    PabloAST * delims = pb.createAnd(getInputStreamSet("delimiterStarts")[0], unquoted);
+    PabloAST * toKeep = getInputStreamSet("toKeep")[0];
+    PabloAST * delimRest = pb.createZeroes();
+    for (unsigned i = 1; i < mDelimiterLength; i++) {
+        delimRest = pb.createOr(delimRest, pb.createAdvance(delims, i));
+    }
+    //  The comma is 0x2C: bits 2, 3 and 5 set.
+    const unsigned comma = 0x2C;
+    for (unsigned i = 0; i < 8; i++) {
+        basis[i] = ((comma >> i) & 1) ? pb.createOr(basis[i], delims) : pb.createAnd(basis[i], pb.createNot(delims));
+    }
+    writeOutputStreamSet("translatedBasis", basis);
+    writeOutputStreamSet("delimiterMarks", std::vector<PabloAST *>{delims});
+    writeOutputStreamSet("keepMask", std::vector<PabloAST *>{pb.createAnd(toKeep, pb.createNot(delimRest))});
 }
 
 class QuoteEscape2Backslash : public PabloKernel {
@@ -398,12 +446,33 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<std::stri
     P.CreateKernelCall<CSVdataFieldMask>(parser.getCsvCCs(), parser.getLineEnds(), toKeep, csv::HeaderSpec == "");
     SHOW_STREAM(toKeep);
 
+    //  A delimiter other than a comma becomes the comma separating JSON members,
+    //  and the fields are thereafter separated at the marks of the delimiters.
+    StreamSet * delimiterMarks = nullptr;
+    if (csv::FieldDelimiter != U',') {
+        const unsigned delimiterLength = csv::FieldDelimiter < 0x80 ? 1 : csv::FieldDelimiter < 0x800 ? 2
+                                       : csv::FieldDelimiter < 0x10000 ? 3 : 4;
+        StreamSet * delimiterStarts = P.CreateStreamSet(1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(csv::FieldDelimiter)},
+                                              BasisBits, delimiterStarts, pablo::BitMovementMode::LookAhead);
+        StreamSet * translatedBasis = P.CreateStreamSet(8);
+        StreamSet * allDelimiterMarks = P.CreateStreamSet(1);
+        StreamSet * keepMask = P.CreateStreamSet(1);
+        P.CreateKernelCall<DelimiterToComma>(BasisBits, delimiterStarts, parser.getQuotedData(), toKeep, delimiterLength,
+                                             translatedBasis, allDelimiterMarks, keepMask);
+        SHOW_STREAM(allDelimiterMarks);
+        BasisBits = translatedBasis;
+        toKeep = keepMask;
+        delimiterMarks = P.CreateStreamSet(1);
+        FilterByMask(P, toKeep, allDelimiterMarks, delimiterMarks);
+    }
+
     StreamSet * filteredBasis = P.CreateStreamSet(8);
     FilterByMask(P, toKeep, BasisBits, filteredBasis);
     SHOW_BIXNUM(filteredBasis);
 
     BasisBits = filteredBasis;
-    parser.setSource(BasisBits);
+    parser.setSource(BasisBits, delimiterMarks);
     StreamSet * fieldStarts = parser.getFieldStarts();
     StreamSet * fieldFollows = parser.getFieldFollows();
 
@@ -423,7 +492,12 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<std::stri
     SpreadByMask(P, spreadMask, BasisBits, ExpandedBasis);
 
     // Parse the expanded stream
-    parser.setSource(ExpandedBasis);
+    StreamSet * expandedDelimiterMarks = nullptr;
+    if (delimiterMarks) {
+        expandedDelimiterMarks = P.CreateStreamSet(1);
+        SpreadByMask(P, spreadMask, delimiterMarks, expandedDelimiterMarks);
+    }
+    parser.setSource(ExpandedBasis, expandedDelimiterMarks);
 
     fieldStarts = parser.getFieldStarts();
     fieldFollows = parser.getFieldFollows();

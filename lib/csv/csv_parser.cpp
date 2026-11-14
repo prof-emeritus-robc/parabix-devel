@@ -6,6 +6,10 @@
 #include <pablo/bixnum/bixnum.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
+#include <re/adt/re_cc.h>
+#include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/sentinel.h>
 
 using namespace kernel;
 using namespace pablo;
@@ -263,11 +267,12 @@ class FieldSeparatorsKernel : public PabloKernel {
 public:
     FieldSeparatorsKernel(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData,
                           StreamSet * delimiterStarts, StreamSet * separators, StreamSet * keepMask)
-        : PabloKernel(ts, delimiterStarts ? "CSV_FieldSeparators_delimStarts" : "CSV_FieldSeparators",
+        : PabloKernel(ts, std::string("CSV_FieldSeparators") + (delimiterStarts ? "_delimStarts" : "")
+                          + (keepMask ? "" : "_keepCR") + (separators ? "" : "_CRmaskOnly"),
                       inputBindings(csvCCs, quotedData, delimiterStarts),
-                      {Binding{"separators", separators},
-                       Binding{"keepMask", keepMask}}),
-          mHasDelimiterStarts(delimiterStarts != nullptr) {}
+                      outputBindings(separators, keepMask)),
+          mHasDelimiterStarts(delimiterStarts != nullptr), mHasSeparators(separators != nullptr),
+          mHasKeepMask(keepMask != nullptr) {}
 protected:
     static Bindings inputBindings(StreamSet * csvCCs, StreamSet * quotedData, StreamSet * delimiterStarts) {
         Bindings inputs{Binding{"csvCCs", csvCCs, FixedRate(), LookAhead(1)},
@@ -277,8 +282,20 @@ protected:
         }
         return inputs;
     }
+    static Bindings outputBindings(StreamSet * separators, StreamSet * keepMask) {
+        Bindings outputs;
+        if (separators) {
+            outputs.emplace_back("separators", separators);
+        }
+        if (keepMask) {
+            outputs.emplace_back("keepMask", keepMask);
+        }
+        return outputs;
+    }
     void generatePabloMethod() override;
     const bool mHasDelimiterStarts;
+    const bool mHasSeparators;
+    const bool mHasKeepMask;
 };
 
 void FieldSeparatorsKernel::generatePabloMethod() {
@@ -291,16 +308,223 @@ void FieldSeparatorsKernel::generatePabloMethod() {
     //  unit is unquoted exactly when its last is.
     PabloAST * delimMarks = mHasDelimiterStarts ? getInputStreamSet("delimiterStarts")[0] : csvMarks[markComma];
     PabloAST * delimiters = pb.createAnd(delimMarks, unquoted);
-    PabloAST * separators = pb.createInFile(pb.createOr(delimiters, recordEnds));
-    PabloAST * CR_of_CRLF = pb.createAnd3(csvMarks[markCR], unquoted, pb.createLookahead(csvMarks[markLF], 1));
-    PabloAST * keepMask = pb.createInFile(pb.createNot(CR_of_CRLF));
-    pb.createAssign(pb.createExtract(getOutputStreamVar("separators"), pb.getInteger(0)), separators);
-    pb.createAssign(pb.createExtract(getOutputStreamVar("keepMask"), pb.getInteger(0)), keepMask);
+    if (mHasSeparators) {
+        PabloAST * separators = pb.createInFile(pb.createOr(delimiters, recordEnds));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("separators"), pb.getInteger(0)), separators);
+    }
+    if (mHasKeepMask) {
+        PabloAST * CR_of_CRLF = pb.createAnd3(csvMarks[markCR], unquoted, pb.createLookahead(csvMarks[markLF], 1));
+        PabloAST * keepMask = pb.createInFile(pb.createNot(CR_of_CRLF));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("keepMask"), pb.getInteger(0)), keepMask);
+    }
 }
 
 void FieldSeparatorsAndCRMask(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * quotedData,
                               StreamSet * separators, StreamSet * keepMask, StreamSet * delimiterStarts) {
     P.CreateKernelCall<FieldSeparatorsKernel>(csvCCs, quotedData, delimiterStarts, separators, keepMask);
+}
+
+unsigned UTF8_Length(codepoint_t cp) {
+    return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+}
+
+class CSV_StandardSyntax : public PabloKernel {
+public:
+    CSV_StandardSyntax(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * syntaxStarts,
+                       StreamSet * quotedData, StreamSet * toKeep, unsigned quoteLength, unsigned delimiterLength,
+                       StreamSet * translatedBasis, StreamSet * syntaxMarks, StreamSet * keepMask)
+        : PabloKernel(ts, "CSV_StandardSyntax_" + std::to_string(quoteLength) + "_" + std::to_string(delimiterLength),
+                      {Binding{"basis", basis}, Binding{"syntaxStarts", syntaxStarts},
+                       Binding{"quotedData", quotedData, FixedRate(), LookAhead(quoteLength - 1)},
+                       Binding{"toKeep", toKeep}},
+                      {Binding{"translatedBasis", translatedBasis}, Binding{"syntaxMarks", syntaxMarks},
+                       Binding{"keepMask", keepMask}})
+    , mQuoteLength(quoteLength), mDelimiterLength(delimiterLength) {}
+protected:
+    void generatePabloMethod() override;
+    const unsigned mQuoteLength;
+    const unsigned mDelimiterLength;
+};
+
+void CSV_StandardSyntax::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    std::vector<PabloAST *> basis = getInputStreamSet("basis");
+    std::vector<PabloAST *> starts = getInputStreamSet("syntaxStarts");
+    std::vector<PabloAST *> quotedData = getInputStreamSet("quotedData");
+    PabloAST * unquoted = pb.createNot(quotedData[0]);
+    //  The quote escapes are marked at the final code unit of the first quote
+    //  of each pair; the second quote begins at the next code unit.
+    PabloAST * quoteEscape = quotedData[1];
+    PabloAST * escapeStarts = (mQuoteLength == 1) ? quoteEscape : pb.createLookahead(quoteEscape, mQuoteLength - 1);
+    PabloAST * escapedStarts = pb.createAdvance(quoteEscape, 1);
+    PabloAST * quotes = pb.createAnd(starts[0], pb.createNot(pb.createOr(escapeStarts, escapedStarts)));
+    PabloAST * delims = pb.createAnd(starts[1], unquoted);
+    PabloAST * toKeep = getInputStreamSet("toKeep")[0];
+    PabloAST * rest = escapeStarts;
+    for (unsigned i = 1; i < mQuoteLength; i++) {
+        rest = pb.createOr(rest, pb.createAdvance(quotes, i));
+        rest = pb.createOr(rest, pb.createAdvance(escapeStarts, i));
+    }
+    for (unsigned i = 1; i < mDelimiterLength; i++) {
+        rest = pb.createOr(rest, pb.createAdvance(delims, i));
+    }
+    const unsigned quote = 0x22;
+    const unsigned comma = 0x2C;
+    PabloAST * marked = pb.createOr(quotes, delims);
+    for (unsigned i = 0; i < 8; i++) {
+        PabloAST * bit = pb.createOr(((quote >> i) & 1) ? quotes : pb.createZeroes(),
+                                     ((comma >> i) & 1) ? delims : pb.createZeroes());
+        basis[i] = pb.createSel(marked, bit, basis[i]);
+    }
+    writeOutputStreamSet("translatedBasis", basis);
+    writeOutputStreamSet("syntaxMarks", std::vector<PabloAST *>{quotes, delims});
+    writeOutputStreamSet("keepMask", std::vector<PabloAST *>{pb.createAnd(toKeep, pb.createNot(rest))});
+}
+
+void StandardSyntax(PipelineBuilder & P, StreamSet * basis, StreamSet * quotedData, StreamSet * toKeep,
+                    codepoint_t quoteCp, codepoint_t delimiterCp,
+                    StreamSet * translatedBasis, StreamSet * syntaxMarks, StreamSet * keepMask) {
+    StreamSet * syntaxStarts = P.CreateStreamSet(2);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(quoteCp), re::makeCC(delimiterCp)},
+                                          basis, syntaxStarts, pablo::BitMovementMode::LookAhead);
+    P.CreateKernelCall<CSV_StandardSyntax>(basis, syntaxStarts, quotedData, toKeep,
+                                           UTF8_Length(quoteCp), UTF8_Length(delimiterCp),
+                                           translatedBasis, syntaxMarks, keepMask);
+}
+
+//  The quotes to be inserted in data of standard syntax (quote and delimiter
+//  marks), and its separators.  A '"' in the data is to be doubled; a field not
+//  quoted is to be quoted if it has a '"' or ',' in its data, and its quotedFollows
+//  marks its fieldFollows.
+class CSV_QuoteInsertions : public PabloKernel {
+public:
+    CSV_QuoteInsertions(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * csvCCs, StreamSet * quotedData,
+                        StreamSet * fieldFollows, StreamSet * dataQuotes, StreamSet * quotedFollows, StreamSet * separators)
+        : PabloKernel(ts, "CSV_QuoteInsertions",
+                      {Binding{"basis", basis}, Binding{"csvCCs", csvCCs}, Binding{"quotedData", quotedData},
+                       Binding{"fieldFollows", fieldFollows}},
+                      {Binding{"dataQuotes", dataQuotes}, Binding{"quotedFollows", quotedFollows},
+                       Binding{"separators", separators}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        cc::Parabix_CC_Compiler_Builder ccc(getInputStreamSet("basis"));
+        std::vector<PabloAST *> csvMarks = getInputStreamSet("csvCCs");
+        PabloAST * unquoted = pb.createNot(getInputStreamSet("quotedData")[0]);
+        PabloAST * fieldFollows = getInputStreamSet("fieldFollows")[0];
+        PabloAST * quoteChars = ccc.compileCC(re::makeByte(0x22), pb);
+        PabloAST * commaChars = ccc.compileCC(re::makeByte(0x2C), pb);
+        PabloAST * dataQuotes = pb.createAnd(quoteChars, pb.createNot(csvMarks[markDQ]));
+        PabloAST * dataCommas = pb.createAnd(commaChars, pb.createNot(csvMarks[markComma]));
+        PabloAST * triggers = pb.createAnd(pb.createOr(dataQuotes, dataCommas), unquoted);
+        PabloAST * quotedFollows = pb.createScanTo(triggers, fieldFollows);
+        PabloAST * separators = pb.createOr(pb.createAnd(csvMarks[markComma], unquoted),
+                                            pb.createAnd(csvMarks[markLF], unquoted));
+        writeOutputStreamSet("dataQuotes", std::vector<PabloAST *>{dataQuotes});
+        writeOutputStreamSet("quotedFollows", std::vector<PabloAST *>{quotedFollows});
+        writeOutputStreamSet("separators", std::vector<PabloAST *>{pb.createInFile(separators)});
+    }
+};
+
+//  The number of quotes to insert before each position.
+class CSV_QuoteInsertBixNum : public PabloKernel {
+public:
+    CSV_QuoteInsertBixNum(LLVMTypeSystemInterface & ts, StreamSet * dataQuotes, StreamSet * quotedStarts,
+                          StreamSet * quotedFollows, StreamSet * insertBixNum)
+        : PabloKernel(ts, "CSV_QuoteInsertBixNum",
+                      {Binding{"dataQuotes", dataQuotes}, Binding{"quotedStarts", quotedStarts},
+                       Binding{"quotedFollows", quotedFollows}},
+                      {Binding{"insertBixNum", insertBixNum}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * dataQuotes = getInputStreamSet("dataQuotes")[0];
+        PabloAST * quotedStarts = getInputStreamSet("quotedStarts")[0];
+        PabloAST * quotedFollows = getInputStreamSet("quotedFollows")[0];
+        //  A field start may have a data quote (two insertions); a field follow
+        //  is a separator, never a data quote or the start of a field to quote.
+        PabloAST * bit0 = pb.createXor(pb.createXor(dataQuotes, quotedStarts), quotedFollows);
+        PabloAST * bit1 = pb.createAnd(dataQuotes, quotedStarts);
+        writeOutputStreamSet("insertBixNum", std::vector<PabloAST *>{bit0, bit1});
+    }
+};
+
+//  The inserted positions (zero in the spread mask) become '"'; keepMask marks
+//  every position but the sentinel.
+class CSV_FillQuotes : public PabloKernel {
+public:
+    CSV_FillQuotes(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * spreadMask, StreamSet * sentinel,
+                   StreamSet * filled, StreamSet * keepMask)
+        : PabloKernel(ts, "CSV_FillQuotes",
+                      {Binding{"basis", basis}, Binding{"spreadMask", spreadMask}, Binding{"sentinel", sentinel}},
+                      {Binding{"filled", filled}, Binding{"keepMask", keepMask}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * inserted = pb.createInFile(pb.createNot(getInputStreamSet("spreadMask")[0]));
+        //  '"' is 0x22: bits 1 and 5.
+        basis[1] = pb.createOr(basis[1], inserted);
+        basis[5] = pb.createOr(basis[5], inserted);
+        writeOutputStreamSet("filled", basis);
+        PabloAST * keep = pb.createInFile(pb.createNot(getInputStreamSet("sentinel")[0]));
+        writeOutputStreamSet("keepMask", std::vector<PabloAST *>{keep});
+    }
+};
+
+void StandardizeCSV(PipelineBuilder & P, StreamSet * basis, codepoint_t quoteCp, codepoint_t delimiterCp,
+                    StreamSet * standardBasis, StreamSet * separators) {
+    CSV_Parser parser(P, quoteCp, delimiterCp);
+    parser.setSource(basis);
+    //  The CRs of CRLFs, then the translation to standard syntax.
+    StreamSet * crMask = P.CreateStreamSet(1);
+    FieldSeparatorsAndCRMask(P, parser.getCsvCCs(), parser.getQuotedData(), nullptr, crMask);
+    StreamSet * translatedBasis = P.CreateStreamSet(8);
+    StreamSet * allSyntaxMarks = P.CreateStreamSet(2);
+    StreamSet * keepMask = P.CreateStreamSet(1);
+    StandardSyntax(P, basis, parser.getQuotedData(), crMask, quoteCp, delimiterCp, translatedBasis, allSyntaxMarks, keepMask);
+    StreamSet * filteredBasis = P.CreateStreamSet(8);
+    FilterByMask(P, keepMask, translatedBasis, filteredBasis);
+    StreamSet * syntaxMarks = P.CreateStreamSet(2);
+    FilterByMask(P, keepMask, allSyntaxMarks, syntaxMarks);
+    //  The quotes to insert in the standard syntax.  A sentinel position (an
+    //  0xFF code unit, marked as a delimiter) ends the data, so that the last
+    //  field of an unterminated final record has a follow position.  It is
+    //  removed after the insertions.
+    StreamSet * sentinelBasis = P.CreateStreamSet(8);
+    P.CreateKernelCall<AddSentinel>(filteredBasis, sentinelBasis);
+    StreamSet * sentinelMarks = P.CreateStreamSet(2);
+    P.CreateKernelCall<AddSentinel>(syntaxMarks, sentinelMarks);
+    StreamSet * sentinel = P.CreateStreamSet(1);
+    P.CreateKernelCall<EOFbit>(filteredBasis, sentinel);
+    filteredBasis = sentinelBasis;
+    parser.setSource(filteredBasis, sentinelMarks);
+    StreamSet * fieldStarts = parser.getFieldStarts();
+    StreamSet * fieldFollows = parser.getFieldFollows();
+    StreamSet * dataQuotes = P.CreateStreamSet(1);
+    StreamSet * quotedFollows = P.CreateStreamSet(1);
+    StreamSet * filteredSeparators = P.CreateStreamSet(1);
+    P.CreateKernelCall<CSV_QuoteInsertions>(filteredBasis, parser.getCsvCCs(), parser.getQuotedData(), fieldFollows,
+                                            dataQuotes, quotedFollows, filteredSeparators);
+    StreamSet * quotedByField = P.CreateStreamSet(1);
+    FilterByMask(P, fieldFollows, quotedFollows, quotedByField);
+    StreamSet * quotedStarts = P.CreateStreamSet(1);
+    SpreadByMask(P, fieldStarts, quotedByField, quotedStarts);
+    StreamSet * insertBixNum = P.CreateStreamSet(2);
+    P.CreateKernelCall<CSV_QuoteInsertBixNum>(dataQuotes, quotedStarts, quotedFollows, insertBixNum);
+    StreamSet * spreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, insertBixNum, spreadMask, InsertPosition::Before);
+    StreamSet * expandedBasis = P.CreateStreamSet(8);
+    SpreadByMask(P, spreadMask, filteredBasis, expandedBasis);
+    StreamSet * expandedSentinel = P.CreateStreamSet(1);
+    SpreadByMask(P, spreadMask, sentinel, expandedSentinel);
+    StreamSet * filledBasis = P.CreateStreamSet(8);
+    StreamSet * withoutSentinel = P.CreateStreamSet(1);
+    P.CreateKernelCall<CSV_FillQuotes>(expandedBasis, spreadMask, expandedSentinel, filledBasis, withoutSentinel);
+    FilterByMask(P, withoutSentinel, filledBasis, standardBasis);
+    StreamSet * expandedSeparators = P.CreateStreamSet(1);
+    SpreadByMask(P, spreadMask, filteredSeparators, expandedSeparators);
+    FilterByMask(P, withoutSentinel, expandedSeparators, separators);
 }
 
 class EmptyFieldsKernel : public PabloKernel {

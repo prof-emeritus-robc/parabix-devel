@@ -86,15 +86,32 @@ CSVOptions & registeredOptions() {
 } // anonymous namespace
 
 //  Headers separated by delimiter (a UTF-8 string): the header line of a file
-//  uses the field delimiter, a --headers string uses commas.
-static std::vector<std::string> split_CSV_headers(const std::string & headerString, const std::string & delimiter) {
+//  uses the field delimiter, a --headers string uses commas.  A header may be
+//  quoted with quote (a UTF-8 string, or empty for none): the quotes are removed,
+//  and a doubled quote within them is a quote.
+static std::vector<std::string> split_CSV_headers(const std::string & headerString, const std::string & delimiter,
+                                                  const std::string & quote = std::string()) {
     std::vector<std::string> headers;
-    for (size_t pos = 0; ; ) {
-        const size_t next = headerString.find(delimiter, pos);
-        headers.push_back(headerString.substr(pos, next == std::string::npos ? std::string::npos : next - pos));
-        if (next == std::string::npos) break;
-        pos = next + delimiter.size();
+    std::string cur;
+    bool inQuotes = false;
+    for (size_t i = 0; i < headerString.size(); ) {
+        if (!quote.empty() && headerString.compare(i, quote.size(), quote) == 0) {
+            if (inQuotes && headerString.compare(i + quote.size(), quote.size(), quote) == 0) {
+                cur += quote;
+                i += 2 * quote.size();
+            } else {
+                inQuotes = !inQuotes;
+                i += quote.size();
+            }
+        } else if (!inQuotes && headerString.compare(i, delimiter.size(), delimiter) == 0) {
+            headers.push_back(cur);
+            cur.clear();
+            i += delimiter.size();
+        } else {
+            cur += headerString[i++];
+        }
     }
+    headers.push_back(cur);
     for (unsigned i = 0; i < headers.size(); i++) {
         boost::algorithm::trim(headers[i]);
     }
@@ -103,6 +120,10 @@ static std::vector<std::string> split_CSV_headers(const std::string & headerStri
 
 static std::string delimiterUTF8() {
     return boost::locale::conv::utf_to_utf<char>(std::u32string(1, FieldDelimiter));
+}
+
+static std::string quoteUTF8() {
+    return boost::locale::conv::utf_to_utf<char>(std::u32string(1, QuoteChar));
 }
 
 std::vector<std::string> parse_CSV_headers(std::string headerString) {
@@ -116,7 +137,7 @@ std::vector<std::string> read_CSV_headers(std::string filename) {
     if (headerFile.is_open()) {
         std::getline(headerFile, line1);
         headerFile.close();
-        headers = split_CSV_headers(line1, delimiterUTF8());
+        headers = split_CSV_headers(line1, delimiterUTF8(), quoteUTF8());
     } else {
         llvm::report_fatal_error(llvm::StringRef("Cannot open ") + filename);
     }
@@ -145,7 +166,7 @@ static std::vector<std::string> read_CSV_headers(const toolio::Input & in) {
         line1.append(buffer, static_cast<size_t>(n));
         offset += n;
     }
-    return split_CSV_headers(line1, delimiterUTF8());
+    return split_CSV_headers(line1, delimiterUTF8(), quoteUTF8());
 }
 
 std::vector<std::string> get_CSV_headers(const toolio::Input & in) {

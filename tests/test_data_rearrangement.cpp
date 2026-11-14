@@ -18,7 +18,7 @@ using namespace testing;
 struct Rearrangement {
     std::string text, separators, expected;
     Rearrangement(const std::string & t, const unsigned N, const std::vector<unsigned> & V,
-                  const std::string & delim = ",") : text(t) {
+                  const std::string & delim = ",", const int prefix = -1) : text(t) {
         const size_t L = delim.size();
         std::vector<size_t> seps;
         for (size_t i = 0; i < text.size(); ) {
@@ -34,28 +34,36 @@ struct Rearrangement {
             }
         }
         const size_t avail = text.size();
-        auto emit = [&](const std::vector<size_t> & sp, const size_t start) {
+        auto emit = [&](const std::vector<size_t> & sp, const size_t start, const bool terminated) {
+            //  The record separator, with its prefix code unit if any.
+            const size_t lastStart = (N == 1) ? start : sp[N - 2] + L;
+            const bool hasPrefix = terminated && prefix >= 0 && sp[N - 1] > lastStart && text[sp[N - 1] - 1] == char(prefix);
+            const size_t recordSepStart = sp[N - 1] - (hasPrefix ? 1 : 0);
             for (size_t i = 0; i < V.size(); ++i) {
                 const size_t k = V[i] - 1;
-                const size_t end = sp[k];
+                const size_t end = (k == N - 1) ? recordSepStart : sp[k];
                 const size_t s = std::min((k == 0) ? start : sp[k - 1] + L, end);
                 expected += text.substr(s, end - s);
                 const bool recordSep = (i == V.size() - 1);
                 const size_t p = sp[recordSep ? (N - 1) : i];
-                if (p < avail) expected += text.substr(p, recordSep ? 1 : L);
+                if (recordSep && hasPrefix) {
+                    expected += text.substr(recordSepStart, 2);
+                } else if (p < avail) {
+                    expected += text.substr(p, recordSep ? 1 : L);
+                }
             }
         };
         size_t start = 0;
         size_t i = 0;
         for (; i + N <= seps.size(); i += N) {
             std::vector<size_t> sp(seps.begin() + i, seps.begin() + i + N);
-            emit(sp, start);
+            emit(sp, start, true);
             start = sp.back() + 1;
         }
         if (i < seps.size() || start < avail) {
             std::vector<size_t> sp(seps.begin() + i, seps.end());
             sp.resize(N, avail);
-            emit(sp, start);
+            emit(sp, start, false);
         }
     }
 };
@@ -94,6 +102,10 @@ static const Rearrangement longFields(longRecords(), 4, {3, 4, 1});
 static const Rearrangement multiUnitDelim("a~|~b~|~c\n1~|~22~|~333\n~|~~|~\nx~|~~|~z\n", 3, {3, 1, 2}, "~|~");
 static const Rearrangement multiUnitLast("a~|~b~|~c\n1~|~22~|~333\n", 3, {1, 3}, "~|~");
 static const Rearrangement multiUnitUnterminated("a~|~b~|~c\n1~|~22", 3, {2, 3, 1}, "~|~");
+//  CRLF record separators, with the CR as the record separator prefix: also a
+//  CR that is not before the LF, an empty last field, and an unterminated record.
+static const Rearrangement crlf("a,b,c\r\n1,22,333\r\nx,\r,\r\n,,\n4,5,6\r", 3, {3, 1}, ",", '\r');
+static const Rearrangement crlfMultiUnit("a~|~b~|~c\r\n1~|~22~|~333\r\n~|~~|~\r\nx~|~y~|~z", 3, {2, 3}, "~|~", '\r');
 static const Rearrangement multiUnitBoundaries(delimitedRecords("~|~"), 4, {4, 2, 1}, "~|~");
 
 #define REARRANGEMENT_INPUTS(R) \
@@ -110,6 +122,8 @@ REARRANGEMENT_INPUTS(multiUnitDelim)
 REARRANGEMENT_INPUTS(multiUnitLast)
 REARRANGEMENT_INPUTS(multiUnitUnterminated)
 REARRANGEMENT_INPUTS(multiUnitBoundaries)
+REARRANGEMENT_INPUTS(crlf)
+REARRANGEMENT_INPUTS(crlfMultiUnit)
 
 TEST_CASE(rearrange_reorder, reorder_sep_i, reorder_text_i, reorder_e) {
     auto Result = P.CreateStreamSet(1, 8);
@@ -169,6 +183,18 @@ TEST_CASE(rearrange_multi_unit_boundaries, multiUnitBoundaries_sep_i, multiUnitB
     AssertEQ(P, Result, Input<2>(T));
 }
 
+TEST_CASE(rearrange_crlf, crlf_sep_i, crlf_text_i, crlf_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(3, std::vector<unsigned>{3, 1}, Input<0>(T), Input<1>(T), Result, 1, '\r');
+    AssertEQ(P, Result, Input<2>(T));
+}
+
+TEST_CASE(rearrange_crlf_multi_unit, crlfMultiUnit_sep_i, crlfMultiUnit_text_i, crlfMultiUnit_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(3, std::vector<unsigned>{2, 3}, Input<0>(T), Input<1>(T), Result, 3, '\r');
+    AssertEQ(P, Result, Input<2>(T));
+}
+
 RUN_TESTS(
     CASE(rearrange_reorder),
     CASE(rearrange_subset),
@@ -178,5 +204,7 @@ RUN_TESTS(
     CASE(rearrange_multi_unit_delim),
     CASE(rearrange_multi_unit_last),
     CASE(rearrange_multi_unit_unterminated),
-    CASE(rearrange_multi_unit_boundaries)
+    CASE(rearrange_multi_unit_boundaries),
+    CASE(rearrange_crlf),
+    CASE(rearrange_crlf_multi_unit)
 )

@@ -37,9 +37,35 @@ void ColumnSelectionMask(PipelineBuilder & P,
 // each delimiter (CharClassesKernel in LookAhead mode), and the separators mark
 // the delimiters there, so that the whole delimiter follows the field it ends.
 // Otherwise (nullptr), the delimiter marks of csvCCs are used.
+// With keepMask nullptr, only the separators are computed (CRs are kept);
+// with separators nullptr, only the keepMask.
 void FieldSeparatorsAndCRMask(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * quotedData,
                               StreamSet * separators, StreamSet * keepMask,
                               StreamSet * delimiterStarts = nullptr);
+
+// The length of a code point in UTF-8 code units.
+unsigned UTF8_Length(codepoint_t cp);
+
+// Standard CSV syntax for a CSV with quote character quoteCp and field delimiter
+// delimiterCp (either possibly a multibyte UTF-8 character; quotedData parsed
+// with them).  Each opening and closing quote becomes '"' and each delimiter
+// outside quotes ',': the first code unit is translated and marked in
+// syntaxMarks (<quotes, delimiters>), and its other code units are removed from
+// toKeep, giving keepMask.  Of each escape pair of quote characters, the first
+// is removed and the second kept as data.  Parsing the translated data
+// (CSV_Parser::setSource with the filtered syntaxMarks) takes the quotes and
+// delimiters at the marks, so that '"' and ',' characters in the data are data.
+void StandardSyntax(PipelineBuilder & P, StreamSet * basis, StreamSet * quotedData, StreamSet * toKeep,
+                    codepoint_t quoteCp, codepoint_t delimiterCp,
+                    StreamSet * translatedBasis, StreamSet * syntaxMarks, StreamSet * keepMask);
+
+// Standard CSV (RFC 4180 style) from a CSV with quote character quoteCp and
+// field delimiter delimiterCp: ',' delimiters, '"' quotes and LF line ends
+// (the CR of each CRLF is removed).  A '"' in the data is doubled, and a field
+// not quoted that has a '"' or ',' in its data is quoted.  separators marks the
+// delimiters and line ends of the standard data.
+void StandardizeCSV(PipelineBuilder & P, StreamSet * basis, codepoint_t quoteCp, codepoint_t delimiterCp,
+                    StreamSet * standardBasis, StreamSet * separators);
 
 void GetEmptyFields(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * fieldSeparators,
                     StreamSet * EmptyFieldMarks);

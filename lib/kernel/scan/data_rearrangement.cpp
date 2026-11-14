@@ -16,7 +16,7 @@ namespace kernel {
 const unsigned SCAN_WORD_BITS = 64;
 
 static std::string rearrangementName(unsigned numFields, const std::vector<unsigned> & fieldOrder,
-                                     unsigned delimiterLength, StreamSet * Data, unsigned strideBlocks) {
+                                     unsigned delimiterLength, int prefix, StreamSet * Data, unsigned strideBlocks) {
     std::string tmp;
     raw_string_ostream nm(tmp);
     nm << "DataRearrangement_" << numFields << "_";
@@ -27,6 +27,9 @@ static std::string rearrangementName(unsigned numFields, const std::vector<unsig
     if (delimiterLength != 1) {
         nm << "_d" << delimiterLength;
     }
+    if (prefix != DataRearrangementKernel::NoPrefix) {
+        nm << "_p" << prefix;
+    }
     nm << "_" << Data->shapeString() << "_" << strideBlocks;
     return nm.str();
 }
@@ -35,8 +38,8 @@ DataRearrangementKernel::DataRearrangementKernel(LLVMTypeSystemInterface & ts,
                                                  unsigned numFields, const std::vector<unsigned> & fieldOrder,
                                                  StreamSet * const Separators, StreamSet * const Data,
                                                  StreamSet * const Rearranged, unsigned delimiterLength,
-                                                 unsigned strideBlocks)
-: MultiBlockKernel(ts, rearrangementName(numFields, fieldOrder, delimiterLength, Data, strideBlocks),
+                                                 int recordSeparatorPrefix, unsigned strideBlocks)
+: MultiBlockKernel(ts, rearrangementName(numFields, fieldOrder, delimiterLength, recordSeparatorPrefix, Data, strideBlocks),
 // inputs
 {Binding{"separators", Separators},
  Binding{"data", Data, FixedRate(), Deferred()}},
@@ -50,6 +53,7 @@ DataRearrangementKernel::DataRearrangementKernel(LLVMTypeSystemInterface & ts,
 , mNumFields(numFields)
 , mFieldOrder(fieldOrder)
 , mDelimiterLength(delimiterLength)
+, mRecordSeparatorPrefix(recordSeparatorPrefix)
 , mStreamCount(Data->getNumElements())
 , mFieldWidth(Data->getFieldWidth()) {
     if (LLVM_UNLIKELY(numFields == 0 || fieldOrder.empty() || fieldOrder.size() > numFields)) {
@@ -67,6 +71,9 @@ DataRearrangementKernel::DataRearrangementKernel(LLVMTypeSystemInterface & ts,
     }
     if (LLVM_UNLIKELY(delimiterLength == 0)) {
         report_fatal_error("DataRearrangementKernel: the delimiter length must be at least 1");
+    }
+    if (LLVM_UNLIKELY(recordSeparatorPrefix != NoPrefix && Data->getNumElements() != 1)) {
+        report_fatal_error("DataRearrangementKernel: a record separator prefix requires a single data stream");
     }
     if (LLVM_UNLIKELY(mFieldWidth < 8 || (mFieldWidth & (mFieldWidth - 1)) != 0)) {
         report_fatal_error("DataRearrangementKernel: data field width must be a power of 2, at least 8");
@@ -167,9 +174,22 @@ void DataRearrangementKernel::generateMultiBlockLogic(KernelBuilder & b, Value *
         Value * const recordStart = b.CreateLoad(sizeTy, recordStartVar);
         Value * produced = b.CreateLoad(sizeTy, producedVar);
         const unsigned outFields = mFieldOrder.size();
+        //  The record separator, preceded by its prefix code unit if any.  (An
+        //  unterminated final record has no record separator.)
+        Value * const recordSep = loadSepPos(mNumFields - 1);
+        Value * prefixLen = ZERO;
+        if (mRecordSeparatorPrefix != NoPrefix && !atEnd) {
+            Value * const lastStart = (mNumFields == 1) ? recordStart : b.CreateAdd(loadSepPos(mNumFields - 2), DELIM_LEN);
+            Value * const room = b.CreateICmpUGT(recordSep, lastStart);
+            Value * const before = b.CreateSelect(room, b.CreateSub(recordSep, ONE), recordSep);
+            Value * const unit = b.CreateLoad(itemTy, b.getRawInputPointer("data", b.getInt32(0), before));
+            Value * const isPrefix = b.CreateAnd(room, b.CreateICmpEQ(unit, ConstantInt::get(itemTy, mRecordSeparatorPrefix)));
+            prefixLen = b.CreateZExt(isPrefix, sizeTy);
+        }
+        Value * const recordSepStart = b.CreateSub(recordSep, prefixLen);
         for (unsigned i = 0; i < outFields; i++) {
             const unsigned k = mFieldOrder[i] - 1;
-            Value * const end = loadSepPos(k);
+            Value * const end = (k == mNumFields - 1) ? recordSepStart : loadSepPos(k);
             //  Field k > 0 follows field separator k - 1 (never the record separator).
             Value * start = (k == 0) ? recordStart : b.CreateAdd(loadSepPos(k - 1), DELIM_LEN);
             if (atEnd) {
@@ -182,7 +202,9 @@ void DataRearrangementKernel::generateMultiBlockLogic(KernelBuilder & b, Value *
             Value * const sep = loadSepPos(isRecordSep ? (mNumFields - 1) : i);
             const unsigned sepLen = isRecordSep ? 1 : mDelimiterLength;
             auto writeSeparator = [&]() {
-                if (sepLen == 1) {
+                if (isRecordSep && mRecordSeparatorPrefix != NoPrefix && !atEnd) {
+                    copyItems(recordSepStart, produced, b.CreateAdd(prefixLen, ONE));
+                } else if (sepLen == 1) {
                     copyItem(sep, produced);
                 } else {
                     copyItems(sep, produced, b.getSize(sepLen));
@@ -201,6 +223,9 @@ void DataRearrangementKernel::generateMultiBlockLogic(KernelBuilder & b, Value *
             } else {
                 writeSeparator();
                 produced = b.CreateAdd(produced, b.getSize(sepLen));
+                if (isRecordSep) {
+                    produced = b.CreateAdd(produced, prefixLen);
+                }
             }
         }
         b.CreateStore(produced, producedVar);

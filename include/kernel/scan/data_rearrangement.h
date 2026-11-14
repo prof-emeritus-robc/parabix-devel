@@ -30,7 +30,11 @@ namespace kernel {
 //  sequence of delimiterLength code units, such as a multibyte UTF-8
 //  delimiter: its separator bit marks its first code unit, the field ends
 //  before it, the next field begins after its last code unit, and all of its
-//  code units are written.  The record separator is a single code unit.
+//  code units are written.  The record separator is a single code unit,
+//  optionally preceded by a recordSeparatorPrefix code unit (such as the CR of a
+//  CRLF): when the code unit just before the record separator, within the last
+//  field, is that code unit, it belongs to the record separator, which it
+//  precedes in the output.  (A single data stream is required for it.)
 //
 //  A record is written when its record separator is reached.  The data input
 //  is deferred to the start of an incomplete record, so a record may extend
@@ -49,12 +53,14 @@ public:
                             unsigned numFields, const std::vector<unsigned> & fieldOrder,
                             StreamSet * const Separators, StreamSet * const Data,
                             StreamSet * const Rearranged, unsigned delimiterLength = 1,
-                            unsigned strideBlocks = 8);
+                            int recordSeparatorPrefix = NoPrefix, unsigned strideBlocks = 8);
+    static constexpr int NoPrefix = -1;
 private:
     void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;
     const unsigned mNumFields;
     const std::vector<unsigned> mFieldOrder;
     const unsigned mDelimiterLength;
+    const int mRecordSeparatorPrefix;
     const unsigned mStreamCount;
     const unsigned mFieldWidth;
 };

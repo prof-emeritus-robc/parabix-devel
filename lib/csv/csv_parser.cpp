@@ -22,14 +22,19 @@ char charCR = 0xD;
 //  (a) a marker stream identifying the contents of each quoted string.
 //  (b) a marker stream marking each quote escape character (first of
 //      each pair of quotes within a quoted string).
+//  Quote marks are at the final code unit of each quote character, which is
+//  quoteLength code units long (a multibyte UTF-8 quote character), so the
+//  two quotes of an escape pair are marked quoteLength apart.
 class CSV_QuoteParser : public PabloKernel {
 public:
-    CSV_QuoteParser(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData)
-        : PabloKernel(ts, "CSV_QuoteParser",
-                      {Binding{"csvCCs", csvCCs, FixedRate(), LookAhead(1)}},
-                      {Binding{"quotedData", quotedData}}) {}
+    CSV_QuoteParser(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData, unsigned quoteLength)
+        : PabloKernel(ts, "CSV_QuoteParser" + (quoteLength == 1 ? std::string() : "_" + std::to_string(quoteLength)),
+                      {Binding{"csvCCs", csvCCs, FixedRate(), LookAhead(quoteLength)}},
+                      {Binding{"quotedData", quotedData}})
+    , mQuoteLength(quoteLength) {}
 protected:
     void generatePabloMethod() override;
+    const unsigned mQuoteLength;
 };
 
 void CSV_QuoteParser::generatePabloMethod() {
@@ -38,8 +43,8 @@ void CSV_QuoteParser::generatePabloMethod() {
     PabloAST * dquote = csvMarks[markDQ];
     PabloAST * dquote_odd = pb.createEveryNth(dquote, pb.getInteger(2));
     PabloAST * dquote_even = pb.createXor(dquote, dquote_odd);
-    PabloAST * quote_escape = pb.createAnd(dquote_even, pb.createLookahead(dquote, 1));
-    PabloAST * escaped_quote = pb.createAdvance(quote_escape, 1);
+    PabloAST * quote_escape = pb.createAnd(dquote_even, pb.createLookahead(dquote, mQuoteLength));
+    PabloAST * escaped_quote = pb.createAdvance(quote_escape, mQuoteLength);
     PabloAST * start_dquote = pb.createXor(dquote_odd, escaped_quote);
     PabloAST * end_dquote = pb.createXor(dquote_even, quote_escape);
     PabloAST * start_data = pb.createAdvance(start_dquote, 1);
@@ -70,22 +75,33 @@ void CSV_RecordParser::generatePabloMethod() {
 class CSV_FieldParser : public PabloKernel {
 public:
     CSV_FieldParser(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData,
-                    StreamSet * delimiterMarks, StreamSet * fieldStarts, StreamSet * fieldFollows)
-        : PabloKernel(ts, delimiterMarks ? "CSVparser_delimiterMarks" : "CSVparser",
-                      inputBindings(csvCCs, quotedData, delimiterMarks),
+                    StreamSet * fieldStarts, StreamSet * fieldFollows)
+        : PabloKernel(ts, "CSVparser",
+                      {Binding{"csvCCs", csvCCs},
+                       Binding{"quotedData", quotedData}},
                       {Binding{"fieldStarts", fieldStarts},
-                       Binding{"fieldFollows", fieldFollows}}),
-          mHasDelimiterMarks(delimiterMarks != nullptr) {}
+                       Binding{"fieldFollows", fieldFollows}}) {}
 protected:
-    static Bindings inputBindings(StreamSet * csvCCs, StreamSet * quotedData, StreamSet * delimiterMarks) {
-        Bindings inputs{Binding{"csvCCs", csvCCs}, Binding{"quotedData", quotedData}};
-        if (delimiterMarks) {
-            inputs.emplace_back("delimiterMarks", delimiterMarks);
-        }
-        return inputs;
-    }
     void generatePabloMethod() override;
-    const bool mHasDelimiterMarks;
+};
+
+//  The CSV character classes with the quote and delimiter streams replaced by
+//  syntaxMarks (<quote marks, delimiter marks>).
+class CSV_SyntaxMarks : public PabloKernel {
+public:
+    CSV_SyntaxMarks(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * syntaxMarks, StreamSet * markedCCs)
+        : PabloKernel(ts, "CSV_SyntaxMarks",
+                      {Binding{"csvCCs", csvCCs}, Binding{"syntaxMarks", syntaxMarks}},
+                      {Binding{"markedCCs", markedCCs}}) {}
+protected:
+    void generatePabloMethod() override {
+        pablo::PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> ccs = getInputStreamSet("csvCCs");
+        std::vector<PabloAST *> marks = getInputStreamSet("syntaxMarks");
+        ccs[markDQ] = marks[0];
+        ccs[markComma] = marks[1];
+        writeOutputStreamSet("markedCCs", ccs);
+    }
 };
 
 void CSV_FieldParser::generatePabloMethod() {
@@ -94,26 +110,24 @@ void CSV_FieldParser::generatePabloMethod() {
     std::vector<PabloAST *> quotedData = getInputStreamSet("quotedData");
     PabloAST * unquoted = pb.createNot(quotedData[0]);
     PabloAST * recordMarks = pb.createAnd(csvMarks[markLF], unquoted);
-    PabloAST * delimiters = mHasDelimiterMarks ? getInputStreamSet("delimiterMarks")[0] : csvMarks[markComma];
-    PabloAST * fieldFollows = pb.createAnd(pb.createOr(delimiters, csvMarks[markCR]), unquoted);
+    PabloAST * fieldFollows = pb.createAnd(pb.createOr(csvMarks[markComma], csvMarks[markCR]), unquoted);
     // In the event that CSV records are terminated by bare LF and not CRLF, we update
     // fieldFollows to include this case.
     PabloAST * bareLF = pb.createAnd(pb.createNot(pb.createAdvance(csvMarks[markCR], 1)), recordMarks);
     fieldFollows = pb.createOr(fieldFollows, bareLF);
-    PabloAST * fieldFinals = pb.createAnd(pb.createOr(delimiters, csvMarks[markLF]), unquoted);
+    PabloAST * fieldFinals = pb.createAnd(pb.createOr(csvMarks[markComma], csvMarks[markLF]), unquoted);
     PabloAST * fieldStarts = pb.createInFile(pb.createNot(pb.createAdvance(pb.createNot(fieldFinals), 1)));
     pb.createAssign(pb.createExtract(getOutputStreamVar("fieldStarts"), pb.getInteger(0)), fieldStarts);
     pb.createAssign(pb.createExtract(getOutputStreamVar("fieldFollows"), pb.getInteger(0)), fieldFollows);
 }
 
 CSV_Parser::CSV_Parser(PipelineBuilder & P, codepoint_t quoteCp, codepoint_t separatorCp) :
-    mPB(P), mQuoteCp(quoteCp), mSeparatorCp(separatorCp), mCsvCCs(nullptr), mDelimiterMarks(nullptr), mQuotedData(nullptr),
+    mPB(P), mQuoteCp(quoteCp), mSeparatorCp(separatorCp), mCsvCCs(nullptr), mQuoteLength(1), mQuotedData(nullptr),
     mFieldStarts(nullptr), mFieldFollows(nullptr), mLineEnds(nullptr) {
 
     }
 
-void CSV_Parser::setSource(StreamSet * basis, StreamSet * delimiterMarks) {
-    mDelimiterMarks = delimiterMarks;
+void CSV_Parser::setSource(StreamSet * basis, StreamSet * syntaxMarks) {
     mQuotedData = nullptr;
     mLineEnds = nullptr;
     mFieldStarts = nullptr;
@@ -125,13 +139,20 @@ void CSV_Parser::setSource(StreamSet * basis, StreamSet * delimiterMarks) {
     csv_marks[markComma] = re::makeCC(mSeparatorCp);
     mCsvCCs = mPB.CreateStreamSet(4);
     mPB.CreateKernelCall<CharClassesKernel>(csv_marks, basis, mCsvCCs);
+    mQuoteLength = mQuoteCp < 0x80 ? 1 : mQuoteCp < 0x800 ? 2 : mQuoteCp < 0x10000 ? 3 : 4;
+    if (syntaxMarks) {
+        StreamSet * markedCCs = mPB.CreateStreamSet(4);
+        mPB.CreateKernelCall<CSV_SyntaxMarks>(mCsvCCs, syntaxMarks, markedCCs);
+        mCsvCCs = markedCCs;
+        mQuoteLength = 1;
+    }
 }
 
 StreamSet * CSV_Parser::getCsvCCs() {return mCsvCCs;}
 StreamSet * CSV_Parser::getQuotedData() {
     if (mQuotedData == nullptr) {
         mQuotedData = mPB.CreateStreamSet(2);
-        mPB.CreateKernelCall<CSV_QuoteParser>(mCsvCCs, mQuotedData);
+        mPB.CreateKernelCall<CSV_QuoteParser>(mCsvCCs, mQuotedData, mQuoteLength);
     }
     return mQuotedData;
 }
@@ -149,7 +170,7 @@ StreamSet * CSV_Parser::getFieldStarts() {
     if (mFieldStarts == nullptr) {
         mFieldStarts = mPB.CreateStreamSet(1);
         mFieldFollows = mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mDelimiterMarks, mFieldStarts, mFieldFollows);
+        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mFieldStarts, mFieldFollows);
     }
     return mFieldStarts;
 }
@@ -157,7 +178,7 @@ StreamSet * CSV_Parser::getFieldFollows() {
     if (mFieldFollows == nullptr) {
         mFieldStarts = mPB.CreateStreamSet(1);
         mFieldFollows = mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mDelimiterMarks, mFieldStarts, mFieldFollows);
+        mPB.CreateKernelCall<CSV_FieldParser>(mCsvCCs, getQuotedData(), mFieldStarts, mFieldFollows);
     }
     return mFieldFollows;
 }

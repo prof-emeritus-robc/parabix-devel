@@ -21,6 +21,8 @@
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/scan/data_rearrangement.h>
+#include <kernel/unicode/charclasses.h>
+#include <re/adt/re_cc.h>
 #include <re/adt/re_name.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
@@ -66,11 +68,24 @@ CSVFunctionType generatePipeline(CPUDriver & driver, unsigned numFields, const s
     csv::CSV_Parser parser(P, csv::QuoteChar, csv::FieldDelimiter);
     parser.setSource(BasisBits);
 
+    //  A delimiter of several UTF-8 code units is marked at its first code unit,
+    //  so that it is kept whole: the field it ends stops before it, and the
+    //  rearrangement copies all of its code units.
+    const unsigned delimiterLength = csv::FieldDelimiter < 0x80 ? 1 : csv::FieldDelimiter < 0x800 ? 2
+                                   : csv::FieldDelimiter < 0x10000 ? 3 : 4;
+    StreamSet * DelimiterStarts = nullptr;
+    if (delimiterLength > 1) {
+        DelimiterStarts = P.CreateStreamSet(1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(csv::FieldDelimiter)},
+                                              BasisBits, DelimiterStarts, pablo::BitMovementMode::LookAhead);
+        SHOW_STREAM(DelimiterStarts);
+    }
+
     //  Separators: unquoted delimiters and record-ending LFs.  The CR of each
     //  CRLF is deleted, so that each record ends with its LF.
     StreamSet * Separators = P.CreateStreamSet(1);
     StreamSet * KeepMask = P.CreateStreamSet(1);
-    csv::FieldSeparatorsAndCRMask(P, parser.getCsvCCs(), parser.getQuotedData(), Separators, KeepMask);
+    csv::FieldSeparatorsAndCRMask(P, parser.getCsvCCs(), parser.getQuotedData(), Separators, KeepMask, DelimiterStarts);
     SHOW_STREAM(Separators);
     SHOW_STREAM(KeepMask);
     StreamSet * Data = P.CreateStreamSet(1, 8);
@@ -80,7 +95,7 @@ CSVFunctionType generatePipeline(CPUDriver & driver, unsigned numFields, const s
     SHOW_STREAM(DataSeparators);
 
     StreamSet * Rearranged = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<DataRearrangementKernel>(numFields, fieldOrder, DataSeparators, Data, Rearranged);
+    P.CreateKernelCall<DataRearrangementKernel>(numFields, fieldOrder, DataSeparators, Data, Rearranged, delimiterLength);
     SHOW_BYTES(Rearranged);
     //  The StdOut kernel writes a byte stream to standard output.
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), Rearranged);

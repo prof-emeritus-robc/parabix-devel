@@ -12,26 +12,37 @@
 using namespace kernel;
 using namespace testing;
 
-//  A rearrangement case: the separator stream marks each ',' and '\n' of the text,
-//  and the expected output is computed as specified for DataRearrangementKernel.
+//  A rearrangement case: the separator stream marks the first code unit of each
+//  delimiter (a string of one or more code units) and each '\n' of the text, and
+//  the expected output is computed as specified for DataRearrangementKernel.
 struct Rearrangement {
     std::string text, separators, expected;
-    Rearrangement(const std::string & t, const unsigned N, const std::vector<unsigned> & V) : text(t) {
+    Rearrangement(const std::string & t, const unsigned N, const std::vector<unsigned> & V,
+                  const std::string & delim = ",") : text(t) {
+        const size_t L = delim.size();
         std::vector<size_t> seps;
-        for (size_t i = 0; i < text.size(); ++i) {
-            const bool sep = (text[i] == ',' || text[i] == '\n');
-            separators += sep ? '1' : '.';
-            if (sep) seps.push_back(i);
+        for (size_t i = 0; i < text.size(); ) {
+            if (text.compare(i, L, delim) == 0) {
+                separators += '1' + std::string(L - 1, '.');
+                seps.push_back(i);
+                i += L;
+            } else {
+                const bool sep = (text[i] == '\n');
+                separators += sep ? '1' : '.';
+                if (sep) seps.push_back(i);
+                i += 1;
+            }
         }
         const size_t avail = text.size();
         auto emit = [&](const std::vector<size_t> & sp, const size_t start) {
             for (size_t i = 0; i < V.size(); ++i) {
                 const size_t k = V[i] - 1;
                 const size_t end = sp[k];
-                const size_t s = std::min((k == 0) ? start : sp[k - 1] + 1, end);
+                const size_t s = std::min((k == 0) ? start : sp[k - 1] + L, end);
                 expected += text.substr(s, end - s);
-                const size_t p = sp[(i == V.size() - 1) ? (N - 1) : i];
-                if (p < avail) expected += text[p];
+                const bool recordSep = (i == V.size() - 1);
+                const size_t p = sp[recordSep ? (N - 1) : i];
+                if (p < avail) expected += text.substr(p, recordSep ? 1 : L);
             }
         };
         size_t start = 0;
@@ -62,11 +73,28 @@ static std::string longRecords() {
     return t;
 }
 
+//  Records with a 3-code-unit delimiter, at varied offsets, so that delimiters
+//  straddle scan word, block and stride boundaries.
+static std::string delimitedRecords(const std::string & d) {
+    std::string t;
+    for (unsigned r = 0; r < 400; ++r) {
+        t += "r" + std::to_string(r) + d;
+        t += std::string((r * 13) % 71, 'b') + d;
+        t += std::string((r * 7) % 29, char('c' + (r % 20))) + d;
+        t += "d" + std::to_string(r * r) + "\n";
+    }
+    return t;
+}
+
 static const Rearrangement reorder("a,b,c\n1,22,333\n,,\nx,,z\n", 3, {3, 1});
 static const Rearrangement subset("a,b,c\n1,22,333\n,,\nx,,z\n", 3, {2});
 static const Rearrangement permute("a,b,c\n1,22,333\n,,\nx,,z\n", 3, {2, 3, 1});
 static const Rearrangement unterminated("a,b,c\n1,22", 3, {3, 1});
 static const Rearrangement longFields(longRecords(), 4, {3, 4, 1});
+static const Rearrangement multiUnitDelim("a~|~b~|~c\n1~|~22~|~333\n~|~~|~\nx~|~~|~z\n", 3, {3, 1, 2}, "~|~");
+static const Rearrangement multiUnitLast("a~|~b~|~c\n1~|~22~|~333\n", 3, {1, 3}, "~|~");
+static const Rearrangement multiUnitUnterminated("a~|~b~|~c\n1~|~22", 3, {2, 3, 1}, "~|~");
+static const Rearrangement multiUnitBoundaries(delimitedRecords("~|~"), 4, {4, 2, 1}, "~|~");
 
 #define REARRANGEMENT_INPUTS(R) \
 auto R##_sep_i = BinaryStream(R.separators.c_str()); \
@@ -78,6 +106,10 @@ REARRANGEMENT_INPUTS(subset)
 REARRANGEMENT_INPUTS(permute)
 REARRANGEMENT_INPUTS(unterminated)
 REARRANGEMENT_INPUTS(longFields)
+REARRANGEMENT_INPUTS(multiUnitDelim)
+REARRANGEMENT_INPUTS(multiUnitLast)
+REARRANGEMENT_INPUTS(multiUnitUnterminated)
+REARRANGEMENT_INPUTS(multiUnitBoundaries)
 
 TEST_CASE(rearrange_reorder, reorder_sep_i, reorder_text_i, reorder_e) {
     auto Result = P.CreateStreamSet(1, 8);
@@ -111,10 +143,40 @@ TEST_CASE(rearrange_long_fields, longFields_sep_i, longFields_text_i, longFields
     AssertEQ(P, Result, Input<2>(T));
 }
 
+//  Delimiters of several code units (as multibyte UTF-8 delimiters), marked at
+//  their first code unit and copied whole.
+TEST_CASE(rearrange_multi_unit_delim, multiUnitDelim_sep_i, multiUnitDelim_text_i, multiUnitDelim_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(3, std::vector<unsigned>{3, 1, 2}, Input<0>(T), Input<1>(T), Result, 3);
+    AssertEQ(P, Result, Input<2>(T));
+}
+
+TEST_CASE(rearrange_multi_unit_last, multiUnitLast_sep_i, multiUnitLast_text_i, multiUnitLast_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(3, std::vector<unsigned>{1, 3}, Input<0>(T), Input<1>(T), Result, 3);
+    AssertEQ(P, Result, Input<2>(T));
+}
+
+TEST_CASE(rearrange_multi_unit_unterminated, multiUnitUnterminated_sep_i, multiUnitUnterminated_text_i, multiUnitUnterminated_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(3, std::vector<unsigned>{2, 3, 1}, Input<0>(T), Input<1>(T), Result, 3);
+    AssertEQ(P, Result, Input<2>(T));
+}
+
+TEST_CASE(rearrange_multi_unit_boundaries, multiUnitBoundaries_sep_i, multiUnitBoundaries_text_i, multiUnitBoundaries_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(4, std::vector<unsigned>{4, 2, 1}, Input<0>(T), Input<1>(T), Result, 3);
+    AssertEQ(P, Result, Input<2>(T));
+}
+
 RUN_TESTS(
     CASE(rearrange_reorder),
     CASE(rearrange_subset),
     CASE(rearrange_permute),
     CASE(rearrange_unterminated),
-    CASE(rearrange_long_fields)
+    CASE(rearrange_long_fields),
+    CASE(rearrange_multi_unit_delim),
+    CASE(rearrange_multi_unit_last),
+    CASE(rearrange_multi_unit_unterminated),
+    CASE(rearrange_multi_unit_boundaries)
 )

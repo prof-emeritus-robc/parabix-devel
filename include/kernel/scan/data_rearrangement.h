@@ -26,6 +26,12 @@ namespace kernel {
 //  separator of the input record.  So separators keep their input slots,
 //  and the record separator ends the record.
 //
+//  A field separator (each separator but the record separator) may be a
+//  sequence of delimiterLength code units, such as a multibyte UTF-8
+//  delimiter: its separator bit marks its first code unit, the field ends
+//  before it, the next field begins after its last code unit, and all of its
+//  code units are written.  The record separator is a single code unit.
+//
 //  A record is written when its record separator is reached.  The data input
 //  is deferred to the start of an incomplete record, so a record may extend
 //  over any number of strides and segments.  As V is without repetitions, an
@@ -42,11 +48,13 @@ public:
     DataRearrangementKernel(LLVMTypeSystemInterface & ts,
                             unsigned numFields, const std::vector<unsigned> & fieldOrder,
                             StreamSet * const Separators, StreamSet * const Data,
-                            StreamSet * const Rearranged, unsigned strideBlocks = 8);
+                            StreamSet * const Rearranged, unsigned delimiterLength = 1,
+                            unsigned strideBlocks = 8);
 private:
     void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;
     const unsigned mNumFields;
     const std::vector<unsigned> mFieldOrder;
+    const unsigned mDelimiterLength;
     const unsigned mStreamCount;
     const unsigned mFieldWidth;
 };

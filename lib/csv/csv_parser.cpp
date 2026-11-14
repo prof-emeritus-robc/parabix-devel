@@ -231,14 +231,23 @@ void ColumnSelectionMask(PipelineBuilder & P, StreamSet * Record_separators, Str
 class FieldSeparatorsKernel : public PabloKernel {
 public:
     FieldSeparatorsKernel(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData,
-                          StreamSet * separators, StreamSet * keepMask)
-        : PabloKernel(ts, "CSV_FieldSeparators",
-                      {Binding{"csvCCs", csvCCs, FixedRate(), LookAhead(1)},
-                       Binding{"quotedData", quotedData}},
+                          StreamSet * delimiterStarts, StreamSet * separators, StreamSet * keepMask)
+        : PabloKernel(ts, delimiterStarts ? "CSV_FieldSeparators_delimStarts" : "CSV_FieldSeparators",
+                      inputBindings(csvCCs, quotedData, delimiterStarts),
                       {Binding{"separators", separators},
-                       Binding{"keepMask", keepMask}}) {}
+                       Binding{"keepMask", keepMask}}),
+          mHasDelimiterStarts(delimiterStarts != nullptr) {}
 protected:
+    static Bindings inputBindings(StreamSet * csvCCs, StreamSet * quotedData, StreamSet * delimiterStarts) {
+        Bindings inputs{Binding{"csvCCs", csvCCs, FixedRate(), LookAhead(1)},
+                        Binding{"quotedData", quotedData}};
+        if (delimiterStarts) {
+            inputs.emplace_back("delimiterStarts", delimiterStarts);
+        }
+        return inputs;
+    }
     void generatePabloMethod() override;
+    const bool mHasDelimiterStarts;
 };
 
 void FieldSeparatorsKernel::generatePabloMethod() {
@@ -247,7 +256,10 @@ void FieldSeparatorsKernel::generatePabloMethod() {
     std::vector<PabloAST *> quotedData = getInputStreamSet("quotedData");
     PabloAST * unquoted = pb.createNot(quotedData[0]);
     PabloAST * recordEnds = pb.createAnd(csvMarks[markLF], unquoted);
-    PabloAST * delimiters = pb.createAnd(csvMarks[markComma], unquoted);
+    //  A delimiter is wholly inside or wholly outside quotes, so its first code
+    //  unit is unquoted exactly when its last is.
+    PabloAST * delimMarks = mHasDelimiterStarts ? getInputStreamSet("delimiterStarts")[0] : csvMarks[markComma];
+    PabloAST * delimiters = pb.createAnd(delimMarks, unquoted);
     PabloAST * separators = pb.createInFile(pb.createOr(delimiters, recordEnds));
     PabloAST * CR_of_CRLF = pb.createAnd3(csvMarks[markCR], unquoted, pb.createLookahead(csvMarks[markLF], 1));
     PabloAST * keepMask = pb.createInFile(pb.createNot(CR_of_CRLF));
@@ -256,8 +268,8 @@ void FieldSeparatorsKernel::generatePabloMethod() {
 }
 
 void FieldSeparatorsAndCRMask(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * quotedData,
-                              StreamSet * separators, StreamSet * keepMask) {
-    P.CreateKernelCall<FieldSeparatorsKernel>(csvCCs, quotedData, separators, keepMask);
+                              StreamSet * separators, StreamSet * keepMask, StreamSet * delimiterStarts) {
+    P.CreateKernelCall<FieldSeparatorsKernel>(csvCCs, quotedData, delimiterStarts, separators, keepMask);
 }
 
 class EmptyFieldsKernel : public PabloKernel {

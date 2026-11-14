@@ -85,13 +85,28 @@ CSVOptions & registeredOptions() {
 
 } // anonymous namespace
 
-std::vector<std::string> parse_CSV_headers(std::string headerString) {
+//  Headers separated by delimiter (a UTF-8 string): the header line of a file
+//  uses the field delimiter, a --headers string uses commas.
+static std::vector<std::string> split_CSV_headers(const std::string & headerString, const std::string & delimiter) {
     std::vector<std::string> headers;
-    boost::algorithm::split(headers, headerString, [] (char c) {return (c == ',');});
+    for (size_t pos = 0; ; ) {
+        const size_t next = headerString.find(delimiter, pos);
+        headers.push_back(headerString.substr(pos, next == std::string::npos ? std::string::npos : next - pos));
+        if (next == std::string::npos) break;
+        pos = next + delimiter.size();
+    }
     for (unsigned i = 0; i < headers.size(); i++) {
         boost::algorithm::trim(headers[i]);
     }
     return headers;
+}
+
+static std::string delimiterUTF8() {
+    return boost::locale::conv::utf_to_utf<char>(std::u32string(1, FieldDelimiter));
+}
+
+std::vector<std::string> parse_CSV_headers(std::string headerString) {
+    return split_CSV_headers(headerString, ",");
 }
 
 std::vector<std::string> read_CSV_headers(std::string filename) {
@@ -101,7 +116,7 @@ std::vector<std::string> read_CSV_headers(std::string filename) {
     if (headerFile.is_open()) {
         std::getline(headerFile, line1);
         headerFile.close();
-        headers = parse_CSV_headers(line1);
+        headers = split_CSV_headers(line1, delimiterUTF8());
     } else {
         llvm::report_fatal_error(llvm::StringRef("Cannot open ") + filename);
     }
@@ -130,7 +145,7 @@ static std::vector<std::string> read_CSV_headers(const toolio::Input & in) {
         line1.append(buffer, static_cast<size_t>(n));
         offset += n;
     }
-    return parse_CSV_headers(line1);
+    return split_CSV_headers(line1, delimiterUTF8());
 }
 
 std::vector<std::string> get_CSV_headers(const toolio::Input & in) {

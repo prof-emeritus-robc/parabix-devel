@@ -16,13 +16,16 @@ namespace kernel {
 const unsigned SCAN_WORD_BITS = 64;
 
 static std::string rearrangementName(unsigned numFields, const std::vector<unsigned> & fieldOrder,
-                                     StreamSet * Data, unsigned strideBlocks) {
+                                     unsigned delimiterLength, StreamSet * Data, unsigned strideBlocks) {
     std::string tmp;
     raw_string_ostream nm(tmp);
     nm << "DataRearrangement_" << numFields << "_";
     for (unsigned i = 0; i < fieldOrder.size(); i++) {
         if (i > 0) nm << ".";
         nm << fieldOrder[i];
+    }
+    if (delimiterLength != 1) {
+        nm << "_d" << delimiterLength;
     }
     nm << "_" << Data->shapeString() << "_" << strideBlocks;
     return nm.str();
@@ -31,8 +34,9 @@ static std::string rearrangementName(unsigned numFields, const std::vector<unsig
 DataRearrangementKernel::DataRearrangementKernel(LLVMTypeSystemInterface & ts,
                                                  unsigned numFields, const std::vector<unsigned> & fieldOrder,
                                                  StreamSet * const Separators, StreamSet * const Data,
-                                                 StreamSet * const Rearranged, unsigned strideBlocks)
-: MultiBlockKernel(ts, rearrangementName(numFields, fieldOrder, Data, strideBlocks),
+                                                 StreamSet * const Rearranged, unsigned delimiterLength,
+                                                 unsigned strideBlocks)
+: MultiBlockKernel(ts, rearrangementName(numFields, fieldOrder, delimiterLength, Data, strideBlocks),
 // inputs
 {Binding{"separators", Separators},
  Binding{"data", Data, FixedRate(), Deferred()}},
@@ -45,6 +49,7 @@ DataRearrangementKernel::DataRearrangementKernel(LLVMTypeSystemInterface & ts,
  InternalScalar{ArrayType::get(ts.getSizeTy(), numFields), "sepPos"}})
 , mNumFields(numFields)
 , mFieldOrder(fieldOrder)
+, mDelimiterLength(delimiterLength)
 , mStreamCount(Data->getNumElements())
 , mFieldWidth(Data->getFieldWidth()) {
     if (LLVM_UNLIKELY(numFields == 0 || fieldOrder.empty() || fieldOrder.size() > numFields)) {
@@ -59,6 +64,9 @@ DataRearrangementKernel::DataRearrangementKernel(LLVMTypeSystemInterface & ts,
             report_fatal_error("DataRearrangementKernel: a field may be selected at most once");
         }
         seen[f - 1] = true;
+    }
+    if (LLVM_UNLIKELY(delimiterLength == 0)) {
+        report_fatal_error("DataRearrangementKernel: the delimiter length must be at least 1");
     }
     if (LLVM_UNLIKELY(mFieldWidth < 8 || (mFieldWidth & (mFieldWidth - 1)) != 0)) {
         report_fatal_error("DataRearrangementKernel: data field width must be a power of 2, at least 8");
@@ -89,6 +97,7 @@ void DataRearrangementKernel::generateMultiBlockLogic(KernelBuilder & b, Value *
     Constant * const SZ_BLOCKS_PER_STRIDE = b.getSize(blocksPerStride);
     Constant * const ITEM_BYTES = b.getSize(mFieldWidth / 8);
     Constant * const NUM_FIELDS = b.getSize(mNumFields);
+    Constant * const DELIM_LEN = b.getSize(mDelimiterLength);
 
     const auto sepArray = b.getScalarFieldPtr("sepPos");
     auto sepPosPtr = [&](Value * k) {
@@ -161,27 +170,37 @@ void DataRearrangementKernel::generateMultiBlockLogic(KernelBuilder & b, Value *
         for (unsigned i = 0; i < outFields; i++) {
             const unsigned k = mFieldOrder[i] - 1;
             Value * const end = loadSepPos(k);
-            Value * start = (k == 0) ? recordStart : b.CreateAdd(loadSepPos(k - 1), ONE);
+            //  Field k > 0 follows field separator k - 1 (never the record separator).
+            Value * start = (k == 0) ? recordStart : b.CreateAdd(loadSepPos(k - 1), DELIM_LEN);
             if (atEnd) {
                 start = b.CreateUMin(start, end);
             }
             Value * const len = b.CreateSub(end, start);
             copyItems(start, produced, len);
             produced = b.CreateAdd(produced, len);
-            Value * const sep = loadSepPos((i == outFields - 1) ? (mNumFields - 1) : i);
+            const bool isRecordSep = (i == outFields - 1);
+            Value * const sep = loadSepPos(isRecordSep ? (mNumFields - 1) : i);
+            const unsigned sepLen = isRecordSep ? 1 : mDelimiterLength;
+            auto writeSeparator = [&]() {
+                if (sepLen == 1) {
+                    copyItem(sep, produced);
+                } else {
+                    copyItems(sep, produced, b.getSize(sepLen));
+                }
+            };
             if (atEnd) {
                 BasicBlock * const writeSep = b.CreateBasicBlock("writeSep");
                 BasicBlock * const sepDone = b.CreateBasicBlock("sepDone");
                 Value * const present = b.CreateICmpULT(sep, avail);
                 b.CreateCondBr(present, writeSep, sepDone);
                 b.SetInsertPoint(writeSep);
-                copyItem(sep, produced);
+                writeSeparator();
                 b.CreateBr(sepDone);
                 b.SetInsertPoint(sepDone);
-                produced = b.CreateAdd(produced, b.CreateZExt(present, sizeTy));
+                produced = b.CreateAdd(produced, b.CreateSelect(present, b.getSize(sepLen), ZERO));
             } else {
-                copyItem(sep, produced);
-                produced = b.CreateAdd(produced, ONE);
+                writeSeparator();
+                produced = b.CreateAdd(produced, b.getSize(sepLen));
             }
         }
         b.CreateStore(produced, producedVar);

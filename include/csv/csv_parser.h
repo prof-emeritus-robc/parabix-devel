@@ -33,8 +33,13 @@ void ColumnSelectionMask(PipelineBuilder & P,
 // delimiters and unquoted LFs (record separators).  keepMask marks every
 // position except the unquoted CR of each CRLF, which is to be deleted from the
 // data (and from the separators) so that each record ends at its LF.
+// For a multibyte UTF-8 delimiter, delimiterStarts marks the first code unit of
+// each delimiter (CharClassesKernel in LookAhead mode), and the separators mark
+// the delimiters there, so that the whole delimiter follows the field it ends.
+// Otherwise (nullptr), the delimiter marks of csvCCs are used.
 void FieldSeparatorsAndCRMask(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * quotedData,
-                              StreamSet * separators, StreamSet * keepMask);
+                              StreamSet * separators, StreamSet * keepMask,
+                              StreamSet * delimiterStarts = nullptr);
 
 void GetEmptyFields(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * fieldSeparators,
                     StreamSet * EmptyFieldMarks);

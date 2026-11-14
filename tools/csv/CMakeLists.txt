@@ -33,6 +33,7 @@ DEPS
     kernel.basis
     kernel.io
     kernel.pipeline
+    kernel.scan
     kernel.streamutils
     toolchain
 )

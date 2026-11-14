@@ -228,6 +228,38 @@ void ColumnSelectionMask(PipelineBuilder & P, StreamSet * Record_separators, Str
     P.CreateKernelCall<SelectMultiField>(Record_separators, fieldStarts, fieldFollows, toKeep, columnNos, forCut);
 }
 
+class FieldSeparatorsKernel : public PabloKernel {
+public:
+    FieldSeparatorsKernel(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * quotedData,
+                          StreamSet * separators, StreamSet * keepMask)
+        : PabloKernel(ts, "CSV_FieldSeparators",
+                      {Binding{"csvCCs", csvCCs, FixedRate(), LookAhead(1)},
+                       Binding{"quotedData", quotedData}},
+                      {Binding{"separators", separators},
+                       Binding{"keepMask", keepMask}}) {}
+protected:
+    void generatePabloMethod() override;
+};
+
+void FieldSeparatorsKernel::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    std::vector<PabloAST *> csvMarks = getInputStreamSet("csvCCs");
+    std::vector<PabloAST *> quotedData = getInputStreamSet("quotedData");
+    PabloAST * unquoted = pb.createNot(quotedData[0]);
+    PabloAST * recordEnds = pb.createAnd(csvMarks[markLF], unquoted);
+    PabloAST * delimiters = pb.createAnd(csvMarks[markComma], unquoted);
+    PabloAST * separators = pb.createInFile(pb.createOr(delimiters, recordEnds));
+    PabloAST * CR_of_CRLF = pb.createAnd3(csvMarks[markCR], unquoted, pb.createLookahead(csvMarks[markLF], 1));
+    PabloAST * keepMask = pb.createInFile(pb.createNot(CR_of_CRLF));
+    pb.createAssign(pb.createExtract(getOutputStreamVar("separators"), pb.getInteger(0)), separators);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("keepMask"), pb.getInteger(0)), keepMask);
+}
+
+void FieldSeparatorsAndCRMask(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * quotedData,
+                              StreamSet * separators, StreamSet * keepMask) {
+    P.CreateKernelCall<FieldSeparatorsKernel>(csvCCs, quotedData, separators, keepMask);
+}
+
 class EmptyFieldsKernel : public PabloKernel {
 public:
     EmptyFieldsKernel(LLVMTypeSystemInterface & ts, StreamSet * csvCCs, StreamSet * fieldFollows,

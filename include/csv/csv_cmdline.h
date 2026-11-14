@@ -32,7 +32,9 @@ extern char32_t QuoteChar;
 // toolio::openSeekableInput, its position unchanged).
 std::vector<std::string> get_CSV_headers(const toolio::Input & in);
 
-std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers);
+// The 0-based column numbers of the --columns option (all columns if none).
+// Unless anyOrder, the columns must be in strictly increasing order.
+std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers, bool anyOrder = false);
 
 void InitializeCommandLineInterface(int argc, char *argv[]);
 

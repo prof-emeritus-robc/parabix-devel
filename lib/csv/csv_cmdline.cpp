@@ -180,17 +180,19 @@ std::pair<unsigned, unsigned> getColumnRange(std::string & columnSpec, std::map<
     if (pos != std::string::npos) {
         auto range_lo = columnSpec.substr(0, pos);
         auto range_hi = columnSpec.substr(pos+1);
-        if (range_lo > range_hi) {
+        const unsigned lo = getColumn(range_lo, headerMap);
+        const unsigned hi = getColumn(range_hi, headerMap);
+        if (lo > hi) {
             llvm::report_fatal_error("Bad column range");
         }
-        return std::pair<unsigned, unsigned>(getColumn(range_lo, headerMap), getColumn(range_hi, headerMap));
+        return std::pair<unsigned, unsigned>(lo, hi);
     } else {
         auto colNo = getColumn(columnSpec, headerMap);
         return std::pair<unsigned, unsigned>(colNo, colNo);
     }
 }
 
-std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers) {
+std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers, bool anyOrder) {
     std::map<std::string, unsigned> headerMap;
     for (unsigned i = 0; i < headers.size(); i++) {
         headerMap.emplace(headers[i], i);
@@ -210,7 +212,7 @@ std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers) {
             if (rg.second >= headers.size()) {
                 llvm::report_fatal_error("Column number too large");
             }
-            if ((i > 0) && (rg.first < colNos.back())) {
+            if (!anyOrder && (i > 0) && (rg.first < colNos.back())) {
                 llvm::report_fatal_error("Column numbers must be specified in strictly increasing order");
             }
             for (auto colNo = rg.first; colNo <= rg.second; colNo++) {

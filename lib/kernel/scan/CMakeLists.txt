@@ -8,6 +8,7 @@ NAME
     kernel.scan
 SRC
     base.cpp
+    data_rearrangement.cpp
     index_generator.cpp
     line_number_generator.cpp
     line_span_generator.cpp

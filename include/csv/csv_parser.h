@@ -29,6 +29,13 @@ void ColumnSelectionMask(PipelineBuilder & P,
                          StreamSet * Record_separators, StreamSet * fieldStarts, StreamSet * fieldFollows,
                          StreamSet * toKeep, const std::vector<unsigned> & columnNos, bool forCut = false);
 
+// Separators for field rearrangement (DataRearrangementKernel): unquoted field
+// delimiters and unquoted LFs (record separators).  keepMask marks every
+// position except the unquoted CR of each CRLF, which is to be deleted from the
+// data (and from the separators) so that each record ends at its LF.
+void FieldSeparatorsAndCRMask(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * quotedData,
+                              StreamSet * separators, StreamSet * keepMask);
+
 void GetEmptyFields(PipelineBuilder & P, StreamSet * csvCCs, StreamSet * fieldSeparators,
                     StreamSet * EmptyFieldMarks);
 

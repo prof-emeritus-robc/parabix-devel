@@ -17,16 +17,10 @@
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
-#include <kernel/streamutils/pdep_kernel.h>
-#include <kernel/streamutils/run_index.h>
-#include <kernel/streamutils/stream_select.h>
-#include <kernel/streamutils/stream_shift.h>
-#include <kernel/streamutils/string_insert.h>
 #include <kernel/basis/s2p_kernel.h>
-#include <kernel/basis/p2s_kernel.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
-#include <kernel/scan/scanmatchgen.h>
+#include <kernel/scan/data_rearrangement.h>
 #include <re/adt/re_name.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
@@ -41,18 +35,15 @@ using namespace kernel;
 using namespace llvm;
 using namespace pablo;
 
-//  These declarations are for command line processing.
-//  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
-static cl::opt<bool> FilterBasisBits("FilterBasisBits", cl::desc("Perform filtering on basis bits rather than on byte stream"), 
-    cl::init(false), cl::cat(csv::CSV_Options), cl::Hidden);
-
 typedef void (*CSVFunctionType)(uint32_t useMMap, uint32_t fd, uint32_t outputFD);
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned> & colNos) {
+//  Each record of numFields fields is rearranged to the fields of fieldOrder
+//  (1-based field numbers), in any order.
+CSVFunctionType generatePipeline(CPUDriver & driver, unsigned numFields, const std::vector<unsigned> & fieldOrder) {
 
     // A Parabix program is build as a set of kernel calls called a pipeline.
     // A pipeline is construction using a Parabix driver object.
@@ -73,29 +64,26 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     SHOW_BIXNUM(BasisBits);
 
     csv::CSV_Parser parser(P, csv::QuoteChar, csv::FieldDelimiter);
-
     parser.setSource(BasisBits);
 
-    StreamSet * fieldStarts = parser.getFieldStarts();
-    StreamSet * fieldFollows = parser.getFieldFollows();
-    StreamSet * recordSeparators = parser.getLineEnds();
+    //  Separators: unquoted delimiters and record-ending LFs.  The CR of each
+    //  CRLF is deleted, so that each record ends with its LF.
+    StreamSet * Separators = P.CreateStreamSet(1);
+    StreamSet * KeepMask = P.CreateStreamSet(1);
+    csv::FieldSeparatorsAndCRMask(P, parser.getCsvCCs(), parser.getQuotedData(), Separators, KeepMask);
+    SHOW_STREAM(Separators);
+    SHOW_STREAM(KeepMask);
+    StreamSet * Data = P.CreateStreamSet(1, 8);
+    FilterByMask(P, KeepMask, ByteStream, Data);
+    StreamSet * DataSeparators = P.CreateStreamSet(1);
+    FilterByMask(P, KeepMask, Separators, DataSeparators);
+    SHOW_STREAM(DataSeparators);
 
-    StreamSet * Selected = P.CreateStreamSet(1);
-    csv::ColumnSelectionMask(P, recordSeparators, fieldStarts, fieldFollows, Selected, colNos, /*forCut = */ true);
-    SHOW_STREAM(Selected);
-
-    StreamSet * Filtered = P.CreateStreamSet(1, 8);
-    if (FilterBasisBits) {
-        StreamSet * filteredBasis = P.CreateStreamSet(8);
-        FilterByMask(P, Selected, BasisBits, filteredBasis);
-        P.CreateKernelCall<P2SKernel>(filteredBasis, Filtered);
-        SHOW_BIXNUM(filteredBasis);
-    } else {
-        FilterByMask(P, Selected, ByteStream, Filtered);
-    }
-    SHOW_BYTES(Filtered);
+    StreamSet * Rearranged = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<DataRearrangementKernel>(numFields, fieldOrder, DataSeparators, Data, Rearranged);
+    SHOW_BYTES(Rearranged);
     //  The StdOut kernel writes a byte stream to standard output.
-    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), Filtered);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), Rearranged);
     return P.compile();
 }
 
@@ -111,11 +99,25 @@ int main(int argc, char *argv[]) {
     }
     std::vector<std::string> headers = csv::get_CSV_headers(in);
 
-    std::vector<unsigned> colNos = csv::getColumnArgs(headers);
+    //  Columns may be given in any order, each at most once.
+    std::vector<unsigned> colNos = csv::getColumnArgs(headers, /* anyOrder = */ true);
+    const unsigned numFields = headers.size();
+    std::vector<bool> seen(numFields, false);
+    for (const auto c : colNos) {
+        if (seen[c]) {
+            llvm::errs() << "csvcut: column " << (c + 1) << " is selected more than once\n";
+            return csv::UsageErrorCode;
+        }
+        seen[c] = true;
+    }
+    std::vector<unsigned> fieldOrder;
+    for (const auto c : colNos) {
+        fieldOrder.push_back(c + 1);
+    }
 
     CPUDriver driver("csv_function");
     //  Build and compile the Parabix pipeline by calling the Pipeline function above.
-    CSVFunctionType fn = generatePipeline(driver, colNos);
+    CSVFunctionType fn = generatePipeline(driver, numFields, fieldOrder);
     //  The compiled function "fn" can now be used.  It takes whether to map
     //  the input, and the input and output file descriptors.
     fn(in.useMMap, in.fd, toolio::outputFD());

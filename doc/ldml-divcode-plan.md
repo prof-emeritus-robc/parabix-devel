@@ -413,3 +413,115 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
    - One-way overlaps (topological stages).
    - Longer contexts and text boundaries.
    - Converted before contexts.
+
+## 9. Plan: one-way overlaps
+
+Status: plan, 2026-11-15.
+
+### Scope
+
+A string rule B *overlaps* a string rule A one way if B may match strictly
+within the text of a match of A, but not A within B (`StringRuleOverlaps`, see
+`include/ldml/transform_plan.h`). ICU, scanning from the left, then applies A
+wherever both match, and skips B's match. If all the overlaps of a group are
+one-way and the precedence graph (A → B) is acyclic, the rules apply in a single
+pass in topological order: a match of B applies unless it begins within an
+applied match of a rule that precedes it. This is how the regular plan applies
+them (`TransformStep::stringOrder`, in *stages*: the rules of the longest chain
+of the graph).
+
+Of the 212 groups with string rules, 48 have one-way overlaps only:
+
+- **12 groups (1,727 rules) are blocked by them alone**:
+  - Ethi-Latn/ES3842 (452 rules, 34 pairs)
+  - Latn-Ethi/Williamson (268, 124 pairs)
+  - und_FONIPA-ar and und_FONIPA-fa group 2 (211 each, 15 pairs)
+  - es_FONIPA-ja (121)
+  - the BGN romanizations of kk, uk, be and bg (76–112 each, 4 pairs)
+  - la-la_FONIPA, Latn-Geor, pl-pl_FONIPA
+- **33 of the other 36** are also blocked by contexts of two or more items,
+  mostly the contexts order disambiguation adds. Latn-Kana and Bopo-Latn are
+  among them. These contexts are the next limit, after this plan.
+
+Two-way overlaps, self-overlaps and cycles (sequential selection) stay out of
+scope.
+
+### Design
+
+**Stages.** Each string rule gets a stage. Stage 1 is the rules with no
+predecessor; a rule's stage is one more than the highest stage of the rules it
+yields to. These are the stages of the regular plan. Single-character rules
+have no stage: they apply outside every applied string match, as now. Parts
+split from one rule by blocks share its stage.
+
+**One hierarchy per stage.** The translation kernel, and the Count kernel, run
+the If-hierarchy on the code bits once per stage. Each pass contains only the
+leaves with rules of that stage (`hasRules` filtered by stage).
+
+- Between passes, at the top level, `Cover_s` is the set of positions strictly
+  within the applied matches of all string rules of stages before s. It is
+  computed as now for coverage, from the Vars of the string matches by number of
+  units: `Cover = ⋁_j Advance(longer_j, j)`.
+- Stage s's rules are ANDed with `¬Cover_s` at their anchors, inside their
+  leaves. `Cover_s` depends on the earlier passes' matches, and `¬Cover_s` is
+  ANDed into a match that depends on the leaf condition, so the If invariant
+  holds.
+- Using the union of all earlier stages, rather than only a rule's own
+  predecessors, is exact. A rule that is not a predecessor of B cannot have a
+  match containing B's first position, or the analysis would have paired them.
+  Rules of the same stage cannot overlap one another either.
+- The Vars of the string matches hold the *applied* matches: after priority,
+  after the stage's suppression, and in the spread text after the gap check.
+  The coverage of single-character rules after the last pass is then, as now,
+  the coverage by the applied string matches.
+
+**Count kernel.** It runs the same stages, so a suppressed expanding match
+inserts nothing. The translation on the spread text suppresses the same matches:
+covers count units of text, and gaps come only after the end of a match, never
+within it. Its gap check (exactly the rule's own expansion after its match)
+stays as it is.
+
+**Contexts.** Nothing changes. A before context of B never sees an applied A
+that contains B's anchor, because B is then suppressed. One that sees the
+converted text of an earlier match is ruled out, as now, by the
+converted-context check.
+
+**UTF-8 mode.** Covers are in code units, as are the lengths of the matches.
+
+**Cost.** Each stage adds one pass of the hierarchy's conditions, over the
+leaves of its rules only, plus one cover of at most (longest text − 1)
+Advances. Groups have few stages: Latn-Kana has 3. Groups of more than a limit
+of stages (initially 8) stay ineligible.
+
+### Steps
+
+1. **Plan** (`divcode_plan`):
+   - accept groups whose overlaps are one-way only and acyclic
+     (`StringRuleOverlaps`: no two-way pairs or self-overlaps, `acyclic`), with
+     at most `maxStages` stages (`DivCodeOptions`, default 8)
+   - set `DivRule::stage` (0 for single-character rules) and include it in the
+     content hash
+   - `--divcode-report` gives the stages and pairs of each group; check the 12
+     groups above become eligible
+2. **Kernels:** the stage loop in `DivCodeTranslate` (both modes, Count and
+   Translate), with `Cover_s` between passes; groups without overlaps keep a
+   single pass and the same code as now.
+3. **Tests** (`QA/tconv_divcode_test.py`):
+   - rules files:
+     - a chain of 3 stages (`abcd > 1 ; bcd > 2 ; cd > 3 ;`)
+     - the kana shape `kya > キャ ; ya > ヤ ;` with single-character rules
+       within
+     - a suppressed match that would expand, and one that would delete
+     - an inner rule with an after context reaching past the outer match
+     - multibyte characters, and a filter
+   - the 12 CLDR groups, on random text and test data, in UTF-8 and Unicode
+     modes
+   - all compared with the regular plan, and the rules files also with ICU
+4. **Measurement:** Ethi-Latn/ES3842, Latn-Ethi/Williamson, und_FONIPA-ar and
+   a BGN romanization against the regular plan, on corpora in their source
+   scripts. Count execution cycles (CYCLES × EXEC%) and single-thread times,
+   each configuration run alone.
+5. **Then:** contexts of two or more items (fixed sequences of sets, as the
+   fused kernels' tier A), which would make most of the other 36 groups with
+   one-way overlaps eligible.
+

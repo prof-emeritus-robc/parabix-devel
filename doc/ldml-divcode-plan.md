@@ -286,7 +286,19 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
    text and their CLDR test data, under div32 and div64, and to the regular
    plan's and ICU's for 13 rules files of the cases. The kernels of these groups
    go from 4–20 to 3–8, typically from 10–12 to 6.)
-4. Count kernel, spreading, gap-aware before contexts; QA tests.
+4. Count kernel, spreading, gap-aware before contexts; QA tests. (Done:
+   `DivCodeTranslate` in Count mode; the translation on the spread text. All 45
+   eligible CLDR groups match the regular plan, and 22 rules files match the
+   regular plan and ICU. Two corrections to §4.5 came out of testing:
+   - In the spread text, the after item of every rule, and of the earlier rules
+     it yields to, reads the first character after any gap (a gap of exactly g
+     positions, for g up to the greatest expansion), as on the text before it
+     was spread. A rule then applies only with exactly its own expansion of gap
+     after it (none, if it does not expand), as the Count kernel found.
+     Otherwise a rule at the same anchor as an expanding one reads the other's
+     gap.
+   - A single-character rule's coverage is applied at its anchor, before its
+     changes are advanced to their offsets, which inserted positions may have.)
 5. Measurement (§6); choose the default s and whether `--divcode-groups` is on by
    default.
 6. Phase 2:

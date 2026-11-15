@@ -7867,9 +7867,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
         const ldml::DivCodePlan plan = ldml::planDivCodeGroup(step, options);
-        bool expands = false;
-        for (const ldml::DivRule & d : plan.rules) expands |= d.expansion() > 0;
-        if (plan.eligible() && !expands) return divCodeGroup(plan, U21);
+        if (plan.eligible()) return divCodeGroup(plan, U21);
     }
     if (insertionsOnly(step)) return insertionGroup(step, U21);
     PreparedSearchReplace sr;
@@ -11285,14 +11283,22 @@ static StreamSet * DivCodeExternalsOf(PipelineBuilder & P, const ldml::DivCodePl
 //    their offsets once, after the hierarchy.
 class DivCodeTranslate final : public PabloKernel {
 public:
-    DivCodeTranslate(LLVMTypeSystemInterface & ts, const ldml::DivCodePlan & plan, const std::string & label,
+    //  Count: the number of positions to insert after each match of an expanding
+    //  rule (its expansion, at its last position), as the bixnum InsertCount;
+    //  Translate: the converted text, on the text spread by those counts (with
+    //  the spread mask Spread) if the plan expands.
+    enum class Mode {Count, Translate};
+    DivCodeTranslate(LLVMTypeSystemInterface & ts, const ldml::DivCodePlan & plan, const std::string & label, Mode mode,
                      StreamSet * U21, StreamSet * Code, StreamSet * Externals, StreamSet * InText, StreamSet * Mask,
-                     StreamSet * Out, StreamSet * Deleted)
-    : PabloKernel(ts, kernelName(plan, label, Mask != nullptr), {}, {Binding{"Out", Out}, Binding{"Deleted", Deleted}})
+                     StreamSet * Spread, StreamSet * Out, StreamSet * Deleted)
+    : PabloKernel(ts, kernelName(plan, label, mode, Mask != nullptr, Spread != nullptr), {},
+                  mode == Mode::Count ? Bindings{Binding{"InsertCount", Out}} : Bindings{Binding{"Out", Out}, Binding{"Deleted", Deleted}})
     , mPlan(plan)
+    , mMode(mode)
     , mHasExternals(Externals != nullptr)
-    , mHasMask(Mask != nullptr) {
-        const unsigned L = lookahead(plan);
+    , mHasMask(Mask != nullptr)
+    , mHasSpread(Spread != nullptr) {
+        const unsigned L = lookahead(plan, Spread != nullptr);
         auto bind = [&](const std::string & name, StreamSet * s) {
             if (L > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(1), LookAhead(L)});
             else mInputStreamSets.push_back(Binding{name, s});
@@ -11302,19 +11308,28 @@ public:
         if (Externals) bind("Externals", Externals);
         bind("InText", InText);
         if (Mask) bind("Mask", Mask);
+        if (Spread) bind("Spread", Spread);
     }
-    static std::string kernelName(const ldml::DivCodePlan & plan, const std::string & label, bool mask) {
+    static std::string kernelName(const ldml::DivCodePlan & plan, const std::string & label, Mode mode, bool mask, bool spread) {
         std::string l;
         for (char c : label) l += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
-        return std::string(plan.shift == 5 ? "Div32Code" : "Div64Code") + "Translate_" + l + "_" + plan.contentHash + "_U21"
-               + (mask ? "_m" : "");
+        return std::string(plan.shift == 5 ? "Div32Code" : "Div64Code") + (mode == Mode::Count ? "Count_" : "Translate_") + l + "_"
+               + plan.contentHash + "_U21" + (mask ? "_m" : "") + (spread ? "_s" : "");
     }
     //  The lookahead of the inputs: the last position of a text, and the item
-    //  of an after context, from the anchor.
-    static unsigned lookahead(const ldml::DivCodePlan & plan) {
+    //  of an after context, from the anchor (past the positions inserted after
+    //  the match, in the spread text).
+    static unsigned lookahead(const ldml::DivCodePlan & plan, bool spread) {
         unsigned L = 0;
         for (const ldml::DivRule & d : plan.rules) {
             L = std::max<unsigned>(L, d.length() - 1 + (d.after.present() ? 1 : 0));
+        }
+        //  (In the spread text, the gap after a match, of up to the greatest
+        //  expansion, and the position after it.)
+        if (spread) {
+            size_t E = 0;
+            for (const ldml::DivRule & d : plan.rules) E = std::max(E, d.expansion());
+            for (const ldml::DivRule & d : plan.rules) L = std::max<unsigned>(L, d.length() + E);
         }
         for (const auto & sc : plan.subgroupContexts) {
             if (sc.second.present()) L = std::max(L, 1u);
@@ -11326,7 +11341,8 @@ protected:
 private:
     //  The Vars of the changes (see above).
     struct Key {
-        unsigned kind;      // 0: bits above the low ones (value), 1: a bit (value), 2: deleted, 3: string matches of a length (value)
+        unsigned kind;      // 0: bits above the low ones (value), 1: a bit (value), 2: deleted, 3: string matches of a length (value),
+                            // 4: matches inserting value positions after the offset (Count)
         unsigned offset;
         bool single;
         unsigned value;
@@ -11341,9 +11357,14 @@ private:
         int flip = -1;      // -1: where the rule matches; 0/1: where the text bit (key.value) at the offset is 0/1
     };
     std::vector<Change> changesOf(const ldml::DivRule & d) const;
+    //  The rules matched: in Count mode, those expanding, and the string rules
+    //  (whose matches cover the single-character rules within them).
+    bool needed(const ldml::DivRule & d) const {return mMode == Mode::Translate || d.expansion() > 0 || d.length() > 1;}
     const ldml::DivCodePlan mPlan;
+    const Mode mMode;
     const bool mHasExternals;
     const bool mHasMask;
+    const bool mHasSpread;
 };
 
 std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(const ldml::DivRule & d) const {
@@ -11352,13 +11373,26 @@ std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(const ldml::Di
     const size_t n = d.length(), m = d.result.size();
     const bool single = n == 1;
     std::vector<Change> changes;
-    for (size_t i = 0; i < n; i++) {
+    if (mMode == Mode::Count) {
+        if (m > n) changes.push_back(Change{Key{4, static_cast<unsigned>(n - 1), single, static_cast<unsigned>(m - n)}});
+        if (!single) changes.push_back(Change{Key{3, 0, false, static_cast<unsigned>(n)}});
+        return changes;
+    }
+    for (size_t i = 0; i < std::max(n, m); i++) {
         const unsigned offset = static_cast<unsigned>(i);
         if (i >= m) {
             changes.push_back(Change{Key{2, offset, single, 0}});
             continue;
         }
         const UCD::codepoint_t dst = d.result[i];
+        if (i >= n) {
+            //  A position inserted after the match (all bits 0 in the spread text).
+            if (dst >> s) changes.push_back(Change{Key{0, offset, single, dst >> s}});
+            for (unsigned b = 0; b < s; b++) {
+                if ((dst >> b) & 1) changes.push_back(Change{Key{1, offset, single, b}});
+            }
+            continue;
+        }
         const UCD::UnicodeSet & text = d.text[i];
         UCD::codepoint_t firstBlock = text.begin()->first >> s, lastBlock = firstBlock;
         for (const auto & r : text) lastBlock = std::max<UCD::codepoint_t>(lastBlock, r.second >> s);
@@ -11397,6 +11431,8 @@ void DivCodeTranslate::generatePabloMethod() {
     const std::vector<PabloAST *> ext = mHasExternals ? getInputStreamSet("Externals") : std::vector<PabloAST *>{};
     PabloAST * const inText = getInputStreamSet("InText")[0];
     PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+    //  The positions inserted after the matches of expanding rules (within the text).
+    PabloAST * const gap = mHasSpread ? pb.createAnd(inText, pb.createNot(getInputStreamSet("Spread")[0])) : nullptr;
     const unsigned k = static_cast<unsigned>(code.size());
     PabloAST * const zeroes = pb.createZeroes();
 
@@ -11480,6 +11516,9 @@ void DivCodeTranslate::generatePabloMethod() {
         PabloAST * x = item.kind == ldml::DivContextItem::Kind::External ? ext[item.external]
                                                                          : top.pseudo(0, plan.pseudoTest(item.set));
         x = pb.createAdvance(x, 1);
+        //  (Through the positions inserted after a match before it, to the
+        //  character of the text before them.)
+        if (gap) x = pb.createMatchStar(x, gap);
         if (item.negated) x = pb.createNot(x);
         befores.emplace(key, x);
         return x;
@@ -11490,15 +11529,38 @@ void DivCodeTranslate::generatePabloMethod() {
     //  The Vars of the changes, created before the hierarchy.
     std::map<Key, Var *> vars;
     for (const ldml::DivRule & d : plan.rules) {
+        if (!needed(d)) continue;
         for (const Change & c : changesOf(d)) {
             if (vars.count(c.key)) continue;
             vars.emplace(c.key, pb.createVar("chg" + std::to_string(vars.size()), zeroes));
         }
     }
 
+    size_t maxExpansion = 0;
+    for (const ldml::DivRule & d : plan.rules) maxExpansion = std::max(maxExpansion, d.expansion());
     //  A leaf: the rules anchored at code A.
     auto leaf = [&](PabloBuilder & b, unsigned A, PabloAST * leafCond) {
         Tests t{b, U, code, s, k};
+        //  In the spread text: the gap positions at an offset, the gaps of
+        //  exactly g positions from an offset, and an after item at the first
+        //  position of the text (not inserted) from an offset, as in the text
+        //  before it was spread.
+        PabloAST * const spreadIn = mHasSpread ? getInputStreamSet("Spread")[0] : nullptr;
+        auto gapAt = [&](unsigned o) {return b.createAnd(t.at(inText, o), b.createNot(t.at(spreadIn, o)));};
+        auto gapOf = [&](unsigned o, unsigned g) {
+            PabloAST * x = b.createNot(gapAt(o + g));
+            for (unsigned i = o; i < o + g; i++) x = b.createAnd(x, gapAt(i));
+            return x;
+        };
+        auto afterItem = [&](const ldml::DivContextItem & item, unsigned o) -> PabloAST * {
+            if (!mHasSpread) return itemTest(t, item, o);
+            PabloAST * x = nullptr;
+            for (unsigned g = 0; g <= maxExpansion; g++) {
+                PabloAST * const y = b.createAnd(gapOf(o, g), itemTest(t, item, o + g));
+                x = x ? b.createOr(x, y) : y;
+            }
+            return x;
+        };
         const std::vector<size_t> & rules = plan.leaves[A - 1];
         std::map<size_t, PabloAST *> raw;
         auto inMask = [&](PabloAST * x, size_t n) {
@@ -11508,16 +11570,18 @@ void DivCodeTranslate::generatePabloMethod() {
         };
         for (size_t r : rules) {
             const ldml::DivRule & d = plan.rules[r];
+            if (!needed(d)) continue;
             const unsigned n = static_cast<unsigned>(d.length());
             PabloAST * M = b.createAnd(leafCond, t.lowBits(0, lowSet(d.text[0])));
             for (unsigned i = 1; i < n; i++) M = b.createAnd(M, t.pseudo(i, plan.pseudoSet(d.text[i])));
             M = inMask(M, n);
-            if (d.after.present()) M = b.createAnd(M, itemTest(t, d.after, n));
+            if (d.after.present()) M = b.createAnd(M, afterItem(d.after, n));
             if (PabloAST * bf = beforeOf(d.before)) M = b.createAnd(M, bf);
             raw.emplace(r, M);
         }
         for (size_t r : rules) {
             const ldml::DivRule & d = plan.rules[r];
+            if (!needed(d)) continue;
             PabloAST * M = raw[r];
             //  The earlier rules it yields to, matching at its anchor.
             PabloAST * earlier = nullptr;
@@ -11532,13 +11596,17 @@ void DivCodeTranslate::generatePabloMethod() {
                     if (!chars.empty()) {
                         x = inMask(b.createAnd(leafCond, t.lowBits(0, lowSet(chars))), 1);
                         const auto & sc = plan.subgroupContexts[e.subgroup];
-                        if (sc.second.present()) x = b.createAnd(x, itemTest(t, sc.second, 1));
+                        if (sc.second.present()) x = b.createAnd(x, afterItem(sc.second, 1));
                         if (PabloAST * bf = beforeOf(sc.first)) x = b.createAnd(x, bf);
                     }
                 }
                 if (x) earlier = earlier ? b.createOr(earlier, x) : x;
             }
             if (earlier) M = b.createAnd(M, b.createNot(earlier));
+            //  In the spread text, a rule applies only where the Count kernel
+            //  found it to: with exactly its expansion inserted after it (none,
+            //  if it does not expand).
+            if (mHasSpread) M = b.createAnd(M, gapOf(static_cast<unsigned>(d.length()), static_cast<unsigned>(d.expansion())));
             for (const Change & c : changesOf(d)) {
                 Var * const v = vars.at(c.key);
                 PabloAST * x = M;
@@ -11556,7 +11624,7 @@ void DivCodeTranslate::generatePabloMethod() {
     //  it with rules (other than 0) is.
     auto hasRules = [&](unsigned lo, unsigned hi) {
         for (unsigned c = std::max(lo, 1u); c <= std::min<unsigned>(hi, plan.blocks.size()); c++) {
-            if (!plan.leaves[c - 1].empty()) return true;
+            for (size_t r : plan.leaves[c - 1]) if (needed(plan.rules[r])) return true;
         }
         return false;
     };
@@ -11597,6 +11665,21 @@ void DivCodeTranslate::generatePabloMethod() {
         covered = pb.createOr(covered, pb.createAdvance(longer, j));
     }
     PabloAST * const uncovered = pb.createNot(covered);
+    if (mMode == Mode::Count) {
+        //  The insertion counts, at the last positions of the matches.
+        std::vector<PabloAST *> count(getOutputStreamSet(0)->getNumElements(), zeroes);
+        for (const auto & v : vars) {
+            if (v.first.kind != 4) continue;
+            PabloAST * x = v.first.single ? pb.createAnd(v.second, uncovered) : v.second;
+            if (v.first.offset) x = pb.createAdvance(x, v.first.offset);
+            for (unsigned j = 0; j < count.size(); j++) {
+                if ((v.first.value >> j) & 1) count[j] = pb.createOr(count[j], x);
+            }
+        }
+        for (PabloAST *& c : count) c = pb.createInFile(c);
+        writeOutputStreamSet("InsertCount", count);
+        return;
+    }
     std::vector<PabloAST *> out(21);
     PabloAST * deleted = zeroes;
     for (bool single : {false, true}) {
@@ -11617,9 +11700,11 @@ void DivCodeTranslate::generatePabloMethod() {
                 deletedAt[key.offset] = deletedAt.count(key.offset) ? pb.createOr(deletedAt[key.offset], v.second) : v.second;
             }
         }
+        //  (A single-character rule applies only at an anchor outside the
+        //  matches of the string rules: its changes at every offset.)
         auto place = [&](PabloAST * x, unsigned offset) {
-            if (offset) x = pb.createAdvance(x, offset);
-            return single ? pb.createAnd(x, uncovered) : x;
+            if (single) x = pb.createAnd(x, uncovered);
+            return offset ? pb.createAdvance(x, offset) : x;
         };
         for (auto & a : bitsAt) {
             for (unsigned b = 0; b < 21; b++) {
@@ -11636,17 +11721,45 @@ void DivCodeTranslate::generatePabloMethod() {
     writeOutputStreamSet("Deleted", std::vector<PabloAST *>{pb.createInFile(deleted)});
 }
 
-//  A conversion group by its DivCode plan (eligible, without expansions).
+//  A conversion group by its DivCode plan (eligible).
 StreamSet * RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    StreamSet * const Code = DivCodeOf(P, plan, U21);
+    StreamSet * Code = DivCodeOf(P, plan, U21);
     SHOW_BIXNUM(Code);
-    StreamSet * const Externals = DivCodeExternalsOf(P, plan, U21);
-    StreamSet * const InText = P.CreateStreamSet(1);
+    StreamSet * Externals = DivCodeExternalsOf(P, plan, U21);
+    StreamSet * InText = P.CreateStreamSet(1);
     P.CreateKernelCall<TextPositions>(U21, InText);
+    //  With expansions: the positions inserted after the matches, counted by the
+    //  Count kernel, and the text (with its codes, classes and masks) spread.
+    size_t maxExpansion = 0;
+    for (const ldml::DivRule & d : plan.rules) maxExpansion = std::max(maxExpansion, d.expansion());
+    StreamSet * SpreadMask = nullptr;
+    if (maxExpansion > 0) {
+        unsigned bits = 0;
+        while ((maxExpansion >> bits) != 0) bits++;
+        StreamSet * const InsertCount = P.CreateStreamSet(bits);
+        P.CreateKernelCall<DivCodeTranslate>(plan, mGroupLabel, DivCodeTranslate::Mode::Count, U21, Code, Externals, InText,
+                                             activeMask(), nullptr, InsertCount, nullptr);
+        SHOW_BIXNUM(InsertCount);
+        SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertCount, SpreadMask, kernel::InsertPosition::After);
+        SHOW_STREAM(SpreadMask);
+        auto spread = [&](StreamSet * s) {
+            StreamSet * const spreadOut = P.CreateStreamSet(s->getNumElements());
+            SpreadByMask(P, SpreadMask, s, spreadOut);
+            return spreadOut;
+        };
+        U21 = spread(U21);
+        Code = spread(Code);
+        if (Externals) Externals = spread(Externals);
+        spreadMasks(SpreadMask);
+        InText = P.CreateStreamSet(1);
+        P.CreateKernelCall<TextPositions>(U21, InText);
+    }
     StreamSet * const Out = P.CreateStreamSet(21);
     StreamSet * const Deleted = P.CreateStreamSet(1);
-    P.CreateKernelCall<DivCodeTranslate>(plan, mGroupLabel, U21, Code, Externals, InText, activeMask(), Out, Deleted);
+    P.CreateKernelCall<DivCodeTranslate>(plan, mGroupLabel, DivCodeTranslate::Mode::Translate, U21, Code, Externals, InText,
+                                         activeMask(), SpreadMask, Out, Deleted);
     SHOW_BIXNUM(Out);
     SHOW_STREAM(Deleted);
     bool deletes = false;

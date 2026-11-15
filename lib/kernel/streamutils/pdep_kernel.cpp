@@ -404,6 +404,33 @@ void StreamExpandKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value 
 
         b.SetInsertPoint(expandLoopContinue);
     }
+    // The fast path: with nothing inserted in the block (its deposit mask all
+    // ones) and the source at a block boundary (as when nothing has been
+    // inserted), the output block is the pending source block, and the next
+    // source block is pending.
+    {
+        BasicBlock * const fastExpand = b.CreateBasicBlock("fastExpand");
+        BasicBlock * const generalExpand = b.CreateBasicBlock("generalExpand");
+        Value * const unaligned = b.CreateICmpNE(b.CreateURem(pendingOffsetPhi, BLOCK_WIDTH), ZERO);
+        b.CreateCondBr(b.CreateOr(unaligned, b.bitblock_any(b.simd_not(deposit_mask))), generalExpand, fastExpand);
+        b.SetInsertPoint(fastExpand);
+        Value * const fastPendingOffset = b.CreateAdd(pendingOffsetPhi, BLOCK_WIDTH);
+        Value * const fastSrcBlockNo = b.CreateUDiv(fastPendingOffset, BLOCK_WIDTH);
+        SmallVector<Value *, 16> fastSource(mSelectedStreamCount);
+        for (unsigned i = 0; i < mSelectedStreamCount; i++) {
+            Constant * const streamIndex = ConstantInt::get(streamBase->getType(), i);
+            Value * const streamOffset = b.CreateAdd(streamBase, streamIndex);
+            b.storeOutputStreamBlock("output", b.getInt32(i), blockNoPhi, pendingDataPhi[i]);
+            fastSource[i] = b.loadInputStreamBlock("source", streamOffset, fastSrcBlockNo);
+        }
+        blockNoPhi->addIncoming(nextBlk, fastExpand);
+        pendingOffsetPhi->addIncoming(fastPendingOffset, fastExpand);
+        for (unsigned i = 0; i < mSelectedStreamCount; i++) {
+            pendingDataPhi[i]->addIncoming(fastSource[i], fastExpand);
+        }
+        b.CreateCondBr(moreToDo, expandLoop, expansionDone);
+        b.SetInsertPoint(generalExpand);
+    }
     // Calculate the field values and offsets we need for assembling a
     // a full block of source bits.  Assembly will use the following operations.
     // A = b.simd_srlv(fw, b.mvmd_dsll(fw, source, pending, field_offset_lo), bit_offset);
@@ -1115,13 +1142,28 @@ void FieldDepositKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value 
     PHINode * blockOffsetPhi = b.CreatePHI(b.getSizeTy(), 2);
     blockOffsetPhi->addIncoming(ZERO, entry);
     Value * depositMask = b.loadInputStreamBlock("depositMask", ZERO, blockOffsetPhi);
+    // The fast path: with nothing inserted in the block (its mask all ones),
+    // the fields are the input fields.
+    BasicBlock * const fastBlock = b.CreateBasicBlock("fastBlock");
+    BasicBlock * const generalBlock = b.CreateBasicBlock("generalBlock");
+    BasicBlock * const blockDone = b.CreateBasicBlock("blockDone");
+    b.CreateCondBr(b.bitblock_any(b.simd_not(depositMask)), generalBlock, fastBlock);
+    b.SetInsertPoint(fastBlock);
+    for (unsigned j = 0; j < mStreamCount; ++j) {
+        b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi,
+                                 b.loadInputStreamBlock("inputStreamSet", b.getInt32(j), blockOffsetPhi));
+    }
+    b.CreateBr(blockDone);
+    b.SetInsertPoint(generalBlock);
     for (unsigned j = 0; j < mStreamCount; ++j) {
         Value * input = b.loadInputStreamBlock("inputStreamSet", b.getInt32(j), blockOffsetPhi);
         Value * output = b.simd_pdep(mFieldWidth, input, depositMask);
         b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi, output);
     }
+    b.CreateBr(blockDone);
+    b.SetInsertPoint(blockDone);
     Value * nextBlk = b.CreateAdd(blockOffsetPhi, b.getSize(1));
-    blockOffsetPhi->addIncoming(nextBlk, processBlock);
+    blockOffsetPhi->addIncoming(nextBlk, blockDone);
     Value * moreToDo = b.CreateICmpNE(nextBlk, numOfBlocks);
     b.CreateCondBr(moreToDo, processBlock, done);
 

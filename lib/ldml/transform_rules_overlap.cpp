@@ -267,6 +267,55 @@ struct RuleOverlapAnalysis::Impl {
     }
 };
 
+//  The states reached from the states of from by edges other than characters
+//  (epsilon edges and text boundaries).
+static std::set<unsigned> closure(const NFA & n, std::vector<unsigned> from) {
+    std::set<unsigned> reached(from.begin(), from.end());
+    while (!from.empty()) {
+        const unsigned q = from.back();
+        from.pop_back();
+        for (const NFA::Edge & e : n.out[q]) {
+            if ((e.kind != NFA::Kind::Chars) && reached.insert(e.to).second) from.push_back(e.to);
+        }
+    }
+    return reached;
+}
+
+//  (compatible(a, b) requires an accepting state of a or b reached without
+//  characters, or a first character step of both, from the closures of their
+//  starts.)
+RuleOverlapAnalysis::Leading RuleOverlapAnalysis::leading(const ConversionRule * r) {
+    const NFA & after = mImpl->get(r).after;
+    Leading l;
+    for (const unsigned q : closure(after, {after.start})) {
+        if (q == after.accept) l.mayBeEmpty = true;
+        for (const NFA::Edge & e : after.out[q]) {
+            if (e.kind == NFA::Kind::Chars) l.chars = l.chars + e.chars;
+        }
+    }
+    return l;
+}
+
+//  (mayMatchWithin(s, r) requires the text after the position, a nonempty
+//  path of the key of r from the target of a character edge, to be
+//  compatible with the text and after context of s.)
+UCD::UnicodeSet RuleOverlapAnalysis::within(const ConversionRule * r) {
+    const NFA & key = mImpl->get(r).key;
+    std::vector<unsigned> targets;
+    for (unsigned q = 0; q < key.out.size(); q++) {
+        for (const NFA::Edge & e : key.out[q]) {
+            if ((e.kind == NFA::Kind::Chars) && !e.chars.empty()) targets.push_back(e.to);
+        }
+    }
+    UCD::UnicodeSet chars;
+    for (const unsigned q : closure(key, targets)) {
+        for (const NFA::Edge & e : key.out[q]) {
+            if (e.kind == NFA::Kind::Chars) chars = chars + e.chars;
+        }
+    }
+    return chars;
+}
+
 RuleOverlapAnalysis::RuleOverlapAnalysis() : mImpl(new Impl()) {}
 
 RuleOverlapAnalysis::~RuleOverlapAnalysis() = default;

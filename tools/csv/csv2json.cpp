@@ -324,16 +324,48 @@ void EnQuoteValues::generatePabloMethod() {
     writeOutputStreamSet("remainingMask", std::vector<PabloAST *>{remainingMask});
 }
 
-StreamSet * QuoteInsertionBixNum(PipelineBuilder & P, StreamSet * BasisBits, StreamSet * fieldStarts, StreamSet * fieldFollows) {
+//  The fieldFollows of the fields that begin with a quote mark: the CSV quoted
+//  fields, when the quotes are given by marks (syntaxMarks[0]) rather than '"'.
+class QuotedFieldFollows : public PabloKernel {
+public:
+    QuotedFieldFollows(LLVMTypeSystemInterface & ts, StreamSet * fieldStarts, StreamSet * fieldFollows,
+                       StreamSet * syntaxMarks, StreamSet * quotedFollows)
+        : PabloKernel(ts, "QuotedFieldFollows",
+                      {Binding{"fieldStarts", fieldStarts}, Binding{"fieldFollows", fieldFollows},
+                       Binding{"syntaxMarks", syntaxMarks}},
+                      {Binding{"quotedFollows", quotedFollows}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * fieldStarts = getInputStreamSet("fieldStarts")[0];
+        PabloAST * fieldFollows = getInputStreamSet("fieldFollows")[0];
+        PabloAST * quoteMarks = getInputStreamSet("syntaxMarks")[0];
+        PabloAST * quotedStarts = pb.createAnd(fieldStarts, quoteMarks);
+        writeOutputStreamSet("quotedFollows", std::vector<PabloAST *>{pb.createScanTo(quotedStarts, fieldFollows)});
+    }
+};
+
+//  With syntaxMarks, the fields already quoted are those beginning with a quote
+//  mark; a '"' in the data (a field such as "abc" with another quote character)
+//  is escaped, and its field quoted.
+StreamSet * QuoteInsertionBixNum(PipelineBuilder & P, StreamSet * BasisBits, StreamSet * fieldStarts, StreamSet * fieldFollows,
+                                 StreamSet * syntaxMarks = nullptr) {
     StreamSet * literalMatches = P.CreateStreamSet(1);
     json::JSON_ValueKind no_quotes_needed_set =
         static_cast<json::JSON_ValueKind>(json::NullLiteral|
                                           json::NumericLiteral|
                                           json::TrueLiteral|
                                           json::FalseLiteral|
-                                          json::QuotedString);
+                                          (syntaxMarks ? 0u : unsigned(json::QuotedString)));
 
     JSON_Value_Matching(P, no_quotes_needed_set, BasisBits, fieldStarts, fieldFollows, literalMatches);
+    if (syntaxMarks) {
+        StreamSet * quotedFollows = P.CreateStreamSet(1);
+        P.CreateKernelCall<QuotedFieldFollows>(fieldStarts, fieldFollows, syntaxMarks, quotedFollows);
+        StreamSet * allMatches = P.CreateStreamSet(1);
+        OrCombine(P, literalMatches, quotedFollows, allMatches);
+        literalMatches = allMatches;
+    }
 
     StreamSet * const literalFollows = P.CreateStreamSet(1);
     P.CreateKernelCall<MatchedLinesKernel>(literalMatches, fieldFollows, literalFollows);
@@ -398,16 +430,33 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<std::stri
     P.CreateKernelCall<CSVdataFieldMask>(parser.getCsvCCs(), parser.getLineEnds(), toKeep, csv::HeaderSpec == "");
     SHOW_STREAM(toKeep);
 
+    //  A quote character other than '"' and a delimiter other than ',' become
+    //  the JSON '"' and ',', and the quotes and fields are thereafter parsed at
+    //  the marks of the original quotes and delimiters.
+    StreamSet * syntaxMarks = nullptr;
+    if (csv::FieldDelimiter != U',' || csv::QuoteChar != U'"') {
+        StreamSet * translatedBasis = P.CreateStreamSet(8);
+        StreamSet * allSyntaxMarks = P.CreateStreamSet(2);
+        StreamSet * keepMask = P.CreateStreamSet(1);
+        csv::StandardSyntax(P, BasisBits, parser.getQuotedData(), toKeep, csv::QuoteChar, csv::FieldDelimiter,
+                            translatedBasis, allSyntaxMarks, keepMask);
+        SHOW_BIXNUM(allSyntaxMarks);
+        BasisBits = translatedBasis;
+        toKeep = keepMask;
+        syntaxMarks = P.CreateStreamSet(2);
+        FilterByMask(P, toKeep, allSyntaxMarks, syntaxMarks);
+    }
+
     StreamSet * filteredBasis = P.CreateStreamSet(8);
     FilterByMask(P, toKeep, BasisBits, filteredBasis);
     SHOW_BIXNUM(filteredBasis);
 
     BasisBits = filteredBasis;
-    parser.setSource(BasisBits);
+    parser.setSource(BasisBits, syntaxMarks);
     StreamSet * fieldStarts = parser.getFieldStarts();
     StreamSet * fieldFollows = parser.getFieldFollows();
 
-    StreamSet * const quoteInsertBixNum = QuoteInsertionBixNum(P, BasisBits, fieldStarts, fieldFollows);
+    StreamSet * const quoteInsertBixNum = QuoteInsertionBixNum(P, BasisBits, fieldStarts, fieldFollows, syntaxMarks);
     StreamSet * expansionCandidates = P.CreateStreamSet(1);
     P.CreateKernelCall<JSON_ExpansionCandidates>(parser.getCsvCCs(), parser.getQuotedData(), expansionCandidates);
     StreamSet * escapeInsertBixNum = json::EscapeSequenceExpansionBixNum(P, BasisBits, expansionCandidates);
@@ -423,7 +472,12 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<std::stri
     SpreadByMask(P, spreadMask, BasisBits, ExpandedBasis);
 
     // Parse the expanded stream
-    parser.setSource(ExpandedBasis);
+    StreamSet * expandedSyntaxMarks = nullptr;
+    if (syntaxMarks) {
+        expandedSyntaxMarks = P.CreateStreamSet(2);
+        SpreadByMask(P, spreadMask, syntaxMarks, expandedSyntaxMarks);
+    }
+    parser.setSource(ExpandedBasis, expandedSyntaxMarks);
 
     fieldStarts = parser.getFieldStarts();
     fieldFollows = parser.getFieldFollows();

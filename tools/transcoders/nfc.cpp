@@ -13,6 +13,7 @@
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/basis/s2p_kernel.h>
 #include <kernel/basis/p2s_kernel.h>
+#include <kernel/unicode/utf8_wellformed.h>
 #include <kernel/streamutils/focused_transform.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
@@ -52,15 +53,30 @@ static FocusOptions NFC_FocusOptions() {
     return options;
 }
 
+//  The source: the input made well-formed UTF-8 (see kernel::WellFormedUTF8 and
+//  --utf8-errors), as basis bits and bytes.
 void source_logic(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * BasisBits) {
     P.SetStageLabel("source");
     Scalar * const buffer = P.getInputScalar("buffer");
     Scalar * const length = P.getInputScalar("length");
-    P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
-
-    Selected_S2P(P, ByteStream, BasisBits);
+    StreamSet * const InputBytes = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<MemorySourceKernel>(buffer, length, InputBytes);
+    StreamSet * const InputBasis = P.CreateStreamSet(8, 1);
+    Selected_S2P(P, InputBytes, InputBasis);
+    WellFormedUTF8(P, InputBasis, BasisBits);
+    P.CreateKernelCall<P2SKernel>(BasisBits, ByteStream);
     SHOW_BIXNUM(BasisBits);
 }
+
+//  With --utf8-errors=abort-on-error, the input is processed up to its first
+//  ill-formed UTF-8: the error is reported, with its offset.
+static bool reportUTF8Abort(size_t offset, const std::string & name) {
+    llvm::errs() << toolio::programName() << ": " << name << ": ill-formed UTF-8 at byte " << offset
+                 << ": the input after it is not processed (--utf8-errors=abort-on-error)\n";
+    return true;
+}
+
+
 
 //  MultiStage: the focus, transform and reintegration stages as separate pipelines.
 
@@ -186,6 +202,9 @@ int main(int argc, char *argv[]) {
         XfrmFunctionType fn = generate_pipeline(driver);
         fn(buf.getBuf(), buf.getBufSize(), toolio::outputFD());
     }
+    const size_t offset = UTF8_ErrorOffset(buf.getBuf(), buf.getBufSize());
+    const bool aborted = codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort && offset < buf.getBufSize() &&
+                         reportUTF8Abort(offset, in.name);
     buf.release();
-    return toolio::finishOutput() ? 0 : 1;
+    return (toolio::finishOutput() && !aborted) ? 0 : 1;
 }

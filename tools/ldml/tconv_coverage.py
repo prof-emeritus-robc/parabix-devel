@@ -22,6 +22,7 @@
 #  Writes to the output directory (default ./tconv-coverage):
 #      plans/<name>.txt     the --plan output of each transform ('/' as '%')
 #      kernels/<name>.txt   the --kernel-counts output of each transform
+#      kernels-regular/<name>.txt   the same with --apply-shape-groups=0
 #      coverage.json        per transform: status, own problem classes,
 #                           transforms used, transitive work items
 #      coverage.md          summary tables and the per-transform table
@@ -276,17 +277,21 @@ def run_plans(args, entries, names):
             entries[name]['rc'] = rc
 
 
-#  The kernel counts of the transforms of names (see tconv --kernel-counts).
-def run_kernel_counts(args, entries, names):
-    kernels = os.path.join(args.out, 'kernels')
+#  The kernel counts of the transforms of names (see tconv --kernel-counts):
+#  with tconv's default plans (with shape groups, where they take fewer
+#  kernels, see doc/ldml-shape-groups-report.md), and with the regular plans
+#  only (--apply-shape-groups=0, in kernels-regular/).
+def run_kernel_counts(args, entries, names, regular=False):
+    key = 'kernels_regular' if regular else 'kernels'
+    kernels = os.path.join(args.out, 'kernels-regular' if regular else 'kernels')
     os.makedirs(kernels, exist_ok=True)
 
     def run(name):
         path = os.path.join(kernels, file_name(name))
-        if args.progress.has('kernels', name) and os.path.exists(path):
-            return name, args.progress.get('kernels', name)
+        if args.progress.has(key, name) and os.path.exists(path):
+            return name, args.progress.get(key, name)
         try:
-            r = subprocess.run(tconv_command(args) + ['--kernel-counts', name],
+            r = subprocess.run(tconv_command(args) + (['--apply-shape-groups=0'] if regular else []) + ['--kernel-counts', name],
                                capture_output=True, timeout=args.timeout)
             text = (r.stdout + r.stderr).decode('utf-8', 'replace')
         except subprocess.TimeoutExpired:
@@ -294,12 +299,12 @@ def run_kernel_counts(args, entries, names):
         with open(path, 'w', encoding='utf-8') as f:
             f.write(text)
         counts = parse_kernel_counts(text)
-        args.progress.put('kernels', name, counts)
+        args.progress.put(key, name, counts)
         return name, counts
 
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
         for name, counts in ex.map(run, names):
-            entries[name]['kernels'] = counts
+            entries[name][key] = counts
 
 
 #  groups, rules, group_kernels, kernels (the last two None if the pipeline
@@ -474,9 +479,10 @@ def classify(args, entries):
                          'S-match-within-string-rule')
         for line in lines:
             if line.startswith('  transform '):
-                #  (The name is last, but for a built-in applied by ICU.)
-                used = resolve(line[:-len(' (applied by ICU)')].split()[-1] if line.endswith(' (applied by ICU)')
-                               else line.split()[-1])
+                #  (The name is last, but for a note in parentheses: a built-in
+                #  applied by ICU, or the segments of the transform applied by
+                #  its shape groups.)
+                used = resolve(re.sub(r' \([^()]*\)$', '', line).split()[-1])
                 if used:
                     uses.add(used)
                 else:
@@ -657,20 +663,26 @@ def summary(entries):
               'Groups, rules: the conversion groups of the transform\'s own rules (not of the transforms it uses), '
               'and their rules (as planned: without the rules reported as problems).  Group kernels: the kernels '
               'of these groups; kernels: of the whole transform, including its filters and the transforms it '
-              'uses, transitively (tconv --kernel-counts; implementable transforms only).\n')
-    md.append('| Transform | file | status | own problem classes (rules) | uses | tests | groups | rules | group kernels | kernels |')
-    md.append('|---|---|---|---|---|---|---:|---:|---:|---:|')
+              'uses, transitively (tconv --kernel-counts; implementable transforms only).  These are counted '
+              'with tconv\'s default plans (--apply-shape-groups=1: each segment by its shape groups where they '
+              'take fewer kernels, see [ldml-shape-groups-report.md](ldml-shape-groups-report.md)); '
+              'regular kernels: of the whole transform with the regular plans only (--apply-shape-groups=0), '
+              'where they differ.  The tests are run with the default plans.\n')
+    md.append('| Transform | file | status | own problem classes (rules) | uses | tests | groups | rules | group kernels | kernels | regular kernels |')
+    md.append('|---|---|---|---|---|---|---:|---:|---:|---:|---:|')
     for e in sorted(entries.values(), key=lambda e: (e['builtin'], e['name'].lower())):
         status = '**ok**' if e['implementable'] else ', '.join(w.split()[0] for w in e['work']) or '?'
         own = ', '.join('%s (%d)' % (c, n) for c, n in sorted(e['own'].items()))
         tests = ', '.join(test_result(f, r) for f, r in e.get('test_results', {}).items()) \
             or ', '.join(e.get('tests', []))
         k = e.get('kernels') or {}
+        regular = (e.get('kernels_regular') or {}).get('kernels')
         cell = lambda v: '' if v is None else str(v)
-        md.append('| %s%s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+        md.append('| %s%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
             e['name'], ' (internal)' if e['internal'] else '', e['file'] or 'built-in', status, own,
             ', '.join(e['uses']), tests, cell(k.get('groups')), cell(k.get('rules')),
-            cell(k.get('group_kernels')), cell(k.get('kernels'))))
+            cell(k.get('group_kernels')), cell(k.get('kernels')),
+            cell(regular) if regular != k.get('kernels') else ''))
     return '\n'.join(md) + '\n'
 
 
@@ -965,11 +977,13 @@ def main():
         with_users(entries, list(names) + [n for n in entries if 'kernels' not in previous.get(n, {})])
     if previous is not None:
         for name, e in entries.items():
-            if name not in counted and name in previous and 'kernels' in previous[name]:
-                e['kernels'] = previous[name]['kernels']
+            for key in ('kernels', 'kernels_regular'):
+                if name not in counted and name in previous and key in previous[name]:
+                    e[key] = previous[name][key]
     if counted:
         print('tconv_coverage.py: counting the kernels of %d transforms' % len(counted), file=sys.stderr)
         run_kernel_counts(args, entries, counted)
+        run_kernel_counts(args, entries, counted, regular=True)
     if args.test_data:
         run_tests(args, entries, names, previous)
     elif previous is not None:

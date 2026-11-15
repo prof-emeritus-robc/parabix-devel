@@ -22,6 +22,7 @@ SRC
     transform_rules_revisit.cpp
     transform_registry.cpp
     transform_plan.cpp
+    shape_groups.cpp
 DEPS
     re.adt
     re.analysis

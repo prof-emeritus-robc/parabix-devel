@@ -222,7 +222,14 @@ protected:
     RE * parse_escaped_char_item();
     
     RE * makeAtomicGroup(RE * r);
-    RE * makeBranchResetGroup(RE * r);
+
+    // A branch reset group (?|A|B|...), after the (?| : an alternation whose
+    // alternatives number their captures from the same number, the number
+    // after the captures before the group (PCRE).  After the group, captures
+    // are numbered from the greatest number reached by an alternative.  The
+    // alternatives' captures of the same number are distinct Capture objects
+    // with the same name.  Back references to them are not supported.
+    RE * parse_branch_reset_group();
 
     virtual codepoint_t parse_escaped_codepoint();
 
@@ -255,6 +262,10 @@ protected:
     RE_Syntax                   mReSyntax;
     NameMap                     mNameMap;
     std::map<std::string, std::pair<re::Capture *, unsigned>> mCaptureMap;
+    // The names of the captures within branch reset groups, and the depth of
+    // the branch reset groups being parsed.
+    std::set<std::string>       mBranchResetCaptures;
+    unsigned                    mBranchResetDepth = 0;
 };
 
 }

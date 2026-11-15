@@ -61,7 +61,33 @@ CASES = [
     ("x[a-z0-9]*([a-z]\\d+);", "[$1]", "x[a-z0-9]*([a-z][0-9]+);", "[\\1]"),
     ("([a-z0-9]*[a-z])(\\d+)-([a-z]+);", "$1.$2.$3", "([a-z0-9]*[a-z])([0-9]+)-([a-z]+);", "\\1.\\2.\\3"),
     ("([a-z0-9é]*é)\\d+;", "<$1>", "([a-z0-9é]*é)[0-9]+;", "<\\1>"),
+    # Branch reset groups: the alternatives number their captures alike.  (Python's
+    # re has no branch reset: its replacement takes the groups of the alternative
+    # matched, see reset.)
+    ("(?|(a)(b)|(c)(d))", "[$1|$2]", "(?:(a)(b)|(c)(d))", lambda m: "[%s|%s]" % reset(m, 2)),
+    ("(?|([a-z]+)@|#([a-z0-9]+);)", "<$1>", "(?:([a-z]+)@|#([a-z0-9]+);)", lambda m: "<%s>" % reset(m, 1)),
+    ("(?|(é)([0-9]+)|([a-z]{2})([0-9]+));", "<$1|$2>",
+     "(?:(é)([0-9]+)|([a-z]{2})([0-9]+));", lambda m: "<%s|%s>" % reset(m, 2)),
+    # Captures of fixed lengths moved back (rotated over the captures before them).
+    ("([a-z]+)@([a-z])$", "$2$1", "([a-z]+)@([a-z])$", "\\2\\1"),                    # carried multiplexed
+    ("([a-z]+)([0-9]);", "$2$1", "([a-z]+)([0-9]);", "\\2\\1"),                      # to the start of the match
+    ("(f)([a-z]+)@([a-z]{3})\\.", "$1$3$2.", "(f)([a-z]+)@([a-z]{3})\\.", "\\1\\3\\2."),  # three characters
+    ("#([a-z0-9]*)([0-9]{2});", "$2/$1", "#([a-z0-9]*)([0-9]{2});", "\\2/\\1"),      # two characters
+    ("#([a-z0-9]*)([^ #a-z0-9])", "$2$1", "#([a-z0-9]*)([^ #a-z0-9])", "\\2\\1"),    # the basis carried
+    ("#([a-z0-9]*)([0-9]);", "$2-$1", "#([a-z0-9]*)([0-9]);", "\\2-\\1"),
+    ("([0-9])([a-z]+)([0-9]);", "$1$3$2;", "([0-9])([a-z]+)([0-9]);", "\\1\\3\\2;"),
+    ("(?|(a)([0-9]+)|(é)([0-9]))([;-])", "$1$3$2", "(?:(a)([0-9]+)|(é)([0-9]))([;-])",
+     lambda m: "%s%s%s" % (reset(m, 2)[0], m.group(5), reset(m, 2)[1])),
 ]
+
+
+def reset(m, n):
+    """The n groups of the alternative matched by m (of alternatives of n groups each)."""
+    groups = m.groups()
+    for k in range(0, len(groups), n):
+        if groups[k] is not None:
+            return tuple(groups[k:k + n])
+    return (None,) * n
 
 # (icgrep pattern, icgrep replacement, a part of the expected error)
 REJECTED = [
@@ -70,8 +96,11 @@ REJECTED = [
     ("x*", "X", "empty string"),
     ("(a)b", "$2", "No capture 2"),
     ("([a-z]+)@([a-z]+)\\.", "$2$1", "in their order"),
-    ("([a-z]+)@", "$1$1", "in their order"),
+    ("([a-z]+)@", "$1$1", "referred to once"),
+    ("([a-z]+)([0-9]{2})(?![0-9])", "$2$1", "not yet supported"),  # no characters around to move through
     ("(?:(a)|b)c", "$1", "no unique binding"),
+    ("(?|(a)|b)c", "$1", "no unique binding"),
+    ("(?|([a-z]+)([a-z]+)@|(#)([0-9]);)", "$1", "is not found"),
     ("([a-z])+@", "$1", "no unique binding"),
     ("#([a-z0-9]*)([0-9]+);", "$1", "is not found"),
     ("([a-z0-9]*[a-z])[a-z0-9]+;", "$1", "is not found"),     # not maximal backward either
@@ -113,6 +142,21 @@ def main():
                 failures += 1
                 print("FAIL s/%s/%s/: expected an error with %r, got exit %d: %s"
                       % (pattern, replacement, message, run.returncode, run.stderr.decode()[:300]))
+        # Captures moved back over long distances (across blocks and segments).
+        long_path = os.path.join(tmp, "long.txt")
+        long_lines = ["#" + "ab1" * k + "4; #x" + "c2" * (k // 3) + "!" for k in (0, 1, 21, 22, 700, 5000, 30000)]
+        with open(long_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(long_lines) + "\n")
+        for argv, (py_pattern, py_replacement) in [
+                (["--replace=$2-$1", "#([a-z0-9]*)([0-9]);"], ("#([a-z0-9]*)([0-9]);", "\\2-\\1")),
+                (["--replace=$2$1", "#([a-z0-9]*)([^ #a-z0-9])"], ("#([a-z0-9]*)([^ #a-z0-9])", "\\2\\1"))]:
+            rx = re.compile(py_pattern)
+            want = "".join(rx.sub(py_replacement, l) + "\n" for l in long_lines if rx.search(l))
+            for extra in ([], ["-segment-size=2"]):
+                run = subprocess.run([icgrep, "--colors=never"] + argv + [long_path] + extra, capture_output=True)
+                if run.stdout.decode("utf-8", "replace") != want:
+                    failures += 1
+                    print("FAIL long lines %s %s: exit %d %s" % (argv, extra, run.returncode, run.stderr.decode()[:300]))
         # Line numbers and file names (one file at a time).
         run = subprocess.run([icgrep, "--colors=never", "-n", "-H", "--replace=Q", "cat", path, path],
                              capture_output=True)

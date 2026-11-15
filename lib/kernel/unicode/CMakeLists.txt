@@ -15,6 +15,8 @@ SRC
     utf8_decoder.cpp
     utf8_support.cpp
     utf16gen.cpp
+    utf8_charmap.cpp
+    utf8_wellformed.cpp
 DEPS
     kernel.bitwise
     kernel.pipeline

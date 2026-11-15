@@ -35,6 +35,7 @@
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
+#include <kernel/unicode/utf8_wellformed.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <re/adt/re_name.h>
 #include <re/cc/cc_kernel.h>
@@ -81,14 +82,34 @@ static cl::opt<bool> UseLayers("UseLayers", cl::desc("With -SeparatedPipelineSta
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
+//  The source: the input made well-formed UTF-8 (see kernel::WellFormedUTF8 and
+//  --utf8-errors), as basis bits and bytes.
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
     P.SetStageLabel("source");
 
-    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
-
-    Selected_S2P(P, ByteStream, BasisBits);
+    StreamSet * const InputBytes = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, InputBytes);
+    StreamSet * const InputBasis = P.CreateStreamSet(8, 1);
+    Selected_S2P(P, InputBytes, InputBasis);
+    WellFormedUTF8(P, InputBasis, BasisBits);
+    P.CreateKernelCall<P2SKernel>(BasisBits, ByteStream);
     SHOW_BIXNUM(BasisBits);
 }
+
+//  With --utf8-errors=abort-on-error, the input is processed up to its first
+//  ill-formed UTF-8: the error is reported, with its offset.
+static bool reportUTF8Abort(size_t offset, const std::string & name) {
+    llvm::errs() << toolio::programName() << ": " << name << ": ill-formed UTF-8 at byte " << offset
+                 << ": the input after it is not processed (--utf8-errors=abort-on-error)\n";
+    return true;
+}
+
+static bool reportUTF8Abort(const toolio::Input & in) {
+    size_t offset = 0;
+    return codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort && UTF8_FileError(in.fd, in.useMMap, offset) &&
+           reportUTF8Abort(offset, in.name);
+}
+
 
 typedef void (*SourceInputFunctionType)(StreamSetPtr &, StreamSetPtr &, uint32_t useMMap, uint32_t fd);
 
@@ -258,6 +279,7 @@ int main(int argc, char *argv[]) {
         llvm::report_fatal_error("-SeparatedPipelineStages=4 with -UseLayers requires -focus-filter=bit");
     }
     CPUDriver driver("NFD_function");
+    bool aborted = false;
     if (SeparatedPipelineStages == 2) {
         CombinedWorkFunctionType working_stages = generate_combined_work_pipeline(driver);
         kernel::StreamSetPtr WorkSelectionMask;
@@ -265,6 +287,7 @@ int main(int argc, char *argv[]) {
         kernel::StreamSetPtr Source;
         kernel::StreamSetPtr TransformedBasis;
         working_stages(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis, in.useMMap, in.fd);
+        aborted = reportUTF8Abort(in);
         toolio::closeInput(in);
 
         OutputAssemblyFunctionType stage3 = generate_output_pipeline(driver);
@@ -274,6 +297,7 @@ int main(int argc, char *argv[]) {
         kernel::StreamSetPtr ByteStream;
         kernel::StreamSetPtr BasisBits;
         stage0(ByteStream, BasisBits, in.useMMap, in.fd);
+        aborted = reportUTF8Abort(in);
         toolio::closeInput(in);
 
         NFD_FilterFunctionType stage1 = NFD_filter_pipeline(driver);
@@ -291,7 +315,8 @@ int main(int argc, char *argv[]) {
     } else {
         XfrmFunctionType fn = generate_unitary_pipeline(driver);
         fn(in.useMMap, in.fd, toolio::outputFD());
+        aborted = reportUTF8Abort(in);
         toolio::closeInput(in);
     }
-    return toolio::finishOutput() ? 0 : 1;
+    return (toolio::finishOutput() && !aborted) ? 0 : 1;
 }

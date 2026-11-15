@@ -83,10 +83,20 @@ RE * RE_Parser::makeAtomicGroup(RE * r) {
     ParseFailure("Atomic grouping not supported.");
 }
 
-RE * RE_Parser::makeBranchResetGroup(RE * r) {
-    // Branch reset groups only affect submatch numbering, but
-    // this has no effect in icgrep.
-    ParseFailure("Branch reset groups not supported.");
+RE * RE_Parser::parse_branch_reset_group() {
+    const unsigned base = mCaptureGroupCount;
+    unsigned greatest = base;
+    mBranchResetDepth++;
+    std::vector<RE *> alt;
+    do {
+        mCaptureGroupCount = base;
+        alt.push_back(parse_seq());
+        greatest = std::max(greatest, mCaptureGroupCount);
+    }
+    while (accept('|'));
+    mBranchResetDepth--;
+    mCaptureGroupCount = greatest;
+    return Alt::Create(alt.begin(), alt.end());
 }
 
 RE * RE_Parser::parse_RE() {
@@ -238,7 +248,7 @@ RE * RE_Parser::parse_group() {
         } else if (accept('>')) {
             group_expr = makeAtomicGroup(parse_alt());
         } else if (accept('|')) {
-            group_expr = makeBranchResetGroup(parse_alt());
+            group_expr = parse_branch_reset_group();
         } else if (atany("-dimsxgK")) { // mode switches
             bool closing_paren_parsed;
             group_expr = parse_mode_group(closing_paren_parsed);
@@ -272,12 +282,16 @@ RE * RE_Parser::parse_capture_body() {
     std::string captureName = "\\" + std::to_string(mCaptureGroupCount);
     Capture * capture  = Capture::Create(captureName, captured);
     mCaptureMap.emplace(captureName, std::make_pair(capture, 0));
+    if (mBranchResetDepth > 0) mBranchResetCaptures.insert(captureName);
     return capture;
 }
     
 Reference * RE_Parser::parse_back_reference() {
     mCursor++;
     std::string backref = std::string(mCursor.pos()-2, mCursor.pos());
+    if (mBranchResetCaptures.count(backref)) {
+        ParseFailure("Back reference " + backref + " to a capture of a branch reset group is not supported.");
+    }
     auto f = mCaptureMap.find(backref);
     if (f != mCaptureMap.end()) {
         Capture * captured = f->second.first;

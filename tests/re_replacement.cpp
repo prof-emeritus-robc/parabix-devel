@@ -64,6 +64,9 @@ const ParseCase ParseCases[] = {
     {"(x{3})y", "$1$1", "\"xxxxxx\""},
     {"(a|b)c", "$1", "<\\1>"},
     {"(?:(a)|b)c", "$1", "<\\1>"},                 // a capture of one string, but on one path only
+    {"(?|(a)b|(a)c)", "$1", "\"a\""},             // branch reset: the same string on every path
+    {"(?|(a)b|(c)d)", "$1", "<\\1>"},             // branch reset: different strings
+    {"(?|(a)b|c)d", "$1", "<\\1>"},               // branch reset: unset on one path
     {"([a-z]+)@([a-z]+)", "$3", nullptr},
     {"([a-z]+)", "$", nullptr},
     {"([a-z]+)", "a\\", nullptr},
@@ -146,6 +149,7 @@ int main(int argc, char * argv[]) {
             {"([a-z]{2,3})", "$1$1", &cc::Unicode, 4, 6},
             {"(\xC3\xA9|e)", "$1", &cc::UTF8, 1, 2},
             {"(x)", "", &cc::Unicode, 0, 0},
+            {"(?|(a)|(bcd))e", "$1", &cc::Unicode, 1, 3},        // all the captures of the name
         };
         for (const LengthCase & c : cases) {
             RE * const search = RE_Parser::parse(c.search);
@@ -181,6 +185,15 @@ int main(int argc, char * argv[]) {
             {"[a-z]*[a-z0-9]*(x)[a-z]+;", {"\\1"}, nullptr},
             {"([a-z])+@", {"\\1"}, nullptr},
             {"(?:(a)|b)c", {"\\1"}, nullptr},
+            // Captures bound within alternations (branch reset groups): one walk for all paths.
+            {"(?|(ab)(c)|(de)(f))", {"\\1", "\\2"}, "2,1 | F0 F1 | F1 F2"},
+            {"(?|(a)(b+)|(u\\x{308})(c+))", {"\\1", "\\2"}, "1,r,r | F0 F2 | F2 F3"},
+            {"(?|([ae])([1-5])|(u\\x{308})([1-5]))", {"\\1", "\\2"}, "1,r,1 | F0 F2 | F2 F3"},
+            {"(?|(a+)(b)|(c+)(d))", {"\\1", "\\2"}, "r,1 | F0 F1 | F1 F2"},
+            {"(?|(a+)(a)|(c+)(c))", {"\\1", "\\2"}, " | F0 B1 | B1 B0"},  // the runs are not maximal
+            {"x(?|(a)|(bc))y", {"\\1"}, "1,1,r | F1 F3"},                    // 1, then a run of [c]
+            {"(?|(a)|b)c", {"\\1"}, nullptr},                                // unset on one path
+            {"(?|(a)(b)|(c))(d)", {"\\2"}, nullptr},                         // \2 unset on one path
             // Walks back from the end of the match (W: after the steps back).
             {"([a-z0-9]*[a-z])\\d+;", {"\\1"}, nullptr},
             {"([a-z0-9]*[a-z])\\d+;", {"\\1"}, " < 1,r,1 | F0 W2", true},

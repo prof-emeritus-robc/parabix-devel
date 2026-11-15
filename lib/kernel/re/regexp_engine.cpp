@@ -147,7 +147,7 @@ RE * multiplexedCodeUnits(RE * re, const cc::MultiplexedAlphabet * mpx, const Ex
 // such as (?<=^), without match regions): the code units are then an input
 // (unused), which gives the kernel the length of the text.
 bool RE_Kernel::needsTextInput(RE_CompilerContext & ctxt, RE * re) {
-    if (ctxt.mMatchStarts || ctxt.mIndexStream || ctxt.mCombiningType != RE_CombiningType::None) return false;
+    if (ctxt.mMatchStarts || ctxt.mIndexStream || ctxt.mTextMask || ctxt.mCombiningType != RE_CombiningType::None) return false;
     std::set<std::string> localExternals;
     std::set<std::string> localAlphabets;
     gatherExternals(re, localExternals, localAlphabets);
@@ -184,6 +184,9 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
     }
     if (ctxt.mIndexStream) {
         sigstrm << "+X";
+    }
+    if (ctxt.mTextMask) {
+        sigstrm << "+M";
     }
     std::set<std::string> localExternals;
     std::set<std::string> localAlphabets;
@@ -256,6 +259,9 @@ Bindings RE_Kernel::makeInputBindings(RE_CompilerContext & ctxt, RE * re) {
     if (ctxt.mIndexStream) {
         externalBindings.emplace_back("mIndexing", ctxt.mIndexStream);
     }
+    if (ctxt.mTextMask) {
+        externalBindings.emplace_back("mTextMask", ctxt.mTextMask);
+    }
     for (auto & a : ctxt.mAlphabets) {
         auto alphaName = a.first->getName();
         //llvm::errs() << "alphaName: " << alphaName << " count = " << localAlphabets.count(alphaName) << "\n";
@@ -317,6 +323,9 @@ void RE_Kernel::generatePabloMethod() {
     if (mContext.mIndexStream) {
         PabloAST * idxStrm = pb.createExtract(getInputStreamVar("mIndexing"), pb.getInteger(0));
         re_compiler.setIndexing(&cc::Unicode, idxStrm);
+    }
+    if (mContext.mTextMask) {
+        re_compiler.setTextMask(pb.createExtract(getInputStreamVar("mTextMask"), pb.getInteger(0)));
     }
     for (auto & e : mContext.mExternals) {
         auto name = e.first;
@@ -585,20 +594,23 @@ static std::string stringClassSignature(const std::vector<std::vector<re::CC *>>
 
 StringClassKernel::StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
                                      StreamSet * basis, StreamSet * fillStartsEnds, StreamSet * follows,
-                                     StringGuards guards)
-: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis, guards) + (follows ? "_f" : "")),
+                                     StringGuards guards, StreamSet * textMask)
+: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis, guards) + (follows ? "_f" : "")
+                                                         + (textMask ? "_m" : "")),
               [&] {
                   const unsigned la = maxStringLength(strings, guards) - 1;
                   Bindings inputs;
                   inputs.emplace_back("basis", basis, FixedRate(1), LookAhead(la));
                   if (follows) inputs.emplace_back("follows", follows, FixedRate(1), LookAhead(la));
+                  if (textMask) inputs.emplace_back("textMask", textMask, FixedRate(1), LookAhead(la));
                   return inputs;
               }(),
               {Binding{"fillStartsEnds", fillStartsEnds}}),
   mStrings(std::move(strings)),
   mGuards(std::move(guards)),
   mHasFollows(follows != nullptr),
-  mSignature(stringClassSignature(mStrings, basis, mGuards) + (follows ? "_f" : "")) {
+  mHasTextMask(textMask != nullptr),
+  mSignature(stringClassSignature(mStrings, basis, mGuards) + (follows ? "_f" : "") + (textMask ? "_m" : "")) {
 }
 
 void StringClassKernel::generatePabloMethod() {
@@ -612,6 +624,13 @@ void StringClassKernel::generatePabloMethod() {
         for (PabloAST * b : basis) ahead.push_back(v == 0 ? b : pb.createLookahead(b, v));
         compilers.emplace_back(std::make_unique<cc::Parabix_CC_Compiler>(ahead));
     }
+    // A character class at offset v (within the text mask, with one).
+    PabloAST * const textMask = mHasTextMask ? getInputStreamSet("textMask")[0] : nullptr;
+    auto charAt = [&](unsigned v, re::CC * cc) {
+        PabloAST * const c = compilers[v]->compileCC(cc, pb);
+        if (textMask == nullptr) return c;
+        return pb.createAnd(c, (v == 0) ? textMask : pb.createLookahead(textMask, v));
+    };
     // The positions with no region follow within the next v + 1 positions.
     std::vector<PabloAST *> followFree;
     if (mHasFollows) {
@@ -629,7 +648,7 @@ void StringClassKernel::generatePabloMethod() {
     for (const auto & str : mStrings) {
         PabloAST * start = pb.createInFile(pb.createOnes());
         for (unsigned k = 0; k < str.size(); ++k) {
-            start = pb.createAnd(start, compilers[k]->compileCC(str[k], pb));
+            start = pb.createAnd(start, charAt(k, str[k]));
         }
         if (mHasFollows) {
             start = pb.createAnd(start, followFree[str.size() - 1]);
@@ -640,7 +659,7 @@ void StringClassKernel::generatePabloMethod() {
             for (const auto & guard : mGuards[i]) {
                 PabloAST * follows = pb.createInFile(pb.createOnes());
                 for (unsigned k = 0; k < guard.size(); ++k) {
-                    follows = pb.createAnd(follows, compilers[str.size() + k]->compileCC(guard[k], pb));
+                    follows = pb.createAnd(follows, charAt(static_cast<unsigned>(str.size() + k), guard[k]));
                 }
                 if (mHasFollows) {
                     follows = pb.createAnd(follows, followFree[str.size() + guard.size() - 1]);
@@ -1472,10 +1491,23 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
             }
             addExternal(e.first, x);
         }
+        //  The text mask (likewise).
+        if (StreamSet * mask = mSourceContext.textMask) {
+            if (sourceCodes) llvm::report_fatal_error("RE_PipelineBuilder: a text mask requires a source of Unicode");
+            if (mTextExtended) {
+                StreamSet * const extended = mPB.CreateStreamSet(1, 1);
+                mPB.CreateKernelCall<ExtendByOne>(mask, extended);
+                mask = extended;
+            }
+            mCtxt.setTextMask(mask);
+        }
         mUsesUnicodeIndexing = true;
         mFinalMatchStarts = matchStarts;
         mFinalMatchFollows = matchFollows;
         return;
+    }
+    if (mSourceContext.textMask) {
+        llvm::report_fatal_error("RE_PipelineBuilder: a text mask requires a source of Unicode");
     }
     if (!mSourceContext.externals.empty()) {
         llvm::report_fatal_error("RE_PipelineBuilder: externals of the client are for a source of Unicode only");
@@ -1676,6 +1708,23 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         compileProperty(pe);
         return;
     }
+    //  A positive lookaround is a context, compiled without the text mask (see
+    //  RE_context::textMask); the starts of a negative lookahead of variable
+    //  length are not found by the RE compiler (see textMaskFailures).
+    StreamSet * const textMask = mCtxt.mTextMask;
+    if (textMask && isa<Assertion>(defn)) {
+        Assertion * const a = cast<Assertion>(defn);
+        if (a->getSense() == Assertion::Sense::Positive) {
+            mCtxt.mTextMask = nullptr;
+            compileExternal(n);
+            mCtxt.mTextMask = textMask;
+            return;
+        }
+        const auto r = getLengthRange(a->getAsserted(), mCtxt.mLengthAlphabet);
+        if ((a->getKind() == Assertion::Kind::LookAhead) && (r.first != r.second)) {
+            llvm::report_fatal_error("RE_PipelineBuilder: a negative lookahead of variable length within a text mask");
+        }
+    }
     if (name.compare(0, ReversedLookaheadPrefix.size(), ReversedLookaheadPrefix) == 0) {
         // A lookahead matched by reversal (see ReversedLookaheadNamer): the
         // starts of the matches of its asserted RE, at their first characters.
@@ -1791,9 +1840,13 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
             std::vector<StreamSet *> classes;
             std::vector<bool> negated;
             for (Assertion * la : seg->assertions) {
+                // (A positive lookahead, a context, without the text mask.)
+                StreamSet * const textMask = mCtxt.mTextMask;
+                if (la->getSense() == Assertion::Sense::Positive) mCtxt.mTextMask = nullptr;
                 prepareExternals(la->getAsserted());
                 StreamSet * const Y = mPB.CreateStreamSet(1);
                 mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, la->getAsserted(), Y);
+                mCtxt.mTextMask = textMask;
                 classes.push_back(Y);
                 negated.push_back(la->getSense() == Assertion::Sense::Negative);
             }
@@ -1834,7 +1887,7 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
                 StringGuards guards;
                 for (const auto & g : seg->guards) guards.push_back(codeUnitStrings(g));
                 mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(seg->strings), codeUnitBasis(), fillStartsEnds,
-                                                        mCtxt.mMatchFollows, std::move(guards));
+                                                        mCtxt.mMatchFollows, std::move(guards), mCtxt.mTextMask);
             }
             StreamSet * const index = mPB.CreateStreamSet(1);
             StreamSet * const good = mPB.CreateStreamSet(1);
@@ -2056,12 +2109,24 @@ void RE_PipelineBuilder::compileClasses(const std::vector<CC *> & ccs, StreamSet
 StreamSet * RE_PipelineBuilder::classStream(RE * re, CC * cc) {
     // The class may already be an external (e.g. a property), whose kernel
     // must then be the one used.
+    StreamSet * strm = nullptr;
     if (Name * const n = dyn_cast<Name>(re)) {
         auto f = mCtxt.mExternals.find(n->getFullName());
-        if (f != mCtxt.mExternals.end()) return f->second.extStream;
+        if (f != mCtxt.mExternals.end()) strm = f->second.extStream;
     }
-    StreamSet * const strm = mPB.CreateStreamSet(1);
-    compileClasses(std::vector<re::CC *>{cc}, strm);
+    if (strm == nullptr) {
+        strm = mPB.CreateStreamSet(1);
+        compileClasses(std::vector<re::CC *>{cc}, strm);
+    }
+    // Within a text mask, the positions of the class in the text of matches
+    // (classStream is used for the classes of the stars of chains, outside
+    // their contexts; a chain within a positive lookahead is compiled without
+    // the text mask, see compileExternal).
+    if (mCtxt.mTextMask) {
+        StreamSet * const masked = mPB.CreateStreamSet(1);
+        AndCombine(mPB, strm, mCtxt.mTextMask, masked);
+        strm = masked;
+    }
     return strm;
 }
 
@@ -2433,7 +2498,8 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
             strm = classStream(f->re, f->cc);
         } else {
             strm = mPB.CreateStreamSet(3);
-            mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(f->strings), codeUnitBasis(), strm, mCtxt.mMatchFollows);
+            mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(f->strings), codeUnitBasis(), strm, mCtxt.mMatchFollows,
+                                                    StringGuards{}, mCtxt.mTextMask);
         }
         finalSteps.push_back(ChainCoverage::Final{f->kind, strm});
     }
@@ -3378,6 +3444,36 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
     return modeFailures(prepared, sourceEncoding, byReversal);
 }
 
+//  (As modeFailures, keeping the RE as transformed.)
+RE_Plan planRE(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding) {
+    if (const auto * mpx = dyn_cast_or_null<cc::MultiplexedAlphabet>(sourceEncoding)) {
+        sourceEncoding = mpx->getSourceAlphabet();
+    }
+    RE_Plan plan;
+    plan.lengthAlphabet = &cc::Unicode;
+    plan.codeUnitAlphabet = &cc::Unicode;
+    if ((sourceEncoding != &cc::Unicode) && (prepared.mode.indexAlphabet == &cc::UTF8)) {
+        plan.lengthAlphabet = prepared.mode.lengthAlphabet;
+        plan.codeUnitAlphabet = &cc::UTF8;
+    }
+    QuietREPrinting quiet;
+    ModeTransformation M(plan.lengthAlphabet, plan.codeUnitAlphabet);
+    M.mAllowReversal = prepared.options.reversal;
+    plan.compiled = M.transform(prepared.re, prepared.options.goal);
+    plan.failures = M.failures(plan.compiled, prepared.options.goal);
+    plan.startsByReversal = M.mStartsByReversal;
+    // (The marks of an RE kernel, see RE_Kernel::makeOutputBindings: with an
+    // index stream in the UTF-8 indexed mode.)
+    const bool indexed = (plan.lengthAlphabet == &cc::Unicode) && (plan.codeUnitAlphabet == &cc::UTF8);
+    plan.matchOffset = re::grepOffset(plan.compiled, indexed);
+    return plan;
+}
+
+std::string RE_Plan::modeName() const {
+    if (codeUnitAlphabet == &cc::Unicode) return "Unicode indexed";
+    return (lengthAlphabet == &cc::UTF8) ? "byte" : "UTF-8 indexed";
+}
+
 std::string preconditionReport(const std::vector<PreconditionFailure> & failures) {
     std::string report;
     for (const PreconditionFailure & f : failures) {
@@ -3649,6 +3745,184 @@ protected:
     }
 };
 
+// A rotation of a capture moved back (see ReferencePlan).  The capture moved
+// is carried back either as the basis bits of its text, or, if the characters
+// at each of its positions are of a small set (chars: the characters of each
+// position, in order), multiplexed: as the bits of the index of its character
+// in the set of its position (bits streams, as many as the largest set
+// needs; none if each set has one character).
+struct Rotation {
+    unsigned moved;                     // the reference moved
+    unsigned destination;               // the reference before which it is moved
+    unsigned length;
+    unsigned advance;                   // the positions F is shifted forward before it is shifted back
+    std::vector<unsigned> shifted;      // the references of the captures rotated forward
+    std::vector<std::vector<UCD::codepoint_t>> chars;   // empty: the basis is carried
+    unsigned bits = 0;
+    bool multiplexed() const {return !chars.empty();}
+    std::string signature() const {
+        std::string s = std::to_string(destination) + "_" + std::to_string(moved) + "_" + std::to_string(length) + "_" +
+                        std::to_string(advance) + "_";
+        for (unsigned x : shifted) s += std::to_string(x) + ",";
+        if (multiplexed()) {
+            std::string c;
+            for (const auto & p : chars) {
+                for (const UCD::codepoint_t cp : p) c += std::to_string(cp) + ",";
+                c += "|";
+            }
+            s += "_m" + std::to_string(bits) + "_" + c;
+        }
+        return s;
+    }
+};
+
+// The largest number of characters of a position of a capture carried
+// multiplexed (decoded one by one at its destination).
+constexpr size_t MaxMultiplexedChars = 64;
+
+// The rotation of a capture moved back in each selected match: the capture
+// moved (F: from the start of capture Moved to its follow, of Length
+// characters) goes before the positions S from the start of capture
+// Destination to the start of the capture moved, which go forward by Length.
+// F is shifted forward by Advance positions (A), then back by Length
+// positions of an index, the positions not in S shifted forward by A
+// (IndexedShiftBack, applied Length times, to all the streams carried at
+// once): it lands Length - A positions before S, and is shifted forward by
+// Length - A, as S is by Length.  The positions F passes through are in the
+// text: the A - 1 positions after F are in the match, or its follow, and the
+// Length - A positions before S in the match (see planReferences).
+//
+// RotationPrepare: the index (Index) and the streams carried (Carried: the
+// text of F, or its multiplexed codes); Marks: the starts and follows of the
+// captures (two streams per capture).
+class RotationPrepare final : public pablo::PabloKernel {
+public:
+    RotationPrepare(LLVMTypeSystemInterface & ts, const Rotation & r,
+                    StreamSet * Marks, StreamSet * Text, StreamSet * Index, StreamSet * Carried)
+    : PabloKernel(ts, "RotationPrepare" + std::to_string(Marks->getNumElements()) + "_" +
+                      std::to_string(Text->getNumElements()) + "_" + getStringHash(r.signature()),
+                  {Binding{"Marks", Marks}, Binding{"Text", Text}},
+                  [&] {
+                      Bindings outputs{Binding{"Index", Index}};
+                      if (Carried) outputs.emplace_back("Carried", Carried);
+                      return outputs;
+                  }()),
+      mRotation(r), mCarried(Carried != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> marks = getInputStreamSet("Marks");
+        const std::vector<PabloAST *> text = getInputStreamSet("Text");
+        const unsigned d = mRotation.destination, m = mRotation.moved;
+        const unsigned A = mRotation.advance;
+        auto ahead = [&](PabloAST * x) {return (A == 0) ? x : pb.createAdvance(x, A);};
+        PabloAST * const S = captureCoverage(pb, marks[2 * d], marks[2 * m]);
+        writeOutputStreamSet("Index", std::vector<PabloAST *>{pb.createInFile(pb.createNot(ahead(S)))});
+        if (!mCarried) return;
+        std::vector<PabloAST *> carried;
+        if (!mRotation.multiplexed()) {
+            PabloAST * const F = captureCoverage(pb, marks[2 * m], marks[2 * m + 1]);
+            for (PabloAST * t : text) carried.push_back(ahead(pb.createAnd(t, F)));
+        } else {
+            // The code of the character at position i of F: its index in chars[i].
+            cc::Parabix_CC_Compiler_Builder ccc(text);
+            carried.assign(mRotation.bits, pb.createZeroes());
+            PabloAST * at = marks[2 * m];
+            for (size_t i = 0; i < mRotation.chars.size(); i++) {
+                if (i > 0) at = pb.createAdvance(at, 1);
+                const std::vector<UCD::codepoint_t> & set = mRotation.chars[i];
+                for (unsigned j = 0; j < mRotation.bits; j++) {
+                    UCD::UnicodeSet withBit;
+                    for (size_t k = 0; k < set.size(); k++) if ((k >> j) & 1) withBit.insert(set[k]);
+                    if (withBit.empty()) continue;
+                    PabloAST * const chars = ccc.compileCC(makeCC(std::move(withBit), &cc::Unicode), pb);
+                    carried[j] = pb.createOr(carried[j], pb.createAnd(at, chars));
+                }
+            }
+            for (PabloAST *& x : carried) x = ahead(x);
+        }
+        writeOutputStreamSet("Carried", carried);
+    }
+private:
+    const Rotation mRotation;
+    const bool mCarried;
+};
+
+// RotationMerge: the text rotated (Rotated), given the streams carried back
+// (Back), and the marks of the captures after the rotation (RotatedMarks):
+// those of the captures in S (the destination and the captures shifted) go
+// forward by Length, and the capture moved takes the place of the start of S.
+// Multiplexed, the characters of the capture moved are decoded from their
+// codes at its new positions.
+class RotationMerge final : public pablo::PabloKernel {
+public:
+    RotationMerge(LLVMTypeSystemInterface & ts, const Rotation & r, StreamSet * Marks, StreamSet * Text,
+                  StreamSet * Back, StreamSet * Rotated, StreamSet * RotatedMarks)
+    : PabloKernel(ts, "RotationMerge" + std::to_string(Marks->getNumElements()) + "_" +
+                      std::to_string(Text->getNumElements()) + "_" + getStringHash(r.signature()),
+                  [&] {
+                      Bindings inputs{Binding{"Marks", Marks}, Binding{"Text", Text}};
+                      if (Back) inputs.emplace_back("Back", Back);
+                      return inputs;
+                  }(),
+                  {Binding{"Rotated", Rotated}, Binding{"RotatedMarks", RotatedMarks}}),
+      mRotation(r), mBack(Back != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> marks = getInputStreamSet("Marks");
+        const std::vector<PabloAST *> text = getInputStreamSet("Text");
+        std::vector<PabloAST *> back;
+        if (mBack) back = getInputStreamSet("Back");
+        const unsigned d = mRotation.destination, m = mRotation.moved, L = mRotation.length;
+        auto forward = [&](PabloAST * x) {return (L == 0) ? x : pb.createAdvance(x, L);};
+        // (F, carried back, the rest of the way.)
+        const unsigned rest = L - mRotation.advance;
+        auto rejoin = [&](PabloAST * x) {return (rest == 0) ? x : pb.createAdvance(x, rest);};
+        PabloAST * const S = captureCoverage(pb, marks[2 * d], marks[2 * m]);
+        PabloAST * const F = captureCoverage(pb, marks[2 * m], marks[2 * m + 1]);
+        PabloAST * const unchanged = pb.createNot(pb.createOr(S, F));
+        std::vector<PabloAST *> rotated;
+        for (size_t b = 0; b < text.size(); b++) {
+            PabloAST * r = pb.createOr(pb.createAnd(text[b], unchanged), forward(pb.createAnd(text[b], S)));
+            if (!mRotation.multiplexed()) r = pb.createOr(r, rejoin(back[b]));
+            rotated.push_back(r);
+        }
+        if (mRotation.multiplexed()) {
+            // The codes at the new positions of the capture moved (from the
+            // start of S), decoded.
+            std::vector<PabloAST *> code;
+            for (PabloAST * x : back) code.push_back(rejoin(x));
+            PabloAST * at = marks[2 * d];
+            for (size_t i = 0; i < mRotation.chars.size(); i++) {
+                if (i > 0) at = pb.createAdvance(at, 1);
+                const std::vector<UCD::codepoint_t> & set = mRotation.chars[i];
+                for (size_t k = 0; k < set.size(); k++) {
+                    PabloAST * hit = at;
+                    for (unsigned j = 0; j < mRotation.bits; j++) {
+                        hit = pb.createAnd(hit, ((k >> j) & 1) ? code[j] : pb.createNot(code[j]));
+                    }
+                    for (size_t b = 0; b < rotated.size(); b++) {
+                        if ((set[k] >> b) & 1) rotated[b] = pb.createOr(rotated[b], hit);
+                    }
+                }
+            }
+        }
+        std::vector<PabloAST *> newMarks(marks);
+        for (unsigned x : mRotation.shifted) {
+            newMarks[2 * x] = forward(marks[2 * x]);
+            newMarks[2 * x + 1] = forward(marks[2 * x + 1]);
+        }
+        newMarks[2 * m] = marks[2 * d];
+        newMarks[2 * m + 1] = forward(marks[2 * d]);
+        writeOutputStreamSet("Rotated", rotated);
+        writeOutputStreamSet("RotatedMarks", newMarks);
+    }
+private:
+    const Rotation mRotation;
+    const bool mBack;
+};
+
 // A literal piece of a replacement, inserted before an anchor of a match: its
 // start, its follow (the position after its last code unit), or the start of
 // a capture, possibly only where that is (or is not) the follow of the match.
@@ -3798,6 +4072,157 @@ bool replacementPieces(const PreparedSearchReplace & sr, std::vector<std::u32str
     return true;
 }
 
+// The references of a replacement (as given by replacementPieces), as kept
+// in place or moved back.  The captures kept are in the order of the search
+// pattern.  A capture moved has a fixed length L (on every path of the search
+// pattern, in characters), and is referred to just before a capture kept that
+// precedes it in the search pattern (its destination): in each selected match,
+// the capture moved is rotated back over the positions from the start of its
+// destination to its own start (see RotationMerge), after which the references
+// are in the order of the captures in the text, and replaced in place.  The
+// regions rotated (from a destination to its capture moved) must be disjoint.
+// The capture moved passes through positions of the text around the region
+// (see RotationPrepare): first forward by A = min(L, 1 + the least length of
+// the match after it), into the match and its follow, then back to L - A
+// positions before the destination, which must have that many characters of
+// the match before it (with L = 1, none).  The
+// references must be to distinct captures, not within one another.  Of the
+// choices of the captures kept, the one keeping the most.
+struct ReferencePlan {
+    std::vector<Rotation> rotations;    // in their order in the text
+};
+
+bool planReferences(const PreparedSearchReplace & sr, const std::vector<std::string> & references,
+                    const re::CaptureWalk & walk, ReferencePlan & plan, std::string & reason) {
+    const size_t n = references.size();
+    plan.rotations.clear();
+    const re::CaptureWalk::CaptureBoundaries * const c = walk.captures.data();
+    // (a, b): the capture of reference a before that of reference b.
+    auto before = [&](size_t a, size_t b) {return c[a].close < c[b].open;};
+    for (size_t a = 0; a < n; a++) {
+        for (size_t b = a + 1; b < n; b++) {
+            if (!before(a, b) && !before(b, a)) {
+                reason = "the references must be to distinct captures, each referred to once and not within "
+                         "another: copying captured text is not yet supported";
+                return false;
+            }
+        }
+    }
+    // Whether the references of a set (a mask) are in the order of their captures.
+    auto inOrder = [&](uint64_t set) {
+        long last = -1;
+        for (size_t a = 0; a < n; a++) {
+            if (((set >> a) & 1) == 0) continue;
+            if ((last >= 0) && !before(static_cast<size_t>(last), a)) return false;
+            last = static_cast<long>(a);
+        }
+        return true;
+    };
+    const uint64_t all = (n >= 64) ? ~uint64_t{0} : ((uint64_t{1} << n) - 1);
+    if (inOrder(all)) return true;
+    const std::string unsupported =
+        "the references must be to captures in their order in the search pattern, but for captures of fixed "
+        "lengths moved back, each referred to just before a capture kept in place that precedes it, over "
+        "disjoint regions, with enough characters of the match around them (as many before the destination "
+        "and after the capture moved, but one, as the capture has): other reorderings of captured text are "
+        "not yet supported";
+    if (n > 16) {
+        reason = unsupported;
+        return false;
+    }
+    // The fixed lengths of the captures (-1: variable).
+    const auto captures = re::allCapturesByName(sr.search.re);
+    std::vector<int> fixed(n, -1);
+    for (size_t a = 0; a < n; a++) {
+        const auto f = captures.find(references[a]);
+        if (f == captures.end()) continue;
+        int lgth = -1;
+        bool same = true;
+        for (Capture * const cap : f->second) {
+            const auto range = getLengthRange(cap, &cc::Unicode);
+            if (lgth < 0) lgth = range.first;
+            same = same && (range.first == range.second) && (range.first == lgth);
+        }
+        if (same) fixed[a] = lgth;
+    }
+    // The rotations for a set of references kept, if they apply.
+    auto rotationsFor = [&](uint64_t kept, std::vector<Rotation> & rotations) {
+        rotations.clear();
+        if (!inOrder(kept)) return false;
+        // The references in the order of their captures in the text.
+        std::vector<unsigned> order(n);
+        for (unsigned a = 0; a < n; a++) order[a] = a;
+        std::sort(order.begin(), order.end(), [&](unsigned x, unsigned y) {return c[x].open < c[y].open;});
+        std::vector<bool> touched(n, false);
+        for (unsigned a = 0; a < n; a++) {
+            if ((kept >> a) & 1) continue;
+            if (fixed[a] < 0) return false;
+            unsigned d = a + 1;
+            while ((d < n) && (((kept >> d) & 1) == 0)) d++;
+            if ((d == n) || !before(d, a)) return false;
+            // F goes forward by A (through the positions after it in the
+            // match, and its follow), then back to Length - A positions before
+            // the destination, in the match.
+            const int A = std::min(fixed[a], 1 + c[a].suffixMinLength);
+            if (c[d].prefixMinLength < fixed[a] - A) return false;
+            rotations.push_back(Rotation{a, d, static_cast<unsigned>(fixed[a]), static_cast<unsigned>(A), {}});
+        }
+        // Applied in the order of the text, over disjoint regions.
+        std::sort(rotations.begin(), rotations.end(),
+                  [&](const Rotation & x, const Rotation & y) {return c[x.moved].open < c[y.moved].open;});
+        for (Rotation & r : rotations) {
+            const auto pos = [&](unsigned x) {return std::find(order.begin(), order.end(), x) - order.begin();};
+            const auto from = pos(r.destination), to = pos(r.moved);
+            for (auto k = from; k <= to; k++) {
+                if (touched[order[k]]) return false;
+                touched[order[k]] = true;
+            }
+            r.shifted.assign(order.begin() + from, order.begin() + to);
+            order.erase(order.begin() + to);
+            order.insert(order.begin() + from, r.moved);
+        }
+        for (unsigned a = 0; a < n; a++) {
+            if (order[a] != a) return false;
+        }
+        return true;
+    };
+    bool found = false;
+    unsigned bestKept = 0;
+    std::vector<Rotation> rotations;
+    for (uint64_t kept = 0; kept <= all; kept++) {
+        const unsigned count = __builtin_popcountll(kept);
+        if ((found && (count <= bestKept)) || !rotationsFor(kept, rotations)) continue;
+        found = true;
+        bestKept = count;
+        plan.rotations = rotations;
+    }
+    if (!found) {
+        reason = unsupported;
+        return false;
+    }
+    // The captures moved carried multiplexed, where their sets are small.
+    for (Rotation & r : plan.rotations) {
+        std::vector<UCD::UnicodeSet> sets;
+        if (!re::captureCharacterSets(sr.search.re, references[r.moved], sets) || (sets.size() != r.length)) continue;
+        std::vector<std::vector<UCD::codepoint_t>> chars;
+        size_t largest = 0;
+        for (const UCD::UnicodeSet & set : sets) {
+            chars.emplace_back();
+            for (const auto & range : set) {
+                for (UCD::codepoint_t cp = range.first; (cp <= range.second) && (chars.back().size() <= MaxMultiplexedChars); cp++) {
+                    chars.back().push_back(cp);
+                }
+            }
+            largest = std::max(largest, chars.back().size());
+        }
+        if (largest > MaxMultiplexedChars) continue;
+        r.chars = std::move(chars);
+        r.bits = 0;
+        while ((size_t{1} << r.bits) < largest) r.bits++;
+    }
+    return true;
+}
+
 // The preconditions of a search and replace other than those of the search
 // pattern as compiled (see ModeTransformation::failures).
 std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchReplace & sr) {
@@ -3833,14 +4258,9 @@ std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchRepla
         if (!planCaptureWalk(search, references, walk, construct, reason, sr.search.options.reversal)) {
             failures.push_back(PreconditionFailure{goal, construct, reason});
         } else {
-            for (size_t j = 0; j + 1 < walk.captures.size(); j++) {
-                if (walk.captures[j].close >= walk.captures[j + 1].open) {
-                    failures.push_back(PreconditionFailure{goal, sr.replacement,
-                                       "the references must be to captures in their order in the search pattern, "
-                                       "each referred to once and not within another: moving or copying captured "
-                                       "text is not yet supported"});
-                    break;
-                }
+            ReferencePlan plan;
+            if (!planReferences(sr, references, walk, plan, reason)) {
+                failures.push_back(PreconditionFailure{goal, sr.replacement, reason});
             }
         }
         if ((sr.search.mode.lengthAlphabet != &cc::Unicode) || (sr.search.mode.indexAlphabet != &cc::Unicode)) {
@@ -3858,6 +4278,30 @@ void reportFailures(const std::vector<PreconditionFailure> & failures) {
     }
 }
 
+}
+
+std::vector<PreconditionFailure> textMaskFailures(const PreparedSearchReplace & sr) {
+    std::vector<PreconditionFailure> failures;
+    const RE_Goal goal = sr.search.options.goal;
+    QuietREPrinting quiet;
+    ModeTransformation M(&cc::Unicode, &cc::Unicode);
+    M.mAllowReversal = sr.search.options.reversal;
+    RE * const transformed = M.transform(sr.search.re, goal);
+    if (!M.failures(transformed, goal).empty()) return failures;   // (reported by checkPreconditions)
+    if (M.mStartsByReversal) {
+        failures.push_back(PreconditionFailure{goal, transformed, "the starts of matches found by reversal, within a text mask"});
+    }
+    std::set<re::Name *> names;
+    re::gatherNames(transformed, names);
+    for (re::Name * n : names) {
+        const Assertion * const a = dyn_cast_or_null<Assertion>(n->getDefinition());
+        if (!a || (a->getSense() != Assertion::Sense::Negative) || (a->getKind() != Assertion::Kind::LookAhead)) continue;
+        const auto r = getLengthRange(a->getAsserted(), &cc::Unicode);
+        if (r.first != r.second) {
+            failures.push_back(PreconditionFailure{goal, n, "a negative lookahead of variable length, within a text mask"});
+        }
+    }
+    return failures;
 }
 
 std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr, const cc::Alphabet * sourceEncoding) {
@@ -3956,8 +4400,26 @@ void RE_PipelineBuilder::captureSpansPipeline(const PreparedSearchReplace & sr, 
     mPB.CreateKernelCall<CaptureSpans>(marks, spans);
 }
 
+//  Masks carried through a replacement (see searchReplaceCodeUnitsPipeline):
+//  1 at the positions inserted (where the spread mask is 0).
+class MarkInsertedPositions final : public pablo::PabloKernel {
+public:
+    MarkInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Masks, StreamSet * Marked)
+    : PabloKernel(ts, "MarkInsertedPositions" + std::to_string(Masks->getNumElements()),
+                  {Binding{"SpreadMask", SpreadMask}, Binding{"Masks", Masks}}, {Binding{"Marked", Marked}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
+        std::vector<PabloAST *> masks = getInputStreamSet("Masks");
+        for (PabloAST *& m : masks) m = pb.createOr(m, inserted);
+        writeOutputStreamSet("Marked", masks);
+    }
+};
+
 RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const PreparedSearchReplace & sr, bool follows,
-                                                                    bool replaced, StreamSet * result) {
+                                                                    bool replaced, StreamSet * result,
+                                                                    StreamSet * masks, StreamSet * resultMasks) {
     if (sr.search.options.goal != RE_Goal::SearchReplace) {
         llvm::report_fatal_error("search and replace: the search pattern must be prepared with prepareSearchReplace");
     }
@@ -3973,6 +4435,12 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
         RE * construct = nullptr;
         std::string reason;
         planCaptureWalk(sr.search.re, references, walk, construct, reason, sr.search.options.reversal);
+    }
+    // The captures moved back (see ReferencePlan).
+    ReferencePlan plan;
+    if (n > 0) {
+        std::string reason;
+        planReferences(sr, references, walk, plan, reason);
     }
     // With references, a piece may be inserted before the follow of a
     // match, which must be a position of the text: without match regions,
@@ -3992,7 +4460,38 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
         llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
     }
-    StreamSet * const marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
+    StreamSet * marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
+    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
+    StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
+    // The masks carried (at the positions of the text, extended as it is).
+    // (Rotations only move text within matches, where the masks are 1.)
+    if (masks && mTextExtended) {
+        StreamSet * const extended = mPB.CreateStreamSet(masks->getNumElements(), 1);
+        mPB.CreateKernelCall<ExtendByOne>(masks, extended);
+        masks = extended;
+    }
+    // The captures moved back rotated into place, in each selected match
+    // (within the match: its coverage and the positions kept outside the
+    // matches are unchanged), with the marks of the captures after the
+    // rotation: the references are then in the order of the captures.
+    for (const Rotation & r : plan.rotations) {
+        // The streams carried back: the basis bits of the text, or the codes
+        // of the characters (none if each position has one character).
+        const unsigned carried = r.multiplexed() ? r.bits : text->getNumElements();
+        StreamSet * const index = mPB.CreateStreamSet(1);
+        StreamSet * back = (carried > 0) ? mPB.CreateStreamSet(carried) : nullptr;
+        mPB.CreateKernelCall<RotationPrepare>(r, marks, text, index, back);
+        for (unsigned k = 0; back && (k < r.length); k++) {
+            StreamSet * const shifted = mPB.CreateStreamSet(carried);
+            mPB.CreateKernelCall<IndexedShiftBack>(index, back, shifted);
+            back = shifted;
+        }
+        StreamSet * const rotated = mPB.CreateStreamSet(text->getNumElements());
+        StreamSet * const rotatedMarks = mPB.CreateStreamSet(marks->getNumElements());
+        mPB.CreateKernelCall<RotationMerge>(r, marks, text, back, rotated, rotatedMarks);
+        text = rotated;
+        marks = rotatedMarks;
+    }
     // Each match is deleted but for the captures referenced, which stay in
     // place, and each literal piece is inserted before an anchor: piece j
     // before the start of the capture of reference j, and the last piece
@@ -4006,7 +4505,6 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     // it is that of its own match.  (The start of a capture whose prefix is
     // nullable may be the start of its match, and the follow of the previous
     // match: its pieces are inserted after those of the previous match.)
-    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
     auto codeUnits = [&](const std::u32string & s) {
         std::vector<unsigned> units;
         if (utf8) {
@@ -4062,7 +4560,6 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     if (mCtxt.mMultiplexed) {
         llvm::report_fatal_error("RE_PipelineBuilder: the text of a replacement needs the codepoints, not a multiplexed basis");
     }
-    StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
     StreamSet * resultFollows = follows ? mCtxt.mMatchFollows : nullptr;
     StreamSet * resultReplaced = matchedFollows;
     // The blocks of slots inserted and filled.
@@ -4080,6 +4577,11 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
         };
         text = spread(text);
         keep = spread(keep);
+        if (masks) {
+            StreamSet * const marked = mPB.CreateStreamSet(masks->getNumElements());
+            mPB.CreateKernelCall<MarkInsertedPositions>(spreadMask, spread(masks), marked);
+            masks = marked;
+        }
         flags = spread(flags);
         if (resultFollows) resultFollows = spread(resultFollows);
         if (resultReplaced) resultReplaced = spread(resultReplaced);
@@ -4100,6 +4602,12 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     }
     ReplacedText r;
     r.text = filtered(text, result);
+    if (masks) {
+        if (resultMasks == nullptr || resultMasks->getNumElements() != masks->getNumElements()) {
+            llvm::report_fatal_error("searchReplaceCodeUnitsPipeline: the result masks must have the streams of the masks");
+        }
+        filtered(masks, resultMasks);
+    }
     if (resultFollows) r.follows = filtered(resultFollows, nullptr);
     if (resultReplaced) r.replaced = filtered(resultReplaced, nullptr);
     return r;
@@ -4133,8 +4641,9 @@ void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr,
     if (replaced) mPB.CreateKernelCall<StreamSelect>(replaced, Select(r.replaced, {0}));
 }
 
-void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, StreamSet * codeUnits) {
-    replaceMatches(sr, false, false, codeUnits);
+void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, StreamSet * codeUnits,
+                                                        StreamSet * masks, StreamSet * resultMasks) {
+    replaceMatches(sr, false, false, codeUnits, masks, resultMasks);
 }
 
 RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {

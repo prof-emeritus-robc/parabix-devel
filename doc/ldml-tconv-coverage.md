@@ -173,7 +173,21 @@ Latn-Grek/UNGEGN, Zawgyi-my and my-Zawgyi; the six give the same output with
 and without the merge and through ICU on 5,000 random lines each, and the CLDR
 test results of the 25 are unchanged. (am_FONIPA-am and the 19 transforms
 through it count 144 kernels more than at their last update, from a change
-since then, not the merge, which takes 3 from am_FONIPA-am: not yet traced.)*
+since then, not the merge, which takes 3 from am_FONIPA-am: not yet traced.)
+Then shape groups (`37fc1ead8` to `63ac1f8b1`, see
+[ldml-shape-groups-report.md](ldml-shape-groups-report.md)): each segment of
+a transform is applied by the search and replace passes of its shape groups
+where they take fewer kernels, also within filters, by default
+(`--apply-shape-groups=1`). The kernels of all transforms are counted again
+with the default plans, and with the regular plans only (the table's new
+"regular kernels" column, where they differ); the six transforms whose
+pipelines change were planned and tested again (`--update --only
+NumericPinyin-Latin am-am_FONIPA am-ar am-chr am-fa Bopo-Latn`):
+NumericPinyin-Latin 848 → 337 kernels, am-am_FONIPA 538 → 190, am-ar 816 →
+468, am-fa 785 → 437, am-chr 799 → 451 and Bopo-Latn 969 → 465, with the
+CLDR test results of the four with test files (the am-* transforms)
+unchanged, with no failing cases. The other test results are those of
+`d97c03f75`.*
 
 This report covers:
 

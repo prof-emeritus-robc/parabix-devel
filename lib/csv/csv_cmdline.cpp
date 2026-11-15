@@ -85,13 +85,49 @@ CSVOptions & registeredOptions() {
 
 } // anonymous namespace
 
-std::vector<std::string> parse_CSV_headers(std::string headerString) {
+//  Headers separated by delimiter (a UTF-8 string): the header line of a file
+//  uses the field delimiter, a --headers string uses commas.  A header may be
+//  quoted with quote (a UTF-8 string, or empty for none): the quotes are removed,
+//  and a doubled quote within them is a quote.
+static std::vector<std::string> split_CSV_headers(const std::string & headerString, const std::string & delimiter,
+                                                  const std::string & quote = std::string()) {
     std::vector<std::string> headers;
-    boost::algorithm::split(headers, headerString, [] (char c) {return (c == ',');});
+    std::string cur;
+    bool inQuotes = false;
+    for (size_t i = 0; i < headerString.size(); ) {
+        if (!quote.empty() && headerString.compare(i, quote.size(), quote) == 0) {
+            if (inQuotes && headerString.compare(i + quote.size(), quote.size(), quote) == 0) {
+                cur += quote;
+                i += 2 * quote.size();
+            } else {
+                inQuotes = !inQuotes;
+                i += quote.size();
+            }
+        } else if (!inQuotes && headerString.compare(i, delimiter.size(), delimiter) == 0) {
+            headers.push_back(cur);
+            cur.clear();
+            i += delimiter.size();
+        } else {
+            cur += headerString[i++];
+        }
+    }
+    headers.push_back(cur);
     for (unsigned i = 0; i < headers.size(); i++) {
         boost::algorithm::trim(headers[i]);
     }
     return headers;
+}
+
+static std::string delimiterUTF8() {
+    return boost::locale::conv::utf_to_utf<char>(std::u32string(1, FieldDelimiter));
+}
+
+static std::string quoteUTF8() {
+    return boost::locale::conv::utf_to_utf<char>(std::u32string(1, QuoteChar));
+}
+
+std::vector<std::string> parse_CSV_headers(std::string headerString) {
+    return split_CSV_headers(headerString, ",");
 }
 
 std::vector<std::string> read_CSV_headers(std::string filename) {
@@ -101,7 +137,7 @@ std::vector<std::string> read_CSV_headers(std::string filename) {
     if (headerFile.is_open()) {
         std::getline(headerFile, line1);
         headerFile.close();
-        headers = parse_CSV_headers(line1);
+        headers = split_CSV_headers(line1, delimiterUTF8(), quoteUTF8());
     } else {
         llvm::report_fatal_error(llvm::StringRef("Cannot open ") + filename);
     }
@@ -130,7 +166,7 @@ static std::vector<std::string> read_CSV_headers(const toolio::Input & in) {
         line1.append(buffer, static_cast<size_t>(n));
         offset += n;
     }
-    return parse_CSV_headers(line1);
+    return split_CSV_headers(line1, delimiterUTF8(), quoteUTF8());
 }
 
 std::vector<std::string> get_CSV_headers(const toolio::Input & in) {
@@ -180,17 +216,19 @@ std::pair<unsigned, unsigned> getColumnRange(std::string & columnSpec, std::map<
     if (pos != std::string::npos) {
         auto range_lo = columnSpec.substr(0, pos);
         auto range_hi = columnSpec.substr(pos+1);
-        if (range_lo > range_hi) {
+        const unsigned lo = getColumn(range_lo, headerMap);
+        const unsigned hi = getColumn(range_hi, headerMap);
+        if (lo > hi) {
             llvm::report_fatal_error("Bad column range");
         }
-        return std::pair<unsigned, unsigned>(getColumn(range_lo, headerMap), getColumn(range_hi, headerMap));
+        return std::pair<unsigned, unsigned>(lo, hi);
     } else {
         auto colNo = getColumn(columnSpec, headerMap);
         return std::pair<unsigned, unsigned>(colNo, colNo);
     }
 }
 
-std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers) {
+std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers, bool anyOrder) {
     std::map<std::string, unsigned> headerMap;
     for (unsigned i = 0; i < headers.size(); i++) {
         headerMap.emplace(headers[i], i);
@@ -210,7 +248,7 @@ std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers) {
             if (rg.second >= headers.size()) {
                 llvm::report_fatal_error("Column number too large");
             }
-            if ((i > 0) && (rg.first < colNos.back())) {
+            if (!anyOrder && (i > 0) && (rg.first < colNos.back())) {
                 llvm::report_fatal_error("Column numbers must be specified in strictly increasing order");
             }
             for (auto colNo = rg.first; colNo <= rg.second; colNo++) {

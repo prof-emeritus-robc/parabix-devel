@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace cc { class Alphabet; }
+namespace UCD { class UnicodeSet; }
 
 namespace re {
 
@@ -28,8 +29,19 @@ class Reference;
 // names resolved), whose captures are new objects with the same names.
 //
 
-// The captures of an RE, by name.
+// The captures of an RE, by name: the first of each name.  (The alternatives of
+// a branch reset group (?|...) bind distinct captures of the same names, see
+// allCapturesByName.)
 std::map<std::string, Capture *> capturesByName(RE * re);
+
+// All the captures of an RE, by name, in order.
+std::map<std::string, std::vector<Capture *>> allCapturesByName(RE * re);
+
+// The characters at each position of the captures of a name in a search
+// pattern (all those of the name, as in the alternatives of a branch reset
+// group), if each matches a fixed number of characters, the same for all, each
+// of a set: the union of their sets at each position (in Unicode code points).
+bool captureCharacterSets(RE * search, const std::string & name, std::vector<UCD::UnicodeSet> & positions);
 
 // The references of a replacement to captures that the search pattern does
 // not have (a precondition of search and replace: there must be none).
@@ -46,13 +58,16 @@ struct ReplacementItem {
 // that matches one string only (characters, possibly repeated a fixed number of
 // times) folded into that string.  Returns false if the replacement is not a
 // sequence of literal characters and references.  Only a capture on every
-// path of the search pattern is folded (another may be unset in a match).
+// path of the search pattern is folded (another may be unset in a match): one
+// not within a repetition or an assertion, nor within an alternation unless
+// every alternative binds a capture of its name (as in a branch reset group
+// (?|...)), all of the same string.
 bool foldReplacement(RE * replacement, RE * search, std::vector<ReplacementItem> & items);
 
 // The range of the lengths of the replacement text, in characters (alphabet
 // &cc::Unicode) or UTF-8 code units (&cc::UTF8), with each reference sized by
-// its capture in the search pattern.  A fixed length gives a constant number
-// of positions for every match.
+// its captures in the search pattern (all those of its name).  A fixed length
+// gives a constant number of positions for every match.
 std::pair<int, int> replacementLengthRange(RE * replacement, RE * search, const cc::Alphabet * alphabet);
 
 // A literal string in UTF-8 code units.
@@ -80,6 +95,13 @@ std::string toUTF8String(const std::u32string & s);
 //     before the boundary are not nullable.  The walk is a forward walk in
 //     the reversed regions of the text (see RE_PipelineBuilder::
 //     captureBoundaries): meeting the forward walk in the middle.
+// A capture within an alternation is on every path if each alternative binds
+// a capture of its name (as the alternatives of a branch reset group (?|...)
+// do).  The walk is then planned for the paths of the search pattern through
+// its alternations together, and must find each boundary in the same way on
+// every path: where the segments between consecutive boundaries differ
+// between paths, by the fixed positions with which they all begin, then a
+// maximal run of the class of all the characters of the rest of the segments.
 //
 struct CaptureWalk {
     struct Step {
@@ -98,6 +120,7 @@ struct CaptureWalk {
         unsigned open = 0;          // the positions of the capture among the items of the
         unsigned close = 0;         // search pattern (for the order of captures)
         int prefixMinLength = 0;    // the minimum length of the match before the capture
+        int suffixMinLength = 0;    // the minimum length of the match after the capture
     };
     std::vector<Step> steps;
     std::vector<Step> backSteps;                // from the end of the match, back

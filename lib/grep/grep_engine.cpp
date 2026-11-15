@@ -148,7 +148,6 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mInitialTab(false),
     mInvertMatches(false),
     mMaxCount(0),
-    mGrepStdIn(false),
     mNullMode(NullCharMode::Data),
     mGrepDriver(driver),
     mMainMethod(nullptr),
@@ -212,8 +211,9 @@ std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths
     uintmax_t groupTotalSize = 0;
     for (auto p : paths) {
         boost::system::error_code errc;
-        auto s = fs::file_size(p, errc);
-        if (skipEmptyFiles && !errc && (s == 0)) continue;
+        // Standard input ("-") has no size known in advance: its own group.
+        auto s = (p.string() == "-") ? 0 : fs::file_size(p, errc);
+        if (skipEmptyFiles && !errc && (s == 0) && (p.string() != "-")) continue;
         if ((s > 0) && (s + 1 + groupTotalSize < max_batch_size)) {
             s += 1;  // +1 for an extra "\n"
             if (groupTotalSize == 0) {
@@ -241,6 +241,7 @@ std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths
 void GrepEngine::initFileResult(const std::vector<boost::filesystem::path> & paths) {
     const unsigned n = paths.size();
     mResultStrs.resize(n);
+    mMessageStrs.resize(n);
     mFileStatus.resize(n, FileStatus::Pending);
     mInputPaths = paths;
     mFileGroups = formFileGroups(paths, mBatchSize, !reportsEmptyFiles());
@@ -478,8 +479,8 @@ static size_t UTF8_errorOffset(const char * text, size_t length) {
     return length;
 }
 
-static void reportUTF8Error(const std::string & fileName, size_t offset) {
-    llvm::errs() << fileName << ": ill-formed UTF-8 at byte " << offset
+static void reportUTF8Error(std::ostringstream & msgs, const std::string & fileName, size_t offset) {
+    msgs << fileName << ": ill-formed UTF-8 at byte " << offset
                  << ": the input after it is not searched (--utf8-errors=abort-on-error)\n";
 }
 
@@ -952,26 +953,26 @@ void EmitMatchesEngine::grepCodeGen() {
     mBatchMethod = P.compile();
 }
 
-uint64_t GrepEngine::doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) {
+uint64_t GrepEngine::doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm, std::ostringstream & msgs) {
     auto f = mMainMethod;
     uint64_t resultTotal = 0;
 
     for (auto fileName : fileNames) {
         GrepCallBackObject handler;
         bool useMMap = mPreferMMap && canMMap(fileName) && (fileNames.size() == 1);
-        int32_t fileDescriptor = openFile(fileName, strm);
+        int32_t fileDescriptor = openFile(fileName, msgs);
         if (fileDescriptor == -1) return 0;
         uint64_t grepResult = f(useMMap, fileDescriptor, handler, mMaxCount);
-        close(fileDescriptor);
+        if (fileDescriptor != STDIN_FILENO) close(fileDescriptor);
         if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
             AlignedFileBuffer buf;
             buf.load(fileName, canMMap(fileName));
             const size_t offset = UTF8_errorOffset(buf.getBuf(), buf.getBufSize());
-            if (offset < buf.getBufSize()) reportUTF8Error(fileName, offset);
+            if (offset < buf.getBufSize()) reportUTF8Error(msgs, fileLabel(fileName), offset);
             buf.release();
         }
         if (handler.binaryFileSignalled()) {
-            llvm::errs() << "Binary file " << fileName << "\n";
+            msgs << "Binary file " << fileLabel(fileName) << "\n";
         }
         else {
             showResult(grepResult, fileName, strm);
@@ -981,14 +982,13 @@ uint64_t GrepEngine::doGrep(const std::vector<std::string> & fileNames, std::ost
     return resultTotal;
 }
 
+std::string GrepEngine::fileLabel(const std::string & fileName) const {
+    return (fileName == "-") ? mStdinLabel : fileName;
+}
+
 std::string GrepEngine::linePrefix(std::string fileName) {
     if (!mShowFileNames) return "";
-    if (fileName == "-") {
-        return mStdinLabel + mFileSuffix;
-    }
-    else {
-        return fileName + mFileSuffix;
-    }
+    return fileLabel(fileName) + mFileSuffix;
 }
 
 // Default: do not show anything
@@ -1016,14 +1016,14 @@ bool EmitMatchesEngine::detectsBinaryByNull() const {
         && (mGrepRecordBreak != GrepRecordBreakKind::Null);
 }
 
-uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) {
+uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm, std::ostringstream & msgs) {
     auto f = mBatchMethod;
     // With a replacement, the positions of the result are not those of the
     // text: files are processed one at a time (not as a batch).
     if (mReplacement && (fileNames.size() > 1)) {
         uint64_t lines = 0;
         for (const std::string & fileName : fileNames) {
-            lines += doGrep(std::vector<std::string>{fileName}, strm);
+            lines += doGrep(std::vector<std::string>{fileName}, strm, msgs);
         }
         return lines;
     }
@@ -1031,7 +1031,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
     accum.setStringStream(&strm);
     AlignedAllocator<char, batch_alignment> alloc;
     if (fileNames.size() == 1) {
-        int32_t fd = openFile(fileNames[0], strm);
+        int32_t fd = openFile(fileNames[0], msgs);
         if (fd == -1) return 0;   // File error; skip.
         // Only try mmap for file groups consisting of a single file.
         bool useMMap = mPreferMMap && canMMap(fileNames[0]);
@@ -1044,7 +1044,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
             buf.release();
             return 0;
         }
-        accum.mFileNames.push_back(fileNames[0]);
+        accum.mFileNames.push_back(fileLabel(fileNames[0]));
         accum.mFileStartPositions.push_back(static_cast<size_t>(0));
         accum.setFileLabel(accum.mFileNames[0]);
         accum.mFileStartLineNumbers.push_back(~static_cast<size_t>(0));
@@ -1054,7 +1054,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
             const size_t offset = UTF8_errorOffset(accum.mBatchBuffer, bytes_read);
             if (offset < bytes_read) {
-                reportUTF8Error(fileNames[0], offset);
+                reportUTF8Error(msgs, fileLabel(fileNames[0]), offset);
                 bytes_read = offset;
                 if (bytes_read == 0) {
                     buf.release();
@@ -1068,7 +1068,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
             if (null_byte_ptr != nullptr) { // Binary file;
                 skip_binary_file = true;
                 if (mBinaryFilesMode != argv::WithoutMatch) {
-                    strm << "Binary file: " << fileNames[0] << " skipped.\n";
+                    msgs << "Binary file: " << fileLabel(fileNames[0]) << " skipped.\n";
                 }
             }
         }
@@ -1101,7 +1101,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
     }
     char * current_base = accum.mBatchBuffer;
     for (unsigned i = 0; i < fileNames.size(); i++) {
-        int32_t fd = openFile(fileNames[i], strm);
+        int32_t fd = openFile(fileNames[i], msgs);
         filesExamined++;
         if (fd == -1) continue;  // File error; skip.
         struct stat st;
@@ -1121,7 +1121,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
             const size_t offset = UTF8_errorOffset(current_base, bytes_read);
             if (offset < static_cast<size_t>(bytes_read)) {
-                reportUTF8Error(fileNames[i], offset);
+                reportUTF8Error(msgs, fileLabel(fileNames[i]), offset);
                 bytes_read = offset;
                 if (bytes_read == 0) continue;
             }
@@ -1131,12 +1131,12 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
             if (null_byte_ptr != nullptr) { // Binary file;
                 // Silently skip in the WithoutMatch mode
                 if (mBinaryFilesMode != argv::WithoutMatch) {
-                    strm << "Binary file: " << fileNames[i] << " skipped.\n";
+                    msgs << "Binary file: " << fileLabel(fileNames[i]) << " skipped.\n";
                 }
                 continue;
             }
         }
-        accum.mFileNames.push_back(fileNames[i]);
+        accum.mFileNames.push_back(fileLabel(fileNames[i]));
         accum.mFileStartPositions.push_back(current_start_position);
         current_base += bytes_read;
         current_start_position += bytes_read;
@@ -1168,7 +1168,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
             remainingFileNames[i] = fileNames[i + filesExamined];
             //llvm::errs() << "remainingFileNames[i]: " << remainingFileNames[i] << "\n";
         }
-        accum.mLineCount += doGrep(remainingFileNames, strm);
+        accum.mLineCount += doGrep(remainingFileNames, strm, msgs);
     }
     if (accum.mLineCount > 0) grepMatchFound = true;
     return accum.mLineCount;
@@ -1191,7 +1191,7 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
         if (LLVM_UNLIKELY(fileDescriptor == -1)) {
             mFileErrorFound = true;
             if (!mSuppressFileMessages) {
-                msgstrm << "icgrep: \"" << fileName << "\": ";
+                msgstrm << "icgrep: " << fileName << ": ";
                 if (errno == EACCES) {
                     msgstrm << "Permission denied.\n";
                 }
@@ -1244,13 +1244,27 @@ bool GrepEngine::searchAllFiles() {
     return grepMatchFound;
 }
 
+void GrepEngine::printFileGroup(unsigned i) {
+    const auto messages = mMessageStrs[i].str();
+    if (!messages.empty()) {
+        // After the results before them (when both go to a terminal)
+        toolio::out().flush();
+        llvm::errs() << messages;
+    }
+    const auto output = mResultStrs[i].str();
+    if (!output.empty()) {
+        toolio::out() << output;
+    }
+    mFileStatus[i] = FileStatus::PrintComplete;
+}
+
 // DoGrep thread function.
 void GrepEngine::DoGrepThreadMethod() {
 
     unsigned fileIdx = mNextFileToGrep++;
     while (fileIdx < mFileGroups.size()) {
 
-        const auto grepResult = doGrep(mFileGroups[fileIdx], mResultStrs[fileIdx]);
+        const auto grepResult = doGrep(mFileGroups[fileIdx], mResultStrs[fileIdx], mMessageStrs[fileIdx]);
         mFileStatus[fileIdx] = FileStatus::GrepComplete;
         if (grepResult > 0) {
             grepMatchFound = true;
@@ -1261,12 +1275,7 @@ void GrepEngine::DoGrepThreadMethod() {
         fileIdx = mNextFileToGrep++;
         if (std::this_thread::get_id() == mEngineThread) {
             while ((mNextFileToPrint < mFileGroups.size()) && (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete)) {
-                const auto output = mResultStrs[mNextFileToPrint].str();
-                if (!output.empty()) {
-                    toolio::out() << output;
-                }
-                mFileStatus[mNextFileToPrint] = FileStatus::PrintComplete;
-                mNextFileToPrint++;
+                printFileGroup(mNextFileToPrint++);
             }
         }
     }
@@ -1276,21 +1285,10 @@ void GrepEngine::DoGrepThreadMethod() {
     while (mNextFileToPrint < mFileGroups.size()) {
         const bool readyToPrint = (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete);
         if (readyToPrint) {
-            const auto output = mResultStrs[mNextFileToPrint].str();
-            if (!output.empty()) {
-                toolio::out() << output;
-            }
-            mFileStatus[mNextFileToPrint] = FileStatus::PrintComplete;
-            mNextFileToPrint++;
+            printFileGroup(mNextFileToPrint++);
         } else {
             sched_yield();
         }
-    }
-    if (mGrepStdIn) {
-        std::ostringstream s;
-        const auto grepResult = doGrep({"-"}, s);
-        toolio::out() << s.str();
-        if (grepResult) grepMatchFound = true;
     }
 }
 

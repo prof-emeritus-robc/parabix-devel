@@ -14,4 +14,5 @@ DEPS
     re.adt
     re.transforms
     kernel.unicode
+    kernel.streamutils
 )

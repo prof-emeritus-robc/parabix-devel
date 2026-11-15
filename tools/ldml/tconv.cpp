@@ -88,6 +88,8 @@
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization/normalization.h>
 #include <kernel/unicode/utf8gen.h>
+#include <kernel/unicode/utf8_charmap.h>
+#include <kernel/unicode/utf8_wellformed.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/UCD_property_kernel.h>
@@ -103,6 +105,7 @@
 #include <re/cc/cc_compiler_target.h>
 #include <ucd/utf/transchar.h>
 #include <ldml/transform_plan.h>
+#include <ldml/shape_groups.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
@@ -156,8 +159,34 @@ static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
     cl::init(8), cl::cat(TconvOptions));
 static cl::opt<bool> RevisitReport("revisit-report", cl::desc("Report each rule with text to revisit, how it is composed and the rules "
                                    "applying to its text to revisit (one JSON object per line), and exit"), cl::cat(TconvOptions));
-static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
+static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit "
+                                       "(with --apply-shape-groups, the plan chosen for each segment)"),
                               cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> ShowShapeGroups("shape-groups",
+                                     cl::desc("Report the conversion groups of the transform planned as search and replace "
+                                              "passes by the shapes of their results (see ldml/shape_groups.h) and exit"),
+                                     cl::init(false), cl::cat(TconvOptions));
+//  (Off by default: the boundaries keep the passes from running together,
+//  which slows them, see doc/ldml-shape-groups-report.md.)
+static cl::opt<bool> ShapePhaseBoundaries("shape-phase-boundaries",
+                                          cl::desc("With --apply-shape-groups, a pipeline phase boundary after each pass"),
+                                          cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> ApplyShapeGroups("apply-shape-groups",
+                                      cl::desc("Apply each segment of a transform by the search and replace passes of its "
+                                               "shape group plans (see --shape-groups) where they take fewer kernels than the "
+                                               "regular plan, and a transform the regular plan does not implement by its shape "
+                                               "groups, if they are implementable (default on; --apply-shape-groups=0 for the "
+                                               "regular plan only)"),
+                                      cl::init(true), cl::cat(TconvOptions));
+//  The two modes of rule pipelines: UTF-8 (the steps applied to the UTF-8 code
+//  units of the text, in their basis bits, one position per code unit) and
+//  Unicode (the steps applied to the 21 basis bits of the codepoints, one
+//  position per character, decoded from UTF-8 and encoded again).  See
+//  TransformAnalyzer::mode.
+static cl::opt<bool> UTF8Mode("utf8-mode",
+                              cl::desc("Apply a transform to the UTF-8 code units of the text where it and the transforms "
+                                       "it invokes can be (see --plan); otherwise, and with --utf8-mode=0, to its codepoints"),
+                              cl::init(true), cl::cat(TconvOptions));
 //  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
 //  are computed by kernels of their own, as the cost of compiling a kernel of
 //  classes of scattered characters grows faster than their number (for Hani-Latn,
@@ -388,7 +417,81 @@ public:
     //  Analyze rules not tied to a registry entry (e.g. from --rules-file), as
     //  the forward rules of an ad hoc transform.
     TransformAnalysis analyzeRulesFile(const std::vector<ldml::Rule *> & parsed);
+    //  The rules of a transform (its forward rules, after capture
+    //  simplification and order disambiguation, with their function calls
+    //  kept) and the shape group plans of its conversion groups, in order:
+    //  the steps, each a transform rule or a plan.
+    struct ShapeStep {
+        const ldml::TransformRule * transform = nullptr;
+        ldml::ShapeGroupPlan plan;
+        //  The passes as prepared for the engine, and their failures; a
+        //  character map planned as rules (see ldml::planTransform).
+        std::vector<PreparedSearchReplace> prepared;
+        std::vector<std::vector<PreconditionFailure>> failures;
+        //  What the engine does not support for the passes within a filter,
+        //  where the text of their matches is restricted to it (see
+        //  RE_context::textMask and textMaskFailures).
+        std::vector<std::vector<PreconditionFailure>> failuresInFilter;
+        bool appliesInFilter() const {
+            for (const auto & fs : failuresInFilter) if (!fs.empty()) return false;
+            return true;
+        }
+        std::vector<ldml::TransformPlan> maps;
+        //  The marks of the deferred calls and their arguments replaced by
+        //  their values: string rules (M a → value), planned as rules.
+        ldml::TransformPlan markMap;
+        std::string markMapProblem;
+    };
+    std::vector<ShapeStep> shapeGroups(const ldml::TransformEntry * entry);
+    //  The shape group plans of a transform (cached), and whether the transform
+    //  can be applied by them (see --apply-shape-groups): every conversion
+    //  group planned, its passes accepted by the engine and its deferred calls
+    //  evaluated, no filters, and the transforms invoked implemented.
+    struct ShapeGroups {
+        std::vector<ShapeStep> steps;
+        bool applicable = false;
+        std::string reason;
+    };
+    const ShapeGroups & shapeGroupsOf(const ldml::TransformEntry * entry);
+    //  The choice, for each segment of a transform (the conversion groups
+    //  between consecutive transform rules), between its regular plan and its
+    //  shape groups (see --apply-shape-groups): the shape groups where they are
+    //  implementable and take fewer kernels.  The segments correspond where the
+    //  two plans have the same transform rules and no filters (aligned).
+    struct ShapeChoice {
+        bool aligned = false;
+        std::vector<bool> useShapes;                        // for each segment
+        std::vector<std::vector<ShapeStep>> shapeSegments;  // the shape groups of each segment
+        std::vector<size_t> regularKernels, shapeKernels;   // of each segment (if both apply)
+        bool any() const {return std::find(useShapes.begin(), useShapes.end(), true) != useShapes.end();}
+        //  Whether the segments chosen apply within a filter as well.
+        bool appliesInFilter() const {
+            for (size_t k = 0; k < useShapes.size(); k++) {
+                if (!useShapes[k]) continue;
+                for (const ShapeStep & s : shapeSegments[k]) if (!s.appliesInFilter()) return false;
+            }
+            return true;
+        }
+    };
+    std::map<std::string, ShapeChoice> mShapeChoices;
+    //  The mode of a transform (see --utf8-mode): UTF-8 if its plan can be
+    //  applied to the UTF-8 code units of the text, and those of the
+    //  transforms it invokes, transitively; otherwise Unicode (the reason
+    //  given).  Supported in UTF-8 mode, for now:
+    //    - conversion groups that are context-free character maps (each
+    //      character of a set replaced by a string, see utf8CharMap), applied
+    //      by kernel::UTF8_CharMapPipeline;
+    //    - transform rules without filters invoking transforms in UTF-8 mode,
+    //      or Any-Null.
+    //  A transform with a filter, or with segments applied by their shape
+    //  groups (see --apply-shape-groups), is in Unicode mode.
+    struct Mode {
+        bool utf8 = false;
+        std::string reason;     // why Unicode mode
+    };
+    const Mode & mode(const ldml::TransformEntry * entry);
 private:
+    std::map<std::string, Mode> mModes;
     //  The common analysis of a set of parsed rules (trivial and nullable
     //  capture elimination, order disambiguation, planning, and checking the
     //  transforms the plan's steps invoke), given the rules to extract as
@@ -402,6 +505,7 @@ private:
     const ldml::TransformRegistry & mRegistry;
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
+    std::map<std::string, ShapeGroups> mShapeGroups;
 };
 
 static std::string readFile(const std::string & path) {
@@ -460,6 +564,216 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
     }
     mInProgress.erase(name);
     return mResults.emplace(name, std::move(a)).first->second;
+}
+
+std::vector<TransformAnalyzer::ShapeStep> TransformAnalyzer::shapeGroups(const ldml::TransformEntry * entry) {
+    const std::vector<ldml::Rule *> parsed = ldml::parseTransformRules(ldml::extractTRules(readFile(entry->file)));
+    std::vector<ldml::Rule *> rules = entry->direction == ldml::TransformDirection::Forward
+                                      ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+    rules = ldml::RemoveUnreferencedCaptures(rules);
+    rules = ldml::TrivialCaptureElimination(rules);
+    rules = ldml::NullableCaptureElimination(rules);
+    rules = ldml::DisambiguateOrder(rules);
+    const ldml::FunctionEvaluator evaluate = [&](const ldml::TransformID & t, const UCD::UnicodeSet & chars,
+                                                 std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                                                 UCD::UnicodeSet & unchanged, std::string & reason) {
+        return evaluateFunction(t, chars, groups, unchanged, reason);
+    };
+    std::vector<ShapeStep> steps;
+    std::vector<const ldml::ConversionRule *> group;
+    auto flush = [&] {
+        if (group.empty()) return;
+        steps.emplace_back();
+        ShapeStep & step = steps.back();
+        step.plan = ldml::planShapeGroup(group, &evaluate);
+        group.clear();
+        if (!step.plan.implementable()) return;
+        for (const ldml::ShapePass & p : step.plan.passes) {
+            if (p.map) {
+                step.prepared.emplace_back();
+                std::vector<ldml::Rule *> rules;
+                for (const ldml::ConversionRule * r : p.rules) rules.push_back(const_cast<ldml::ConversionRule *>(r));
+                step.maps.push_back(ldml::planTransform(rules));
+                step.failures.emplace_back();
+                step.failuresInFilter.emplace_back();
+                if (!step.maps.back().implementable()) {
+                    step.failures.back().push_back(PreconditionFailure{re::RE_Goal::SearchReplace, nullptr,
+                                                   "the character map is not implementable: " + step.maps.back().problems.front()});
+                }
+                continue;
+            }
+            RE_ModeOptions opts;
+            opts.forceUnicodeIndexing = true;
+            opts.reversal = false;
+            step.prepared.push_back(prepareSearchReplace(p.search, p.replacement, opts));
+            step.failures.push_back(checkPreconditions(step.prepared.back(), &cc::Unicode));
+            step.failuresInFilter.push_back(textMaskFailures(step.prepared.back()));
+            step.maps.emplace_back();
+        }
+        std::vector<ldml::Rule *> markRules;
+        for (const ldml::DeferredCall & call : step.plan.calls) {
+            for (const auto & v : call.values) {
+                std::vector<re::RE *> value;
+                for (const char32_t c : v.second) value.push_back(re::makeCC(static_cast<UCD::codepoint_t>(c), &cc::Unicode));
+                re::RE * const text = re::makeSeq({re::makeCC(call.mark, &cc::Unicode), re::makeCC(v.first, &cc::Unicode)});
+                markRules.push_back(ldml::makeConversionRule(ldml::makeRuleSide(text), ldml::Direction::Forward,
+                                                             ldml::makeRuleSide(re::makeSeq(value.begin(), value.end()))));
+            }
+        }
+        if (!markRules.empty()) {
+            step.markMap = ldml::planTransform(markRules);
+            if (!step.markMap.implementable()) step.markMapProblem = step.markMap.problems.front();
+        }
+    };
+    for (const ldml::Rule * r : rules) {
+        if (const ldml::ConversionRule * c = dyn_cast<ldml::ConversionRule>(r)) {
+            group.push_back(c);
+        } else if (const ldml::TransformRule * t = dyn_cast<ldml::TransformRule>(r)) {
+            flush();
+            steps.emplace_back();
+            steps.back().transform = t;
+        } else if (isa<ldml::FilterRule>(r)) {
+            flush();
+            steps.emplace_back();
+            steps.back().plan.problems.push_back("a filter rule (not supported by shape groups)");
+        } else if (!isa<ldml::VariableDefinitionRule>(r)) {
+            flush();
+        }
+    }
+    flush();
+    return steps;
+}
+
+const TransformAnalyzer::ShapeGroups & TransformAnalyzer::shapeGroupsOf(const ldml::TransformEntry * entry) {
+    const std::string & name = entry->canonicalName;
+    auto f = mShapeGroups.find(name);
+    if (f != mShapeGroups.end()) return f->second;
+    ShapeGroups g;
+    try {
+        g.steps = shapeGroups(entry);
+        g.applicable = true;
+    } catch (const std::exception & e) {
+        g.reason = std::string("rules not loaded: ") + e.what();
+    }
+    for (const ShapeStep & step : g.steps) {
+        if (!g.applicable) break;
+        if (step.transform) {
+            const ldml::TransformEntry * used = mRegistry.lookup(step.transform->getForwardID().getText());
+            if (step.transform->getForwardFilter()) {
+                g.reason = "a transform rule with a filter";
+            } else if (used == nullptr) {
+                g.reason = "an unknown transform " + step.transform->getForwardID().getText();
+            } else if (!analyze(used).implementable) {
+                g.reason = "a transform invoked that is not implemented: " + used->canonicalName;
+            }
+        } else if (!step.plan.implementable()) {
+            g.reason = step.plan.problems.front();
+        } else {
+            for (const std::vector<PreconditionFailure> & fs : step.failures) {
+                if (!fs.empty()) g.reason = "a pass not accepted by the engine: " + fs.front().reason;
+            }
+            for (const ldml::DeferredCall & call : step.plan.calls) {
+                if (!call.evaluated) g.reason = "a function call not evaluated: &" + call.function.getText();
+            }
+            if (!step.markMapProblem.empty()) g.reason = "the values of the deferred calls not implementable: " + step.markMapProblem;
+        }
+        g.applicable = g.reason.empty();
+    }
+    return mShapeGroups.emplace(name, std::move(g)).first->second;
+}
+
+//  A conversion group planned by shape groups (see TransformAnalyzer::
+//  shapeGroups): for each pass, its search pattern and replacement (in the
+//  syntax of the regular expression parser and of re::parseReplacement),
+//  whether the engine's search and replace accepts them, and the values of the
+//  deferred calls.  False if the group is not implementable.
+static bool printShapeStep(const TransformAnalyzer::ShapeStep & step) {
+    auto codepoints = [](const std::u32string & s) {
+        std::string out;
+        for (const char32_t c : s) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%sU+%04X", out.empty() ? "" : " ", static_cast<unsigned>(c));
+            out += buf;
+        }
+        return out.empty() ? std::string("(deleted)") : out;
+    };
+    bool all = true;
+    const ldml::ShapeGroupPlan & plan = step.plan;
+    size_t rules = 0;
+    for (const ldml::ShapePass & p : plan.passes) rules += p.rules.size();
+    toolio::out() << "  conversion group: " << plan.passes.size() << " passes, " << rules << " rules\n";
+    for (const std::string & problem : plan.problems) toolio::out() << "    problem: " << problem << "\n";
+    if (!plan.implementable()) return false;
+    for (size_t i = 0; i < plan.passes.size(); i++) {
+        const ldml::ShapePass & p = plan.passes[i];
+        toolio::out() << "    pass " << (i + 1) << ": " << p.shape << ", " << p.rules.size() << " rules";
+        for (const size_t g : p.guards) toolio::out() << ", yields to pass " << (g + 1);
+        if (p.contexts) toolio::out() << ", before contexts as in the converted text";
+        toolio::out() << "\n";
+        for (const ldml::ConversionRule * r : p.rules) toolio::out() << "      rule: " << ldml::printRule(r) << "\n";
+        if (p.map) {
+            for (const PreconditionFailure & f : step.failures[i]) toolio::out() << "      character map: " << f.reason << "\n";
+            if (step.failures[i].empty()) toolio::out() << "      character map: implementable\n";
+            all = all && step.failures[i].empty();
+            continue;
+        }
+        std::string reason;
+        const std::string search = ldml::regexSyntax(p.search, &reason);
+        toolio::out() << "      search: " << (search.empty() ? "(no syntax: " + reason + ")" : search) << "\n";
+        toolio::out() << "      replacement: " << ldml::replacementSyntax(p.replacement) << "\n";
+        const std::vector<PreconditionFailure> & failures = step.failures[i];
+        if (failures.empty()) {
+            toolio::out() << "      engine: accepted\n";
+        } else {
+            all = false;
+            for (const PreconditionFailure & f : failures) toolio::out() << "      engine: not accepted: " << f.reason << "\n";
+        }
+        for (const PreconditionFailure & f : step.failuresInFilter[i]) {
+            toolio::out() << "      engine, within a filter: not accepted: " << f.reason << "\n";
+        }
+    }
+    for (const ldml::DeferredCall & call : plan.calls) {
+        char mark[16];
+        snprintf(mark, sizeof(mark), "U+%04X", static_cast<unsigned>(call.mark));
+        toolio::out() << "    deferred call &" << call.function.getText() << ": mark " << mark;
+        if (!call.evaluated) {
+            all = false;
+            toolio::out() << ", not evaluated\n";
+            continue;
+        }
+        toolio::out() << "\n";
+        for (const auto & v : call.values) {
+            toolio::out() << "      value " << codepoints(std::u32string(1, v.first)) << " -> " << codepoints(v.second) << "\n";
+        }
+    }
+    if (!step.markMapProblem.empty()) {
+        all = false;
+        toolio::out() << "    values not implementable: " << step.markMapProblem << "\n";
+    }
+    return all;
+}
+
+//  The shape group plans of a transform (see printShapeStep).  0 if all the
+//  conversion groups are implementable.
+static int printShapeGroups(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
+    TransformAnalyzer analyzer(registry);
+    std::vector<TransformAnalyzer::ShapeStep> steps;
+    try {
+        steps = analyzer.shapeGroups(entry);
+    } catch (const std::exception & e) {
+        llvm::errs() << entry->canonicalName << ": " << e.what() << "\n";
+        return 2;
+    }
+    bool all = true;
+    toolio::out() << entry->canonicalName << " (" << entry->file << "): shape groups\n";
+    for (const TransformAnalyzer::ShapeStep & step : steps) {
+        if (step.transform) {
+            toolio::out() << "  transform " << step.transform->getForwardID().getText() << "\n";
+            continue;
+        }
+        all = printShapeStep(step) && all;
+    }
+    return all ? 0 : 2;
 }
 
 //  The value of a transform, as planned, on a single character: through its
@@ -831,7 +1145,14 @@ static std::string printRanges(const UCD::UnicodeSet & set) {
 static void printBeforeContextNotes(const ldml::TransformStep & step);
 static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearchReplace * sr = nullptr, std::string * reason = nullptr);
 
-static void printPlan(const std::string & label, const TransformAnalysis & a) {
+//  The plan of a transform: its problems, filter and steps.  With a choice
+//  of plans for its segments (see TransformAnalyzer::ShapeChoice, with
+//  --apply-shape-groups), the kernels of each segment by each plan, and the
+//  shape groups of the segments applied by them in place of their conversion
+//  groups.
+static void printPlan(const std::string & label, const TransformAnalysis & a,
+                      const TransformAnalyzer::ShapeChoice * choice = nullptr,
+                      const std::function<std::string (const ldml::TransformStep &)> & transformNote = nullptr) {
     toolio::out() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
     for (const std::string & p : a.problems) {
         std::string shown = p;
@@ -844,10 +1165,34 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         toolio::out() << "  problem: " << shown << "\n";
     }
     if (a.plan.filter) toolio::out() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
+    if (choice && !choice->aligned) {
+        toolio::out() << "  shape groups not applied: the segments of the two plans do not correspond (filters, or different transform rules)\n";
+    }
+    if (choice && !choice->aligned) choice = nullptr;
+    size_t segment = 0;
+    std::vector<bool> started(choice ? choice->useShapes.size() : 0, false);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) segment++;
+        //  (The plan chosen for a segment, at its first conversion group.)
+        if (choice && step.kind != ldml::TransformStep::Kind::Transform && !started[segment]) {
+            started[segment] = true;
+            const size_t regular = choice->regularKernels[segment], shapes = choice->shapeKernels[segment];
+            if (choice->useShapes[segment]) {
+                toolio::out() << "  segment " << (segment + 1) << ": by shape groups (" << shapes << " kernels; regular plan "
+                              << regular << " kernels)\n";
+                for (const TransformAnalyzer::ShapeStep & s : choice->shapeSegments[segment]) printShapeStep(s);
+            } else if (regular > 0 || shapes > 0) {
+                toolio::out() << "  segment " << (segment + 1) << ": by the regular plan (" << regular << " kernels; shape groups "
+                              << shapes << " kernels)\n";
+            } else {
+                toolio::out() << "  segment " << (segment + 1) << ": by the regular plan (shape groups not implementable)\n";
+            }
+        }
+        if (choice && step.kind != ldml::TransformStep::Kind::Transform && choice->useShapes[segment]) continue;
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             toolio::out() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
-                         << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "") << "\n";
+                         << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "")
+                         << (transformNote ? transformNote(step) : "") << "\n";
             continue;
         }
         if (step.hasFrontLetters) {
@@ -6327,6 +6672,13 @@ public:
     : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
+    StreamSet * applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21);
+    //  The passes of a conversion group planned by shapes (with its group
+    //  count, if outermost).
+    StreamSet * applyShapeStep(const TransformAnalyzer::ShapeStep & step, StreamSet * U21, bool outermost);
+    //  The segments of the transform being applied that are applied by their
+    //  shape groups (see TransformAnalyzer::ShapeChoice), if any.
+    const TransformAnalyzer::ShapeChoice * mShapeChoice = nullptr;
     // Apply an already-analyzed plan (e.g. of an ad hoc --rules-file transform,
     // not tied to a registry entry) to U21.
     StreamSet * applyAnalysis(const TransformAnalysis & a, StreamSet * U21);
@@ -8987,11 +9339,634 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     return result;
 }
 
+//  The choice of plans for the segments of a transform (see
+//  TransformAnalyzer::ShapeChoice), computed once: the kernels of each
+//  segment, by each plan, are counted in a pipeline of their own (built, not
+//  compiled).
+static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                                          const ldml::TransformEntry * entry) {
+    auto f = analyzer.mShapeChoices.find(entry->canonicalName);
+    if (f != analyzer.mShapeChoices.end()) return f->second;
+    TransformAnalyzer::ShapeChoice choice;
+    const TransformAnalysis & a = analyzer.analyze(entry);
+    const TransformAnalyzer::ShapeGroups & groups = analyzer.shapeGroupsOf(entry);
+    //  The segments of each plan, by their transform rules.
+    std::vector<std::string> regularTransforms, shapeTransforms;
+    std::vector<std::vector<const ldml::TransformStep *>> regularSegments(1);
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            regularTransforms.push_back(step.transform.getText() + (step.filter ? " (filtered)" : ""));
+            regularSegments.emplace_back();
+        } else {
+            regularSegments.back().push_back(&step);
+        }
+    }
+    choice.shapeSegments.resize(1);
+    bool filters = a.plan.filter != nullptr;
+    for (const TransformAnalyzer::ShapeStep & step : groups.steps) {
+        if (step.transform) {
+            shapeTransforms.push_back(step.transform->getForwardID().getText() + (step.transform->getForwardFilter() ? " (filtered)" : ""));
+            choice.shapeSegments.emplace_back();
+        } else {
+            for (const std::string & p : step.plan.problems) filters |= p.compare(0, 13, "a filter rule") == 0;
+            choice.shapeSegments.back().push_back(step);
+        }
+    }
+    choice.aligned = a.implementable && !filters && regularTransforms == shapeTransforms;
+    choice.useShapes.assign(choice.shapeSegments.size(), false);
+    if (!choice.aligned) return analyzer.mShapeChoices.emplace(entry->canonicalName, std::move(choice)).first->second;
+    static std::unique_ptr<CPUDriver> counting;
+    if (!counting) counting = std::make_unique<CPUDriver>("tconv-counting");
+    auto count = [&](const std::function<void (RulePipelineBuilder &, StreamSet *)> & build) {
+        auto P = CreatePipeline(*counting, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
+        StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
+        StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+        const size_t base = P.getNumOfKernelCalls();
+        RulePipelineBuilder builder(P, registry, analyzer);
+        builder.omitICUBuiltIns();
+        build(builder, U21);
+        return P.getNumOfKernelCalls() - base;
+    };
+    choice.regularKernels.assign(choice.shapeSegments.size(), 0);
+    choice.shapeKernels.assign(choice.shapeSegments.size(), 0);
+    for (size_t k = 0; k < choice.shapeSegments.size(); k++) {
+        const std::vector<TransformAnalyzer::ShapeStep> & shapes = choice.shapeSegments[k];
+        bool implementable = !shapes.empty();
+        for (const TransformAnalyzer::ShapeStep & step : shapes) {
+            implementable = implementable && step.plan.implementable() && step.markMapProblem.empty();
+            for (const auto & fs : step.failures) implementable = implementable && fs.empty();
+            for (const ldml::DeferredCall & call : step.plan.calls) implementable = implementable && call.evaluated;
+        }
+        if (!implementable) continue;
+        TransformAnalysis segment;
+        segment.implementable = true;
+        for (const ldml::TransformStep * s : regularSegments[k]) segment.plan.steps.push_back(*s);
+        choice.regularKernels[k] = count([&](RulePipelineBuilder & b, StreamSet * U21) {b.applyAnalysis(segment, U21);});
+        choice.shapeKernels[k] = count([&](RulePipelineBuilder & b, StreamSet * U21) {
+            for (const TransformAnalyzer::ShapeStep & step : shapes) U21 = b.applyShapeStep(step, U21, false);
+        });
+        choice.useShapes[k] = choice.shapeKernels[k] < choice.regularKernels[k];
+    }
+    return analyzer.mShapeChoices.emplace(entry->canonicalName, std::move(choice)).first->second;
+}
+
+//  A conversion group as a context-free character map (see
+//  kernel::UTF8_CharMapPipeline): its rules all single-character rules
+//  without contexts, each character of a set replaced by a string (the
+//  characters replaced by themselves left out); false, with the reason, if
+//  it is not.
+//
+//  Single-character rules with contexts are supported where the regular
+//  expression engine matches them, with their contexts, on the UTF-8 code
+//  units (see utf8Applies), and their before contexts do not depend on the
+//  conversions of the group (as ICU matches them against the converted text,
+//  see convertedContextMatters): their subgroups (contextual) and characters
+//  (contextualChars).
+static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap & map, std::string & reason,
+                        std::vector<const ldml::CharMapSubgroup *> * contextual = nullptr, UCD::UnicodeSet * contextualChars = nullptr) {
+    map.clear();
+    if (contextual) contextual->clear();
+    if (contextualChars) *contextualChars = UCD::UnicodeSet();
+    if (step.kind != ldml::TransformStep::Kind::Conversion) {
+        reason = "not a conversion group";
+        return false;
+    }
+    auto other = [&](bool present, const std::string & what) {
+        if (present && reason.empty()) reason = what;
+    };
+    reason.clear();
+    other(!step.stringRules.empty(), "string rules");
+    other(!step.captureReplacements.empty(), "rules with captures");
+    other(!step.insertions.empty(), "insertion rules");
+    other(!step.deferred.empty(), "deferred rules");
+    other(!step.prefixRuns.empty(), "prefix runs");
+    other(!step.chainRevisitRules.empty(), "chain revisits");
+    other(!step.markRunEditRules.empty(), "mark run edits");
+    other(step.hasFrontLetters || step.frontLettersEnd, "front-letter revisits");
+    for (const auto & p : step.subgroupPriority) other(!p.empty(), "single-character rules with priorities");
+    UCD::UnicodeSet covered;
+    std::vector<ConversionOutcome> outcomes;
+    bool outcomesKnown = false;
+    for (const ldml::CharMapSubgroup & g : step.subgroups) {
+        const bool contexts = g.engineBefore != nullptr || g.engineAfter != nullptr;
+        if (contexts) {
+            FusedContexts before, after;
+            if (!outcomesKnown) {
+                outcomes = conversionOutcomes(step);
+                outcomesKnown = true;
+            }
+            if (!fusedContexts(g.engineBefore, true, before)) {
+                other(true, "single-character rules with before contexts that are not sequences of sets");
+            } else if (convertedContextMatters(before, outcomes)) {
+                other(true, "single-character rules with before contexts matched against the converted text");
+            } else {
+                UCD::UnicodeSet chars;
+                for (const ldml::CharMapping & m : g.mappings) chars = chars + m.chars;
+                const RE_Plan plan = planRE(prepareRE(contextPattern(g.engineBefore, g.engineAfter, {re::makeCC(chars, &cc::Unicode)}),
+                                                      engineOptions()), &cc::UTF8);
+                if (!plan.feasible()) other(true, "single-character rules with contexts not matched by the engine: " + plan.failures.front().reason);
+            }
+        }
+        for (const ldml::CharMapping & m : g.mappings) {
+            UCD::UnicodeSet chars = m.chars - UCD::UnicodeSet(DeletionMark);
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
+            if (chars.empty()) continue;
+            other(chars.intersects(covered), "characters of several subgroups");
+            covered = covered + chars;
+            map.emplace_back(chars, m.replacement);
+            if (contexts && contextualChars) *contextualChars = *contextualChars + chars;
+        }
+        if (contexts && contextual) contextual->push_back(&g);
+    }
+    return reason.empty();
+}
+
+//  The positions where the single-character rules with contexts of a group
+//  apply (see utf8CharMap): their matches with their contexts, by the regular
+//  expression engine on the UTF-8 code units (in its UTF-8 modes), marked at
+//  the last byte of each character.
+static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml::CharMapSubgroup *> & contextual, StreamSet * Basis) {
+    StreamSet * applies = nullptr;
+    for (const ldml::CharMapSubgroup * g : contextual) {
+        UCD::UnicodeSet chars;
+        for (const ldml::CharMapping & m : g->mappings) chars = chars + m.chars;
+        const PreparedRE prepared = prepareRE(contextPattern(g->engineBefore, g->engineAfter, {re::makeCC(chars, &cc::Unicode)}),
+                                              engineOptions());
+        StreamSet * matches = P.CreateStreamSet(1);
+        RE_PipelineBuilder engine(P, RE_context{&cc::UTF8, Basis});
+        engine.matchSearchPipeline(prepared, matches);
+        //  (The marks as the engine places them, see RE_Plan: matchOffset
+        //  positions after the last unit, of code units or, with Unicode
+        //  indexing, of characters, mapped to their last code units.)
+        const RE_Plan plan = planRE(prepared, &cc::UTF8);
+        if (plan.matchOffset > 0) {
+            StreamSet * const shifted = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftBack>(matches, shifted, plan.matchOffset);
+            matches = shifted;
+        }
+        if (engine.usesUnicodeIndexing()) {
+            StreamSet * const atBytes = P.CreateStreamSet(1);
+            SpreadByMask(P, engine.getU8Index(), matches, atBytes);
+            matches = atBytes;
+        }
+        if (applies) {
+            StreamSet * const both = P.CreateStreamSet(1);
+            OrCombine(P, applies, matches, both);
+            matches = both;
+        }
+        applies = matches;
+    }
+    return applies;
+}
+
+static bool utf8BuiltIn(const std::string & name);
+
+const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEntry * entry) {
+    const std::string name = entry->canonicalName;
+    auto f = mModes.find(name);
+    if (f != mModes.end()) return f->second;
+    Mode m;
+    m.utf8 = true;
+    auto unicode = [&](const std::string & why) {
+        if (m.utf8) {
+            m.utf8 = false;
+            m.reason = why;
+        }
+    };
+    if (entry->isBuiltIn()) {
+        if (!utf8BuiltIn(name)) unicode("the built-in " + name);
+        return mModes.emplace(name, std::move(m)).first->second;
+    }
+    //  (The decoding of UTF-8 stops at an error, with --utf8-errors=abort-on-error.)
+    if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) unicode("ill-formed UTF-8 aborting (--utf8-errors=abort-on-error)");
+    mModes.emplace(name, Mode{false, "a transform invoking itself"});     // (while in progress)
+    const TransformAnalysis & a = analyze(entry);
+    if (!a.implementable) unicode("not implemented by tconv's own rules");
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (!m.utf8) break;
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            const ldml::TransformEntry * used = mRegistry.lookup(step.transform.getText());
+            if (used == nullptr) {
+                unicode("an unknown transform " + step.transform.getText());
+            } else if (!mode(used).utf8) {
+                unicode("invokes " + used->canonicalName + " (" + mode(used).reason + ")");
+            }
+            continue;
+        }
+        kernel::UTF8_CharMap map;
+        std::string why;
+        if (!utf8CharMap(step, map, why)) unicode("a conversion group with " + why);
+    }
+    if (m.utf8 && ApplyShapeGroups && shapeChoice(mRegistry, *this, entry).any()) unicode("segments applied by shape groups");
+    mModes[name] = m;
+    return mModes[name];
+}
+
+//  A transform in UTF-8 mode (see TransformAnalyzer::mode) applied to the
+//  basis bits of UTF-8 code units.
+//  The pipeline of a transform in UTF-8 mode (see TransformAnalyzer::mode),
+//  on the basis bits of the UTF-8 code units of a well-formed text (see
+//  utf8TransformText).
+class UTF8PipelineBuilder {
+public:
+    UTF8PipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                        std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
+    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
+    StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
+private:
+    StreamSet * builtIn(const std::string & name, StreamSet * Basis);
+    StreamSet * normalization(const std::string & name, StreamSet * Basis);
+    StreamSet * maskedNormalization(const std::string & name, StreamSet * Basis);
+    StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
+    //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
+    //  masks of the filters in effect (the innermost last, within the ones
+    //  before it), over the bytes of the characters each selects, kept in step
+    //  with the text as bytes are deleted and inserted.
+    void pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis);
+    void popFilter() {mMasks.pop_back();}
+    std::vector<StreamSet *> * masks() {return mMasks.empty() ? nullptr : &mMasks;}
+    std::vector<StreamSet *> mMasks;
+    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count);
+    PipelineBuilder & mP;
+    const ldml::TransformRegistry & mRegistry;
+    TransformAnalyzer & mAnalyzer;
+    std::vector<std::pair<size_t, size_t>> * mGroupCounts;
+    unsigned mDepth = 0;
+};
+
+StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * Basis) {
+    if (entry->isBuiltIn()) return builtIn(entry->canonicalName, Basis);
+    const bool outermost = mDepth++ == 0;
+    const TransformAnalysis & a = mAnalyzer.analyze(entry);
+    if (a.plan.filter) pushFilter(a.plan.filterSet, Basis);
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            if (step.filter) pushFilter(step.filterSet, Basis);
+            Basis = transform(mRegistry.lookup(step.transform.getText()), Basis);
+            if (step.filter) popFilter();
+        } else {
+            Basis = conversionGroup(step, Basis, outermost);
+        }
+    }
+    if (a.plan.filter) popFilter();
+    mDepth--;
+    return Basis;
+}
+
+StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count) {
+    kernel::UTF8_CharMap map;
+    std::string reason;
+    std::vector<const ldml::CharMapSubgroup *> contextual;
+    UCD::UnicodeSet contextualChars;
+    if (!utf8CharMap(step, map, reason, &contextual, &contextualChars)) {
+        llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
+    }
+    const size_t kernels = mP.getNumOfKernelCalls();
+    StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(mP, contextual, Basis);
+    Basis = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextualChars, applies, masks());
+    if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
+    return Basis;
+}
+
+//  The built-in transforms of UTF-8 mode (see utf8BuiltIn).
+static bool utf8BuiltIn(const std::string & name) {
+    return name == "Any-Null" || name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" ||
+           name == "Any-Lower" || name == "Any-Upper";
+}
+
+StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
+    if (name == "Any-Null") return Basis;
+    if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
+        return mMasks.empty() ? normalization(name, Basis) : maskedNormalization(name, Basis);
+    }
+    if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
+    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " not in UTF-8 mode"));
+}
+
+//  The normalization forms, focused (as in the nfd, nfkd and nfc tools), from
+//  the basis bits and the bytes of the text.
+StreamSet * UTF8PipelineBuilder::normalization(const std::string & name, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    NFD_PipelineBuilder NFD_builder(P);
+    StreamSet * bytes = BytesOf(P, Basis);
+    if (name == "Any-NFD") return BasisOf(P, NFD_Bytes(P, NFD_builder, bytes, Basis));
+    if (name == "Any-NFKD") return BasisOf(P, NFKD_Bytes(P, NFD_builder, bytes, Basis));
+    if (name == "Any-NFKC") {
+        bytes = NFKD_Bytes(P, NFD_builder, bytes, Basis);
+        Basis = BasisOf(P, bytes);
+    }
+    return BasisOf(P, NFC_Bytes(P, bytes, Basis));
+}
+
+//  The bytes of the characters marked at their first bytes (Firsts), within
+//  Outer if given.
+class UTF8_CharSpans final : public pablo::PabloKernel {
+public:
+    UTF8_CharSpans(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Firsts, StreamSet * Outer, StreamSet * Spans)
+    : PabloKernel(ts, std::string("UTF8_CharSpans") + (Outer ? "_o" : ""),
+                  [&] {
+                      Bindings in{Binding{"basis", Basis}, Binding{"firsts", Firsts}};
+                      if (Outer) in.emplace_back("outer", Outer);
+                      return in;
+                  }(),
+                  {Binding{"spans", Spans}}),
+      mOuter(Outer != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const f = getInputStreamSet("firsts")[0];
+        PabloAST * const prefix = pb.createAnd(basis[7], basis[6]);
+        PabloAST * const prefix34 = pb.createAnd(prefix, basis[5]);
+        PabloAST * const prefix4 = pb.createAnd(prefix34, basis[4]);
+        PabloAST * spans = pb.createOr(f, pb.createAdvance(pb.createAnd(f, prefix), 1));
+        spans = pb.createOr3(spans, pb.createAdvance(pb.createAnd(f, prefix34), 2), pb.createAdvance(pb.createAnd(f, prefix4), 3));
+        if (mOuter) spans = pb.createAnd(spans, getInputStreamSet("outer")[0]);
+        writeOutputStreamSet("spans", std::vector<PabloAST *>{spans});
+    }
+private:
+    const bool mOuter;
+};
+
+//  The barriers of normalization within a filter in UTF-8 mode (as BarrierMark
+//  in Unicode mode, see RulePipelineBuilder::barrierNormalization): for each
+//  length of UTF-8 sequence, a starter without a decomposition that composes
+//  with no character, so that a character outside the filter is replaced in
+//  place by the barrier of its length.
+static const UCD::codepoint_t UTF8_Barriers[4] = {0x0000, 0x0080, 0xFDD0, 0x1FFFE};
+
+//  The basis with the bytes of the characters outside Selected replaced by
+//  those of the barrier of the same length.
+class UTF8_ReplaceUnselected final : public pablo::PabloKernel {
+public:
+    UTF8_ReplaceUnselected(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Selected, StreamSet * Replaced)
+    : PabloKernel(ts, "UTF8_ReplaceUnselected", {Binding{"basis", Basis}, Binding{"selected", Selected}}, {Binding{"replaced", Replaced}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const unselected = pb.createInFile(pb.createNot(getInputStreamSet("selected")[0]));
+        PabloAST * const prefix = pb.createAnd(basis[7], basis[6]);
+        PabloAST * const prefix34 = pb.createAnd(prefix, basis[5]);
+        PabloAST * const leads[4] = {pb.createNot(basis[7]), pb.createAnd(prefix, pb.createNot(basis[5])),
+                                     pb.createAnd(prefix34, pb.createNot(basis[4])), pb.createAnd(prefix34, basis[4])};
+        std::vector<PabloAST *> barrier(8, pb.createZeroes());
+        for (unsigned L = 1; L <= 4; L++) {
+            const std::string bytes = [&] {
+                std::string b;
+                const UCD::codepoint_t c = UTF8_Barriers[L - 1];
+                if (L == 1) b += static_cast<char>(c);
+                else if (L == 2) {b += static_cast<char>(0xC0 | (c >> 6)); b += static_cast<char>(0x80 | (c & 0x3F));}
+                else if (L == 3) {b += static_cast<char>(0xE0 | (c >> 12)); b += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); b += static_cast<char>(0x80 | (c & 0x3F));}
+                else {b += static_cast<char>(0xF0 | (c >> 18)); b += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+                      b += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); b += static_cast<char>(0x80 | (c & 0x3F));}
+                return b;
+            }();
+            for (unsigned j = 0; j < L; j++) {
+                PabloAST * const at = j ? pb.createAdvance(leads[L - 1], j) : leads[L - 1];
+                for (unsigned b = 0; b < 8; b++) {
+                    if ((static_cast<unsigned char>(bytes[j]) >> b) & 1) barrier[b] = pb.createOr(barrier[b], at);
+                }
+            }
+        }
+        for (unsigned b = 0; b < 8; b++) basis[b] = pb.createSel(unselected, barrier[b], basis[b]);
+        writeOutputStreamSet("replaced", basis);
+    }
+};
+
+void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    StreamSet * const firsts = P.CreateStreamSet(1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(filter, &cc::Unicode)}, Basis, firsts,
+                                          pablo::BitMovementMode::LookAhead);
+    StreamSet * const spans = P.CreateStreamSet(1);
+    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.empty() ? nullptr : mMasks.back(), spans);
+    mMasks.push_back(spans);
+}
+
+//  A normalization within a filter, as in Unicode mode (see RulePipelineBuilder::
+//  barrierNormalization): each run of the characters of the filter normalized by
+//  itself, the characters outside it (and any barrier in the text) replaced in
+//  place by the barriers of their lengths, and restored after the normalization,
+//  which keeps the barriers in order; the masks are kept in step.
+StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    UCD::UnicodeSet barrierSet;
+    for (UCD::codepoint_t c : UTF8_Barriers) barrierSet.insert(c);
+    auto barrierSpans = [&](StreamSet * basis) {
+        StreamSet * const firsts = P.CreateStreamSet(1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(barrierSet, &cc::Unicode)}, basis, firsts,
+                                              pablo::BitMovementMode::LookAhead);
+        StreamSet * const spans = P.CreateStreamSet(1);
+        P.CreateKernelCall<UTF8_CharSpans>(basis, firsts, nullptr, spans);
+        return spans;
+    };
+    StreamSet * const notBarriers = P.CreateStreamSet(1);
+    Invert(P, barrierSpans(Basis), notBarriers);
+    StreamSet * const selected = P.CreateStreamSet(1);
+    AndCombine(P, mMasks.back(), notBarriers, selected);
+    StreamSet * const unselected = P.CreateStreamSet(1);
+    Invert(P, selected, unselected);
+    StreamSet * const Work = P.CreateStreamSet(8);
+    P.CreateKernelCall<UTF8_ReplaceUnselected>(Basis, selected, Work);
+    StreamSet * const Normalized = normalization(name, Work);
+    StreamSet * const barriers = barrierSpans(Normalized);
+    StreamSet * const others = P.CreateStreamSet(1);
+    Invert(P, barriers, others);
+    //  The bytes of the characters replaced, at the bytes of the barriers.
+    StreamSet * const outside = P.CreateStreamSet(8);
+    FilterByMask(P, unselected, Basis, outside);
+    StreamSet * const restored = P.CreateStreamSet(8);
+    SpreadByMask(P, barriers, outside, restored);
+    StreamSet * const kept = P.CreateStreamSet(8);
+    ZeroByMask(P, others, Normalized, kept);
+    StreamSet * const result = P.CreateStreamSet(8);
+    OrCombine(P, kept, restored, result);
+    //  The masks hold at the normalized characters, and keep their values at
+    //  the barriers.
+    for (StreamSet *& m : mMasks) {
+        StreamSet * const outer = P.CreateStreamSet(1);
+        FilterByMask(P, unselected, m, outer);
+        StreamSet * const spread = P.CreateStreamSet(1);
+        SpreadByMask(P, barriers, outer, spread);
+        StreamSet * const combined = P.CreateStreamSet(1);
+        OrCombine(P, spread, others, combined);
+        m = combined;
+    }
+    return result;
+}
+
+//  The full case mapping of a string override property (lc or uc): each
+//  character that changes (Changes_When_Lowercased or _Uppercased) mapped to
+//  its value.
+static const kernel::UTF8_CharMap & fullCaseMap(UCD::property_t prop) {
+    static std::map<UCD::property_t, kernel::UTF8_CharMap> maps;
+    auto f = maps.find(prop);
+    if (f != maps.end()) return f->second;
+    auto * obj = llvm::cast<UCD::StringOverridePropertyObject>(UCD::getPropertyObject(prop));
+    const UCD::property_t changes = (prop == UCD::lc) ? UCD::CWL : UCD::CWU;
+    const UCD::UnicodeSet changed = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(changes))->GetCodepointSet(UCD::Binary_ns::Y);
+    std::map<std::u32string, UCD::UnicodeSet> byValue;
+    for (const auto & range : changed) {
+        for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
+            const std::u32string value = obj->GetU32StringValue(cp);
+            if (value.size() == 1 && value[0] == cp) continue;
+            byValue[value].insert(cp);
+        }
+    }
+    kernel::UTF8_CharMap map;
+    for (auto & v : byValue) map.emplace_back(std::move(v.second), v.first);
+    return maps.emplace(prop, std::move(map)).first->second;
+}
+
+//  Any-Lower: as in Unicode mode (RulePipelineBuilder::builtIn), the Final_Sigma
+//  context of Σ (finalSigmaPlan: Σ → ς where its rule applies, with its contexts
+//  matched by the engine; Σ → σ is the lc mapping's), then the lc mapping.
+//  Any-Upper: the uc mapping.
+StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet * Basis) {
+    if (name == "Any-Lower") {
+        for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
+            for (const ldml::CharMapSubgroup & g : step.subgroups) {
+                for (const ldml::CharMapping & m : g.mappings) {
+                    if (m.replacement != std::u32string(1, U'ς')) continue;
+                    StreamSet * const applies = utf8Applies(mP, {&g}, Basis);
+                    Basis = kernel::UTF8_CharMapPipeline(mP, {{m.chars, m.replacement}}, Basis, m.chars, applies, masks());
+                }
+            }
+        }
+    }
+    return kernel::UTF8_CharMapPipeline(mP, fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis, UCD::UnicodeSet(),
+                                        nullptr, masks());
+}
+
+//  A transform in UTF-8 mode on the UTF-8 code units of a text, made
+//  well-formed first, as decoding UTF-8 does in Unicode mode (see
+//  kernel::WellFormedUTF8 and codegen::UTF8Errors).
+static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                     const ldml::TransformEntry * entry, StreamSet * Basis,
+                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
+    UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
+    return builder.transform(entry, kernel::WellFormedUTF8(P, Basis));
+}
+
+static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
+                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
+    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream));
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
+    return P.compile();
+}
+
 StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21) {
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
     const TransformAnalysis & a = mAnalyzer.analyze(entry);
+    if (ApplyShapeGroups) {
+        //  (A transform the regular plan does not implement, by its shape
+        //  groups; otherwise, segment by segment, the plan with fewer kernels.)
+        if (!a.implementable) {
+            assert (mAnalyzer.shapeGroupsOf(entry).applicable);
+            return applyShapeGroups(mAnalyzer.shapeGroupsOf(entry), U21);
+        }
+        //  (Within a filter, where the engine supports its passes within it, see
+        //  RulePipelineBuilder::applyShapeStep.)
+        const TransformAnalyzer::ShapeChoice & choice = shapeChoice(mRegistry, mAnalyzer, entry);
+        if (choice.any() && (!activeMask() || choice.appliesInFilter())) {
+            const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
+            mShapeChoice = &choice;
+            U21 = applyAnalysis(a, U21);
+            mShapeChoice = outer;
+            return U21;
+        }
+    }
     assert (a.implementable);
-    return applyAnalysis(a, U21);
+    const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
+    mShapeChoice = nullptr;
+    U21 = applyAnalysis(a, U21);
+    mShapeChoice = outer;
+    return U21;
+}
+
+//  A transform applied by its shape group plans (see --apply-shape-groups):
+//  its transform rules, and for each conversion group, its passes, each a
+//  search and replace of the engine, then the marks of its deferred calls and
+//  their arguments replaced by their values.  A character map, and the
+//  replacement of the marks (string rules M a → value), are planned as rules
+//  (ldml::planTransform) and applied as conversion groups.
+StreamSet * RulePipelineBuilder::applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21) {
+    const bool outermost = mDepth++ == 0;
+    const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
+    mShapeChoice = nullptr;
+    for (const TransformAnalyzer::ShapeStep & step : groups.steps) {
+        if (step.transform) {
+            U21 = transform(mRegistry.lookup(step.transform->getForwardID().getText()), U21);
+            continue;
+        }
+        U21 = applyShapeStep(step, U21, outermost);
+    }
+    mShapeChoice = outer;
+    mDepth--;
+    return U21;
+}
+
+StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeStep & step, StreamSet * U21, bool outermost) {
+    //  (A phase boundary after each pass only with --shape-phase-boundaries.)
+    //  Within a filter, as in ICU, the text a rule matches lies within the
+    //  filter (in a run of its characters), while its contexts match the whole
+    //  text (see pushFilter): the active mask is the text mask of the engine
+    //  (see RE_context::textMask).  The masks of the filters are carried
+    //  through the replacement: the text the replacements write is within them.
+    auto searchReplace = [&](size_t i, StreamSet * text) {
+        StreamSet * const mask = activeMask();
+        RE_context context{&cc::Unicode, text};
+        if (mask) {
+            if (!step.failuresInFilter[i].empty()) {
+                llvm::report_fatal_error(llvm::StringRef("tconv: a pass of shape groups not applicable within a filter: ")
+                                         + step.failuresInFilter[i].front().reason);
+            }
+            context.textMask = mask;
+        }
+        RE_PipelineBuilder engine(mP, context);
+        StreamSet * const result = mP.CreateStreamSet(21);
+        if (!mask) {
+            engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result);
+        } else {
+            //  (Every match lies within each mask.)
+            StreamSet * masks = mMasks.front();
+            if (mMasks.size() > 1) {
+                masks = mP.CreateStreamSet(mMasks.size());
+                mP.CreateKernelCall<CollectStreams>(mMasks, masks);
+            }
+            StreamSet * const resultMasks = mP.CreateStreamSet(mMasks.size());
+            engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result, masks, resultMasks);
+            for (size_t k = 0; k < mMasks.size(); k++) {
+                if (mMasks.size() == 1) {
+                    mMasks[k] = resultMasks;
+                    break;
+                }
+                mMasks[k] = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<StreamSelect>(mMasks[k], Select(resultMasks, {static_cast<unsigned>(k)}));
+            }
+        }
+        if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
+        return result;
+    };
+    const size_t kernels = mP.getNumOfKernelCalls();
+    size_t rules = 0;
+    for (const ldml::ShapePass & p : step.plan.passes) rules += p.rules.size();
+    for (size_t i = 0; i < step.plan.passes.size(); i++) {
+        if (!step.plan.passes[i].map) {
+            U21 = searchReplace(i, U21);
+            continue;
+        }
+        for (const ldml::TransformStep & s : step.maps[i].steps) U21 = conversionGroup(s, U21);
+        if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
+    }
+    for (const ldml::TransformStep & s : step.markMap.steps) U21 = conversionGroup(s, U21);
+    if (outermost && rules > 0) mGroupCounts.push_back({rules, mP.getNumOfKernelCalls() - kernels});
+    return U21;
 }
 
 //  The deferred rules of a group (see ldml::DeferredRule and DeferredPlan).
@@ -9572,7 +10547,22 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mNextDeletedRunEnds = nullptr;
     mNextDeletedRunAfter = nullptr;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
+    //  The segments applied by their shape groups (see TransformAnalyzer::
+    //  ShapeChoice): their shape groups in place of their conversion groups.
+    const TransformAnalyzer::ShapeChoice * const choice = mShapeChoice;
+    mShapeChoice = nullptr;
+    size_t segment = 0;
+    std::vector<bool> applied(choice ? choice->useShapes.size() : 0, false);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            segment++;
+        } else if (choice && choice->useShapes[segment]) {
+            if (!applied[segment]) {
+                for (const TransformAnalyzer::ShapeStep & s : choice->shapeSegments[segment]) U21 = applyShapeStep(s, U21, outermost);
+                applied[segment] = true;
+            }
+            continue;
+        }
         //  (The positions of the runs deleted by prefix runs, for the step after
         //  them, past :: Null ;.)
         const bool null = step.kind == ldml::TransformStep::Kind::Transform && !step.filter
@@ -9604,6 +10594,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
         }
     }
     if (a.plan.filter) popFilter();
+    mShapeChoice = choice;
     mDeletedRunEnds = deletedRunEnds;
     mNextDeletedRunEnds = nextDeletedRunEnds;
     mDeletedRunAfter = deletedRunAfter;
@@ -9643,14 +10634,34 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     TransformAnalyzer analyzer(registry);
     const TransformAnalysis & a = analyzer.analyze(entry);
     size_t groups = 0, rules = 0;
+    //  (With --apply-shape-groups: the transform by its shape groups, if the
+    //  regular plan does not implement it; otherwise its segments by the plan
+    //  with fewer kernels, see shapeChoice.  The groups and rules are then
+    //  those built.)
+    const bool byShapeGroups = ApplyShapeGroups && !entry->isBuiltIn() && !a.implementable
+                               && analyzer.shapeGroupsOf(entry).applicable;
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Conversion && groupRules(step) > 0) {
             groups++;
             rules += groupRules(step);
         }
     }
-    toolio::out() << "kernel counts: " << entry->canonicalName << "\n";
-    if (!a.implementable) {
+    toolio::out() << "kernel counts: " << entry->canonicalName << (byShapeGroups ? " (by shape groups)" : "") << "\n";
+    if (ApplyShapeGroups && !entry->isBuiltIn()) {
+        if (!analyzer.shapeGroupsOf(entry).applicable) {
+            toolio::out() << "not entirely by shape groups: " << analyzer.shapeGroupsOf(entry).reason << "\n";
+        }
+        if (a.implementable) {
+            const TransformAnalyzer::ShapeChoice & choice = shapeChoice(registry, analyzer, entry);
+            if (!choice.aligned) toolio::out() << "segments not aligned: regular plan\n";
+            for (size_t k = 0; choice.aligned && k < choice.useShapes.size(); k++) {
+                if (choice.shapeKernels[k] == 0 && choice.regularKernels[k] == 0) continue;
+                toolio::out() << "segment " << (k + 1) << ": regular " << choice.regularKernels[k] << " kernels, shape groups "
+                              << choice.shapeKernels[k] << " kernels: " << (choice.useShapes[k] ? "shape groups" : "regular") << "\n";
+            }
+        }
+    }
+    if (!a.implementable && !byShapeGroups) {
         toolio::out() << "total: " << groups << " groups, " << rules << " rules\n";
         return 2;
     }
@@ -9662,6 +10673,22 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     const size_t base = P.getNumOfKernelCalls();
+    //  (In UTF-8 mode, the kernels from the UTF-8 basis bits.)
+    if (UTF8Mode && !entry->isBuiltIn() && analyzer.mode(entry).utf8) {
+        StreamSet * const Basis = BasisOf(P, ByteStream);
+        const size_t from = P.getNumOfKernelCalls();
+        std::vector<std::pair<size_t, size_t>> counts;
+        utf8TransformText(P, registry, analyzer, entry, Basis, &counts);
+        size_t groupKernels = 0;
+        for (size_t i = 0; i < counts.size(); i++) {
+            toolio::out() << "group " << (i + 1) << ": " << counts[i].first << " rules, " << counts[i].second << " kernels\n";
+            groupKernels += counts[i].second;
+        }
+        toolio::out() << "mode: UTF-8\n";
+        toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
+                     << (P.getNumOfKernelCalls() - from) << " kernels\n";
+        return 0;
+    }
     RulePipelineBuilder builder(P, registry, analyzer);
     builder.omitICUBuiltIns();
     if (entry->canonicalName == "Any-CaseFold") {
@@ -9673,6 +10700,11 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     }
     builder.transform(entry, U21);
     const size_t total = P.getNumOfKernelCalls() - base;
+    if (ApplyShapeGroups) {
+        groups = builder.groupCounts().size();
+        rules = 0;
+        for (const RulePipelineBuilder::GroupCount & g : builder.groupCounts()) rules += g.rules;
+    }
     size_t groupKernels = 0;
     for (size_t i = 0; i < builder.groupCounts().size(); i++) {
         const RulePipelineBuilder::GroupCount & g = builder.groupCounts()[i];
@@ -10033,6 +11065,31 @@ static int run(int argc, char *argv[]);
 //  The reports (--list-transforms, --plan, --kernel-counts, --revisit-report)
 //  and the transformed text go to the output: the standard output, or the
 //  file of --output.
+//  The mode of a transform (see TransformAnalyzer::mode), for --plan.
+static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+    const TransformAnalyzer::Mode & m = analyzer.mode(entry);
+    if (m.utf8) {
+        toolio::out() << "  mode: UTF-8" << (UTF8Mode ? "" : " (not used: --utf8-mode=0)") << "\n";
+        //  (The single-character rules with contexts of its own groups, and
+        //  how the engine matches them, see RE_Plan.)
+        for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+            kernel::UTF8_CharMap map;
+            std::string reason;
+            std::vector<const ldml::CharMapSubgroup *> contextual;
+            if (step.kind != ldml::TransformStep::Kind::Conversion || !utf8CharMap(step, map, reason, &contextual)) continue;
+            for (const ldml::CharMapSubgroup * g : contextual) {
+                UCD::UnicodeSet chars;
+                for (const ldml::CharMapping & mp : g->mappings) chars = chars + mp.chars;
+                const RE_Plan plan = planRE(prepareRE(contextPattern(g->engineBefore, g->engineAfter, {re::makeCC(chars, &cc::Unicode)}),
+                                                      engineOptions()), &cc::UTF8);
+                toolio::out() << "    contexts [" << g->contextKey << "] matched by the engine in " << plan.modeName() << " mode\n";
+            }
+        }
+    } else {
+        toolio::out() << "  mode: Unicode: " << m.reason << "\n";
+    }
+}
+
 int main(int argc, char *argv[]) {
     const int status = run(argc, argv);
     return toolio::finishOutput() ? status : 1;
@@ -10163,11 +11220,62 @@ static int run(int argc, char *argv[]) {
         for (const std::string & line : a.revisitReport) toolio::out() << line << "\n";
         return 0;
     }
+    if (ShowShapeGroups) {
+        if (entry->isBuiltIn()) {
+            llvm::errs() << "Error: " << entry->canonicalName << " is a built-in transform\n";
+            return 1;
+        }
+        return printShapeGroups(registry, entry);
+    }
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);
-        printPlan(entry->canonicalName + (!entry->isBuiltIn() ? " (" + entry->file + ")"
-                                          : isICUBuiltIn(entry->canonicalName) ? " (built-in, applied by ICU)" : " (built-in)"), a);
+        const std::string label = entry->canonicalName + (!entry->isBuiltIn() ? " (" + entry->file + ")"
+                                  : isICUBuiltIn(entry->canonicalName) ? " (built-in, applied by ICU)" : " (built-in)");
+        //  With --apply-shape-groups, the plan applied (see RulePipelineBuilder::
+        //  transform): by the shape groups, for a transform the regular plan
+        //  does not implement; otherwise, segment by segment.
+        if (ApplyShapeGroups && !entry->isBuiltIn()) {
+            const TransformAnalyzer::ShapeGroups & groups = analyzer.shapeGroupsOf(entry);
+            if (!a.implementable && groups.applicable) {
+                toolio::out() << label << ": implementable by shape groups (the regular plan is not)\n";
+                for (const std::string & p : a.problems) toolio::out() << "  regular plan problem: " << p << "\n";
+                for (const TransformAnalyzer::ShapeStep & step : groups.steps) {
+                    if (step.transform) {
+                        toolio::out() << "  transform " << step.transform->getForwardID().getText() << "\n";
+                    } else {
+                        printShapeStep(step);
+                    }
+                }
+                return 0;
+            }
+            //  (The transforms invoked by their shape groups, within filters
+            //  where their passes apply within them.)
+            auto note = [&](const ldml::TransformStep & step) -> std::string {
+                const ldml::TransformEntry * used = registry.lookup(step.transform.getText());
+                if (used == nullptr || used->isBuiltIn()) return "";
+                if (!analyzer.analyze(used).implementable) return analyzer.shapeGroupsOf(used).applicable ? " (by its shape groups)" : "";
+                const TransformAnalyzer::ShapeChoice & c = shapeChoice(registry, analyzer, used);
+                if ((step.filter || a.plan.filter) && !c.appliesInFilter()) return "";
+                std::string segments;
+                for (size_t k = 0; c.aligned && k < c.useShapes.size(); k++) {
+                    if (c.useShapes[k]) segments += (segments.empty() ? "" : ", ") + std::to_string(k + 1);
+                }
+                const bool several = segments.find(',') != std::string::npos;
+                return segments.empty() ? "" : std::string(several ? " (segments " : " (segment ") + segments + " by shape groups, see its --plan)";
+            };
+            if (a.implementable) {
+                printPlan(label, a, &shapeChoice(registry, analyzer, entry), note);
+                if (!groups.applicable) toolio::out() << "  (not entirely by shape groups: " << groups.reason << ")\n";
+                printMode(analyzer, entry);
+                return 0;
+            }
+            printPlan(label, a);
+            toolio::out() << "  not by shape groups: " << groups.reason << "\n";
+            return 2;
+        }
+        printPlan(label, a);
+        if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry);
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
@@ -10194,8 +11302,13 @@ static int run(int argc, char *argv[]) {
     //  The transform applied by ICU (see --use-ICU): all of it, by its name or
     //  as tconv does not implement its own rules, or only the transforms its
     //  rules invoke that ICU applies (in stages with the rest).
-    const bool implemented = impl != implementedTransforms.end() || analyzer.analyze(entry).implementable;
-    bool wholeICU = icu->selected(entry, TransformName) || (entry->isBuiltIn() && isICUBuiltIn(entry->canonicalName));
+    //  (With --apply-shape-groups, a transform the regular plan does not
+    //  implement may be applied by its shape groups; one it does is applied
+    //  with its segments chosen by kernels, see shapeChoice.)
+    const bool byShapeGroups = ApplyShapeGroups && !entry->isBuiltIn() && !analyzer.analyze(entry).implementable
+                               && analyzer.shapeGroupsOf(entry).applicable;
+    const bool implemented = impl != implementedTransforms.end() || analyzer.analyze(entry).implementable || byShapeGroups;
+    bool wholeICU = !byShapeGroups && (icu->selected(entry, TransformName) || (entry->isBuiltIn() && isICUBuiltIn(entry->canonicalName)));
     if (!wholeICU && !implemented && (entry->isBuiltIn() || !ownProblems(analyzer.analyze(entry)).empty())) {
         if (icu->off) return notImplemented("");
         wholeICU = true;
@@ -10207,7 +11320,7 @@ static int run(int argc, char *argv[]) {
                || (!icu->off && (used == nullptr || !analyzer.analyze(used).implementable));
     };
     bool staged = false;
-    if (!wholeICU && !entry->isBuiltIn()) {
+    if (!wholeICU && !entry->isBuiltIn() && !byShapeGroups) {
         for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
             staged |= step.kind == ldml::TransformStep::Kind::Transform && byICU(step);
         }
@@ -10247,7 +11360,8 @@ static int run(int argc, char *argv[]) {
                         && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode
                         && impl->second != Transform::Remove;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
-                                      : generateRulePipeline(driver, registry, analyzer, entry);
+                               : (UTF8Mode && analyzer.mode(entry).utf8) ? generateUTF8Pipeline(driver, registry, analyzer, entry)
+                               : generateRulePipeline(driver, registry, analyzer, entry);
     applyToInput(pipelineRunner(fn), MainInput.fd);
     return finishOutput();
 }

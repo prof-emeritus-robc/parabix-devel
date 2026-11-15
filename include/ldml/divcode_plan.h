@@ -108,7 +108,6 @@ struct DivCodePlan {
     std::vector<DivRule> rules;             // by leaf (anchor code), in rule order within a leaf
     std::vector<std::vector<size_t>> leaves;    // leaves[code - 1]: the rules anchored there
     size_t sourceRules = 0;                 // string rules + mappings, before splitting
-    std::string alphabetName;               // for the Div32Code / Div64Code kernel (block list, or a hash)
     std::string contentHash;                // of the whole plan
     std::vector<std::string> problems;
     bool eligible() const {return problems.empty();}

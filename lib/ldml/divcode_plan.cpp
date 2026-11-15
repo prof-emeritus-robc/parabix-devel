@@ -360,11 +360,9 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         }
     }
 
-    //  The names: the alphabet (its blocks, or a hash of them), and the hash of
-    //  the whole plan.
+    //  The hash of the whole plan (the alphabet is named by the DivCode kernel).
     std::string blockList;
     for (UCD::codepoint_t b : plan.blocks) blockList += (blockList.empty() ? "x" : "_x") + hex(b);
-    plan.alphabetName = plan.blocks.size() <= 8 ? blockList : "h" + hex(fnv1a(blockList), 16);
     std::string content = "s" + std::to_string(s) + ";" + blockList + ";";
     for (const UCD::UnicodeSet & e : plan.externalSets) appendSet(content, e);
     auto appendItem = [&](const DivContextItem & item) {

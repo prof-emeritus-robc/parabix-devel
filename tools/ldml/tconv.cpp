@@ -106,6 +106,7 @@
 #include <ucd/utf/transchar.h>
 #include <ldml/transform_plan.h>
 #include <ldml/shape_groups.h>
+#include <ldml/divcode_plan.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
@@ -208,6 +209,10 @@ static cl::opt<bool> DisableEngineSearchReplace("disable-engine-search-replace",
                                                 cl::desc("Apply no conversion group by the search and replace of the regular "
                                                          "expression engine (see engineSearchReplace)"),
                                                 cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> DivCodeReport("divcode-report",
+    cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
+             "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
+    cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> KernelCounts("kernel-counts", cl::desc("Report the conversion groups of the transform (with their rules and "
                                   "kernels) and the kernels of its pipeline, built without compiling it, and exit"),
                                   cl::init(false), cl::cat(TconvOptions));
@@ -10630,6 +10635,102 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
 //  A built-in transform that only the direct pipeline implements (Any-CaseFold)
 //  is counted in its direct pipeline, including the kernels decoding the input
 //  and encoding the result.
+//  --divcode-report: the DivCode plan of each conversion group with string rules
+//  (see ldml/divcode_plan.h, doc/ldml-divcode-plan.md), one JSON object per
+//  line: whether it is eligible (or its problems), and for div32 and div64, its
+//  alphabet, rules (split by the blocks of their first sets), leaves, and the
+//  bits its translations change (by the XOR technique: at each position of a
+//  match, from a known character or a gap to a known character; the bits above
+//  the low s shared by the matches with the same offset, source block and
+//  target block).
+static std::string jsonEscape(const std::string & s) {
+    std::string r;
+    for (char c : s) {
+        if (c == '"' || c == '\\') {r += '\\'; r += c;}
+        else if (static_cast<unsigned char>(c) < 0x20) {char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); r += b;}
+        else r += c;
+    }
+    return r;
+}
+
+//  Whether a before context of a group may match differently in the converted
+//  text (see convertedContextMatters), or is not a sequence of sets.
+static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * engineBefore) {
+    if (engineBefore == nullptr) return false;
+    FusedContexts before;
+    return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
+}
+
+static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
+    const unsigned s = plan.shift;
+    size_t expanding = 0, deleting = 0, maxExpansion = 0, maxLeaf = 0, upperNaive = 0, lower = 0, setPositions = 0, maxLength = 0;
+    std::map<std::tuple<size_t, UCD::codepoint_t, UCD::codepoint_t>, unsigned> pairs;
+    for (const ldml::DivRule & d : plan.rules) {
+        if (d.expansion()) expanding++;
+        if (d.deletions()) deleting++;
+        maxExpansion = std::max(maxExpansion, d.expansion());
+        maxLength = std::max(maxLength, d.length());
+        const size_t n = d.length(), m = d.result.size();
+        for (size_t i = 0; i < m; i++) {
+            if (i < n && d.text[i].count() != 1) {setPositions++; continue;}
+            const UCD::codepoint_t src = i < n ? d.text[i].begin()->first : 0, dst = d.result[i];
+            const unsigned upper = __builtin_popcount((src ^ dst) >> s);
+            upperNaive += upper;
+            lower += __builtin_popcount((src ^ dst) & ((1u << s) - 1));
+            if (upper) pairs[std::make_tuple(i, src >> s, dst >> s)] = upper;
+        }
+    }
+    size_t upperShared = 0;
+    for (const auto & p : pairs) upperShared += p.second;
+    for (const auto & l : plan.leaves) maxLeaf = std::max(maxLeaf, l.size());
+    std::string r = "{\"blocks\": " + std::to_string(plan.blocks.size()) + ", \"code_bits\": " + std::to_string(plan.codeBits)
+        + ", \"rules\": " + std::to_string(plan.rules.size()) + ", \"max_leaf\": " + std::to_string(maxLeaf)
+        + ", \"max_length\": " + std::to_string(maxLength)
+        + ", \"external_sets\": " + std::to_string(plan.externalSets.size())
+        + ", \"expanding_rules\": " + std::to_string(expanding) + ", \"max_expansion\": " + std::to_string(maxExpansion)
+        + ", \"deleting_rules\": " + std::to_string(deleting)
+        + ", \"xor_upper\": " + std::to_string(upperNaive) + ", \"xor_upper_shared\": " + std::to_string(upperShared)
+        + ", \"xor_pairs\": " + std::to_string(pairs.size()) + ", \"xor_lower\": " + std::to_string(lower)
+        + ", \"set_positions\": " + std::to_string(setPositions)
+        + ", \"alphabet\": \"Div" + std::string(s == 5 ? "32" : "64") + "Code_" + plan.alphabetName + "\""
+        + ", \"hash\": \"" + plan.contentHash + "\"}";
+    return r;
+}
+
+static int printDivCodeReport(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
+    TransformAnalyzer analyzer(registry);
+    const TransformAnalysis & a = analyzer.analyze(entry);
+    size_t group = 0;
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) continue;
+        group++;
+        if (step.stringRules.empty()) continue;
+        ldml::DivCodeOptions options;
+        options.convertedBefore = convertedBeforeContext;
+        options.shift = 5;
+        const ldml::DivCodePlan p32 = ldml::planDivCodeGroup(step, options);
+        options.shift = 6;
+        const ldml::DivCodePlan p64 = ldml::planDivCodeGroup(step, options);
+        std::string problems;
+        for (const std::string & p : p32.problems) problems += (problems.empty() ? "\"" : ", \"") + jsonEscape(p) + "\"";
+        //  (Problems of div64 alone: the code bits.)
+        for (const std::string & p : p64.problems) {
+            if (std::find(p32.problems.begin(), p32.problems.end(), p) == p32.problems.end()) {
+                problems += (problems.empty() ? "\"" : ", \"") + jsonEscape("div64: " + p) + "\"";
+            }
+        }
+        toolio::out() << "{\"transform\": \"" << jsonEscape(entry->canonicalName) << "\", \"implementable\": "
+                      << (a.implementable ? "true" : "false") << ", \"group\": " << group
+                      << ", \"string_rules\": " << step.stringRules.size() << ", \"subgroups\": " << step.subgroups.size()
+                      << ", \"source_rules\": " << p32.sourceRules
+                      << ", \"eligible\": " << (p32.eligible() ? "true" : "false")
+                      << ", \"eligible64\": " << (p64.eligible() ? "true" : "false")
+                      << ", \"problems\": [" << problems << "]"
+                      << ", \"div32\": " << divCodeShiftReport(p32) << ", \"div64\": " << divCodeShiftReport(p64) << "}\n";
+    }
+    return 0;
+}
+
 static int printKernelCounts(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
     TransformAnalyzer analyzer(registry);
     const TransformAnalysis & a = analyzer.analyze(entry);
@@ -11211,6 +11312,10 @@ static int run(int argc, char *argv[]) {
         return 1;
     }
     if (KernelCounts) return printKernelCounts(registry, entry);
+    if (DivCodeReport) {
+        if (entry->isBuiltIn()) return 0;
+        return printDivCodeReport(registry, entry);
+    }
     if (RevisitReport) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);

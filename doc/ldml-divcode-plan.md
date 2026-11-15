@@ -286,6 +286,66 @@ the same output.
 - Leaf If entries were not measured: `-EnableProfiling` (Pablo branch counters)
   ran over 12 minutes without finishing on one transform.
 
+A correction to these figures: the CYCLES column of `-EnableCycleCounter`
+includes the time a kernel spends synchronizing with other threads, so the
+totals above overstate some kernels. Counted in execution cycles (CYCLES ×
+EXEC%), DivCode in Unicode mode is still ahead of the regular plan on all nine
+transforms (from −1% to −45%; see the next section).
+
+### UTF-8 mode (phase 2)
+
+DivCode groups also apply to UTF-8 code units, and a transform whose
+conversion groups are character maps or DivCode-eligible groups now runs in
+UTF-8 mode (the default; `--utf8-mode=0` for Unicode mode), as do rules files
+(`--rules-file`).
+
+- **Codes and pseudo-basis.** `DivCodeKernel` marks the code at the first byte
+  of each character (LookAhead mode). The low s bits of a character are those of
+  its last byte, at offset + L − 1 for its length L: each block has one UTF-8
+  length (the length boundaries 0x80, 0x800 and 0x10000 are multiples of 64), and
+  s ≤ 6 bits fit in the last byte.
+- **Lengths.** A rule's offsets, gaps, insertions and deletions count bytes.
+  Each text position after the first has characters of one UTF-8 length
+  (`DivCodeOptions::utf8`; the first is split by blocks). The characters whose
+  length is not known (context items, the character before an anchor) take it
+  from their first byte: the low bits of an item are selected by it, and a before
+  item is moved past the character by an Advance of each length.
+- **Changes** are per byte: the bits that a set position does not vary (the
+  leading bytes, and the high bits of the last) by constant XORs, the low bits
+  of the last byte flipped where they differ from the result's.
+- **After items** are tested once per position by a kernel of their own
+  (`DivCode Items`), read by the translation and Count kernels with a lookahead
+  (Pablo lookahead applies to the inputs of a kernel only); in both modes.
+- **Filters** are masks over the bytes of the selected characters, as in the
+  other kernels of UTF-8 mode.
+
+Execution cycles (CYCLES × EXEC%) and single-thread times, on the corpora of
+step 5 (each configuration alone, `-thread-num=4` for the cycles):
+
+| transform | DivCode Unicode vs regular | DivCode UTF-8 vs regular | 1 thread, s: regular / Unicode / UTF-8 |
+|---|--:|--:|--:|
+| Latn-Armn | −14.4% | −59.4% | 0.194 / 0.180 / 0.119 |
+| Armn-Latn | −14.1% | −55.7% | 0.161 / 0.147 / 0.106 |
+| ja_Hrkt-ja_Latn/BGN | −22.8% | −53.2% | 0.309 / 0.269 / 0.201 |
+| InterIndic-Devanagari | −4.4% | −53.1% | 0.123 / 0.120 / 0.081 |
+| Cyrl-Latn | −1.9% | −51.4% | 0.203 / 0.202 / 0.133 |
+| byn_Ethi-byn_Latn/Xaleget | −31.9% | −44.2% | 0.183 / 0.163 / 0.154 |
+| Hira-Kana | −0.9% | −27.9% | 0.387 / 0.383 / 0.315 |
+| Thaa-Latn | −44.6% | −35.4% | 0.212 / 0.159 / 0.187 |
+| Halfwidth-Fullwidth | −6.0% | +19.4% | 0.093 / 0.092 / 0.104 |
+
+- UTF-8 mode is the best for seven of the nine, about halving the execution
+  cycles: the DivCode kernels cost 2–4 times as much on bytes, but the decoding,
+  encoding and other steps of the transform cost much less.
+- Thaa-Latn, a single large group (430 rules), is best in Unicode mode, where
+  the group's own cost dominates.
+- Halfwidth-Fullwidth is worse in UTF-8 mode than the regular plan: every ASCII
+  character becomes 3 bytes, so the whole text is counted, spread and filled in
+  gaps, while in Unicode mode nothing expands.
+- UTF-8 mode stays the default. To do: choose Unicode mode for a transform of
+  DivCode groups alone with large groups or dense expansions in bytes, once such
+  a rule is validated on more transforms.
+
 ## 7. Results of step 1
 
 `tconv --divcode-report <transform>` (one JSON object per conversion group with
@@ -349,6 +409,7 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
 6. Phase 2:
    - UTF-8 mode: codes at first bytes; one UTF-8 length per class (s ≤ 6); offsets
      in code units; set positions of mixed lengths split by length or excluded.
+     (Done, with set positions of mixed lengths excluded; see "UTF-8 mode" in §6.)
    - One-way overlaps (topological stages).
    - Longer contexts and text boundaries.
    - Converted before contexts.

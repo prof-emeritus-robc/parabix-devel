@@ -57,6 +57,9 @@ struct DivCodeOptions {
     // For UTF-8 code units: each position of a text has characters of one
     // UTF-8 length (the first, split by blocks, always does).
     bool utf8 = false;
+    // At most this many stages of string rules with one-way overlaps (see
+    // DivRule::stage).
+    unsigned maxStages = 8;
     // Whether a before context (as given for the regular expression engine)
     // may match differently in the text as converted by the group, against
     // which ICU matches it (or is not known not to).  If not given, no before
@@ -83,6 +86,14 @@ struct DivContextItem {
     bool present() const {return kind != Kind::None;}
 };
 
+// A context: a fixed sequence of items (sets), from the one next to the text
+// outward.  Only the outermost item may hold at the text boundary (negated):
+// beyond an inner one, a character must still match.
+struct DivContext {
+    std::vector<DivContextItem> items;
+    bool present() const {return !items.empty();}
+};
+
 // An earlier rule that a rule yields to at its first position (see
 // TransformStep::stringPriority and subgroupPriority): a string rule (its
 // index in TransformStep::stringRules), or the single-character rule of a
@@ -100,8 +111,14 @@ struct DivRule {
     unsigned anchor = 0;                    // the code of the block of text[0]
     std::vector<UCD::UnicodeSet> text;      // text[0] within the anchor block
     std::u32string result;
-    DivContextItem before, after;
+    DivContext before, after;
     std::vector<DivEarlier> yieldsTo;
+    // The stage of a string rule (from 1; 0 for a single-character rule).  With
+    // one-way overlaps (see StringRuleOverlaps), a rule within whose texts a
+    // rule may match precedes it: the stage of a rule is one more than the
+    // highest stage of the rules preceding it (1 if none), and a match applies
+    // unless it begins strictly within an applied match of an earlier stage.
+    unsigned stage = 0;
     size_t length() const {return text.size();}
     size_t expansion() const {return result.size() > text.size() ? result.size() - text.size() : 0;}
     size_t deletions() const {return text.size() > result.size() ? text.size() - result.size() : 0;}
@@ -116,8 +133,10 @@ struct DivCodePlan {
     std::vector<std::vector<size_t>> leaves;    // leaves[code - 1]: the rules anchored there
     // The context items (before, after) of each subgroup of the step, for the
     // earlier single-character rules that rules yield to.
-    std::vector<std::pair<DivContextItem, DivContextItem>> subgroupContexts;
+    std::vector<std::pair<DivContext, DivContext>> subgroupContexts;
     size_t sourceRules = 0;                 // string rules + mappings, before splitting
+    unsigned stages = 0;                    // the number of stages of the string rules (see DivRule::stage)
+    size_t overlapPairs = 0;                // the one-way overlaps of the string rules
     std::string contentHash;                // of the whole plan
     std::vector<std::string> problems;
     bool eligible() const {return problems.empty();}

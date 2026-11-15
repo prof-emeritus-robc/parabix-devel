@@ -525,3 +525,37 @@ of stages (initially 8) stay ineligible.
    fused kernels' tier A), which would make most of the other 36 groups with
    one-way overlaps eligible.
 
+### Status (2026-11-15)
+
+- **Steps 1 and 2 are done.** Stages are planned (`DivRule::stage`) and applied
+  by one If-hierarchy pass per stage, in Count and Translate modes and in both
+  encodings. Priority works across stages: raw matches are computed per leaf as
+  needed, for a pass's own rules and the earlier rules they yield to.
+  - The Vars of the applied string matches are keyed by stage. Each cover reads
+    only the Vars of the stages before it. Otherwise the Pablo builder reuses
+    the expression of an earlier cover over the same Vars, computed before a
+    later pass assigned them, and the single-character rules within the
+    matches of that pass are not covered.
+- **Contexts of two or more items are done.** A context is a fixed sequence of
+  items, from the text outward; only the outermost may hold at the text
+  boundary (a bare `[$]` included).
+  - Before contexts are chained at the top level, by moving each item's value
+    past the character before it (`next`).
+  - After contexts are chained by the Items kernel on the text before it is
+    spread, each item at a lookahead offset (in UTF-8, one for each length of
+    the characters before it). The streams are then spread with the text.
+- **Eligibility:** 76 of the 212 groups with string rules (12,442 rules), against
+  45 before stages. The new ones include my-my_Latn (1,527 rules, 4 stages),
+  ru-zh (1,207 rules, 8 stages) and Bopo-Latn (871 rules, 4 stages).
+- **What remains:**
+  - before contexts matched against the converted text (65 groups, the only
+    problem of 30)
+  - two-way and self overlaps (61, the only problem of 20)
+  - contexts with repetitions or alternatives (30)
+- **Tests** (`QA/tconv_divcode_test.py`): the 31 CLDR groups with stages or
+  multi-item contexts, and 16 rules files of these cases, in both encodings,
+  give the regular plan's output (and ICU's, for the rules files). None of the
+  other tconv suites has an eligible group with one-way overlaps. Four have
+  such groups, each blocked by another limit; Bopo-Latn in
+  `tconv_shape_groups_test` is now eligible.
+

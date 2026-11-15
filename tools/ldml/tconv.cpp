@@ -107,6 +107,7 @@
 #include <ldml/transform_plan.h>
 #include <ldml/shape_groups.h>
 #include <ldml/divcode_plan.h>
+#include <kernel/unicode/divcode.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
@@ -209,6 +210,13 @@ static cl::opt<bool> DisableEngineSearchReplace("disable-engine-search-replace",
                                                 cl::desc("Apply no conversion group by the search and replace of the regular "
                                                          "expression engine (see engineSearchReplace)"),
                                                 cl::init(false), cl::cat(TconvOptions));
+static cl::opt<unsigned> DivCodeCodes("divcode-codes",
+    cl::desc("Smoke test of the Div32Code/Div64Code kernels: replace each character of the input by U+4000 | (its external "
+             "classes << 10) | its code, in the alphabet of the given conversion group (numbered from 1, as by "
+             "--divcode-report) of the transform's own rules; the alphabet is described on the standard error"),
+    cl::init(0), cl::cat(TconvOptions), cl::Hidden);
+static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32) or 6 (div64)"),
+                                      cl::init(5), cl::cat(TconvOptions));
 static cl::opt<bool> DivCodeReport("divcode-report",
     cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
              "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
@@ -10692,7 +10700,7 @@ static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
         + ", \"xor_upper\": " + std::to_string(upperNaive) + ", \"xor_upper_shared\": " + std::to_string(upperShared)
         + ", \"xor_pairs\": " + std::to_string(pairs.size()) + ", \"xor_lower\": " + std::to_string(lower)
         + ", \"set_positions\": " + std::to_string(setPositions)
-        + ", \"alphabet\": \"Div" + std::string(s == 5 ? "32" : "64") + "Code_" + plan.alphabetName + "\""
+        + ", \"alphabet\": \"Div" + std::string(s == 5 ? "32" : "64") + "Code_" + DivCodeKernel::alphabetName(plan.blocks) + "\""
         + ", \"hash\": \"" + plan.contentHash + "\"}";
     return r;
 }
@@ -11191,6 +11199,112 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
     }
 }
 
+//  The code bixnum of a DivCode plan's alphabet (see kernel::DivCodeKernel).
+static StreamSet * DivCodeOf(PipelineBuilder & P, const ldml::DivCodePlan & plan, StreamSet * Basis,
+                             BitMovementMode mode = BitMovementMode::LookAhead) {
+    StreamSet * const Code = P.CreateStreamSet(std::max(plan.codeBits, 1u));
+    P.CreateKernelCall<DivCodeKernel>(plan.shift, plan.blocks, Basis, Code, mode);
+    return Code;
+}
+
+//  The class streams of a DivCode plan's external sets (one each), or nullptr.
+static StreamSet * DivCodeExternalsOf(PipelineBuilder & P, const ldml::DivCodePlan & plan, StreamSet * Basis,
+                                      BitMovementMode mode = BitMovementMode::LookAhead) {
+    if (plan.externalSets.empty()) return nullptr;
+    std::vector<re::CC *> ccs;
+    for (const UCD::UnicodeSet & s : plan.externalSets) ccs.push_back(re::makeCC(s, &cc::Unicode));
+    StreamSet * const Externals = P.CreateStreamSet(ccs.size());
+    if (Basis->getNumElements() == 21) {
+        P.CreateKernelCall<CharClassesKernel>(ccs, Basis, Externals);
+    } else {
+        P.CreateKernelCall<CharClassesKernel>(ccs, Basis, Externals, mode);
+    }
+    return Externals;
+}
+
+//  For the smoke test (--divcode-codes): each character replaced by the
+//  codepoint 0x4000 | (externals << 10) | code, its code (of at most 10 bits)
+//  and the bits of the external classes (at most 4) it is in.
+class DivCodeDumpKernel final : public PabloKernel {
+public:
+    DivCodeDumpKernel(LLVMTypeSystemInterface & ts, StreamSet * Code, StreamSet * Externals, StreamSet * U21)
+    : PabloKernel(ts, "DivCodeDump_" + std::to_string(Code->getNumElements()) + "_"
+                  + std::to_string(Externals ? Externals->getNumElements() : 0),
+                  {Binding{"code", Code}}, {Binding{"U21", U21}}) {
+        if (Externals) mInputStreamSets.push_back(Binding{"externals", Externals});
+    }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> code = getInputStreamSet("code");
+        std::vector<PabloAST *> ext;
+        if (getNumOfInputs() > 1) ext = getInputStreamSet("externals");
+        PabloAST * const all = pb.createInFile(pb.createOnes());
+        for (unsigned b = 0; b < 21; b++) {
+            PabloAST * v = pb.createZeroes();
+            if (b < code.size() && b < 10) v = code[b];
+            if (b >= 10 && b < 14 && b - 10 < ext.size()) v = ext[b - 10];
+            if (b == 14) v = all;
+            pb.createAssign(pb.createExtract(getOutput(0), pb.getInteger(b)), pb.createAnd(v, all));
+        }
+    }
+};
+
+//  --divcode-codes=G: the smoke test of the DivCode kernels (see DivCodeDumpKernel).
+static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry, const std::string & inputFile) {
+    TransformAnalyzer analyzer(registry);
+    const TransformAnalysis & a = analyzer.analyze(entry);
+    size_t group = 0;
+    const ldml::TransformStep * step = nullptr;
+    for (const ldml::TransformStep & s : a.plan.steps) {
+        if (s.kind == ldml::TransformStep::Kind::Transform) continue;
+        if (++group == DivCodeCodes) step = &s;
+    }
+    if (step == nullptr) {
+        llvm::errs() << "Error: " << entry->canonicalName << " has no conversion group " << DivCodeCodes << "\n";
+        return 1;
+    }
+    ldml::DivCodeOptions options;
+    options.shift = DivCodeShift;
+    options.convertedBefore = convertedBeforeContext;
+    const ldml::DivCodePlan plan = ldml::planDivCodeGroup(*step, options);
+    if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 4) {
+        llvm::errs() << "Error: the alphabet of group " << DivCodeCodes << " has " << plan.blocks.size() << " blocks and "
+                     << plan.externalSets.size() << " external sets (1 to 1023 blocks and at most 4 external sets are dumped)\n";
+        return 1;
+    }
+    //  The alphabet, for the test: shift, blocks, the ranges of the external sets.
+    std::string desc = "{\"shift\": " + std::to_string(plan.shift) + ", \"blocks\": [";
+    for (size_t i = 0; i < plan.blocks.size(); i++) desc += (i ? ", " : "") + std::to_string(plan.blocks[i]);
+    desc += "], \"externals\": [";
+    for (size_t i = 0; i < plan.externalSets.size(); i++) {
+        desc += i ? ", [" : "[";
+        bool first = true;
+        for (const auto & r : plan.externalSets[i]) {
+            desc += (first ? "[" : ", [") + std::to_string(r.first) + ", " + std::to_string(r.second) + "]";
+            first = false;
+        }
+        desc += "]";
+    }
+    desc += "], \"kernel\": \"" + DivCodeKernel::kernelName(plan.shift, plan.blocks, "U21") + "\"}";
+    llvm::errs() << desc << "\n";
+    if (!openInputAndOutput(inputFile)) return 1;
+    CPUDriver driver("tconv");
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
+    StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+    StreamSet * const Code = DivCodeOf(P, plan, U21);
+    SHOW_BIXNUM(Code);
+    StreamSet * const Externals = DivCodeExternalsOf(P, plan, U21);
+    StreamSet * const Dump = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<DivCodeDumpKernel>(Code, Externals, Dump);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, UTF8_Of(P, Dump)));
+    TransformFunctionType fn = P.compile();
+    applyToInput(pipelineRunner(fn), MainInput.fd);
+    return finishOutput();
+}
+
 int main(int argc, char *argv[]) {
     const int status = run(argc, argv);
     return toolio::finishOutput() ? status : 1;
@@ -11312,6 +11426,13 @@ static int run(int argc, char *argv[]) {
         return 1;
     }
     if (KernelCounts) return printKernelCounts(registry, entry);
+    if (DivCodeCodes) {
+        if (entry->isBuiltIn()) {
+            llvm::errs() << "Error: " << entry->canonicalName << " is a built-in transform\n";
+            return 1;
+        }
+        return divCodeCodes(registry, entry, InputFile);
+    }
     if (DivCodeReport) {
         if (entry->isBuiltIn()) return 0;
         return printDivCodeReport(registry, entry);

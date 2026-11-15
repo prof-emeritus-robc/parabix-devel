@@ -86,7 +86,7 @@ sizes, expanding rules, and the XOR bit counts.
 
 ## 4. Kernels and pipeline
 
-New files `tools/ldml/divcode_kernels.{h,cpp}`, added to `tconv`'s `SRC`.
+The Div32Code / Div64Code kernel is `kernel::DivCodeKernel` (`include/kernel/unicode/divcode.h`, module `kernel.unicode`); it depends only on the shift, the blocks and the basis. The kernels specific to the plans of conversion groups are in `tools/ldml/tconv.cpp`.
 `RulePipelineBuilder::conversionGroup` calls `divCodeGroup(step, U21)` for an
 eligible group when `--divcode-groups` is on (off by default until measured). It
 uses `--divcode-shift=5|6` (default 5).
@@ -276,7 +276,7 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
 1. `divcode_plan` (eligibility, alphabet, splitting, rules, hash) and
    `--divcode-report`; check the eligible groups and the reasons for the rest.
 2. Div32Code/Div64Code kernel and external classes; a test that dumps the code
-   bixnum.
+   bixnum (done: `tconv --divcode-codes`, `QA/tconv_divcode_test.py`).
 3. Translation kernel without expansions (groups where m ≤ n everywhere), with
    deletion; QA tests; the CLDR comparison.
 4. Count kernel, spreading, gap-aware before contexts; QA tests.

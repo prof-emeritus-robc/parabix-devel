@@ -89,6 +89,9 @@ RULES = {
     # (A second step, as ICU ignores the global filter of a transform of a
     # single conversion group.)
     "filter": ":: [a-m] ; ab > X ; mn > Y ; k > K ; :: Null ;",
+    # (The end of a run of a global filter, of a compound transform, as the
+    # end of the text: ldml::FilterRunEndMark.)
+    "filter-run-end": ":: [a-m] ; :: Null ; ab } [$] > X ; k > K ; :: Null ;",
     # expansions (positions inserted after the matches)
     "expansion": "ab > XYZ ; c > DE ; b > B ;",
     "expansion-after": "ab } c > XYZ ; c > C ;",

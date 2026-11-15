@@ -204,6 +204,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
                 problem("before contexts matched against the converted text");
             }
         }
+        item.runEnd = marksFilterRunEnd(set);
         //  With the text boundary: tested as the negation of the complement.
         item.negated = boundary;
         item.set = boundary ? ~set : set;
@@ -255,6 +256,10 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             ok &= !t.empty();
         }
         if (!ok) {problem("string rules with empty text positions"); continue;}
+        for (const UCD::UnicodeSet & t : src.text) {
+            if (marksFilterRunEnd(t)) {problem("texts at the end of a filtered run"); ok = false; break;}
+        }
+        if (!ok) continue;
         src.result = sr.replacement;
         src.rule = sr.rule;
         src.stringRule = static_cast<int>(r);
@@ -377,7 +382,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     std::string content = "s" + std::to_string(s) + ";" + blockList + ";";
     for (const UCD::UnicodeSet & e : plan.externalSets) appendSet(content, e);
     auto appendItem = [&](const DivContextItem & item) {
-        content += "|" + std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.guardEnd ? "g" : "");
+        content += "|" + std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.guardEnd ? "g" : "")
+                   + (item.runEnd ? "r" : "");
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);
     };

@@ -244,6 +244,48 @@ Hant-Hans), against the regular plan, one run at a time, with `-thread-num=4`:
 Do this for s = 5 and s = 6. Div64 needs fewer classes and splits; div32 has sparser
 leaves and about 13% fewer bit operations with upper-bit sharing.
 
+### Results (step 5)
+
+DivCode is on by default (`--divcode-groups`, div32: `--divcode-shift=5`);
+`--divcode-groups=0` gives the regular plan.
+
+Inputs: 8 MB of `QA/TestCorpora/Twain.txt`, transliterated into each source
+script by the reverse transform (14–23 MB; Sinh-Latn has none, and is left out).
+Each configuration runs alone, with `-thread-num=4` and its own object-cache
+salt; the cycles are the totals of one `-EnableCycleCounter` run, and the cold
+start a run on one line with the object cache off. All four configurations give
+the same output.
+
+| transform | group kernels (regular / div32 / div64) | total cycles, div32 vs regular | div64 vs regular | DivCode kernels' share of cycles (div32) | cold start, s (regular / div32) |
+|---|--:|--:|--:|--:|--:|
+| Thaa-Latn | 28 / 13 / 13 | −47.4% | −46.1% | 24.2% | 1.78 / 0.82 |
+| byn_Ethi-byn_Latn/Xaleget | 36 / 16 / 16 | −27.8% | −25.8% | 17.0% | 1.66 / 0.91 |
+| ja_Hrkt-ja_Latn/BGN | 50 / 26 / 26 | −22.3% | −20.0% | 5.6% | 5.35 / 4.80 |
+| Latn-Armn | 22 / 13 / 13 | −12.7% | −13.2% | 2.0% | 4.82 / 4.66 |
+| Armn-Latn | 22 / 13 / 13 | −12.4% | −12.8% | 2.9% | 4.73 / 4.64 |
+| Halfwidth-Fullwidth | 11 / 6 / 6 | −6.8% | −6.4% | 2.8% | 0.48 / 0.44 |
+| Hira-Kana | 12 / 8 / 8 | −5.3% | −5.2% | 0.3% | 8.78 / 8.48 |
+| InterIndic-Devanagari | 22 / 13 / 13 | −5.0% | −7.9% | 3.6% | 0.55 / 0.50 |
+| Cyrl-Latn | 26 / 18 / 18 | −2.2% | −2.8% | 1.9% | 4.85 / 5.08 |
+
+- The gains follow the group's part of the pipeline. Where the group is the
+  whole transform (Thaa-Latn, byn_Ethi, InterIndic-Devanagari,
+  Halfwidth-Fullwidth), the saving is the group's own; elsewhere the other steps
+  (normalizations, 150–350 kernels) dilute it. The group's kernels drop by
+  40–55% everywhere.
+- div32 is ahead by 1–3 points on the largest groups (Thaa-Latn, byn_Ethi,
+  ja_Hrkt), consistent with its sparser leaves and fewer bit operations; div64
+  is slightly ahead on the alphabetic groups (up to 3 points). div32 is the
+  default, as it wins where the gains are greatest. (Single cycle-counter runs:
+  differences of a point or two are within the noise.)
+- The warm runs take 0.06–0.16 s, mostly startup, so their wall times are not
+  reliable at these sizes; they point the same way as the cycles (e.g.
+  Thaa-Latn 157 MB/s regular, 201 MB/s div32).
+- The default plan with shape groups is no faster than the regular plan on any
+  of these.
+- Leaf If entries were not measured: `-EnableProfiling` (Pablo branch counters)
+  ran over 12 minutes without finishing on one transform.
+
 ## 7. Results of step 1
 
 `tconv --divcode-report <transform>` (one JSON object per conversion group with
@@ -300,7 +342,10 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
    - A single-character rule's coverage is applied at its anchor, before its
      changes are advanced to their offsets, which inserted positions may have.)
 5. Measurement (§6); choose the default s and whether `--divcode-groups` is on by
-   default.
+   default. (Done: on by default, div32. With the default on, the other tconv
+   suites showed that the end of a run of a global filter (`FilterRunEndMark`
+   in a context set) also holds outside the filter's mask; the plan and the
+   kernel now do so, and a text position with the mark is not eligible.)
 6. Phase 2:
    - UTF-8 mode: codes at first bytes; one UTF-8 length per class (s ≤ 6); offsets
      in code units; set positions of mixed lengths split by length or excluded.

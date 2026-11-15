@@ -217,10 +217,11 @@ static cl::opt<unsigned> DivCodeCodes("divcode-codes",
              "--divcode-report) of the transform's own rules; the alphabet is described on the standard error"),
     cl::init(0), cl::cat(TconvOptions), cl::Hidden);
 static cl::opt<bool> DivCodeGroups("divcode-groups",
-    cl::desc("Apply the conversion groups eligible for DivCode kernels (see --divcode-report; for now, those without "
-             "expansions) by them (see doc/ldml-divcode-plan.md)"),
-    cl::init(false), cl::cat(TconvOptions));
-static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32) or 6 (div64)"),
+    cl::desc("Apply the conversion groups eligible for DivCode kernels (see --divcode-report) by them (see "
+             "doc/ldml-divcode-plan.md; default on, --divcode-groups=0 for the regular plan)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32, the default) "
+                                      "or 6 (div64)"),
                                       cl::init(5), cl::cat(TconvOptions));
 static cl::opt<bool> DivCodeReport("divcode-report",
     cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
@@ -11498,14 +11499,17 @@ void DivCodeTranslate::generatePabloMethod() {
         PabloAST * x = item.kind == ldml::DivContextItem::Kind::External ? t.at(ext[item.external], offset)
                                                                          : t.pseudo(offset, plan.pseudoTest(item.set));
         x = t.b.createAnd(x, t.at(inText, offset));
-        return item.negated ? t.b.createNot(x) : x;
+        x = item.negated ? t.b.createNot(x) : x;
+        //  (The end of a filtered run: a position of the text outside the mask.)
+        if (item.runEnd && mask) x = t.b.createOr(x, t.b.createAnd(t.at(inText, offset), t.b.createNot(t.at(mask, offset))));
+        return x;
     };
 
     //  The before items, at the top level.
     Tests top{pb, U, code, s, k};
     std::map<std::string, PabloAST *> befores;
     auto itemKey = [&](const ldml::DivContextItem & item) {
-        return std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + std::to_string(item.external)
+        return std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "") + std::to_string(item.external)
                + Tests::key(item.set);
     };
     auto beforeOf = [&](const ldml::DivContextItem & item) -> PabloAST * {
@@ -11520,6 +11524,12 @@ void DivCodeTranslate::generatePabloMethod() {
         //  character of the text before them.)
         if (gap) x = pb.createMatchStar(x, gap);
         if (item.negated) x = pb.createNot(x);
+        if (item.runEnd && mask) {
+            //  (The end of a filtered run: the position before is outside the mask.)
+            PabloAST * outside = pb.createAdvance(pb.createAnd(inText, pb.createNot(mask)), 1);
+            if (gap) outside = pb.createMatchStar(outside, gap);
+            x = pb.createOr(x, outside);
+        }
         befores.emplace(key, x);
         return x;
     };

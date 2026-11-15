@@ -59,6 +59,7 @@
 //  transforms invoked directly are applied in stages: one that invokes another
 //  not implemented is applied by ICU as a whole.)
 
+#include <cctype>
 #include <fcntl.h>
 #include <unistd.h>
 #include <thread>
@@ -215,6 +216,10 @@ static cl::opt<unsigned> DivCodeCodes("divcode-codes",
              "classes << 10) | its code, in the alphabet of the given conversion group (numbered from 1, as by "
              "--divcode-report) of the transform's own rules; the alphabet is described on the standard error"),
     cl::init(0), cl::cat(TconvOptions), cl::Hidden);
+static cl::opt<bool> DivCodeGroups("divcode-groups",
+    cl::desc("Apply the conversion groups eligible for DivCode kernels (see --divcode-report; for now, those without "
+             "expansions) by them (see doc/ldml-divcode-plan.md)"),
+    cl::init(false), cl::cat(TconvOptions));
 static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32) or 6 (div64)"),
                                       cl::init(5), cl::cat(TconvOptions));
 static cl::opt<bool> DivCodeReport("divcode-report",
@@ -2836,6 +2841,14 @@ static bool convertedContextMatters(const FusedContexts & before, const std::vec
         }
     }
     return false;
+}
+
+//  Whether a before context of a group may match differently in the converted
+//  text (see convertedContextMatters), or is not a sequence of sets.
+static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * engineBefore) {
+    if (engineBefore == nullptr) return false;
+    FusedContexts before;
+    return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
 }
 
 //  The notes of tconv --plan on the before contexts of a conversion group that
@@ -6744,6 +6757,7 @@ private:
     StreamSet * fcc(StreamSet * U21);
     StreamSet * fcd(StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -6795,6 +6809,10 @@ private:
     unsigned mDepth = 0;
     std::vector<GroupCount> mGroupCounts;
     bool mOmitICUBuiltIns = false;
+    //  The transform being applied, and its conversion group being applied
+    //  (numbered from 1, as by --divcode-report), for the names of kernels.
+    std::string mTransformLabel = "rules";
+    std::string mGroupLabel = "rulesG0";
     //  The letters of the front-letter revisits being applied (see frontLettersBegin).
     std::pair<char32_t, char32_t> mFrontLetters;
 };
@@ -7844,6 +7862,15 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
 }
 
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter && !step.stringRules.empty()) {
+        ldml::DivCodeOptions options;
+        options.shift = DivCodeShift;
+        options.convertedBefore = convertedBeforeContext;
+        const ldml::DivCodePlan plan = ldml::planDivCodeGroup(step, options);
+        bool expands = false;
+        for (const ldml::DivRule & d : plan.rules) expands |= d.expansion() > 0;
+        if (plan.eligible() && !expands) return divCodeGroup(plan, U21);
+    }
     if (insertionsOnly(step)) return insertionGroup(step, U21);
     PreparedSearchReplace sr;
     if (!activeMask() && !mDeletedRunEnds && engineSearchReplace(step, &sr)) {
@@ -9875,6 +9902,13 @@ static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml
 
 StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21) {
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
+    //  (The label of the transform for the names of kernels, while it is applied.)
+    struct Label {
+        std::string & label;
+        const std::string saved;
+        Label(std::string & l, const std::string & v) : label(l), saved(l) {label = v;}
+        ~Label() {label = saved;}
+    } transformLabel(mTransformLabel, entry->canonicalName);
     const TransformAnalysis & a = mAnalyzer.analyze(entry);
     if (ApplyShapeGroups) {
         //  (A transform the regular plan does not implement, by its shape
@@ -10565,6 +10599,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     const TransformAnalyzer::ShapeChoice * const choice = mShapeChoice;
     mShapeChoice = nullptr;
     size_t segment = 0;
+    size_t group = 0;
     std::vector<bool> applied(choice ? choice->useShapes.size() : 0, false);
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
@@ -10593,6 +10628,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             mInvokedWithFilter = false;
             if (step.filter) popFilter();
         } else {
+            mGroupLabel = mTransformLabel + "G" + std::to_string(++group);
             const size_t kernels = mP.getNumOfKernelCalls();
             if (step.hasFrontLetters) U21 = frontLettersBegin(step, U21);
             if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
@@ -10661,14 +10697,6 @@ static std::string jsonEscape(const std::string & s) {
     return r;
 }
 
-//  Whether a before context of a group may match differently in the converted
-//  text (see convertedContextMatters), or is not a sequence of sets.
-static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * engineBefore) {
-    if (engineBefore == nullptr) return false;
-    FusedContexts before;
-    return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
-}
-
 static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
     const unsigned s = plan.shift;
     size_t expanding = 0, deleting = 0, maxExpansion = 0, maxLeaf = 0, upperNaive = 0, lower = 0, setPositions = 0, maxLength = 0;
@@ -10705,9 +10733,14 @@ static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
     return r;
 }
 
+static int printDivCodeReportOf(const std::string & name, const TransformAnalysis & a);
+
 static int printDivCodeReport(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
     TransformAnalyzer analyzer(registry);
-    const TransformAnalysis & a = analyzer.analyze(entry);
+    return printDivCodeReportOf(entry->canonicalName, analyzer.analyze(entry));
+}
+
+static int printDivCodeReportOf(const std::string & name, const TransformAnalysis & a) {
     size_t group = 0;
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) continue;
@@ -10727,7 +10760,7 @@ static int printDivCodeReport(const ldml::TransformRegistry & registry, const ld
                 problems += (problems.empty() ? "\"" : ", \"") + jsonEscape("div64: " + p) + "\"";
             }
         }
-        toolio::out() << "{\"transform\": \"" << jsonEscape(entry->canonicalName) << "\", \"implementable\": "
+        toolio::out() << "{\"transform\": \"" << jsonEscape(name) << "\", \"implementable\": "
                       << (a.implementable ? "true" : "false") << ", \"group\": " << group
                       << ", \"string_rules\": " << step.stringRules.size() << ", \"subgroups\": " << step.subgroups.size()
                       << ", \"source_rules\": " << p32.sourceRules
@@ -11222,6 +11255,411 @@ static StreamSet * DivCodeExternalsOf(PipelineBuilder & P, const ldml::DivCodePl
     return Externals;
 }
 
+//  The translation kernel of a DivCode plan without expansions (see
+//  doc/ldml-divcode-plan.md, section 4.5): the rules of the plan (string rules
+//  and single-character rules) matched by their anchors in an If-hierarchy on
+//  the bits of the code, and applied by the XOR technique, with a deletion
+//  stream.
+//
+//  Inputs: U21, the code bixnum, the external class streams (if any), InText
+//  (the positions of the text), and the filter mask (if any; every position of
+//  a match must be within it, while contexts see the whole text).  Outputs: the
+//  converted U21 and Deleted (the positions to delete).
+//
+//  - Each set of the plan is tested on the pseudo-basis (the low shift bits of
+//    U21 and the code bits) at an offset from the anchor, by Lookahead of the
+//    input streams.  The character of an after item must be within the text
+//    (InText): beyond it the code is 0, and a set given by its complement
+//    includes the characters of code 0.  An item with the text boundary
+//    (negated) holds where that fails.
+//  - Before items are computed at the top level, Advance of their tests, as
+//    they do not depend on the conditions of the Ifs.
+//  - In the leaf of code A, the anchor test is leaf_A ∧ (the low bits of the
+//    first set): the If only skips blocks without the code.  A rule yields to
+//    the earlier rules (by priority) that match at its anchor.
+//  - The changes are accumulated in Vars escaping the Ifs: for each offset of a
+//    match, the matches whose constant change of the bits above the low shift
+//    bits is the same (one Var for each such value), each low bit changed, and
+//    the positions deleted; single-character rules apart, as they apply only
+//    outside the matches of the string rules (coverage).  They are advanced to
+//    their offsets once, after the hierarchy.
+class DivCodeTranslate final : public PabloKernel {
+public:
+    DivCodeTranslate(LLVMTypeSystemInterface & ts, const ldml::DivCodePlan & plan, const std::string & label,
+                     StreamSet * U21, StreamSet * Code, StreamSet * Externals, StreamSet * InText, StreamSet * Mask,
+                     StreamSet * Out, StreamSet * Deleted)
+    : PabloKernel(ts, kernelName(plan, label, Mask != nullptr), {}, {Binding{"Out", Out}, Binding{"Deleted", Deleted}})
+    , mPlan(plan)
+    , mHasExternals(Externals != nullptr)
+    , mHasMask(Mask != nullptr) {
+        const unsigned L = lookahead(plan);
+        auto bind = [&](const std::string & name, StreamSet * s) {
+            if (L > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(1), LookAhead(L)});
+            else mInputStreamSets.push_back(Binding{name, s});
+        };
+        bind("U21", U21);
+        bind("Code", Code);
+        if (Externals) bind("Externals", Externals);
+        bind("InText", InText);
+        if (Mask) bind("Mask", Mask);
+    }
+    static std::string kernelName(const ldml::DivCodePlan & plan, const std::string & label, bool mask) {
+        std::string l;
+        for (char c : label) l += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+        return std::string(plan.shift == 5 ? "Div32Code" : "Div64Code") + "Translate_" + l + "_" + plan.contentHash + "_U21"
+               + (mask ? "_m" : "");
+    }
+    //  The lookahead of the inputs: the last position of a text, and the item
+    //  of an after context, from the anchor.
+    static unsigned lookahead(const ldml::DivCodePlan & plan) {
+        unsigned L = 0;
+        for (const ldml::DivRule & d : plan.rules) {
+            L = std::max<unsigned>(L, d.length() - 1 + (d.after.present() ? 1 : 0));
+        }
+        for (const auto & sc : plan.subgroupContexts) {
+            if (sc.second.present()) L = std::max(L, 1u);
+        }
+        return L;
+    }
+protected:
+    void generatePabloMethod() override;
+private:
+    //  The Vars of the changes (see above).
+    struct Key {
+        unsigned kind;      // 0: bits above the low ones (value), 1: a bit (value), 2: deleted, 3: string matches of a length (value)
+        unsigned offset;
+        bool single;
+        unsigned value;
+        bool operator<(const Key & o) const {
+            return std::tie(kind, offset, single, value) < std::tie(o.kind, o.offset, o.single, o.value);
+        }
+    };
+    //  The changes of a rule: for each, its key and, for a bit changed where the
+    //  bit of the text is (flip: 1) or is not (flip: 0) set, the offset of that bit.
+    struct Change {
+        Key key;
+        int flip = -1;      // -1: where the rule matches; 0/1: where the text bit (key.value) at the offset is 0/1
+    };
+    std::vector<Change> changesOf(const ldml::DivRule & d) const;
+    const ldml::DivCodePlan mPlan;
+    const bool mHasExternals;
+    const bool mHasMask;
+};
+
+std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(const ldml::DivRule & d) const {
+    const unsigned s = mPlan.shift;
+    const UCD::codepoint_t low = (1u << s) - 1;
+    const size_t n = d.length(), m = d.result.size();
+    const bool single = n == 1;
+    std::vector<Change> changes;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned offset = static_cast<unsigned>(i);
+        if (i >= m) {
+            changes.push_back(Change{Key{2, offset, single, 0}});
+            continue;
+        }
+        const UCD::codepoint_t dst = d.result[i];
+        const UCD::UnicodeSet & text = d.text[i];
+        UCD::codepoint_t firstBlock = text.begin()->first >> s, lastBlock = firstBlock;
+        for (const auto & r : text) lastBlock = std::max<UCD::codepoint_t>(lastBlock, r.second >> s);
+        if (firstBlock == lastBlock) {
+            //  One block: the bits above the low ones change by a constant.
+            const UCD::codepoint_t upper = (firstBlock ^ (dst >> s));
+            if (upper) changes.push_back(Change{Key{0, offset, single, upper}});
+            if (text.count() == 1) {
+                const UCD::codepoint_t x = (text.begin()->first ^ dst) & low;
+                for (unsigned b = 0; b < s; b++) {
+                    if ((x >> b) & 1) changes.push_back(Change{Key{1, offset, single, b}});
+                }
+            } else {
+                //  The low bits that differ from those of dst.
+                for (unsigned b = 0; b < s; b++) {
+                    changes.push_back(Change{Key{1, offset, single, b}, ((dst >> b) & 1) ? 0 : 1});
+                }
+            }
+        } else {
+            for (unsigned b = 0; b < 21; b++) {
+                changes.push_back(Change{Key{1, offset, single, b}, ((dst >> b) & 1) ? 0 : 1});
+            }
+        }
+    }
+    if (!single) changes.push_back(Change{Key{3, 0, false, static_cast<unsigned>(n)}});
+    return changes;
+}
+
+void DivCodeTranslate::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const ldml::DivCodePlan & plan = mPlan;
+    const unsigned s = plan.shift;
+    const UCD::codepoint_t low = (1u << s) - 1;
+    const std::vector<PabloAST *> U = getInputStreamSet("U21");
+    const std::vector<PabloAST *> code = getInputStreamSet("Code");
+    const std::vector<PabloAST *> ext = mHasExternals ? getInputStreamSet("Externals") : std::vector<PabloAST *>{};
+    PabloAST * const inText = getInputStreamSet("InText")[0];
+    PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+    const unsigned k = static_cast<unsigned>(code.size());
+    PabloAST * const zeroes = pb.createZeroes();
+
+    //  Tests of sets on the pseudo-basis in a scope, at offsets from the anchor.
+    struct Tests {
+        PabloBuilder & b;
+        const std::vector<PabloAST *> & U;
+        const std::vector<PabloAST *> & code;
+        unsigned s, k;
+        std::map<unsigned, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> full, lowOnly;
+        std::map<std::pair<unsigned, std::string>, PabloAST *> cache;
+        std::map<unsigned, std::vector<PabloAST *>> bases;
+        PabloAST * at(PabloAST * x, unsigned offset) {return offset ? b.createLookahead(x, offset) : x;}
+        static std::string key(const UCD::UnicodeSet & set) {
+            std::string r;
+            for (const auto & range : set) r += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
+            return r;
+        }
+        //  A set of pseudo-codepoints (over the low bits and the code bits).
+        PabloAST * pseudo(unsigned offset, const UCD::UnicodeSet & set) {
+            auto f = cache.find({offset, "p" + key(set)});
+            if (f != cache.end()) return f->second;
+            auto & c = full[offset];
+            if (!c) {
+                std::vector<PabloAST *> basis;
+                for (unsigned i = 0; i < s; i++) basis.push_back(at(U[i], offset));
+                for (unsigned i = 0; i < k; i++) basis.push_back(at(code[i], offset));
+                c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(basis);
+            }
+            PabloAST * const t = c->compileCC(re::makeCC(set, &cc::Unicode), b);
+            cache.emplace(std::make_pair(offset, "p" + key(set)), t);
+            return t;
+        }
+        //  A set of values of the low bits (within a block known otherwise).
+        PabloAST * lowBits(unsigned offset, const UCD::UnicodeSet & set) {
+            if (set.count() == (1u << s)) return b.createOnes();
+            auto f = cache.find({offset, "l" + key(set)});
+            if (f != cache.end()) return f->second;
+            auto & c = lowOnly[offset];
+            if (!c) {
+                std::vector<PabloAST *> basis;
+                for (unsigned i = 0; i < s; i++) basis.push_back(at(U[i], offset));
+                c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(basis);
+            }
+            PabloAST * const t = c->compileCC(re::makeCC(set, &cc::Unicode), b);
+            cache.emplace(std::make_pair(offset, "l" + key(set)), t);
+            return t;
+        }
+    };
+    auto lowSet = [&](const UCD::UnicodeSet & chars) {
+        UCD::UnicodeSet r;
+        for (const auto & range : chars) {
+            //  (Within one block.)
+            r = r + UCD::UnicodeSet(range.first & low, range.second & low);
+        }
+        return r;
+    };
+    //  An after item at an offset from the anchor: its character, within the
+    //  text (beyond it, the code is 0, and a set given by its complement, which
+    //  includes the characters of code 0, would hold), in its set or, negated,
+    //  not in it or at the end of the text.
+    auto itemTest = [&](Tests & t, const ldml::DivContextItem & item, unsigned offset) -> PabloAST * {
+        PabloAST * x = item.kind == ldml::DivContextItem::Kind::External ? t.at(ext[item.external], offset)
+                                                                         : t.pseudo(offset, plan.pseudoTest(item.set));
+        x = t.b.createAnd(x, t.at(inText, offset));
+        return item.negated ? t.b.createNot(x) : x;
+    };
+
+    //  The before items, at the top level.
+    Tests top{pb, U, code, s, k};
+    std::map<std::string, PabloAST *> befores;
+    auto itemKey = [&](const ldml::DivContextItem & item) {
+        return std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + std::to_string(item.external)
+               + Tests::key(item.set);
+    };
+    auto beforeOf = [&](const ldml::DivContextItem & item) -> PabloAST * {
+        if (!item.present()) return nullptr;
+        const std::string key = itemKey(item);
+        auto f = befores.find(key);
+        if (f != befores.end()) return f->second;
+        PabloAST * x = item.kind == ldml::DivContextItem::Kind::External ? ext[item.external]
+                                                                         : top.pseudo(0, plan.pseudoTest(item.set));
+        x = pb.createAdvance(x, 1);
+        if (item.negated) x = pb.createNot(x);
+        befores.emplace(key, x);
+        return x;
+    };
+    for (const ldml::DivRule & d : plan.rules) beforeOf(d.before);
+    for (const auto & sc : plan.subgroupContexts) beforeOf(sc.first);
+
+    //  The Vars of the changes, created before the hierarchy.
+    std::map<Key, Var *> vars;
+    for (const ldml::DivRule & d : plan.rules) {
+        for (const Change & c : changesOf(d)) {
+            if (vars.count(c.key)) continue;
+            vars.emplace(c.key, pb.createVar("chg" + std::to_string(vars.size()), zeroes));
+        }
+    }
+
+    //  A leaf: the rules anchored at code A.
+    auto leaf = [&](PabloBuilder & b, unsigned A, PabloAST * leafCond) {
+        Tests t{b, U, code, s, k};
+        const std::vector<size_t> & rules = plan.leaves[A - 1];
+        std::map<size_t, PabloAST *> raw;
+        auto inMask = [&](PabloAST * x, size_t n) {
+            if (!mask) return x;
+            for (unsigned i = 0; i < n; i++) x = b.createAnd(x, t.at(mask, i));
+            return x;
+        };
+        for (size_t r : rules) {
+            const ldml::DivRule & d = plan.rules[r];
+            const unsigned n = static_cast<unsigned>(d.length());
+            PabloAST * M = b.createAnd(leafCond, t.lowBits(0, lowSet(d.text[0])));
+            for (unsigned i = 1; i < n; i++) M = b.createAnd(M, t.pseudo(i, plan.pseudoSet(d.text[i])));
+            M = inMask(M, n);
+            if (d.after.present()) M = b.createAnd(M, itemTest(t, d.after, n));
+            if (PabloAST * bf = beforeOf(d.before)) M = b.createAnd(M, bf);
+            raw.emplace(r, M);
+        }
+        for (size_t r : rules) {
+            const ldml::DivRule & d = plan.rules[r];
+            PabloAST * M = raw[r];
+            //  The earlier rules it yields to, matching at its anchor.
+            PabloAST * earlier = nullptr;
+            for (const ldml::DivEarlier & e : d.yieldsTo) {
+                PabloAST * x = nullptr;
+                if (e.stringRule >= 0) {
+                    for (size_t q : rules) {
+                        if (plan.rules[q].stringRule == e.stringRule) x = x ? b.createOr(x, raw[q]) : raw[q];
+                    }
+                } else if (e.subgroup >= 0) {
+                    const UCD::UnicodeSet chars = e.chars & UCD::UnicodeSet(plan.blocks[A - 1] << s, (plan.blocks[A - 1] << s) | low);
+                    if (!chars.empty()) {
+                        x = inMask(b.createAnd(leafCond, t.lowBits(0, lowSet(chars))), 1);
+                        const auto & sc = plan.subgroupContexts[e.subgroup];
+                        if (sc.second.present()) x = b.createAnd(x, itemTest(t, sc.second, 1));
+                        if (PabloAST * bf = beforeOf(sc.first)) x = b.createAnd(x, bf);
+                    }
+                }
+                if (x) earlier = earlier ? b.createOr(earlier, x) : x;
+            }
+            if (earlier) M = b.createAnd(M, b.createNot(earlier));
+            for (const Change & c : changesOf(d)) {
+                Var * const v = vars.at(c.key);
+                PabloAST * x = M;
+                if (c.flip >= 0) {
+                    PabloAST * bit = t.at(U[c.key.value], c.key.offset);
+                    x = b.createAnd(M, c.flip ? bit : b.createNot(bit));
+                }
+                b.createAssign(v, b.createOr(v, x));
+            }
+        }
+    };
+
+    //  The If-hierarchy on the code bits, from the highest: a subtree of the
+    //  codes with the bits above 'bit' given (prefix), entered where a code of
+    //  it with rules (other than 0) is.
+    auto hasRules = [&](unsigned lo, unsigned hi) {
+        for (unsigned c = std::max(lo, 1u); c <= std::min<unsigned>(hi, plan.blocks.size()); c++) {
+            if (!plan.leaves[c - 1].empty()) return true;
+        }
+        return false;
+    };
+    std::function<void (PabloBuilder &, int, unsigned, PabloAST *)> subtree = [&](PabloBuilder & b, int bit, unsigned prefix, PabloAST * cond) {
+        if (bit < 0) {
+            leaf(b, prefix, cond);
+            return;
+        }
+        for (unsigned v : {1u, 0u}) {
+            const unsigned p = (prefix << 1) | v;
+            const unsigned lo = p << bit, hi = ((p + 1) << bit) - 1;
+            if (!hasRules(lo, hi)) continue;
+            PabloAST * c = v ? code[bit] : b.createNot(code[bit]);
+            if (cond) c = b.createAnd(cond, c);
+            if (p == 0) {
+                //  (Codes other than 0 below.)
+                PabloAST * any = zeroes;
+                for (int j = 0; j < bit; j++) any = b.createOr(any, code[j]);
+                c = b.createAnd(c, any);
+            }
+            PabloBuilder body = b.createScope();
+            b.createIf(c, body);
+            subtree(body, bit - 1, p, c);
+        }
+    };
+    subtree(pb, static_cast<int>(k) - 1, 0, nullptr);
+
+    //  The changes, advanced to their offsets: of the string rules, and of the
+    //  single-character rules outside the matches of the string rules.
+    PabloAST * covered = zeroes;
+    unsigned maxLength = 0;
+    for (const auto & v : vars) if (v.first.kind == 3) maxLength = std::max(maxLength, v.first.value);
+    for (unsigned j = 1; j < maxLength; j++) {
+        PabloAST * longer = zeroes;
+        for (const auto & v : vars) {
+            if (v.first.kind == 3 && v.first.value > j) longer = pb.createOr(longer, v.second);
+        }
+        covered = pb.createOr(covered, pb.createAdvance(longer, j));
+    }
+    PabloAST * const uncovered = pb.createNot(covered);
+    std::vector<PabloAST *> out(21);
+    PabloAST * deleted = zeroes;
+    for (bool single : {false, true}) {
+        std::map<unsigned, std::vector<PabloAST *>> bitsAt;    // offset: the changes of each bit
+        std::map<unsigned, PabloAST *> deletedAt;
+        for (const auto & v : vars) {
+            const Key & key = v.first;
+            if (key.single != single || key.kind == 3) continue;
+            auto & bits = bitsAt[key.offset];
+            if (bits.empty()) bits.assign(21, zeroes);
+            if (key.kind == 0) {
+                for (unsigned b = s; b < 21; b++) {
+                    if ((key.value >> (b - s)) & 1) bits[b] = pb.createOr(bits[b], v.second);
+                }
+            } else if (key.kind == 1) {
+                bits[key.value] = pb.createOr(bits[key.value], v.second);
+            } else if (key.kind == 2) {
+                deletedAt[key.offset] = deletedAt.count(key.offset) ? pb.createOr(deletedAt[key.offset], v.second) : v.second;
+            }
+        }
+        auto place = [&](PabloAST * x, unsigned offset) {
+            if (offset) x = pb.createAdvance(x, offset);
+            return single ? pb.createAnd(x, uncovered) : x;
+        };
+        for (auto & a : bitsAt) {
+            for (unsigned b = 0; b < 21; b++) {
+                if (a.second[b] == zeroes) continue;
+                PabloAST * const x = place(a.second[b], a.first);
+                out[b] = out[b] ? pb.createOr(out[b], x) : x;
+            }
+        }
+        for (auto & d : deletedAt) deleted = pb.createOr(deleted, place(d.second, d.first));
+    }
+    std::vector<PabloAST *> result(21);
+    for (unsigned b = 0; b < 21; b++) result[b] = out[b] ? pb.createXor(U[b], out[b]) : U[b];
+    writeOutputStreamSet("Out", result);
+    writeOutputStreamSet("Deleted", std::vector<PabloAST *>{pb.createInFile(deleted)});
+}
+
+//  A conversion group by its DivCode plan (eligible, without expansions).
+StreamSet * RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    StreamSet * const Code = DivCodeOf(P, plan, U21);
+    SHOW_BIXNUM(Code);
+    StreamSet * const Externals = DivCodeExternalsOf(P, plan, U21);
+    StreamSet * const InText = P.CreateStreamSet(1);
+    P.CreateKernelCall<TextPositions>(U21, InText);
+    StreamSet * const Out = P.CreateStreamSet(21);
+    StreamSet * const Deleted = P.CreateStreamSet(1);
+    P.CreateKernelCall<DivCodeTranslate>(plan, mGroupLabel, U21, Code, Externals, InText, activeMask(), Out, Deleted);
+    SHOW_BIXNUM(Out);
+    SHOW_STREAM(Deleted);
+    bool deletes = false;
+    for (const ldml::DivRule & d : plan.rules) deletes |= d.deletions() > 0;
+    if (!deletes) return Out;
+    StreamSet * const keep = P.CreateStreamSet(1);
+    Invert(P, Deleted, keep);
+    StreamSet * const filtered = P.CreateStreamSet(21);
+    FilterByMask(P, keep, Out, filtered);
+    filterMasks(keep);
+    return filtered;
+}
+
 //  For the smoke test (--divcode-codes): each character replaced by the
 //  codepoint 0x4000 | (externals << 10) | code, its code (of at most 10 bits)
 //  and the bits of the external classes (at most 4) it is in.
@@ -11286,7 +11724,45 @@ static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::Tr
         }
         desc += "]";
     }
-    desc += "], \"kernel\": \"" + DivCodeKernel::kernelName(plan.shift, plan.blocks, "U21") + "\"}";
+    //  (Samples of the texts of the rules, and of the explicit sets of their
+    //  contexts, for the text of tests.)
+    auto utf8 = [](const std::u32string & u) {
+        std::string r;
+        for (char32_t c : u) {
+            if (c < 0x80) {
+                r += static_cast<char>(c);
+            } else if (c < 0x800) {
+                r += static_cast<char>(0xC0 | (c >> 6)); r += static_cast<char>(0x80 | (c & 0x3F));
+            } else if (c < 0x10000) {
+                r += static_cast<char>(0xE0 | (c >> 12)); r += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+                r += static_cast<char>(0x80 | (c & 0x3F));
+            } else {
+                r += static_cast<char>(0xF0 | (c >> 18)); r += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+                r += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); r += static_cast<char>(0x80 | (c & 0x3F));
+            }
+        }
+        return r;
+    };
+    desc += "], \"samples\": [";
+    for (size_t i = 0; i < plan.rules.size() && i < 4000; i++) {
+        std::u32string t;
+        for (const UCD::UnicodeSet & p : plan.rules[i].text) t += static_cast<char32_t>(p.begin()->first);
+        desc += (i ? ", \"" : "\"") + jsonEscape(utf8(t)) + "\"";
+    }
+    desc += "], \"context_chars\": \"";
+    std::u32string contextChars;
+    for (const ldml::DivRule & d : plan.rules) {
+        for (const ldml::DivContextItem * item : {&d.before, &d.after}) {
+            if (item->kind != ldml::DivContextItem::Kind::Explicit || item->set.count() > 64) continue;
+            for (const auto & r : item->set) {
+                for (UCD::codepoint_t c = r.first; c <= r.second; c++) {
+                    if (contextChars.find(static_cast<char32_t>(c)) == std::u32string::npos) contextChars += static_cast<char32_t>(c);
+                }
+            }
+        }
+    }
+    desc += jsonEscape(utf8(contextChars)) + "\"";
+    desc += ", \"kernel\": \"" + DivCodeKernel::kernelName(plan.shift, plan.blocks, "U21") + "\"}";
     llvm::errs() << desc << "\n";
     if (!openInputAndOutput(inputFile)) return 1;
     CPUDriver driver("tconv");
@@ -11353,6 +11829,7 @@ static int run(int argc, char *argv[]) {
         }
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis a = analyzer.analyzeRulesFile(parsed);
+        if (DivCodeReport) return printDivCodeReportOf(RulesFile, a);
         if (ShowPlan) {
             printPlan("rules file " + RulesFile, a);
             return a.implementable ? 0 : 2;

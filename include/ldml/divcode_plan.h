@@ -69,9 +69,9 @@ struct DivContextItem {
     UCD::UnicodeSet set;
     bool negated = false;
     size_t external = 0;            // index in DivCodePlan::externalSets
-    // An after item whose test would hold on the zero bits beyond the end of
-    // the text (a set of nearly all characters without the boundary, as
-    // [^X$]): ANDed with a lookahead of the positions within the text.
+    // An after item whose set includes the characters of code 0 (given by its
+    // complement) without the boundary (as [^X$]).  (The translation kernel
+    // tests every after item within the text.)
     bool guardEnd = false;
     bool present() const {return kind != Kind::None;}
 };
@@ -107,6 +107,9 @@ struct DivCodePlan {
     std::vector<UCD::UnicodeSet> externalSets;
     std::vector<DivRule> rules;             // by leaf (anchor code), in rule order within a leaf
     std::vector<std::vector<size_t>> leaves;    // leaves[code - 1]: the rules anchored there
+    // The context items (before, after) of each subgroup of the step, for the
+    // earlier single-character rules that rules yield to.
+    std::vector<std::pair<DivContextItem, DivContextItem>> subgroupContexts;
     size_t sourceRules = 0;                 // string rules + mappings, before splitting
     std::string contentHash;                // of the whole plan
     std::vector<std::string> problems;
@@ -116,6 +119,10 @@ struct DivCodePlan {
     // The pseudo-codepoints of a set within the alphabet (each of its
     // characters must be in a block of the alphabet).
     UCD::UnicodeSet pseudoSet(const UCD::UnicodeSet & set) const;
+    // The pseudo-codepoints testing a set within the alphabet or whose
+    // complement is (the complement of the pseudo-codepoints of the complement,
+    // including those of code 0).
+    UCD::UnicodeSet pseudoTest(const UCD::UnicodeSet & set) const;
 };
 
 // The DivCode plan of a conversion group (with the problems that keep it from

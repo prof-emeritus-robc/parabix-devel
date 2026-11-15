@@ -146,6 +146,16 @@ UCD::UnicodeSet DivCodePlan::pseudoSet(const UCD::UnicodeSet & set) const {
     return pseudo;
 }
 
+UCD::UnicodeSet DivCodePlan::pseudoTest(const UCD::UnicodeSet & set) const {
+    bool within = true;
+    for (UCD::codepoint_t b : blocksOf(set, shift)) {
+        if (!std::binary_search(blocks.begin(), blocks.end(), b)) {within = false; break;}
+    }
+    if (within) return pseudoSet(set);
+    const UCD::UnicodeSet all(0, static_cast<UCD::codepoint_t>(((blocks.size() + 1) << shift) - 1));
+    return all - pseudoSet(~set);
+}
+
 DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & options) {
     DivCodePlan plan;
     plan.shift = options.shift;
@@ -257,6 +267,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         DivContextItem before, after;
         classify(sg.before, sg.engineBefore, true, before);
         classify(sg.after, nullptr, false, after);
+        plan.subgroupContexts.emplace_back(before, after);
         for (const CharMapping & m : sg.mappings) {
             const UCD::UnicodeSet chars = m.chars - UCD::UnicodeSet(StringRuleDeleted);
             if (chars.empty()) continue;
@@ -370,6 +381,11 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);
     };
+    for (const auto & sc : plan.subgroupContexts) {
+        content += ";g";
+        appendItem(sc.first);
+        appendItem(sc.second);
+    }
     for (const DivRule & d : plan.rules) {
         content += ";r" + std::to_string(d.stringRule) + "," + std::to_string(d.subgroup) + "," + std::to_string(d.anchor) + ":";
         for (const UCD::UnicodeSet & t : d.text) appendSet(content, t);

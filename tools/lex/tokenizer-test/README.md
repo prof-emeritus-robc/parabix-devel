@@ -1,493 +1,409 @@
 # Tokenizer Test Suite
 
-This directory holds the test and benchmark harness for the **Parabix tokenizer**
-(`tools/lex`). Scripts 1–4 compare Parabix against the **HuggingFace
-`tokenizers` library** running the same GPT-2 model, so HuggingFace is the ground
-truth for both correctness and performance. Script 5 is the exception: it
-benchmarks Parabix configurations against **each other** and never loads HF.
+Test and benchmark scripts for the Parabix tokenizer (`tools/lex`). Most of them
+compare Parabix with **HuggingFace `tokenizers`** and **OpenAI `tiktoken`**
+running the same GPT-2 model: these two are the references for correctness and
+speed. `bench_configs.py` compares Parabix option sets with each other, and
+`selfmerge_test.py` checks Parabix against a small reference BPE of its own.
 
-None of these are wired into `make check` — run them directly from this directory
-with the repo venv active.
+None of them run under `make check`. Run them from this directory with the repo's
+venv.
 
-| # | Script | Kind | What it covers |
-|---|--------|------|----------------|
-| 1 | `compare_normalizers.py`   | correctness | Text normalization (NFD/NFC/NFKD/NFKC, lowercase, strip accents, BERT, sequences) |
-| 2 | `compare_pretokenizers.py` | correctness | Pre-tokenization / word splitting (whitespace, bytelevel, punctuation, …) |
-| 3 | `compare_bpe.py`           | correctness + timing | Full BPE encoding → token IDs, plus a fair head-to-head timing section |
-| 4 | `bench_bpe.py`             | performance | Throughput (MB/s), size sweep, fixed-floor vs marginal-rate fit, SVG charts |
-| 5 | `bench_configs.py`         | performance (Parabix only) | N flag configurations timed against each other — interleaved rounds, per-config floor/marginal fit, output-identity check |
-| 6 | `selfmerge_test.py`        | correctness (no HF) | Self-merges (X+X→XX): runs of repeated tokens of length 1–12, checked against a built-in reference BPE for several flag configurations |
+| Script | Kind | What it covers |
+|---|---|---|
+| `compare_normalizers.py` | correctness | Normalizers, against HF `tokenizers.normalizers` |
+| `compare_pretokenizers.py` | correctness | Pre-tokenizers and `--behavior`, against HF `tokenizers.pre_tokenizers` |
+| `compare_bpe.py` | correctness + timing | BPE token ids against HF `tokenizers` 0.23 and tiktoken |
+| `compare_bpe_hf1.py` | correctness + timing | The same against HF `tokenizers` 1.0.0rc4 |
+| `bench_bpe.py` | performance | Throughput (MB/s) against HF 0.23 and tiktoken |
+| `bench_bpe_hf1.py` | performance | The same against HF 1.0.0rc4 |
+| `bench_configs.py` | performance (Parabix only) | Several Parabix option sets timed against each other, with an output-identity check |
+| `selfmerge_test.py` | correctness (no HF) | Runs of repeated tokens (X+X→XX merges), against a built-in reference BPE |
 
-Scripts 1–3 print `MATCH` / `MISMATCH` per case; all five tee their output to
-`<script>_output.txt` in this directory (those result files are not committed).
+Each script copies its report to `<script>_output.txt` in this directory. Those
+files are not committed, and they hold whatever the last local run wrote: re-run
+before quoting one.
 
 ---
 
 ## Requirements
 
-- **Python 3.10+**
-- **A built tokenizer binary**, by default `<repo>/build19/bin/tokenizer`
-  (`make -C build19 -j8 tokenizer`). `compare_bpe.py` and `bench_bpe.py` take
-  another one via `--tokenizer PATH`.
-- **HuggingFace `tokenizers`** (PyPI, no account or token needed).
-- **`datasets`** (PyPI) — only for `bench_bpe.py --openwebtext`, which streams a
-  fresh corpus sample from the Hub instead of downloading the 40 GB dataset.
+- **Python 3.10+**.
+- **A built tokenizer**, by default `<repo>/build19/bin/tokenizer`
+  (`make -C build19 -j8 tokenizer`); every script takes `--tokenizer PATH`.
+- **HuggingFace `tokenizers`** and **`tiktoken`** from PyPI. The results below use
+  `tokenizers` 0.23.3 and `tiktoken` 0.14.0. `compare_bpe.py` and `bench_bpe.py`
+  import both.
+- **`tokenizers` 1.0.0rc4**, only for the `*_hf1.py` scripts, in a side folder of
+  the same venv (it has the same package name as 0.23).
+- **`datasets`**, only for `bench_bpe.py --openwebtext`.
 
 ### One-time setup
 
 ```bash
-cd ~/parabix-devel
+cd <repo>
 python3 -m venv .venv
-source .venv/bin/activate
-pip install tokenizers
-pip install datasets            # optional: only for --openwebtext
-python -c "import tokenizers; print(tokenizers.__version__)"
+.venv/bin/pip install "tokenizers==0.23.3" "tiktoken==0.14.0"
+.venv/bin/pip install datasets                      # optional: --openwebtext
+
+# HF 1.0 for compare_bpe_hf1.py / bench_bpe_hf1.py
+.venv/bin/pip install numpy huggingface-hub
+.venv/bin/pip install --no-deps --target .venv/hf1-site "tokenizers==1.0.0rc4"
 ```
+
+The `*_hf1.py` scripts put `<venv>/hf1-site` (or `$HF1_SITE`) first on
+`sys.path` before importing `tokenizers`, and stop unless they get version 1.x
+and `tiktoken` 0.14.0 (`--any-tiktoken` allows another). The other scripts in the
+same venv still get 0.23.3.
 
 ### Paths
 
-Every script finds the repo from its own location (three levels up from
-`tools/lex/tokenizer-test/`), so it runs from any directory and any checkout.
-Every path can be overridden on the command line:
+Each script finds the repo from its own location (three levels up), so it runs
+from any directory. Defaults and overrides:
 
-| Option | Default | `compare_bpe` | `bench_bpe` | `bench_configs` | `compare_normalizers`, `compare_pretokenizers` |
-|---|---|---|---|---|---|
-| `--input PATH` | see each script below | ✓ | ✓ | ✓ | ✓ |
-| `--tokenizer PATH` | `<repo>/build19/bin/tokenizer` | ✓ | ✓ | ✓ | ✓ |
-| `--merges PATH` | `<repo>/tools/lex/tokenizer_files/merges.txt` | ✓ | ✓ | ✓ | — |
-| `--tokenizer-json PATH` | `<repo>/tools/lex/tokenizer_files/tokenizer.json` | ✓ | ✓ | — | — |
-| `--vocab PATH` | `<repo>/tools/lex/tokenizer_files/vocab.json` | ✓ | — | — | — |
+| Option | Default | Scripts |
+|---|---|---|
+| `--tokenizer PATH` | `<repo>/build19/bin/tokenizer` | all |
+| `--merges PATH` | `<repo>/tools/lex/tokenizer_files/merges.txt` | `compare_bpe*`, `bench_bpe*`, `bench_configs`, `selfmerge_test` |
+| `--vocab PATH` | `<repo>/tools/lex/tokenizer_files/vocab.json` | `compare_bpe*` |
+| `--tokenizer-json PATH` | `<repo>/tools/lex/tokenizer_files/tokenizer.json` | `compare_bpe*`, `bench_bpe*` |
+| `--input PATH` | none (required) | `compare_bpe*`; `bench_bpe*` take `--input FILE …`, `--sweep --sweep-source FILE` or `--openwebtext` |
+| `--input PATH` | `<repo>/build19/test.txt` (not in the repo) | `compare_normalizers`, `compare_pretokenizers` |
+| `--input PATH` | `tokenizer_files/val_2MB.txt` (no longer in the repo) | `bench_configs` |
 
-Each script stops with an error when the tokenizer binary is missing (except
-with `--hf-only`).
+So pass `--input` to every script except `selfmerge_test.py`, which writes its
+own input.
+
+---
+
+## Inputs
+
+The GPT-2 model files and three 4 MB test files are committed in
+`tools/lex/tokenizer_files/` (see the parent [Data files](../README.md#data-files)):
+
+| File | Contents | Tokens (GPT-2) |
+|---|---|---|
+| `val_4MB.txt` | Web text, CRLF line ends, some NUL runs | 1,302,487 |
+| `code_4MB.txt` | C++ source | 1,729,186 |
+| `multi_4MB.txt` | Many languages | 2,230,628 |
+
+`merges.txt` is the Parabix input; `tokenizer.json` is what HuggingFace loads;
+`tiktoken` uses its built-in `gpt2` encoding, which has the same vocabulary and
+merges. So all three run the same model.
+
+Two notes on line ends:
+
+- `compare_bpe*.py` read the input in text mode, so `\r\n` becomes `\n`, and all
+  engines tokenize that text. `bench_bpe*.py` keep `\r\n`, so every engine reads
+  the file's own bytes.
+- `compare_pretokenizers.py` and `compare_normalizers.py` split on `\n` only. Give
+  them LF text (`tr -d '\r'`), or a leftover `\r` shows up as a mismatch.
+
+---
+
+## `compare_normalizers.py`
+
+Compares the normalized text of each `--normalize=X` with the matching HF
+normalizer, character by character. 19 modes: `nfd`, `nfc`, `nfkd`, `nfkc`,
+`stripaccents` (HF: `NFD` + `StripAccents`), `stripleft`, `stripright`, `strip`,
+`bytelevel`, `lowercase`, `nmt`, `bertchinesechars`, `bertcleantext`, and the
+sequences `bertcleantext,stripaccents,lowercase`,
+`bertcleantext,bertchinesechars,stripaccents,lowercase`, `bytelevel,lowercase`,
+`lowercase,strip`, `bytelevel,strip`, `bytelevel,strip,lowercase`.
 
 ```bash
-python compare_bpe.py --no-timing --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
-python bench_bpe.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer \
-    --parabix-args="--pretokenizer=bytelevel --partition=level"
-python compare_pretokenizers.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
+python compare_normalizers.py --input FILE                 # all modes
+python compare_normalizers.py --input FILE lowercase nfd   # some modes
+python compare_normalizers.py --input FILE --hf-only       # HF side only
+python compare_normalizers.py --input FILE --parabix-only  # Parabix side only
 ```
 
 ---
 
-## Model files
+## `compare_pretokenizers.py`
 
-The three GPT-2 model files in `tools/lex/tokenizer_files/` are committed. The
-truncated dev copies directly under `tools/lex/` (`vocab.json`, `merges.txt`) are
-for fast manual smoke tests only — **the scripts never use them**.
+Compares each `--pretokenizer=X` with the matching HF pre-tokenizer, line by line
+(Parabix always ends a pre-token at `\n`). At most `--max-lines` lines (default
+200; 0 = all).
 
-| File | Size | Used by |
-|------|------|---------|
-| `merges.txt`     | 456 KB | Parabix side (`--merges`). Self-sufficient: `buildBaseAlphabet` regenerates GPT-2 ids 0..255 internally |
-| `vocab.json`     | 1.0 MB | Parabix side, optional (id cross-check + `--strings` decode) |
-| `tokenizer.json` | 3.5 MB | HuggingFace side (`Tokenizer.from_file`) — vocab + merges + pre-tokenizer config in one file |
+| Parabix mode | HF pre-tokenizer |
+|---|---|
+| `whitespacesplit` | `WhitespaceSplit()` |
+| `whitespace` | `Whitespace()` |
+| `bytelevel` | `ByteLevel(add_prefix_space=False)` |
+| `bert` | `BertPreTokenizer()` |
+| `punctuation` | `Punctuation()` |
+| `digits` | `Digits(individual_digits=True)` |
+| `chardelimiter` | `CharDelimiterSplit(",")` |
+| `sequence_whitespace_punct` (`--pretokenizer=sequence_whitespace_punctuation`) | `Sequence([WhitespaceSplit(), Punctuation()])` |
+| `simplewordboundaries` | `Split(Regex(r"\w+"), "isolated")` |
 
-All three come from `openai-community/gpt2` on the Hub, so both sides run an
-identical model. To re-fetch them manually:
-[huggingface.co/openai-community/gpt2](https://huggingface.co/openai-community/gpt2/tree/main).
+`--behaviors` instead checks all 5 `--behavior=` values (`removed`, `isolated`,
+`mergedwithprevious`, `mergedwithnext`, `contiguous`) for `simplewordboundaries`
+(against `Split(Regex(r"\w+"), behavior)`) and `punctuation` (against
+`Punctuation(behavior)`): 10 cases. `--parabix-only` also runs the
+Parabix-specific cases in `tokenizertest.xml`, which have no HF counterpart.
 
-## Corpora — supply your own
-
-**No test corpus is committed.** `compare_bpe.py` and `bench_bpe.py` have no
-default input at all: `compare_bpe.py` needs `--input FILE`, and `bench_bpe.py`
-needs `--input FILE [FILE ...]`, `--sweep --sweep-source FILE` or
-`--openwebtext`. The other two scripts still default to a local file that is
-not in the repo, so a fresh checkout must pass `--input` there too, or create it
-first.
-
-| Default the scripts expect | Used by |
-|----------------------------|---------|
-| `build19/test.txt` | `compare_normalizers.py`, `compare_pretokenizers.py` |
-
-Any UTF-8 text works for scripts 1–3. For `bench_bpe.py`, size matters — the
-sweep needs multi-MB inputs to condition its fit (see below), and the easiest way
-to get one without hunting for a corpus is `--openwebtext`, which streams a
-~24 MB sample from the Hub and caches it as
-`tokenizer_files/openwebtext_sample.txt`. Sweep sizes larger than the source are
-skipped with a reason on stderr rather than failing.
+```bash
+python compare_pretokenizers.py --input FILE                       # all modes
+python compare_pretokenizers.py --input FILE whitespace bytelevel  # some modes
+python compare_pretokenizers.py --input FILE --behaviors           # the 10 behavior cases
+python compare_pretokenizers.py --input FILE --parabix-only        # + tokenizertest.xml
+python compare_pretokenizers.py --input FILE --hf-only
+```
 
 ---
 
-## 1. `compare_normalizers.py`
+## `compare_bpe.py`
 
-Compares the **raw normalized string** from each Parabix `--normalize=X` mode
-against the equivalent HuggingFace normalizer. Normalization is a pure string
-transform — no splitting happens yet.
+End-to-end check: GPT-2 BPE token ids from Parabix, HF and tiktoken. The whole
+input is one test case: one `encode(text)` call for HF, one
+`encode(text, allowed_special="all")` for tiktoken, one tokenizer run for Parabix:
 
-**Modes covered** (18 total, including sequences):
-`nfd`, `nfc`, `nfkd`, `nfkc`, `stripaccents`, `stripleft`, `stripright`,
-`strip`, `bytelevel`, `lowercase`, `nmt`, `bertchinesechars`,
-`bertcleantext,stripaccents,lowercase`,
-`bertcleantext,bertchinesechars,stripaccents,lowercase`,
-`bytelevel,lowercase`, `lowercase,strip`, `bytelevel,strip`,
-`bytelevel,strip,lowercase`.
-
-Comma-separated names map to a HuggingFace `Sequence([...])` or a single
-`BertNormalizer` with the matching flag combination.
-
-**How it works:** for each mode, run `tokenizer --normalize=<mode> input.txt` as a
-subprocess and capture stdout, run the equivalent Python normalizer on the same
-text, compare the strings character-for-character.
-
-```bash
-python compare_normalizers.py                        # all modes
-python compare_normalizers.py lowercase nfd strip    # specific modes only
-python compare_normalizers.py --hf-only              # HuggingFace side only
-python compare_normalizers.py --parabix-only         # Parabix side only
-python compare_normalizers.py --input file.txt       # custom input
+```
+tokenizer --pretokenizer=bytelevel --vocab=vocab.json --merges=merges.txt <PARABIX ARGS> <input>
 ```
 
-Output → `compare_normalizers_output.txt`.
+`--parabix-args="…"` adds tokenizer options (use the `=` form). The script adds
+`--pretokenizer=bytelevel` only when the arguments name no pre-tokenizer. It
+prints `Extra tokenizer flags: …` when any are given; no such line means the
+default options were tested.
+
+**Pass the recommended options.** With none, the tokenizer runs the old
+merge-kernel design: correct, but its first run compiles 1,123 kernels. With the
+options from the parent README:
+
+```bash
+BEST="--pretokenizer=bytelevel --tail-from-bytes --tail-vocab-table --tail-cache-pool \
+--tail-scan-kernel --tail-emit-from-segs --tail-long-cache --tail-batch-bpe --tail-hard-split \
+--tail-simd-emit --skip-identity-normalize --pretok-compress-classes --pretok-class-code \
+--fast-emit --memsource-in-place --pretok-byte-domain --pretok-utf8-classes \
+--tail-unit-seed --pair-cuts=3 --len-scan=15"
+
+python compare_bpe.py --no-timing --input ../tokenizer_files/code_4MB.txt \
+    --parabix-args="$BEST --thread-num=4"
+```
+
+Output: `MATCH` or `MISMATCH` and the token count of each engine. A second
+Parabix run with `--strings` gives the token strings, so a mismatch prints a
+side-by-side table (Parabix, HF, tiktoken) and the first position where they
+differ. `--verbose` always prints the table.
+
+**Timing section** (on by default; `--no-timing` turns it off, `--runs N` sets
+the count, default 5): Parabix with `--bench-loop=N` and the same arguments, HF
+and tiktoken as warm in-process loops. It adds N tokenizations per engine; for
+proper benchmarks use `bench_bpe.py`.
+
+```bash
+python compare_bpe.py --input FILE --parabix-args="$BEST"   # check + timing
+python compare_bpe.py --input FILE --no-timing ...          # check only
+python compare_bpe.py --input FILE --no-tiktoken ...        # Parabix vs HF only
+python compare_bpe.py --input FILE --parabix-only | --hf-only | --tiktoken-only
+python compare_bpe.py --input FILE --show-input             # print the input text
+```
+
+The docstring at the top of `compare_bpe.py` still describes an older two-step
+run and line-by-line cases; the code does what is described here.
+
+## `compare_bpe_hf1.py`
+
+`compare_bpe.py` with HF `tokenizers` 1.0.0rc4 (its "bitcannon" bit-stream
+pre-tokenizer, word cache and whole-word fold) and tiktoken pinned to 0.14.0. HF
+1.0's `Tokenizer.from_file()` only loads; `compile()` builds the
+`CompiledTokenizer` that encodes (setup, not timed). Its results have ids only, so
+token strings come from `id_to_token()`. `--cold` empties the caches before every
+timed run (a fresh `compile()` for HF); `--bench-cold-cache` in `--parabix-args`
+has the same effect.
+
+```bash
+.venv/bin/python compare_bpe_hf1.py --no-timing --input FILE --parabix-args="$BEST"
+```
 
 ---
 
-## 2. `compare_pretokenizers.py`
+## `bench_bpe.py`
 
-Compares each Parabix `--pretokenizer=X` mode against the equivalent HuggingFace
-pre-tokenizer. A pre-tokenizer splits text into pre-tokens (rough word-level
-chunks) before any BPE merging.
+Throughput of Parabix, HF and tiktoken, in the style of HF's own criterion
+benchmarks: a fixed input, N warm runs, MB/s. Each engine is timed in process,
+without start-up:
 
-**Modes covered:** `whitespacesplit`, `whitespace`, `bytelevel`, `punctuation`,
-`digits`, `chardelimiter`, `sequence_whitespace_punct`.
+- **Parabix**: `--bench-loop=N` builds and compiles the pipeline once, runs it N
+  times on the in-memory input with output off (after one warm-up run), and
+  prints `BENCH_RESULT bytes=… iters=… min_ms=… median_ms=… mean_ms=… mbps=…`.
+  The script parses that line. `--pretokenizer=bytelevel` is added unless
+  `--parabix-args` names a pre-tokenizer.
+- **HF**: `encode()` of the whole text, model loaded by `Tokenizer.from_file()`.
+- **tiktoken**: `encode(text, allowed_special="all")` (`--tiktoken-ordinary`:
+  `encode_ordinary`).
 
-It also runs **behavior tests** from `tokenizertest.xml` (committed alongside the
-scripts) — Parabix-specific edge cases, mostly `--behavior=` delimiter handling,
-with no HuggingFace counterpart. Those only run in `--parabix-only` mode.
+It prints min, median and mean ms and peak MB/s (from the min) for each engine and
+input, and a speed-up line computed from the min.
+
+**Threads.** `--baseline-threads N` splits the text at safe pre-token boundaries
+and times `encode_batch` on N threads for HF (`RAYON_NUM_THREADS=N`) and tiktoken.
+Give Parabix the same number with `--thread-num=N` for an equal-threads
+comparison.
+
+**Caches.** Parabix keeps its caches across `--bench-loop` runs unless
+`--bench-cold-cache` is given. `--hf-cache=match` (default) clears HF's word
+cache before every run exactly when Parabix runs cold; `warm` and `cold` force it.
+
+**Iterations.** Above 1 MB the count is scaled down (to at least 3) to hold the
+time per input; `--no-adaptive-iters` uses `--iters` for every input, which gives
+every engine the same number of runs. `--parabix-iters N` sets Parabix's count alone.
+
+**Size sweep.** `--sweep --sweep-source FILE` cuts prefixes from 4 KB to 20 MB
+(`--sweep-sizes 1,4,8` in MB, `--sweep-max-mb`) and fits
+`min_ms = floor + slope · bytes` per engine: the floor is a fixed cost per call,
+`1e-3 / slope` the marginal MB/s. This mattered for the merge-kernel design, whose
+floor was large; the current design has a small one. The fit needs inputs of
+different sizes, so ignore it when the inputs are all the same size.
 
 ```bash
-python compare_pretokenizers.py                      # all modes
-python compare_pretokenizers.py whitespace bytelevel # specific modes only
-python compare_pretokenizers.py --hf-only
-python compare_pretokenizers.py --parabix-only       # + XML behavior tests
-python compare_pretokenizers.py --input file.txt
+python bench_bpe.py --input ../tokenizer_files/val_4MB.txt ../tokenizer_files/code_4MB.txt \
+    ../tokenizer_files/multi_4MB.txt --iters 10 --no-adaptive-iters \
+    --parabix-args="$BEST --thread-num=1 --bench-cold-cache"
+python bench_bpe.py --input FILE --baseline-threads 4 --parabix-args="$BEST --thread-num=4"
+python bench_bpe.py --sweep --sweep-source FILE --parabix-args="$BEST"
+python bench_bpe.py --openwebtext                   # stream and cache an OpenWebText sample
+python bench_bpe.py --input FILE --svg bench.svg    # also an MB/s bar chart
+python bench_bpe.py --input FILE --parabix-only | --hf-only | --tiktoken-only | --no-tiktoken
 ```
 
-Output → `compare_pretokenizers_output.txt`.
+## `bench_bpe_hf1.py`
+
+`bench_bpe.py` with HF 1.0.0rc4 and tiktoken 0.14.0. Differences:
+
+- HF 1.0 is cold when Parabix is (`--hf-cache=match`): a fresh `compile()`, not
+  timed, before every run.
+- HF 1.0's `encode_batch` uses its own pool of one thread per core and ignores
+  `RAYON_NUM_THREADS`. So with `--baseline-threads N` the script runs N Python
+  threads, each calling `encode()` on pieces of the text (`encode()` releases the
+  GIL), and checks the process CPU time against N. `--hf-native-batch` times HF's
+  own `encode_batch` instead (all cores: not an equal-threads comparison).
 
 ---
 
-## 3. `compare_bpe.py`
+## `bench_configs.py`
 
-The end-to-end correctness check: full GPT-2 BPE encoding, Parabix vs
-HuggingFace, compared as **integer ID lists**.
+Parabix option sets timed against each other; no HF. One run times N sets:
 
-### One subprocess, not two
+- **Interleaved rounds**: each round runs every set once, and each set keeps its
+  best time over the rounds (`--rounds`, default 3; `--iters`, the `--bench-loop`
+  count, default 5), so machine drift hits all sets alike.
+- **Output identity** (`--verify`): each set runs once more without
+  `--bench-loop`, and its ids are hashed against the first set's: `IDENTICAL` or
+  `DIFFERS`. A faster set with different output is a bug, not a win.
+- **Sizes** (`--sizes 0.25,1,4`, in MB): the floor/marginal fit per set, as in
+  `bench_bpe.py --sweep`.
 
-Earlier revisions ran Parabix in two passes (pre-tokenize to text, then BPE over
-that text). That is gone. The script now makes **one** call per side:
-
-```
-tokenizer --pretokenizer=bytelevel --vocab=vocab.json --merges=merges.txt <input>
-```
-
-With `--merges` **and** `--pretokenizer=bytelevel`, `tokenizer.cpp` takes the
-**boundary-gated** path: the bytelevel pre-tokenizer contributes only a
-pretoken-**start mask** (`GPT2PretokenBoundaryKernel`), and BPE consumes the
-**raw** byte basis plus that mask, so merges cannot cross a pretoken boundary.
-
-> ⚠️ **Double-encode trap.** Do not pipe `--pretokenizer=bytelevel` *text output*
-> into a second BPE call. `BPEBaseIdKernel` already applies GPT-2 `bytes_to_unicode`
-> to the raw bytes. Feeding it pre-encoded text encodes twice: a space `0x20`
-> becomes `Ġ`, emitted as UTF-8 `0xC4 0xA0`, which the seed re-maps to ids
-> 128/254 instead of the correct `Ġ` id 220.
-
-### Test cases
-
-The **entire input file is one test case** — a single `encode(text)` call on the
-HuggingFace side, a single byte stream on the Parabix side. This matches the HF
-API shape (one string in, one ID list out).
-
-The script also collects token **strings** with a second `--strings` call, so a
-mismatch prints a side-by-side table (`#`, Parabix ID, Parabix token, HF ID, HF
-token, match), plus a first-divergence position and any length delta.
-
-### Timing section
-
-Compare mode also runs a fair timing pass. **It is on by default** — no flag
-turns it on, `--no-timing` turns it off, `--runs N` changes the iteration count
-(default 5). It costs N extra tokenizations per side on top of the correctness
-pass, so on a multi-MB corpus it roughly doubles the runtime:
-
-- **Parabix** — `--bench-loop=N`: pipeline built once, run N times in-process,
-  token output suppressed; the script parses the `BENCH_RESULT …` stderr line.
-- **HuggingFace** — warm best-of-N in-process `encode()` loop, model preloaded
-  by `Tokenizer.from_file()`.
-
-One-time setup (spawn + merges load + JIT on one side, `from_file()` on the
-other) is excluded from both. Reported as min / median / mean ms and MB/s.
+`--common-flags` (default `--pretokenizer=bytelevel`) is put before every set, so
+**leave `--pretokenizer` out of the sets** (the tokenizer rejects it twice). The
+first `--config NAME=FLAGS` is the baseline of the `vs base` column. The `kernels`
+column counts merge kernels and shows `-` for the current design. Example, the
+per-length kernels against a single scan kernel:
 
 ```bash
-python compare_bpe.py --input path/to/corpus.txt   # --input is required
-python compare_bpe.py --input FILE --verbose       # always print the token table
-python compare_bpe.py --input FILE --show-input    # print the input text, not just a byte count
-python compare_bpe.py --input FILE --runs 10       # timed iterations per side (timing is ON by default, N=5)
-python compare_bpe.py --input FILE --no-timing     # correctness only — the only way to skip timing
-python compare_bpe.py --input FILE --parabix-only
-python compare_bpe.py --input FILE --hf-only
+B="--tail-from-bytes --tail-vocab-table --tail-cache-pool --tail-scan-kernel \
+--tail-emit-from-segs --tail-long-cache --tail-batch-bpe --tail-hard-split --tail-simd-emit \
+--skip-identity-normalize --pretok-compress-classes --pretok-class-code --fast-emit \
+--memsource-in-place --pretok-byte-domain --pretok-utf8-classes --tail-unit-seed"
+
+python bench_configs.py --input ../tokenizer_files/code_4MB.txt --verify \
+    --config "best=$B --pair-cuts=3 --len-scan=15" \
+    --config "single-scan=$B"
 ```
 
-Output → `compare_bpe_output.txt`.
+Add `--bench-cold-cache` to time cold caches. Without `--config`, the default
+sets are the merge-kernel design with and without `--partition=level`.
 
 ---
 
-## 4. `bench_bpe.py`
+## `selfmerge_test.py`
 
-The **performance** counterpart to `compare_bpe.py`. It mirrors HuggingFace's own
-criterion methodology (`tokenizers/benches/*.rs`): fixed corpus, N warm
-iterations, primary metric **MB/s** rather than raw milliseconds. HF's repo only
-benches itself for regressions, so this cross-engine comparison is
-Parabix-specific.
+Self-merges (X+X→XX) need care in the merge-kernel design: a run of equal tokens
+must pair left to right, each token used once (`XXXXX` → `XX XX X`). The script
+writes its own input (runs of 1 to 12 copies of single bytes, multi-byte
+characters and short strings, in several contexts, plus mixed patterns), and
+compares the tokenizer's ids with a reference BPE in Python built from
+`merges.txt` (lowest rank first, leftmost on a tie). It needs neither HF nor
+`vocab.json`.
 
-### Fairness
-
-A naive subprocess timing of the Parabix binary would also pay OS process spawn,
-`merges.txt` load, Pablo pipeline build, and (cold) JIT compile on every call —
-none of which is tokenization. `--bench-loop=N` builds the pipeline once, mmaps
-the input once, then runs it N times in the same process with token output
-suppressed, and prints:
-
-```
-BENCH_RESULT bytes=… iters=… min_ms=… median_ms=… mean_ms=… mbps=…
-```
-
-The script parses the **min** iteration — the steady-state peak, exactly what
-criterion reports. HF is timed as a warm in-process `encode()` loop over the
-whole-file string (not `encode_batch` over pre-split lines, so both sides see one
-contiguous stream), with the model preloaded.
-
-### Peak MB/s vs marginal MB/s
-
-Parabix pays a **fixed per-call pipeline-dispatch floor** — the cost of invoking
-its merge-range kernels (1123 for full GPT-2 merges), roughly 160–190 ms
-independent of input size. On small inputs that floor dominates, so peak MB/s is
-a floor artifact rather than a real rate.
-
-`--sweep` cuts increasing-size prefixes (4 KB → 20 MB) from a source corpus and
-least-squares fits
-
-```
-min_ms = floor + slope · bytes
-```
-
-per engine, reporting the intercept as the fixed floor and `1e-3 / slope` as the
-**marginal MB/s** — the floor-free steady-state rate the SIMD data-parallelism
-actually delivers. R² and point count are printed with the fit. The multi-MB tail
-carries most of the leverage: at 1 MB the floor is still ~24% of `min_ms`, past
-8 MB it is a few percent.
-
-### Adaptive iterations
-
-Multi-MB inputs cost seconds per iteration, so above 1 MB the iteration count
-scales down to hold wall-clock roughly constant, with a floor of 3 samples
-(criterion's own minimum). `min_ms`'s relative noise shrinks as the input grows,
-so this costs almost no precision. Disable with `--no-adaptive-iters`.
-
-### Usage
+The tokenizer runs **without a pre-tokenizer** (the whole input is one sequence,
+`\n` is content), so the test applies to the merge-kernel design; the current
+design needs a pre-tokenizer.
 
 ```bash
-python bench_bpe.py --input file.txt         # one file
-python bench_bpe.py --input a.txt b.txt      # several files, one row each
-python bench_bpe.py --sweep --sweep-source file.txt   # prefix sweep + floor/marginal fit
-python bench_bpe.py --sweep --sweep-source file.txt --sweep-max-mb 1   # cheap sub-MB sweep
-python bench_bpe.py --sweep --sweep-source file.txt --sweep-sizes 1,4,8   # explicit sizes in MB
-python bench_bpe.py --input FILE --iters 20  # timed iterations per side
-python bench_bpe.py --input FILE --no-adaptive-iters
-python bench_bpe.py --openwebtext            # stream + cache a real-world sample, bench it
-python bench_bpe.py --openwebtext --owt-bytes 50000000
-python bench_bpe.py --input FILE --svg bench.svg   # also emit a MB/s bar chart
-python bench_bpe.py --input FILE --parabix-only
-python bench_bpe.py --input FILE --hf-only
-```
-
-`--parabix-args "<flags>"` passes raw tokenizer flags straight through to every
-Parabix invocation — this is how the BPE optimization flags below get swept:
-
-```bash
-python bench_bpe.py --sweep --sweep-source corpus.txt \
-    --parabix-args "--if-group-lower-limit=100 --if-group-size=8"
-```
-
-Output → `bench_bpe_output.txt`, plus an SVG chart when `--svg` is given.
-
----
-
-## 5. `bench_configs.py`
-
-Parabix **against itself** — no HuggingFace, no `tokenizers` import, no
-`vocab.json`. `bench_bpe.py --parabix-only --parabix-args "…"` times ONE config
-per invocation; this script times N configs in one run and tabulates them, which
-is what you want when the question is "which flag combination is fastest", not
-"are we faster than HF".
-
-Three things it does that repeating `bench_bpe.py` cannot:
-
-- **Interleaving.** Sequential benchmark runs are minutes apart and laptop
-  clocks drift (thermal throttle, background load), so the config that runs last
-  is penalised. Each round here round-robins every config, and each config keeps
-  its **min across rounds** — drift hits all configs alike.
-- **Floor vs marginal rate.** With `--sizes`, each config is timed at several
-  prefix sizes and `min_ms = floor + slope·bytes` is fitted per config, so the
-  fixed per-call dispatch floor (kernel-count driven) is separated from the
-  floor-free per-byte rate. A single MB/s number at one size is mostly the
-  floor — see [Peak MB/s vs marginal MB/s](#peak-mbs-vs-marginal-mbs).
-- **Output identity.** `--verify` re-runs each config *without* `--bench-loop`
-  (so ids actually print) and hashes stdout against the baseline config. A
-  config that is faster but prints different tokens is flagged `DIFFERS` — a
-  faster-but-wrong config is not a win.
-
-```bash
-# default pair: no flags vs --partition=level, on val_2MB
-python bench_configs.py
-
-# explicit configs — NAME=FLAGS, first one is the speedup baseline
-python bench_configs.py \
-    --config 'baseline=' \
-    --config 'level=--partition=level' \
-    --config 'level+compact=--partition=level --compact-base=40'
-
-# floor / marginal split + output-identity check
-python bench_configs.py --input ../tokenizer_files/val_4MB.txt \
-    --sizes 0.25,1,4 --verify
-
-# noisy machine: more interleaved rounds, fewer in-process iterations
-python bench_configs.py --rounds 5 --iters 3
-
-# time the raw-byte path instead of the boundary-gated one
-python bench_configs.py --common-flags=''
-```
-
-`--iters` is the in-process `--bench-loop` count (default 5), `--rounds` the
-number of interleaved passes (default 3). A warm-up run per (config, size) pays
-the JIT and fills `~/.parabix/objcache/` before any timing starts. Prefix sizes
-larger than the input are skipped with a reason on stderr. Output →
-`bench_configs_output.txt`.
-
-`--common-flags` (default `--pretokenizer=bytelevel`) is prepended to every
-config, so all of them share a pipeline shape and only the flags under test
-differ. That default is the boundary-gated pipeline `compare_bpe.py` verifies;
-`--common-flags=''` selects the raw-byte path instead. The banner records what
-was applied.
-
-The `vs base` column and the relative marginal rate are against the **first
-named** config, looked up by name — if it produces no result at some size, that
-table says so and omits the speedups rather than promoting another config to
-denominator. With `--sizes`, `--verify` hashes the smallest prefix: it runs
-without `--bench-loop` so every token id prints, and two configs that tokenize
-identically do so at any size.
-
-The run that answers "which lever does what":
-
-```bash
-python3 bench_configs.py \
-    --input ../tokenizer_files/val_8MB.txt \
-    --sizes 0.25,1,2,4,7.5 \
-    --config 'baseline=' \
-    --config 'level=--partition=level' \
-    --config 'level+compact=--partition=level --geometric-compaction --compact-base=15' \
-    --verify
-```
-
-Read the floor/marginal table, not the per-size MB/s. `--partition=level` cuts
-kernel count, so it moves the **floor** roughly in proportion; compaction shrinks
-the stream every kernel scans, so it moves the **marginal MB/s**. A flag that
-moves neither is doing nothing. `floor @ largest` says how much of the biggest
-run is still dispatch overhead — while that is high, end-to-end speedups mostly
-measure the floor and will shrink as the input grows.
-
-Sweeping the compaction interval is the same command with several
-`--compact-base=N` configs.
-
----
-
-## 6. `selfmerge_test.py`
-
-Correctness of self-merges, which the merge kernels resolve with run-parity logic: a
-run of equal tokens must pair left to right, each token used once (`XXXXX` → `XX XX X`).
-The script generates its own input (runs of length 1–12 of single bytes, multi-byte
-characters and multi-character units, in several contexts, plus mixed alternations)
-and compares the tokenizer's ids with a self-contained reference BPE built from
-`merges.txt` (priority queue, lowest rank then leftmost first, as in HuggingFace), so
-it needs neither HuggingFace nor `vocab.json`.
-
-```bash
-python selfmerge_test.py --tokenizer ../../../build22/bin/tokenizer
+python selfmerge_test.py                                   # 8 built-in merge-kernel option sets
 python selfmerge_test.py --config 'mine=--partition=level --compact-base=2' --keep /tmp/sm
 ```
 
-Each `--config NAME=FLAGS` is one tokenizer run (the default is a built-in set of merge
-strategies); `--keep DIR` saves the input, the reference ids and each output. Prints
-`MATCH` / `MISMATCH` per configuration and exits 1 on any mismatch. The first run of a
-new configuration pays its JIT compile.
+`--keep DIR` saves the input, the reference ids and each output. It prints
+`MATCH` or `MISMATCH` per set and exits 1 on any mismatch. A new set's first run
+compiles its kernels, which takes minutes.
 
 ---
 
-## Tokenizer flags
+## Tokenizer options
 
-The binary's CLI is documented once, in the parent
-[tools/lex/README.md](../README.md):
-
-- **[All CLI flags](../README.md#all-cli-flags)** — `--merges`, `--vocab`,
-  `--strings`, `--offsets`, `--bench-loop`, `--merges-limit`,
-  `--strip-newlines`, and the normalizer / pre-tokenizer modes.
-- **[BPE optimization parameters](../README.md#bpe-optimization-parameters)** —
-  `--compact-base`, `--geometric-compaction`, `--if-group-lower-limit`,
-  `--if-group-count`, `--if-group-size`, `--lookahead-in-gate`,
-  `--lookahead-in-group`, `--partition=level`, `--indexed-shift`, each with its
-  objcache-name tag. All default OFF. Sweep them against HF via
-  `bench_bpe.py --parabix-args`, or against each other via
-  [`bench_configs.py --config`](#5-bench_configspy); the parent's
-  [Correctness testing](../README.md#correctness-testing) and
-  [Performance testing](../README.md#performance-testing) sections have the
-  A/B recipe.
+The tokenizer's options are documented once, in the parent
+[README](../README.md): [Tokenizer options](../README.md#tokenizer-options),
+[Options of the current design](../README.md#options-of-the-current-design) and
+[merge-kernel options](../README.md#merge-kernel-options).
 
 ---
 
 ## Gotchas
 
-- **No corpus ships with the repo.** Every script's default `--input` points at a
-  local file that is not committed. Pass `--input` explicitly on a fresh
-  checkout, or use `bench_bpe.py --openwebtext` to fetch one.
-- **Wipe the JIT object cache after a rebuild**, not between flag variants.
-  `BPEMergeKernel`'s cache name encodes a hash of its rule set, its lengths, its
-  stream widths, and the active optimization flags, so two flag settings never
-  collide — but a stale entry from an older *build* can fake both passes and
-  failures. `rm -rf ~/.parabix/objcache/`.
-- **Rebuild framework dylibs after a pull.** `dyld: Library not loaded:
-  @rpath/libparabix_*.dylib` means the dependency chain is stale — run
-  `make -C build19 -j8 tokenizer`.
-- **First run of a new merge set is slow.** 1123 kernels have to JIT-compile.
-  Subsequent runs hit the object cache. Use `--merges-limit` while iterating.
-- **`*_output.txt` files are not committed and are not proof of the current
-  build.** They are whatever the last local run wrote. Check the mtime, or just
-  re-run, before quoting a result.
-- **HF applies its regex pre-tokenizer; Parabix runs boundary-gated.** The two
-  agree on the corpora tested so far, but the gating mechanisms differ —
-  divergence first shows up on contraction / optional-space edge cases.
+- **Pass `--input`.** Only `selfmerge_test.py` has an input of its own.
+- **Pass the recommended options to `compare_bpe*.py` and `bench_bpe*.py`.**
+  Without them they test the slow merge-kernel design.
+- **No need to clear `~/.parabix/objcache`** after a rebuild or between option
+  sets: cached kernels belong to the build that made them, and kernel names
+  encode their options. Use `-object-cache-dir=DIR` for a private cache.
+- **Benchmark on an idle machine.** Other work on the machine (a build, another
+  test, file writes) changes the timings, most of all at 4 threads.
+- **Compare equal threads and equal caches**: `--thread-num=N` with
+  `--baseline-threads N`, and `--bench-cold-cache` with `--hf-cache=match`.
+- **`dyld: Library not loaded: @rpath/libparabix_*.dylib`** means the framework
+  libraries are stale: run `make -C build19 -j8 tokenizer`.
 
 ---
 
 ## Reference results
 
-Measured locally on a 4.2 MB webtext-derived corpus (not committed). A sanity
-reference, not a continuously verified state — the authoritative correctness
-record is the parent's
-[Validation status](../README.md#validation-status).
+Run on 2026-11-15, commit `a02100f9e`, Apple M3 (macOS), `tokenizers` 0.23.3,
+`tiktoken` 0.14.0, with the recommended options (`$BEST` above).
 
-| Script | Result |
-|--------|--------|
-| `compare_normalizers.py` | 18/18 PASS |
-| `compare_pretokenizers.py` | 7/7 PASS |
-| `compare_bpe.py` | **MATCH** — 1,302,487 tokens on both sides (4,163,141 bytes) |
-| `bench_bpe.py` (4 MB sweep point, 3 iters) | Parabix 974.9 ms / **4.30 MB/s** vs HF 1078.7 ms / 3.86 MB/s → Parabix 1.11x faster |
+**Correctness**
 
-Same corpus through `compare_bpe.py`'s own timing section (5 runs) measured
-Parabix at 2.34 MB/s against HF's 3.99 MB/s, while the `bench_bpe.py` sweep point
-at the same size measured 4.30 vs 3.86 MB/s. The gap is the fixed dispatch floor
-and the iteration count — always state which harness a number came from.
+| Script | Input | Result |
+|---|---|---|
+| `compare_bpe.py`, `$BEST`, 1 and 4 threads | `val_4MB.txt` | MATCH, 1,302,487 tokens (Parabix, HF, tiktoken) |
+| | `code_4MB.txt` | MATCH, 1,729,186 tokens |
+| | `multi_4MB.txt` | MATCH, 2,230,628 tokens |
+| `compare_bpe_hf1.py`, `$BEST` | `val_4MB.txt` | MATCH with HF 1.0.0rc4 and tiktoken |
+| `compare_bpe.py`, no options (merge kernels) | `val_4MB.txt` | MATCH |
+| `selfmerge_test.py` | its own input | 8/8 sets MATCH |
+| `compare_pretokenizers.py` and `--behaviors` | first 200 lines of each 4 MB file, LF | 9/9 modes and 10/10 behavior cases PASS on each |
+| `compare_normalizers.py` | the same lines | 19/19 PASS on each |
 
----
+**Speed** (`bench_bpe.py --iters 10 --no-adaptive-iters`, cold caches:
+`--bench-cold-cache`, HF word cache cleared before every run). Time per
+tokenization of the whole 4 MB file, median of 10 runs (min in brackets);
+speed-ups from the medians:
 
-## License
+| Threads | Input | Parabix ms | tiktoken ms | HF 0.23.3 ms | vs tiktoken | vs HF |
+|---|---|---|---|---|---|---|
+| 1 | `val_4MB.txt` | 12.69 (12.63) | 137.0 (136.4) | 1,123 (1,095) | 10.8× | 88× |
+| 1 | `code_4MB.txt` | 15.71 (15.67) | 241.3 (239.6) | 1,218 (1,203) | 15.4× | 78× |
+| 1 | `multi_4MB.txt` | 17.53 (17.47) | 221.3 (216.9) | 1,396 (1,364) | 12.6× | 80× |
+| 4 | `val_4MB.txt` | 3.95 (3.73) | 51.8 (50.5) | 338.5 (336.5) | 13.1× | 86× |
+| 4 | `code_4MB.txt` | 5.84 (5.70) | 91.8 (86.9) | 340.4 (337.8) | 15.7× | 58× |
+| 4 | `multi_4MB.txt` | 5.85 (5.71) | 92.3 (88.9) | 390.9 (385.2) | 15.8× | 67× |
 
-Parabix is governed by the Open Software License 3.0. See `OSL3.0.txt` in the
-repository root.
+At 4 threads HF and tiktoken run `encode_batch` over the text split at pre-token
+boundaries (`--baseline-threads 4`). These times exclude start-up: a one-shot run
+of the tokenizer also loads the rules, builds the tables and the pipeline (about
+60 ms, `[BPE] pipeline graph build` on stderr), compiles or loads the kernels,
+and formats the output.

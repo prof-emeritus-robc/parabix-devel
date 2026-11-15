@@ -79,6 +79,14 @@ BEHAVIOR_MAP = {
 # so a mismatch here isolates a behavior-kernel bug, not a pattern bug.
 BEHAVIOR_PATTERN = Regex(r"\w+")
 
+# The two HF pre-tokenizers that take a behavior: Split(pattern, behavior) and
+# Punctuation(behavior). Each Parabix mode is checked against the one it mirrors.
+BEHAVIOR_MODES = [
+    ("simplewordboundaries", lambda b: Split(pattern=BEHAVIOR_PATTERN, behavior=b),
+     r'Split(Regex(r"\w+"))'),
+    ("punctuation",          lambda b: Punctuation(behavior=b), "Punctuation()"),
+]
+
 # ---------------------------------------------------------------------------
 # Tee: write to terminal and file simultaneously
 # ---------------------------------------------------------------------------
@@ -196,26 +204,32 @@ def run_compare(out, lines: list[str], requested: list[str]) -> dict[str, str]:
 
 
 def run_behavior_compare(out, lines: list[str]) -> dict[str, str]:
-    r"""Differential check of all 5 --behavior= values against HF's
-    Split(Regex(r"\w+"), behavior=X) -- same pattern as simplewordboundaries,
-    already confirmed correct, so a mismatch here isolates a behavior-kernel
-    bug rather than a boundary-detection bug. Per-line, same reason as
-    run_compare (newline is a hard Parabix pretoken boundary)."""
+    r"""Differential check of all 5 --behavior= values for each mode of
+    BEHAVIOR_MODES: simplewordboundaries against HF's Split(Regex(r"\w+"),
+    behavior=X), punctuation against HF's Punctuation(behavior=X). Both modes'
+    default boundaries are already confirmed correct, so a mismatch here
+    isolates a behavior-kernel bug rather than a boundary-detection bug.
+    Per-line, same reason as run_compare (newline is a hard Parabix pretoken
+    boundary)."""
     results = {}
-    for num, (pbx_behavior, hf_behavior) in enumerate(BEHAVIOR_MAP.items(), 1):
-        hf_split = Split(pattern=BEHAVIOR_PATTERN, behavior=hf_behavior)
+    cases = [(mode, make_hf, hf_name, pbx_behavior, hf_behavior)
+             for mode, make_hf, hf_name in BEHAVIOR_MODES
+             for pbx_behavior, hf_behavior in BEHAVIOR_MAP.items()]
+    for num, (mode, make_hf, hf_name, pbx_behavior, hf_behavior) in enumerate(cases, 1):
+        hf_split = make_hf(hf_behavior)
         mismatches = []
         for li, line in enumerate(lines):
-            parabix = run_parabix("simplewordboundaries", line, behavior=pbx_behavior)
+            parabix = run_parabix(mode, line, behavior=pbx_behavior)
             hf      = run_hf(hf_split, line)
             if parabix != hf:
                 mismatches.append((li, line, parabix, hf))
 
         status = "MATCH" if not mismatches else "MISMATCH"
-        results[pbx_behavior] = status
+        results[f"{mode}+{pbx_behavior}"] = status
 
         out.write(SEP + "\n")
-        out.write(f"Behavior Test {num}: {pbx_behavior}  (HF: {hf_behavior})  →  {status}\n")
+        out.write(f"Behavior Test {num}: {mode} + {pbx_behavior}  "
+                  f"(HF: {hf_name}, {hf_behavior})  →  {status}\n")
         out.write(SEP + "\n")
         out.write(f"  Lines tested:  {len(lines)}\n")
         out.write(f"  Lines matched: {len(lines) - len(mismatches)}\n")

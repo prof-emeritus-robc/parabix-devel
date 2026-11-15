@@ -429,6 +429,47 @@ protected:
     }
 };
 
+// HF's Punctuation(behavior): the behaviour acts on the MATCHES of the pre-tokenizer, here
+// every punctuation character (BERT class) on its own, and the text between them is one
+// non-match piece (HF tokenizers v0.23.3, tokenizer/normalizer.rs NormalizedString::split;
+// pattern.rs, the Fn(char) -> bool pattern). The input boundaries are those of "isolated":
+// every match and the start of every non-match run. With M the match mask and Mp its value
+// at the previous codepoint, a behaviour drops the boundaries that HF merges away:
+//   removed            M          the matches are deleted afterwards (stage 2b), so only the
+//                                  starts of the non-match runs separate pieces
+//   contiguous         M & Mp     two matches in a row form one piece ("!!", "--")
+//   mergedwithprevious M & ~Mp    a match right after a non-match piece joins that piece
+//   mergedwithnext     ~M & Mp    a non-match piece right after a match takes that match
+// "isolated" needs no kernel: the boundaries are already HF's.
+class PunctuationBehavior : public PabloKernel {
+public:
+    PunctuationBehavior(LLVMTypeSystemInterface & ts,
+                        SplitBehaviorMode b,
+                        StreamSet * TokenBoundaries,
+                        StreamSet * MatchMask,
+                        StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "punctuationBehavior:" + SplitCode(b),
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"MatchMask", MatchMask}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}), mBehavior(b) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
+        PabloAST * M  = getInputStreamSet("MatchMask")[0];
+        PabloAST * Mp = pb.createAdvance(M, 1);
+        PabloAST * drop = nullptr;
+        if (mBehavior == removed)                 drop = M;
+        else if (mBehavior == contiguous)         drop = pb.createAnd(M, Mp);
+        else if (mBehavior == mergedwithprevious) drop = pb.createAnd(M, pb.createNot(Mp));
+        else /* mergedwithnext */                 drop = pb.createAnd(pb.createNot(M), Mp);
+        PabloAST * result = pb.createAnd(boundaries, pb.createNot(drop));
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+private:
+    SplitBehaviorMode mBehavior;
+};
+
 // Detect positions of a specific delimiter codepoint
 class CharDelimiterKernel : public PabloKernel {
 public:
@@ -804,7 +845,7 @@ static StreamSet * buildREBasedTokenizer(
 // since: U+166D CANADIAN SYLLABICS CHI SIGN (now So) and U+111C9 SHARADA SANDHI MARK (now
 // Mn) were Po then. With the current tables, 142 newer characters split where HF keeps
 // them in the word (per-codepoint sweep against Punctuation() and BertPreTokenizer()).
-static re::RE * buildBertPunctuationRule() {
+static re::CC * bertPunctuationCC() {
     auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
         UCD::getPropertyObject(UCD::gc));
     auto * ageObj = llvm::cast<UCD::EnumeratedPropertyObject>(
@@ -817,7 +858,11 @@ static re::RE * buildBertPunctuationRule() {
                                   &cc::Unicode);
     re::CC * asciiPunctCC = re::makeCC({{0x21,0x2F},{0x3A,0x40},
                                          {0x5B,0x60},{0x7B,0x7E}}, &cc::Unicode);
-    re::CC * bertPunctCC = re::makeCC(punctCC, asciiPunctCC);
+    return re::makeCC(punctCC, asciiPunctCC);
+}
+
+static re::RE * buildBertPunctuationRule() {
+    re::CC * bertPunctCC = bertPunctuationCC();
     re::RE * notBertPunctCC = re::makeComplement(bertPunctCC);
     re::RE * possessiveRun = re::makeSeq({
         re::makeRep(notBertPunctCC, 1, re::Rep::UNBOUNDED_REP),
@@ -872,6 +917,9 @@ PreTokenizerResult buildPreTokenizerBoundaries(
 
     StreamSet * WordBoundaries = nullptr;
     StreamSet * SW_WordClass = nullptr;  // set below iff preTokenizer == simpleWordBoundaries
+    StreamSet * PunctMatch = nullptr;    // set below iff preTokenizer == punctuation: the
+                                         // BERT punctuation characters, the matches HF's
+                                         // Punctuation(behavior) acts on
 
     if (preTokenizer == simpleWordBoundaries) {
         // CLI help says "Boundaries between \w and \W characters" (a plain
@@ -990,6 +1038,9 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     else if (preTokenizer == punctuation) {
         WordBoundaries = buildREBasedTokenizer(P, "BPC",
             buildBertPunctuationRule(), U21codepoints);
+        PunctMatch = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{bertPunctuationCC()},
+                                              U21codepoints, PunctMatch);
     }
     else if (preTokenizer == chardelimiter) {
         uint32_t delimCP;
@@ -1075,6 +1126,14 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         P.CreateKernelCall<NotKernel>(SW_WordClass, notWordClass);
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWordClass, insertionBoundaries);
+    } else if (preTokenizer == punctuation &&
+               (effectiveBehavior == removed || effectiveBehavior == contiguous ||
+                effectiveBehavior == mergedwithprevious || effectiveBehavior == mergedwithnext)) {
+        // HF's Punctuation(behavior): act on the punctuation matches, not on whitespace
+        // (see PunctuationBehavior). "removed" deletes the matches in stage 2b.
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<PunctuationBehavior>(effectiveBehavior, U21_tokenBoundaries, PunctMatch,
+                                                insertionBoundaries);
     } else if (effectiveBehavior == isolated && preTokenizer != digits && preTokenizer != punctuation
                && preTokenizer != simpleWordBoundaries) {
         insertionBoundaries = P.CreateStreamSet(1);
@@ -1125,7 +1184,7 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         AlphanumericMask,
         PunctuationStream,
         effectiveBehavior,
-        SW_WordClass
+        SW_WordClass ? SW_WordClass : PunctMatch
     };
 }
 
@@ -1398,11 +1457,12 @@ StreamSet * applyTokenSeparatorInsertion(
         FilterByMask(P, tokenMask, realSlots, newReal);
         realSlots = newReal;
     } else if (result.effectiveBehavior == removed && result.WordClassMask != nullptr) {
-        // HF's real "removed": delete the matched \w+ characters entirely,
-        // same FilterByMask mechanism as excludewhitespace above, keyed on
-        // word-class instead of whitespace. Guarded on WordClassMask being
-        // set (only simpleWordBoundaries populates it) so a stray
-        // --behavior=removed on another mode is a safe no-op, not a crash.
+        // HF's real "removed": delete the matched characters entirely (\w for
+        // simplewordboundaries, punctuation for punctuation), same FilterByMask
+        // mechanism as excludewhitespace above, keyed on the match mask instead of
+        // whitespace. Guarded on WordClassMask being set (only those two modes
+        // populate it) so a stray --behavior=removed on another mode is a safe
+        // no-op, not a crash.
         StreamSet * spreadWordClassMask = P.CreateStreamSet(1);
         SpreadByMask(P, lineInsertMask, result.WordClassMask, spreadWordClassMask);
         StreamSet * notWordClassMask = P.CreateStreamSet(1);

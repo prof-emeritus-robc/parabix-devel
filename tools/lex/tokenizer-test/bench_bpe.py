@@ -207,10 +207,13 @@ def split_for_threads(text: str, pieces: int) -> list[str]:
     return [text[a:b] for a, b in zip(cuts, cuts[1:]) if b > a]
 
 
-def _timed(fn, nbytes: int, iters: int) -> dict:
-    """Run fn() `iters` times (already warmed up); min/median/mean ms + peak MB/s."""
+def _timed(fn, nbytes: int, iters: int, setup=None) -> dict:
+    """Run fn() `iters` times (already warmed up); min/median/mean ms + peak MB/s.
+    setup(), if given, runs before every timed call, outside the timer."""
     times = []
     for _ in range(iters):
+        if setup:
+            setup()
         t0 = time.perf_counter()
         fn()
         times.append((time.perf_counter() - t0) * 1e3)   # ms
@@ -233,22 +236,26 @@ def _timed(fn, nbytes: int, iters: int) -> dict:
 # HuggingFace side — in-process encode loop, min/median of N iterations
 # ---------------------------------------------------------------------------
 
-def run_hf(tok, text: str, iters: int, chunks: list[str] | None = None) -> dict | None:
-    """Time HF encode() on the whole-file string, N warm iterations + 1 discard.
+def run_hf(tok, text: str, iters: int, chunks: list[str] | None = None,
+           cold: bool = False) -> dict | None:
+    """Time HF encode() on the whole-file string, N iterations + 1 discard.
 
     Whole-file encode mirrors how Parabix processes the input as a single byte
     stream (rather than encode_batch over pre-split lines). With `chunks`
     (--baseline-threads > 1) it times encode_batch over them instead (rayon,
-    RAYON_NUM_THREADS threads), after checking that their ids match one encode."""
+    RAYON_NUM_THREADS threads), after checking that their ids match one encode.
+    cold: empty the BPE model's word cache before every timed run (not timed),
+    the counterpart of Parabix's --bench-cold-cache."""
     nbytes = len(text.encode("utf-8"))
+    setup = tok.model._clear_cache if cold else None
     if chunks:
         joined = [i for e in tok.encode_batch(chunks) for i in e.ids]   # also the warm-up
         if joined != tok.encode(text).ids:
             sys.stderr.write("  [HF] split encode differs from one encode: not timed\n")
             return None
-        return _timed(lambda: tok.encode_batch(chunks), nbytes, iters)
+        return _timed(lambda: tok.encode_batch(chunks), nbytes, iters, setup)
     tok.encode(text)                       # warm-up (discarded)
-    return _timed(lambda: tok.encode(text), nbytes, iters)
+    return _timed(lambda: tok.encode(text), nbytes, iters, setup)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +546,10 @@ def main():
                          "whole text). N > 1 splits the text at safe pretoken boundaries "
                          "and times encode_batch on N threads; match Parabix's --thread-num "
                          "for an equal-threads comparison.")
+    ap.add_argument("--hf-cache", choices=["match", "warm", "cold"], default="match",
+                    help="HF word cache between timed runs: 'match' (default) = cold when "
+                         "--parabix-args has --bench-cold-cache, else warm; 'cold' = cleared "
+                         "before every run (not timed)")
     ap.add_argument("--tiktoken-ordinary", action="store_true",
                     help="Time tiktoken's encode_ordinary(_batch), which skips the "
                          "special-token scan, instead of encode(_batch)")
@@ -569,6 +580,8 @@ def main():
         parabix_extra.insert(0, "--pretokenizer=bytelevel")
     parabix_threads = next((a.split("=", 1)[1] for a in parabix_extra
                             if a.startswith("--thread-num=")), "default")
+    parabix_cold = "--bench-cold-cache" in parabix_extra
+    hf_cold = parabix_cold if args.hf_cache == "match" else args.hf_cache == "cold"
     if args.baseline_threads > 1:
         # rayon reads this when HF first runs a batch, so set it before any encode.
         os.environ["RAYON_NUM_THREADS"] = str(args.baseline_threads)
@@ -658,6 +671,9 @@ def main():
                       f"(floor {ITER_FLOOR})")
         if args.parabix_iters:
             out.write(f"; Parabix {args.parabix_iters}")
+        out.write(f"\nCaches: Parabix {'cold (--bench-cold-cache)' if parabix_cold else 'warm'}")
+        if tok is not None:
+            out.write(f", HF {'cold (word cache cleared before every run)' if hf_cold else 'warm'}")
         out.write(f"\nThreads: Parabix --thread-num={parabix_threads}, "
                   f"HF/tiktoken {args.baseline_threads}")
         if args.baseline_threads > 1:
@@ -676,7 +692,7 @@ def main():
                     text = f.read()
                 if args.baseline_threads > 1:
                     chunks = split_for_threads(text, 4 * args.baseline_threads)
-            h = run_hf(tok, text, it, chunks) if want_hf else None
+            h = run_hf(tok, text, it, chunks, hf_cold) if want_hf else None
             t = run_tiktoken(tiktoken_enc, text, it, chunks, args.baseline_threads,
                              args.tiktoken_ordinary) if want_tiktoken else None
             results = {"Parabix": p, "HF": h, "tiktoken": t}

@@ -1,736 +1,589 @@
 # Parabix Tokenizer
 
-Parabix technology is a high-performance programming framework for streaming text
-processing applications, leveraging both SIMD and multicore parallel processing
-features. The Parabix tokenizer is a Unicode tokenizer built on this framework —
-text is processed as parallel bitstreams so all characters are transformed
-simultaneously rather than one at a time.
+`tokenizer` is a GPT-2 byte-level BPE tokenizer built on the Parabix framework,
+together with HuggingFace-style normalizers and pre-tokenizers. Parabix processes
+text as parallel bit streams (one bit per input byte in each stream, a whole SIMD
+register of positions per operation) and compiles its kernels at run time.
+
+For GPT-2, the BPE output is the same token ids as HuggingFace `tokenizers` and
+OpenAI `tiktoken` (see [Validation](#validation)). Only GPT-2-style vocabularies
+are supported (see [Limitations](#limitations)).
+
+| File | Contents |
+|---|---|
+| `tokenizer.cpp` | Command line, pipeline assembly, token output |
+| `normalize.h` / `normalize.cpp` | Normalizers |
+| `pretokenizer.h` / `pretokenizer.cpp` | Pre-tokenizers, including the GPT-2 boundary kernels |
+| `bpe.h` / `bpe.cpp` | BPE: rule loading, cut and per-length kernels, lookup tables, the C++ miss path, the emitter, and the older merge-kernel design |
+| `ICU_Boundaries.h` / `.cpp` | ICU `BreakIterator` word boundaries |
+| `merge_analysis.py` | Python reference for the merge-kernel clean-range partition |
+| `bpe_pipeline.drawio` | An early design sketch (depth-stratified merge passes); not the current pipeline |
+| `tokenizer_files/` | GPT-2 model files and test inputs ([Data files](#data-files)) |
+| `tokenizer-test/` | Correctness and benchmark scripts ([README](tokenizer-test/README.md)) |
+| `third_party/nlohmann/json.hpp` | JSON parser for `vocab.json` (committed) |
 
 ## Requirements
 
-To build the tokenizer, you need a development environment that satisfies the
-Parabix project requirements:
+The Parabix requirements from the top-level [README](../../README.md): a C++17
+compiler, cmake 3.12+, Boost 1.61+, LLVM 17 or later (Release build). The
+tokenizer also needs:
 
-- Standard C++ development tools including git, C++, etc.
-- A modern C++ compiler supporting at least C++17.
-- The cmake build system version 3.12 or better.
-- Boost libraries version 1.61 or better (Ubuntu: `libboost-all-dev`).
-- LLVM system version 12 or later (built in Release mode).
-- ICU development libraries, components `uc` and `i18n` (Ubuntu:
-  `libicu-dev`; macOS/Homebrew: `brew install icu4c`). `tools/lex/CMakeLists.txt`
-  does `find_package(ICU REQUIRED COMPONENTS uc i18n)` and links `ICU::uc` +
-  `ICU::i18n` — `ICU_Boundaries.cpp` uses ICU's `BreakIterator` for locale-aware
-  word boundaries, so the tokenizer does not build without it. If Homebrew's
-  keg-only `icu4c` is not found, configure with
+- **ICU** (`uc` and `i18n`; Ubuntu `libicu-dev`, Homebrew `icu4c`).
+  `CMakeLists.txt` does `find_package(ICU REQUIRED COMPONENTS uc i18n)`. If
+  Homebrew's keg-only `icu4c` is not found, configure with
   `-DCMAKE_PREFIX_PATH=$(brew --prefix icu4c)`.
-- A JSON parser: [nlohmann/json](https://github.com/nlohmann/json) (header-only).
-  `bpe.cpp` does `#include <nlohmann/json.hpp>` to parse `vocab.json`, and
-  `CMakeLists.txt` puts `tools/lex/third_party` on the include path — so the
-  single header must be present at `tools/lex/third_party/nlohmann/json.hpp`:
-
-  ```bash
-  mkdir -p tools/lex/third_party/nlohmann
-  curl -L -o tools/lex/third_party/nlohmann/json.hpp \
-      https://github.com/nlohmann/json/releases/latest/download/json.hpp
-  ```
+- **nlohmann/json**: the single header is committed at
+  `third_party/nlohmann/json.hpp`, so there is nothing to install.
 
 ## Build
-
-Clone the repository and build the tokenizer:
 
 ```bash
 git clone https://cs-git-research.cs.sfu.ca/cameron/parabix-devel.git
 cd parabix-devel
-mkdir build19
-cd build19
+mkdir build19 && cd build19
 cmake -DCMAKE_BUILD_TYPE=Release ..
-make tokenizer
+make -j8 tokenizer
 ```
 
-All compiled tools land under `build19/bin/`; the tokenizer binary is
-`build19/bin/tokenizer`. The test scripts in `tokenizer-test/` default to that
-binary; pass `--tokenizer=PATH` to use another build directory.
+The binary is `build19/bin/tokenizer`. `build19` is only a name: it is the
+default path of the scripts in `tokenizer-test/`, which take `--tokenizer=PATH`
+for any other build.
 
-## Tokenizer
+Kernels are compiled at run time and cached in `~/.parabix/objcache` (see the
+top-level README). Cache entries belong to the build that made them, so a rebuild
+never reuses stale kernels and there is no need to clear the cache. BPE kernel
+names also encode their tables and options, so switching options is safe.
 
-`tokenizer.cpp` is the CLI entry point. It reads an input file, runs optional
-normalization, optional pre-tokenization, and optional BPE encoding, writing the
-result to stdout.
-
-```
-input file → [normalize] → [pre-tokenize] → [BPE encode] → stdout
-```
-
-Basic usage:
+## Quick start
 
 ```bash
-bin/tokenizer input.txt
-bin/tokenizer --normalize=lowercase input.txt
-bin/tokenizer --normalize=nfd --pretokenizer=bert input.txt
-bin/tokenizer --merges=tools/lex/tokenizer_files/merges.txt input.txt
+T=build19/bin/tokenizer
+M=tools/lex/tokenizer_files/merges.txt
+
+# Pre-tokenize only (default UAX#29 word boundaries), one pre-token per line
+$T input.txt
+
+# GPT-2 BPE with the recommended options: one token id per line
+BEST="--pretokenizer=bytelevel --tail-from-bytes --tail-vocab-table --tail-cache-pool \
+--tail-scan-kernel --tail-emit-from-segs --tail-long-cache --tail-batch-bpe --tail-hard-split \
+--tail-simd-emit --skip-identity-normalize --pretok-compress-classes --pretok-class-code \
+--fast-emit --memsource-in-place --pretok-byte-domain --pretok-utf8-classes \
+--tail-unit-seed --pair-cuts=3 --len-scan=15"
+$T $BEST --merges=$M input.txt
 ```
 
-If only `--normalize` is given with no `--pretokenizer`, the tokenizer outputs
-the raw normalized text and stops — normalization alone is not tokenization.
+Every optimization is opt-in and defaults off, so that each one could be added and
+measured on its own. That is why the recommended command is long. Without these
+options, `$T --pretokenizer=bytelevel --merges=$M input.txt` runs the original
+[merge-kernel design](#older-design-merge-kernels): the same output, but 1,123
+kernels, a long first compile and a much slower run.
 
-### All CLI flags
+Example. Input (42 bytes: a line, a blank line, a line indented by 4 spaces):
 
-| Flag | Meaning |
+```
+Hello world, it's 日本 code;
+
+    x = 1
+```
+
+`$T $BEST --merges=$M --strings --offsets=byte input.txt` prints the id, the
+byte span and the token string (GPT-2 shows a space as `Ġ` and
+a newline as `Ċ`):
+
+```
+15496   0   5   Hello
+995     5   11  Ġworld
+11      11  12  ,
+340     12  15  Ġit
+338     15  17  's
+10545   17  19  Ġæ
+245     19  20  Ĺ
+98      20  21  ¥
+17312   21  23  æľ
+105     23  24  ¬
+2438    24  29  Ġcode
+26      29  30  ;
+628     30  32  ĊĊ
+220     32  33  Ġ
+220     33  34  Ġ
+220     34  35  Ġ
+2124    35  37  Ġx
+796     37  39  Ġ=
+352     39  41  Ġ1
+198     41  42  Ċ
+```
+
+Without `--strings` and `--offsets`, only the ids are printed. [How BPE
+works](#bpe) walks through this example.
+
+Status lines go to stderr: rules loaded, table sizes, build and compile times,
+and the run time (`[BPE] run (execute pipeline): … ms`).
+
+## Command line
+
+```
+tokenizer [options] [input file]
+```
+
+With no input file the tokenizer reads standard input. Two modes:
+
+- **Pre-tokenizer mode** (no `--merges` or `--vocab`): normalize, pre-tokenize,
+  and write the pre-tokens one per line. With `--normalize` and no
+  `--pretokenizer`, it writes the normalized text and stops.
+- **BPE mode** (`--merges` or `--vocab` given): token ids, one per line.
+
+Useful Parabix framework options: `--thread-num=N` (worker threads, default 3,
+capped at the number of cores), `--segment-size=N`, `--output=FILE`,
+`-EnableCycleCounter` (cycles per kernel), `-object-cache-dir=DIR`.
+
+### Tokenizer options
+
+Defined in `tokenizer.cpp` (shown by `--help`). The BPE design options live in
+`bpe.cpp` and are listed under [Options of the current design](#options-of-the-current-design)
+and [merge-kernel options](#merge-kernel-options).
+
+| Option | Meaning |
 |---|---|
-| `<input file>` | Positional, required. |
-| `--normalize=` | Normalization mode(s); repeatable. See below. |
-| `--pretokenizer=` | Pre-tokenizer mode. See below. |
-| `--behavior=` | Delimiter handling for the pre-tokenizer. |
-| `--delimiter=` | Delimiter character for `--pretokenizer=chardelimiter` (default `,`). |
-| `--vocab=` | Path to a HuggingFace `vocab.json`. Enables BPE mode. |
-| `--merges=` | Path to a HuggingFace `merges.txt`. Enables BPE mode. |
-| `--strings` | BPE mode: print token strings instead of integer IDs. |
-| `--merges-limit=N` | BPE mode: use only the first N merges by rank (0 = all). Fewer rules = smaller kernels = faster JIT, for size sweeps and smoke tests. |
-| `--strip-newlines` | BPE mode with no `--pretokenizer`: drop `\n` bytes as pre-token separators instead of treating them as content. |
-| `--bench-loop=N` | BPE mode: tokenize the input N times inside one process, suppressing output, then print a `BENCH_RESULT` line to stderr. Excludes process spawn, merges load, JIT, and file I/O. |
+| `--normalize=M[,M…]` | Normalizers, applied in order; comma-separated or repeated ([Normalizer](#normalizer)). |
+| `--pretokenizer=M` | Pre-tokenizer mode (default `uax29`) ([Pre-tokenizer](#pre-tokenizer)). |
+| `--behavior=B` | Delimiter handling of the pre-tokenizer (default `isolated`). |
+| `--delimiter=C` | Delimiter for `--pretokenizer=chardelimiter` (default `,`). |
+| `--merges=FILE` | HuggingFace `merges.txt`. Enables BPE mode and is enough on its own. |
+| `--vocab=FILE` | HuggingFace `vocab.json`. Also enables BPE mode; optional with `--merges`, which alone gives the token strings for `--strings` and `--offsets`. |
+| `--merges-limit=N` | Use only the first N merges by rank (0 = all), for quick tests. |
+| `--strings` | Print `id<TAB>token` instead of the id. |
+| `--offsets=none\|byte\|char` | Also print each token's span. `byte`: byte offsets. `char`: character offsets as HuggingFace `Encoding.offsets` (a token that covers part of a character reports the whole character, so spans can overlap). Not with `--strip-newlines`; with `--normalize` the spans refer to the normalized text. |
+| `--fast-emit` | Write plain ids with a direct integer formatter (same output; ignored with `--strings`/`--offsets`). |
+| `--emit-id-table` | With `--fast-emit` and the tail emitter: format ids from a precomputed table (same output). |
+| `--strip-newlines` | BPE without `--pretokenizer`: drop `\n` bytes as separators. By default `\n` is content (id 198, `Ċ`), as in HuggingFace. |
+| `--skip-identity-normalize` | BPE without `--normalize`: feed BPE the input bytes, not decoded and re-encoded codepoints (the same bytes for valid UTF-8). |
+| `--pretok-compress-classes` | Bytelevel pre-tokenizer, no normalizer, with `--skip-identity-normalize`: compress only the pre-tokenizer's character classes to one slot per codepoint, not all 21 codepoint bits. |
+| `--pretok-class-code` | With the above: compress a 4-bit code of the classes instead of 9 class streams. |
+| `--pretok-byte-domain` | With `--pretok-class-code`: find the pre-token starts on the bytes, with no compression at all ([GPT-2 boundaries](#the-bytelevel-pre-tokenizer)). |
+| `--pretok-utf8-classes` | With `--pretok-byte-domain`: compile the classes on the UTF-8 bytes, with no UTF-8 decoder. |
+| `--memsource-in-place` | Load the input once into a padded buffer that the source kernel reads in place, instead of copying it on every pipeline call. |
+| `--auto-segment-size` | Pick `--segment-size` from the input size and `--thread-num` (16K to 256K, at least 64 segments per thread) unless `--segment-size` is given. |
+| `--bench-loop=N` | Tokenize the input N times in one process with output off, after one warm-up run, and print a `BENCH_RESULT` line to stderr. Excludes process start, rule loading, compiling and file reading. |
+| `--bench-cold-cache` | With `--bench-loop`: empty the tail's caches before every run, so each run starts cold like a one-shot run. |
 
 ## Normalizer
 
-`normalize.h` / `normalize.cpp`
+`normalize.h` / `normalize.cpp`. Each mode is a Parabix pipeline on the UTF-8 bit
+streams. `--normalize=` takes:
 
-Normalization is stage 1. It transforms the input text before any splitting
-happens. Each mode is a Parabix pipeline operating directly on the UTF-8
-bitstreams. Available via `--normalize=`:
+- `none` (default), `nfc`, `nfd`, `nfkc`, `nfkd` (Unicode normalization forms).
+- `lowercase`: map uppercase codepoints to lowercase (Unicode simple lowercase, one to one).
+- `stripaccents`: remove nonspacing marks (`Mn`). Use after `nfd`.
+- `stripleft`, `stripright`, `strip`: remove leading, trailing or both
+  `\p{White_Space}`.
+- `bytelevel`: GPT-2 byte alphabet, every byte mapped to a printable character.
+- `nmt`: Google NMT clean-up (control characters removed, whitespace to space).
+- `bertcleantext`: BERT `clean_text` (drop `\p{C}` except `\t\n\r`, and U+FFFD;
+  `\p{Zs}`, `\t`, `\n`, `\r` become U+0020).
+- `bertchinesechars`: BERT `handle_chinese_chars` (spaces around each CJK character).
 
-- `none` — No normalization (default).
-- `nfc` — Canonical decomposition followed by canonical composition.
-- `nfd` — Canonical decomposition.
-- `nfkc` — Compatibility decomposition followed by canonical composition.
-- `nfkd` — Compatibility decomposition.
-- `lowercase` — Map all uppercase codepoints to lowercase (Unicode SLC, 1-to-1).
-- `stripaccents` — Remove Mn (Mark, Nonspacing) codepoints. Apply *after* `nfd`
-  so accents are isolated codepoints.
-- `stripleft` — Remove leading Unicode whitespace (`\p{White_Space}`).
-- `stripright` — Remove trailing Unicode whitespace.
-- `strip` — Remove both leading and trailing Unicode whitespace.
-- `bytelevel` — GPT-2 byte alphabet: remap every input byte to a unique
-  printable Unicode character.
-- `nmt` — Google NMT preprocessing: control-character cleanup, whitespace → space.
-- `bertcleantext` — BERT `clean_text`: drop `\p{C}` (except `\t\n\r`) and U+FFFD;
-  map `\p{Zs}`, `\t`, `\n`, `\r` to U+0020.
-- `bertchinesechars` — BERT `handle_chinese_chars`: surround each CJK character
-  with spaces.
-
-`--normalize` is repeatable, so modes compose in the order given:
-
-```bash
-bin/tokenizer --normalize=nfd --normalize=stripaccents input.txt
-```
+Modes compose in order: `--normalize=nfd,stripaccents,lowercase` (or the option
+repeated).
 
 ## Pre-tokenizer
 
-`pretokenizer.h` / `pretokenizer.cpp`
+`pretokenizer.h` / `pretokenizer.cpp`. `--pretokenizer=` takes:
 
-Pre-tokenization is stage 2. It splits the (possibly normalized) text into tokens
-by inserting newline separators at token boundaries. Available via
-`--pretokenizer=`:
+| Mode | Splits | HuggingFace counterpart |
+|---|---|---|
+| `uax29` (default) | Unicode UAX #29 word boundaries | none |
+| `whitespace` | `\w+` and `[^\w\s]+` runs, whitespace dropped | `Whitespace()` |
+| `whitespacesplit` | On whitespace, whitespace dropped | `WhitespaceSplit()` |
+| `digits` | Each digit on its own | `Digits(individual_digits=True)` |
+| `punctuation` | At punctuation, by `--behavior` | `Punctuation(behavior)` |
+| `simplewordboundaries` | Between `\w` and `\W` runs, by `--behavior` | `Split(Regex(r"\w+"), behavior)` |
+| `bytelevel` | GPT-2 pre-tokenization ([below](#the-bytelevel-pre-tokenizer)) | `ByteLevel(add_prefix_space=False)` |
+| `chardelimiter` | On `--delimiter` | `CharDelimiterSplit` |
+| `bert` | Whitespace and punctuation | `BertPreTokenizer()` |
+| `sequence_whitespace_punctuation` | Whitespace, then punctuation | `Sequence([WhitespaceSplit(), Punctuation()])` |
 
-- `uax29` — Unicode UAX#29 word boundaries (default).
-- `whitespace` — Split on whitespace characters.
-- `whitespacesplit` — Split on whitespace, output delimiters as separate tokens.
-- `digits` — Split on digit sequences.
-- `punctuation` — Split on punctuation characters.
-- `simplewordboundaries` — Boundaries between `\w` and `\W` characters.
-- `bytelevel` — GPT-2 pre-tokenization with byte remapping (see below).
-- `chardelimiter` — Split on a specific character, set with `--delimiter`.
-- `bert` — BERT pre-tokenizer: separates punctuation and words.
-- `sequence_whitespace_punctuation` — Whitespace then punctuation splitting.
+`--behavior=` decides what happens to the delimiters:
 
-`--behavior` controls what happens to the delimiter at each split boundary:
+- `isolated` (default): delimiters become pre-tokens of their own.
+- `removed`: HuggingFace's `removed`, the matches are deleted
+  (`simplewordboundaries` deletes the `\w+` runs, `punctuation` the punctuation).
+- `mergedwithprevious`, `mergedwithnext`: a delimiter joins the pre-token before or after it.
+- `contiguous`: adjacent delimiters form one pre-token.
+- `excludewhitespace`: keep the boundaries, drop whitespace (the old meaning of
+  `removed`).
 
-- `isolated` — Keep token boundaries and add space boundaries (default).
-- `removed` — Only keep word/punctuation boundaries, exclude whitespace.
-- `mergedwithprevious` — Attach whitespace to the previous word.
-- `mergedwithnext` — Attach whitespace to the next word.
-- `contiguous` — Keep punctuation with words, separate spaces.
+`bert`, `sequence_whitespace_punctuation`, `whitespace`, `whitespacesplit` and
+`chardelimiter` always use `excludewhitespace`. For `simplewordboundaries` and
+`punctuation` the behaviors follow HuggingFace exactly; for the other modes they
+act on whitespace. The output has one pre-token per line, so a `\n` in the input
+always ends a pre-token.
 
-Examples:
+### The bytelevel pre-tokenizer
 
-```bash
-bin/tokenizer --pretokenizer=whitespace input.txt
-bin/tokenizer --pretokenizer=chardelimiter --delimiter=, input.txt
-bin/tokenizer --pretokenizer=whitespace --behavior=removed input.txt
-bin/tokenizer --normalize=lowercase --pretokenizer=bert input.txt
-```
-
-### The `bytelevel` pre-tokenizer
-
-`bytelevel` reproduces GPT-2's pre-tokenization regex:
+`bytelevel` gives the pre-token boundaries of GPT-2's regex:
 
 ```
-'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s+(?!\S)|\s+
+'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
 ```
 
-It is **not** implemented by compiling that regex. Parabix's generic regex engine
-(`RE_Kernel`) evaluates all alternatives in parallel and marks every match end,
-which loses the leftmost-first alternation priority the GPT-2 regex depends on.
-For example at a space before a word, both `\s+` and ` ?\p{L}+` match, and both
-ends get marked, so `hello world` splits as `hello|Ġ|world` instead of
-`hello|Ġworld`.
+It does not compile that regex. Parabix's regex engine finds every match end of
+every alternative at once, which loses the leftmost-first priority this regex
+relies on. Instead the boundaries come from **character-class transitions**: a
+pre-token is an optional single space plus a run of one class (letter, number,
+other), or a whitespace run, plus contractions, and for runs of one class the
+leftmost-longest split is "a boundary at each class change", which bit streams
+compute in one pass. Two details:
 
-Instead, `GPT2PretokenBoundaryKernel` computes pre-token starts from
-**character-class transitions**. A GPT-2 pre-token is an optional single leading
-space plus a maximal run of one class (Letter / Number / Other), or a whitespace
-run, plus contraction glue. For disjoint class runs, leftmost-longest is
-equivalent to "boundary at each class transition", which is one parallel pass.
+- The optional leading space is the literal byte 0x20, not `\s`. The last space
+  of a whitespace run joins the next word; a tab, newline or NBSP cannot, and
+  stays in the whitespace run.
+- A contraction (`'s`, `'t`, `'d`, `'m`, `'ll`, `'ve`, `'re`) is split off unless
+  the apostrophe was already taken by the run before it: after a literal space
+  (` ?[^\s\p{L}\p{N}]+` takes `" '"`) or after an other-class character.
 
-Two subtleties the kernel encodes:
+In the example above: `Hello`, ` world`, `,`, ` it`, `'s`, ` 日本`, ` code`, `;`,
+`\n\n   ` (the whitespace run without its last space), ` x`, ` =`, ` 1`, `\n`.
 
-- HF's optional leading space ` ?` is the **literal byte 0x20**, not `\s`. So the
-  last space of a whitespace run attaches forward into the following word, but a
-  tab, newline, or NBSP cannot attach and forms its own `\s+` token.
-- A contraction (`'s`, `'t`, `'d`, `'m`, `'ll`, `'ve`, `'re`) fires whenever the
-  scanner *resumes* at the apostrophe. It resumes there unless the previous
-  codepoint swallowed it, which happens in exactly two cases: the previous
-  codepoint is a literal 0x20 (` ?[^\s\p{L}\p{N}]+` takes `" '"`), or it is an
-  Other-class character (that run already absorbed the apostrophe). Letter,
-  Number, non-0x20 whitespace, and start-of-input all produce a contraction.
+There are three implementations, chosen by the `--pretok-*` options; all give the
+same boundaries:
+
+1. **Codepoint domain** (`GPT2PretokenBoundaryKernel`, the default): decode
+   UTF-8, compute the classes per codepoint, find boundaries, spread them back to
+   the bytes.
+2. **Compressed classes** (`--pretok-compress-classes`, `--pretok-class-code`):
+   only the class bits are compressed to one slot per codepoint. The nine classes
+   the rules need (whitespace, 0x20, letter, number, apostrophe, and the
+   contraction letters) fall into 10 disjoint categories, so a 4-bit code holds them.
+3. **Byte domain** (`--pretok-byte-domain`, `--pretok-utf8-classes`):
+   `GPT2ByteBoundaryLA` applies the rules to the bytes. One `CharClassesKernel`
+   compiles the 4 code bits (and an "any codepoint" stream) directly on the UTF-8
+   bytes, marked at each codepoint's first byte. The previous codepoint's class
+   is moved to its last byte by advances under nested `If`s on the lead bytes,
+   and the next codepoint's start is found from the lead byte's length. No
+   decoder, no compression, no spreading back. Valid UTF-8 is assumed, as in
+   HuggingFace, which takes a decoded string.
 
 ## BPE
 
-`bpe.h` / `bpe.cpp`
+`bpe.h` / `bpe.cpp`. This section describes the design the recommended options
+run. The older design is in [Older design: merge kernels](#older-design-merge-kernels).
 
-BPE encoding is stage 3. It performs a **real rank-ordered BPE merge** on a
-token-id stream — it applies HuggingFace `merges.txt` rules lowest-rank-first, so
-a later merge sees the ids stamped by earlier ones (the `Ġthe` → `Ġthey`
-cascade). It is not a longest-match vocabulary scan.
+### Model files
 
-BPE activates when `--merges` **or** `--vocab` is supplied. `--merges` is the
-primary input and is self-sufficient: `buildBaseAlphabet()` regenerates the GPT-2
-base ids 0..255 internally, so no `vocab.json` is needed. A real `vocab.json` is
-optional, used for an id cross-check and for `--strings` decoding. `loadVocab`
-sniffs the first non-space byte and delegates to `loadMerges` when it is not `{`,
-so `--vocab=merges.txt` also works.
+`merges.txt` is enough. Each line `A B` after the `#version` header is a merge
+with **rank** = its line index and **id = 256 + rank**, which is how GPT-2
+numbers its vocabulary. The 256 base tokens (GPT-2's `bytes_to_unicode`) are
+generated internally, and each merge's string is the two parts joined, so the
+token strings for `--strings` and `--offsets` need no `vocab.json` either.
+`vocab.json` is optional.
 
-### Why bytes, not codepoints?
+GPT-2's one added token, `<|endoftext|>` (id 50256), is matched as a literal
+before BPE, as HuggingFace does: `tokenizer.cpp` runs the pipeline on the text
+around each occurrence and prints 50256 in between. (`--bench-loop` runs the
+whole input as plain text.)
 
-GPT-2 stores tokens as UTF-8 byte strings. Working on bytes skips UTF-8 → U21
-decode in the BPE stage, shrinks the `EQ` comparison to a log2(8) AND-tree, and
-matches the internal representation HuggingFace `tokenizers` uses.
+BPE result: within each pre-token, repeatedly merge the adjacent pair with the
+lowest rank (leftmost on a tie) until no pair is a rule.
 
-### Preprocessing — `buildMergeRuleRanges()`
+### Cuts: where no merge can happen
 
-Runs on the CPU before any kernel is built.
+A byte pair `x y` is **inside a token** when some rule joins a token ending in
+`x` to a token starting with `y`. For GPT-2 that is 2,689 of the 65,536 byte
+pairs. Between two bytes that form no such pair, no merge can ever happen, so
+**the BPE of a pre-token is the BPE of its pieces between such pairs, put
+together**. The pipeline cuts the text at every pre-token start and at those
+pairs, then finishes each piece on its own. Pieces are short, and most of them
+are themselves one vocabulary token.
 
-`loadMerges` reads `merges.txt`: each non-header line `"A B"` is a merge
-A + B → AB with **rank = line index** and **id = 256 + rank**. That id identity
-is a GPT-2 property, so the merged token's vocab id equals `256 + rank` exactly,
-and a rank-ordered partition is also an id-ordered partition.
+In the example, the pre-token starts are at bytes 0 5 11 12 15 17 24 29 30 35 37
+39 41, and the cuts add 20 21 23 (inside ` 日本`, bytes E6 97 A5 E6 9C AC) and
+32 33 34 (before and between the spaces of the indent: no GPT-2 token holds a
+newline followed by a space, or two spaces). Some of the pieces:
 
-`buildMergeRuleRanges` then resolves each raw merge's parts into a
-`MergeRule {idA, idB, lenA, lenB, idAB}` using the base alphabet plus earlier
-merge outputs (unresolvable parts are skipped with a count on stderr), sorts by
-`idAB` ascending (= rank ascending), and partitions into **clean ranges**. A
-range `[lo, hi)` holds only rules that are both:
+| Piece | Bytes | Finished by | Tokens |
+|---|---|---|---|
+| `Hello` | 5 | length-5 table, hit | 15496 |
+| ` world` | 6 | length-6 table, hit | 995 |
+| `,` | 1 | its base id | 11 |
+| `'s` | 2 | pair table, a rule | 338 |
+| ` ` E6 97 | 3 | length-3 table misses; pair check from the pair rules | 10545 `Ġæ`, 245 `Ĺ` |
+| A5 | 1 | base id | 98 `¥` |
+| E6 9C | 2 | pair table, a rule | 17312 `æľ` |
+| `\n\n` | 2 | pair table, a rule | 628 `ĊĊ` |
 
-1. **dependency-independent** — both part ids are `< lo`, so every part was
-   already stamped by a *lower* kernel; and
-2. **conflict-free** — no two rules in the range compete for a shared middle
-   token, i.e. the right part id of one equals the left part id of the other
-   (`cur.idB == p.idA || p.idB == cur.idA`).
+### Pipeline
 
-`lo` is the first rule's own `idAB` (a merge's parts always precede it, so the
-first rule always fits); the range extends while both conditions hold, and the
-first violator starts the next range, so ranges tile contiguously.
+The recommended options build this pipeline of 24 kernels (names as printed by
+`-EnableCycleCounter`). No kernel applies merge rules one by one: the bit-stream
+kernels find pre-tokens, cuts and piece lengths, and the scan kernels look pieces
+up in tables.
 
-Condition 2 matters: dependency-independence alone removes intra-kernel
-*dependency* but not byte *conflict*. Two competitors sharing a kernel — e.g.
-`Ġt` = (`Ġ`,`t`) and `ter` = (`t`,`er`), which both claim the `t` token — could
-both fire on the same bytes. Splitting them into rank-ordered kernels lets the
-lower-rank write reach the later kernel's input and starve the other. The cost is
-many more kernels, which is what drives the fixed per-call dispatch floor (see
-`tokenizer-test/README.md`).
-
-The Python ground truth for this partition is
-`tools/lex/merge_analysis.py::clean_range_analysis`.
-
-### Alternative partition — ASAP level scheduling (`--partition=level`)
-
-The clean-range walk closes a group at the **first** violating rule and never
-rewinds, so groups are contiguous rank intervals. That contiguity, not the two
-conditions, sets the kernel count: 1098 of the 1123 groups close on a conflict,
-and at each break ~179 of the next 200 rules would still have fit. Group size
-saturates near 44, and 50000 / 44.5 = 1123.
-
-`--partition=level` drops contiguity only. Each rule takes its earliest legal
-kernel:
-
-```
-level(r) = 1 + max( level(producer of idA), level(producer of idB),
-                    level of any lower-rank rule sharing a seam with r )
-```
-
-A violator defers itself instead of ending the group, so the count becomes the
-constraint DAG's longest path — a provable minimum. **1123 → 283 kernels**, mean
-group size 44.5 → 176.7. Levels are not rank intervals: level 1 holds rank 0
-alongside rank 47815.
-
-Both conditions are preserved; only the packing changes. Two mechanics follow:
-
-* `idA < lo` tests condition 1 only because `idAB == 256 + rank` **and** groups
-  are contiguous make id order equal kernel order. Without contiguity it becomes
-  an explicit `prodLevel[id]` lookup.
-* Condition 2 must consider all prior rules, not just the current group, so
-  `maxLeft[tok]` / `maxRight[tok]` hold the highest level using that token as a
-  left / right part. Only `maxRight[idA]` and `maxLeft[idB]` are consulted —
-  same-side sharing is harmless, since those rules' B parts differ.
-
-Group `hi` becomes a running maximum across levels (a kernel's output carries ids
-from every lower level), keeping `W_out` monotonic at the cost of the narrow early
-streams (mean 14.2 → 16.0 bits). `hi` is now a **width bound only**, not an
-"already stamped" watermark — see [Compaction and slot distances](#compaction-and-slot-distances).
-
-### Runtime pipeline — `buildBPEPassPipeline()`
-
-A `source` id stream and a 1-bit `inPlayMask` thread kernel → kernel.
-
-**1. `BPEBaseIdKernel`** (`BPE_BaseIds+active`) turns each raw byte into its
-base-alphabet id. `id(byte)` is a fixed byte→id bijection (GPT-2's
-`bytes_to_unicode`, a piecewise `id = byte + offset`), computed with **BixNum
-arithmetic**: four range compares choose the offset (0..32 and 174..255 share
-0xBC mod 256), then one 8-bit modular add — 77 Pablo statements, where one
-character class per id bit took 776. The mapping is constant, so the kernel is
-data-independent and its cache name is constant. It also seeds `active` (all ones
-— every byte starts as a live token start).
-
-**2. One `BPEMergeKernel` per clean range**, ascending = rank order. Each keeps a
-mutable id accumulator `idAcc` (starting from the input `source`) and the 1-bit
-`inPlayMask` threaded in via `meIn`. Every rule (A, B → AB) is
-**start-anchored** — the merged id is written at A's start:
-
-```
-Astart    = compileCC(idA) AND meInFrozen      // A starts here; read from the FROZEN entry ids
-                                               //   (srcFrozen), not the mutating idAcc
-BstartAtA = compileCC(idB) over LookAhead(sourceIn, lenA)  // B starts lenA bytes ahead, also
-                                               //   read frozen (no same-kernel stamps)
-fire      = Astart AND BstartAtA               // (Astart already AND-ed meInFrozen)
-idAcc[i]  = fire ? idAB_bit_i : idAcc[i]       // stamp idAB at A's start (inside createIf(Astart))
-inPlayMask &= NOT(Advance(fire, lenA))         // consume B's start; A's start survives as AB's
-```
-
-Both compares are `compileCC` character classes over the id bit-planes (the
-frozen entry ids), replacing BixNum `EQ`. Reading the **frozen** entry state
-(`srcFrozen` / `meInFrozen`) rather than the mutating `idAcc` / `inPlayMask` is
-what makes the rules within a kernel order-independent — guaranteed safe by the
-clean-range partition's independence + conflict-freedom.
-
-`lenA` is A's **raw-byte length = codepoint count** (`rawByteLen` counts
-non-continuation bytes), not its display byte size. The id stream carries one id
-per raw byte and the byte-level remap is a byte↔codepoint bijection, so `Ġ` is
-two display bytes but `lenA` 1.
-
-The kernel's output width is `ceil_log2(hi + 1)` bits, so low ranges move fewer
-bits and only the top ranges reach the full 16.
-
-**3. Returns** `BPEPassResult{matchEnd = inPlayMask, vocabID = source}`.
-`matchEnd` marks surviving token **starts** — the field name is historical.
-
-### Self-merges
-
-A self-merge X + X → XX (`idA == idB`) fired at every X start over-consumes:
-position `i` glues `(i, i+L)` while `i+L` glues `(i+L, i+2L)`, so the shared
-token is pulled two ways and a whole run of X collapses to one surviving start.
-Real BPE pairs left-to-right, using each token once.
-
-`selfMergeFireStarts()` fixes this by firing only at the 1st, 3rd, 5th … X of
-**each maximal run**. `createEveryNth(isX, 2)` gives the *global* parity of X
-starts; `createMatchStar(runStart & parity, body)` spreads each run's starting
-parity across that run so the odd/even choice **resets per run** — otherwise a
-preceding odd-length run flips the next run's pairing. The idiom is ported from
-`lib/kernel/unicode/normalization.cpp::SelfComposableLogic`. Note the parity is
-computed on the **live** starts (`Astart AND inPlayMask`): a lower-rank neighbour
-merge may already have consumed the run's head, and counting that dead position
-would flip the parity.
-
-### Pre-token boundary gating
-
-`buildBPEPassPipeline` takes an optional `boundary` stream — a 1-bit per-byte
-mask of pre-token starts. When present, each `BPEMergeKernel` also requires that
-B does *not* begin a new pre-token:
-
-```
-fire = fire AND NOT LookAhead(boundaryIn, lenA)
-```
-
-so merges never cross a pre-token boundary. This is what stops contraction
-merges (`'t`, `'s`, …) from forming across a boundary HuggingFace enforces.
-Kernels built with a boundary stream are named `BPEMerge_b1_h{hash}` rather than
-`BPEMerge_h{hash}`, keeping their cache entries distinct.
-
-`tokenizer.cpp` supplies this stream when `--pretokenizer=bytelevel` is given in
-BPE mode: the bytelevel pre-tokenizer's only job there is to mark pre-token
-starts, and BPE is fed the **raw** bytes (using the Ġ-remapped bytes would
-double-encode, since `BPEBaseIdKernel` already applies `bytes_to_unicode` once).
-
-### Emission
-
-In `tokenizer.cpp`: `P2S16Kernel` packs `vocabID` into a single 1×16 stream,
-`ScanIndexGenerator` reads `matchEnd` to drive `scan::Reader`, and
-`bpe_emit_token` dereferences the 16-bit id at each surviving-token-start byte
-position and prints it (or the token string with `--strings`).
-
-Do **not** split the id into low/high byte streams read through the scan
-`additionalStreams` channel — that channel indexes by scan-iteration counter, not
-byte position, which silently zeroes the high byte.
-
-### Usage
-
-```bash
-# Full GPT-2 BPE from merges.txt alone → integer token IDs
-bin/tokenizer --merges=tools/lex/tokenizer_files/merges.txt input.txt
-
-# With GPT-2 pre-tokenization (supplies the boundary mask that gates merges)
-bin/tokenizer --pretokenizer=bytelevel \
-              --merges=tools/lex/tokenizer_files/merges.txt input.txt
-
-# Token strings instead of IDs (needs a real vocab.json)
-bin/tokenizer --vocab=tools/lex/tokenizer_files/vocab.json \
-              --merges=tools/lex/tokenizer_files/merges.txt --strings input.txt
-
-# Smoke test with a truncated rule set (fast JIT)
-bin/tokenizer --merges=tools/lex/merges.txt --merges-limit=64 input.txt
-```
-
-When BPE is enabled **without** `--pretokenizer`, `\n` bytes are treated as real
-content by default — a newline seeds to id 198 (GPT-2 `Ċ`) and flows through the
-merges, matching HuggingFace byte-level BPE. `--strip-newlines` restores the
-legacy behaviour where `\n` is only a pre-token separator and is filtered out via
-`FilterByMask` (`buildLinePretokens`).
-
-### Data files
-
-Each data file has a full GPT-2 copy under `tokenizer_files/` and a truncated dev
-copy directly under `tools/lex/`:
-
-| File | Size | Purpose |
+| # | Kernel | Work |
 |---|---|---|
-| `tokenizer_files/merges.txt` | 456 KB | Full GPT-2 merges. The primary BPE input. |
-| `merges.txt` | 13 KB | Truncated dev copy; tiny partition, instant JIT. |
-| `tokenizer_files/vocab.json` | ~50 k tokens, 1 MB | Optional id cross-check + `--strings` decode. |
-| `vocab.json` | 260 tokens | Truncated dev copy. |
-| `tokenizer_files/tokenizer.json` | 3.5 MB | HuggingFace-side config, used by the test scripts. |
+| 1 | `memory_source` | The input buffer (read in place with `--memsource-in-place`). |
+| 2 | `s2p8` | Bytes to 8 bit streams. |
+| 3 | `cc_…` | One character-class kernel on the UTF-8 bytes: the 4-bit pre-tokenizer class code, "any codepoint", and the 3 cut classes of `--pair-cuts=3`. |
+| 4 | `GPT2ByteBoundaryLA` | Pre-token starts, on the bytes. |
+| 5 | `BPE_Cuts` | All cuts in one kernel (below). |
+| 6 | `BPE_BaseIds` | Every byte's GPT-2 base id (8 bit streams, BixNum arithmetic: four range tests choose an offset, one 8-bit add). |
+| 7 | `p2s_16` | Base ids to a 16-bit id per byte, the stream the scan kernels update in place (`--tail-unit-seed`). |
+| 8 | `BPE_LenSelect15_long` | From the cuts: the starts of the pieces of each length 2..15, the starts of longer pieces, and the bytes of short pieces. |
+| 9 | `BPE_LongPieces` | Pieces over 15 bytes and the input's last piece, through the C++ path. |
+| 10–23 | `BPE_len2_pretokenScan` … `BPE_len15_pretokenScan` | One two-level scan kernel per piece length (below). |
+| 24 | `BPE_TailV` | Output, in input order. |
 
-Check what actually loaded via the `BPE: loaded vocab with N tokens` and
-`[BPE] N merge-range kernels` lines on stderr.
+Pieces of one byte need no work: their base id is already in place.
 
-### Debugging
+**Cuts** (`BPE_Cuts`, `--pair-cuts=3`). The cut stream is the OR of:
 
-`buildBPEPassPipeline` unconditionally prints the merge-range groups to stderr:
-`[BPE] N merge-range kernels`, then `[lo,hi) xN maxLen=M` per group. Environment
-knobs, set before running:
+- pre-token starts and the input's first byte;
+- before and after each **frozen byte**: a byte whose base id is in no rule (66 for
+  GPT-2) is a piece of its own;
+- **run cuts** (`--byte-run-cuts`, default 2): between the copies inside a run of
+  spaces, and before a run where the byte before it and the space form no pair;
+- the **cut classes**: codepoint classes compiled in kernel 3 together with the
+  pre-tokenizer's classes. `Before`: no byte can precede this codepoint inside a
+  token (cut before it). `BeforeCond`: some can (cut before it when the previous
+  byte and its lead byte form no pair). `AfterLead`: its first two bytes form no
+  pair (cut after the lead byte);
+- byte-pair tests for what classes cannot express cheaply: after a codepoint end
+  that never joins what follows, and between two continuation bytes that form no pair.
+
+All tables come from the merge rules at start-up, so the kernel fits any merge list.
+
+**Per-length kernels** (`--len-scan=15`). Kernel `BPE_len<L>_pretokenScan` walks
+the starts of the L-byte pieces with Parabix's two-level scan (find the 64-bit
+words with a set bit, then the bits):
+
+- L = 2: one load from a 64K-entry table of byte pairs (the rule's id, or none:
+  the two base ids stay).
+- L = 3..15: a hash table of the L-byte tokens **whose own BPE gives back the
+  token**, in 64-byte buckets compared at once (8 keys for L ≤ 4, 6 for L ≤ 8, 3
+  above). A hash multiplier is searched per length so that every token fits
+  (`--len-hash-search`; GPT-2: 3.7 MB, built in about 35–45 ms). A hit writes one id.
+- A miss of L = 3 or 4 is finished in generated code (`--len3-pair-check`,
+  `--len4-pair-check`): the piece is not one token, so its BPE follows from which
+  pairs are rules, their ranks, and (for L = 4) which 3-byte parts are tokens.
+- Other misses call C++ (`bpe_len_miss`).
+
+A piece that starts in a segment and ends in the next is finished by the kernel of
+the segment it starts in (its lookahead covers the rest). The scan kernels update
+the id stream and the "token starts here" stream in place (`InOut`).
+`BPE_LongPieces` and the length kernels keep no state between calls, so Parabix
+runs them on several segments at once.
+
+**C++ miss path.** Two entry points:
+
+- `bpe_len_miss` (a piece of up to 15 bytes that its length table misses): the
+  thread cache, else BPE.
+- `bpe_long_block` (from `BPE_LongPieces`): a piece over 15 bytes is looked up in
+  the long cache (`--tail-long-cache`, pieces of 16..4096 bytes); else it is split
+  at the byte pairs that no token holds and that `BPE_Cuts` did not cut
+  (`--tail-hard-split`), and each part is finished on its own: one byte by its
+  base id, up to 15 bytes by the vocabulary table, the thread cache, else BPE;
+  longer by BPE.
+
+The structures behind them:
+
+- **Vocabulary table** (`--tail-vocab-table`): tokens of 2..15 bytes whose own BPE
+  gives back the token, in 4-entry sets. Built on a background thread while the
+  pipeline compiles (about 14 ms; pieces before that just merge).
+  `--tail-vocab-file` keeps it in a file for later runs.
+- **Thread cache**: 2-way sets, 2 MB per thread, keyed by the piece's bytes.
+  `--tail-cache-pool` keeps the caches across pipeline calls and threads.
+- **BPE**: lowest rank first, leftmost on a tie. With `--tail-batch-bpe`, misses
+  of up to 15 bytes are queued and merged several at a time without branches (one
+  min over 16 lanes of `rank << 4 | position` picks the next pair; rules in a
+  cuckoo table).
+
+**Output** (`BPE_TailV`, `--tail-simd-emit`). It runs one call at a time in input
+order. For each 64 positions it moves the ids at token starts to the front with a
+vector compress (IDISA `mvmd_compress`) and stores them; words with a token
+continued from another call go to a scalar C++ loop. The ids go to the output in
+one batch per call.
+
+### Why the output is exact
+
+- The pre-token starts are GPT-2's regex boundaries (tested against HuggingFace).
+- Cuts are only at pre-token starts and between bytes that no token holds next to
+  each other. No merge crosses such a spot, so pieces can be finished separately.
+- Every table entry is checked when it is built: a token is stored only if BPE on
+  its own bytes gives that token back. A hit is therefore BPE's answer.
+- Everything else goes to plain rank-order BPE.
+- No piece is split by a segment edge: a short piece is finished by the length
+  kernel of the segment it starts in, and a long piece cut by an edge is finished
+  whole by `BPE_TailV`, which runs in input order.
+
+### Options of the current design
+
+All in `bpe.cpp`, off by default unless stated.
+
+| Option | Meaning |
+|---|---|
+| `--tail-from-bytes` | With a pre-tokenizer: no merge kernels; BPE is finished per pre-token from the bytes. Without a pre-tokenizer it is ignored (with a message). |
+| `--tail-scan-kernel` | Walk the pre-tokens in a two-level scan kernel that finishes one-byte pre-tokens and table hits in generated code. Needed by the options below; turns on `--tail-emit-from-segs`. |
+| `--len-scan=N` | Pieces of 2..N bytes (N ≤ 15) in kernels of their own, `BPE_len<L>_pretokenScan`. 0 = off. |
+| `--pair-cuts=0..3` | Cut between byte pairs that no token holds. 1: all, in a kernel `BPE_PairCuts`; 2: only pairs with a byte ≥ 0x80; 3: the cut classes and codepoint pair tests in `BPE_Cuts` (needs `--len-scan` and `--pretok-class-code --pretok-byte-domain --pretok-utf8-classes`). |
+| `--tail-unit-seed` | Start the ids as every byte's base id from bit streams (`BPE_BaseIds` + `p2s_16`). Implies `--tail-unit-cuts`; with `--len-scan` the long pieces go to `BPE_LongPieces`. |
+| `--tail-unit-cuts` | Cut at frozen bytes; one-byte pieces are finished as their base id. |
+| `--byte-run-cuts=N` | Cut runs of N or more spaces into single bytes (default 2; 0 = off; active only with `--tail-scan-kernel`). `--byte-run-edges` (default 1), `--byte-run-bytes` (0: space only), `--byte-run-guard` (default on) tune it. |
+| `--tail-vocab-table` | Answer single-token pieces from the vocabulary table. `--tail-vocab-file=PATH` reads it from, or writes it to, a file. `--tail-vocab-layout=1` is an experiment (one region per length; slower). |
+| `--tail-cache-pool` | Reuse the per-thread caches across pipeline calls and threads. |
+| `--tail-long-cache` | Cache pieces over 15 bytes. `--tail-long-admit=0..3` chooses which are kept (default 0: all). |
+| `--tail-batch-bpe` | Merge misses of up to 15 bytes in batches, without branches. |
+| `--tail-hard-split` | Split a miss at byte pairs that no token holds and look each part up. `--tail-trigram-split` also cuts pieces over 15 bytes where no token can cover 3 bytes around a spot. |
+| `--tail-simd-emit` | Vector-compress output in generated code (`BPE_TailV`). |
+| `--tail-emit-from-segs` | Start the emit stream from the pre-token starts (on whenever `--tail-scan-kernel` is). |
+| `--tail-scan-ir-cache` | Check the thread cache's first entry in generated code (only for the general scan kernel, not with `--len-scan` + `--tail-unit-seed`). |
+| `--len-hash-search=N` | Hash multipliers tried per length table so no token is left out (default 4096; 0 = fixed multiplier). |
+| `--len3-pair-check`, `--len4-pair-check` | Finish 3- and 4-byte misses from the pair rules in generated code (default on). |
+| `--len-long-kernel` | Long pieces in `BPE_LongPieces` (default on). |
+| `--len-select-if=K[,K…]` | Compute the longer lengths' starts inside nested `If`s. |
+| `--pair-cut-guard` | `--pair-cuts=1/2`: non-ASCII pairs inside an `If` (default on). |
+| `--memsource-block-capacity` | Round the source buffer up to a whole block. Added for wrong last tokens when the last segment had 1..127 bytes; that case (70 × 16384 + 38 bytes) now gives the right ids without it. |
+
+### Limitations
+
+- **GPT-2-style vocabularies only.** Ids are 16 bits, ids are `256 + rank`, and the
+  GPT-2 regex is built into the boundary kernels. GPT-2 and GPT-Neo match
+  HuggingFace; larger vocabularies (`cl100k`, `o200k`, …) are not supported.
+- `<|endoftext|>` is the only added token.
+- The byte-domain pre-tokenizer assumes valid UTF-8.
+- `bpe.cpp`'s top-of-file comment and the comment on `BPEPassResult` in `bpe.h`
+  describe only the merge-kernel design.
+
+## Older design: merge kernels
+
+`buildBPEPassPipeline` without `--tail-from-bytes` builds one `BPEMergeKernel` per
+group of merge rules. It gives the same ids (see [Validation](#validation)) but is
+much slower: most merges happen on repeated words, which the current design's
+tables and caches answer once, while every merge kernel scans every live
+position. The code remains for comparison and for the options below.
+
+**Partition.** `buildMergeRuleRanges` resolves each merge into
+`MergeRule {idA, idB, lenA, lenB, idAB}` and groups rules into kernels run in rank
+order. A group may only hold rules that are
+
+1. dependency-independent: both parts were built by an earlier kernel; and
+2. conflict-free: no rule's right part is another rule's left part (they would
+   compete for the same token).
+
+`--partition=clean` (default) cuts contiguous rank ranges: 1,123 kernels for GPT-2
+(Python reference: `merge_analysis.py::clean_range_analysis`). `level` puts each
+rule in its earliest legal kernel (ASAP scheduling): 283 kernels. `bit-tier` keeps
+each kernel to merged ids of one bit length. `asymmetric` and `chain` relax the
+conditions further.
+
+**Merge kernel.** The id stream starts as the base ids (`BPE_BaseIds`); each kernel
+reads the ids written by earlier kernels and, for each rule, writes `idAB` at A's
+start where B starts `lenA` bytes later, then clears B's start from the live mask.
+Rules within a kernel read the kernel's input, so their order does not matter.
+`lenA` is A's length in input bytes, not in `Ġ`-style display bytes. Merges may not
+cross a pre-token start (with `--pretokenizer=bytelevel`).
+
+**Self-merges** (`X + X`): only the 1st, 3rd, 5th, … X of each run may fire, so a
+run pairs left to right. `selfMergeFireStarts` takes the parity per run
+(`EveryNth` + `MatchStar`, as in `SelfComposableLogic` of the normalizer).
+
+**Compaction** (`--compaction`, `--compact-base`): `FilterByMask` between kernels
+keeps only live token starts, so later kernels scan fewer positions. Lookahead
+distances then count slots, not bytes: a token built before the compaction is one
+slot, a later one spans the slots of its parts.
+
+**Bit transformations** (`--bit-xfrm-limit`): a kernel whose output ids have at
+most N bits computes each output bit as the input bit XOR a character class over
+the `(idA, idB)` pair, instead of one test per rule; ids over 10 bits are split
+into subtiers.
+
+**Hybrid** (`--bpe-tail=P`): merge kernels up to compaction point P, then the
+emitter finishes BPE per segment in C++. `--retire-words` and its options drop
+finished words from the stream at compaction points.
+
+### Merge-kernel options
+
+| Option | Meaning |
+|---|---|
+| `--partition=clean\|level\|asymmetric\|chain\|bit-tier` | Rule partition (default `clean`). |
+| `--max-merges-per-kernel=N` | Split groups over N rules (default 500; 0 = no cap). |
+| `--compaction=linear\|geometric\|by-output-bits`, `--compact-base=N`, `--geometric-compaction` | Where `FilterByMask` compactions go. `BPE_COMPACT_EVERY` overrides `--compact-base`. |
+| `--if-group-lower-limit=N`, `--if-group-count=K`, `--if-group-size=S` | Gate groups of rules by one `If` on their id range, in kernels from index N on. |
+| `--if-test-significant-bits=K`, `--embedded-if-bits=E` | Gate rules by the K bits of idA from its highest 1 bit; nested inner gates. |
+| `--key-cluster`, `--key-cluster-cap=N` | Move rules so that rules with one gate key share a kernel. |
+| `--lookahead-in-gate`, `--lookahead-in-group` | Where the B lookahead is built. |
+| `--indexed-shift=N` | First N kernels read the next live id with `IndexedShiftBack` instead of `LookAhead`. |
+| `--batch-writeback` | One `Advance` per distinct `lenA` and one select per id bit per kernel, instead of per rule. |
+| `--infile-once`, `--gate-mask-fold`, `--if-reduce-test`, `--if-unlikely-weight=N`, `--skip-instcombine` | Code-generation variants. |
+| `--chain-fuse-siblings`, `--chain-ungate-roots` | With `--partition=chain`. |
+| `--bit-xfrm-limit=N`, `--subtier-gating-bits=K`, `--subtier-grouping-by-min-ID=N` | Bit-transformation kernels. |
+| `--self-merge-block` | All self-merges of a kernel in one gated block. |
+| `--bpe-tail=P`, `--tail-direct-input` | The hybrid. |
+| `--retire-words`, `--retire-points=…`, `--retire-frozen`, `--retire-stuck=N` | Drop finished words at compaction points. |
+| `--bit-frequency-statistics`, `--merge-frequency-statistics` | Report id widths and merges per bit tier. |
+
+## Data files
+
+`tokenizer_files/`:
+
+| File | Size | Contents |
+|---|---|---|
+| `merges.txt` | 456 KB | GPT-2 merges (50,000), the BPE input |
+| `vocab.json` | 1.1 MB | GPT-2 vocabulary (optional for the tokenizer; used by the test scripts) |
+| `tokenizer.json` | 3.6 MB | HuggingFace's GPT-2 config, used by the test scripts |
+| `val_4MB.txt` | 4.2 MB | Web text (OpenWebText-style), CRLF line ends, some NUL runs |
+| `code_4MB.txt` | 4.2 MB | C++ source code |
+| `multi_4MB.txt` | 4.2 MB | Text in many languages |
+| `stress.txt` | 5.0 MB | Adversarial mix: long runs, odd bytes, scripts |
+| `test_vocab.txt` | 374 KB | Every GPT-2 vocabulary token, one per line |
+
+The model files come from
+[openai-community/gpt2](https://huggingface.co/openai-community/gpt2/tree/main).
+`tokenizer_files/langs/` (per-language samples) is ignored by git.
+
+## Debugging
+
+Environment variables, set before a run:
 
 | Variable | Effect |
 |---|---|
-| `BPE_DBG=seed` | Return right after the seed, dumping base-alphabet ids at every byte. Verifies the seed map. |
-| `BPE_DBG=bound` | Return the pre-token boundary mask, printing the base id at each boundary byte. Verifies boundary placement. |
-| `BPE_RULES=1` | Dump resolved merge rules to stderr. |
-| `BPE_RULES_N=k` | Cap rules dumped per group (default 4). |
+| `BPE_DUMP=PREFIX` | Write the byte offsets of the pre-token starts and the cuts to `PREFIX.segs` and `PREFIX.cuts` (current design). |
+| `BPE_DUMP_CLASSES=1` | With `BPE_DUMP`: also the class streams of the byte-domain pre-tokenizer. |
+| `BPE_EMIT_DBG=1` | Merge kernels: print every emitted id and its two bytes. |
+| `BPE_VOCAB_SYNC=1` | Build the vocabulary table before running, not on a background thread. |
+| `BPE_VOCAB_BITS=N`, `BPE_LEN_LOAD=F` | Vocabulary table size; length table load (default 0.5). |
+| `BPE_DBG=seed`, `BPE_DBG=bound` | Merge kernels: print base ids, or the pre-token boundary mask, and stop. |
+| `BPE_GROUPS=1`, `BPE_RULES=1`, `BPE_RULES_N=k` | Merge kernels: print the rule groups, and the rules of each (k per group, default 4). |
 
-The JIT object cache lives in `~/.parabix/objcache/`, keyed by kernel signature.
-`BPEMergeKernel` folds an FNV rolling hash of its rule list into its name, so
-swapping `merges.txt` invalidates correctly without manual eviction. Wipe with
-`rm -rf ~/.parabix/objcache/` if you suspect a stale entry.
+`-EnableCycleCounter` prints each kernel's cycles. To check that two option sets
+give the same output, compare their id streams (`cmp`) on the same input, or use
+`tokenizer-test/bench_configs.py --verify`.
 
-Smallest useful probe: a `merges.txt` containing just `Ġ t` then `Ġt he`, run on
-the input `Ġthe`, should cascade `Ġ`+`t` → `Ġt` then `Ġt`+`he` → `Ġthe`.
+## Validation
 
-### Validation status
+Run on 2026-11-15, commit `a02100f9e`, macOS (Apple M3), scripts in
+`tokenizer-test/`:
 
-- All 7 comparable pre-tokenizer modes match HuggingFace on the test corpus
-  (`compare_pretokenizers.py`).
-- BPE on 24 MB of openwebtext produced 5,445,573 tokens against HuggingFace's
-  5,445,574 — a single divergence in 5.4 M tokens, at a GPT-2 contraction
-  (`'d` inside `'default'`). The contraction-context rule described above was
-  added to fix that case and is verified on targeted probes; **re-verification
-  over the full 24 MB corpus is still pending.**
+- **BPE**, recommended options: same ids as HuggingFace `tokenizers` 0.23.3 and
+  `tiktoken` 0.14.0 on `val_4MB.txt` (1,302,487 tokens), `code_4MB.txt`
+  (1,729,186) and `multi_4MB.txt` (2,230,628), at 1 and 4 threads; also the same
+  as HuggingFace `tokenizers` 1.0.0rc4 on `val_4MB.txt`.
+- **BPE**, merge kernels (no options, 1,123 kernels): same ids on `val_4MB.txt`.
+- **Self-merges** (`selfmerge_test.py`, merge kernels, no pre-tokenizer): all 8
+  built-in option sets match the reference BPE.
+- **Pre-tokenizers**: all 9 modes with a HuggingFace counterpart, and all 5
+  behaviors for `simplewordboundaries` and `punctuation`, match on 200 lines of
+  each test file.
+- **Normalizers**: all 19 modes and sequences match on the same lines.
 
-Note that `bpe.cpp`'s top-of-file header comment and part of `bpe.h`'s comment on
-`BPEPassResult` still describe an older end-anchored, emit-everything design
-(`matchEnd = active`, "Stage-B"). The kernel code no longer implements that —
-trust this document and the code over those comments.
-
-## BPE optimization parameters
-
-The `BPEMergeKernel` design has several **optional, opt-in** optimizations, each
-behind a CLI flag. **All default OFF**, so a bare `--merges=…` run is the plain,
-unoptimized pipeline; every flag is added on the command line to turn one on.
-This keeps a clean baseline to A/B against, and lets each optimization be
-benchmarked in isolation. They are experimental — measure before trusting.
-
-> Note: **character-class (CC) compilation is always on, not a flag.** Every id
-> comparison (Astart, B-detection, the grouped-if range gate) and the seed id
-> derivation are compiled with `re::cc::Parabix_CC_Compiler_Builder` /
-> `compileCC` over the id (or byte) bit-planes, replacing the earlier BixNum
-> `EQ`/`UGE`/`ULE`/`Select`/`AddModular` arithmetic. Output is byte-identical;
-> this was a straight port, not a tunable.
-
-Each flag encodes itself into the kernel cache name (tags below) so switching a
-flag never serves a stale compiled body from `~/.parabix/objcache/`. You can
-therefore A/B two flag settings back-to-back **without** wiping the cache.
-
-| Flag | Default | Cache tag | What it does |
-|---|---|---|---|
-| `--partition=level` | (one of `--partition`'s values; default `clean`) | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling** (minimum kernel count) instead of contiguous clean id ranges. Full GPT-2: **1123 → 283 kernels**. Same two correctness conditions, only the packing changes — see [Alternative partition](#alternative-partition--asap-level-scheduling---partitionlevel). Verified byte-identical output. |
-| `--partition=bit-tier` | (one of `--partition`'s values; default `clean`) | (via rule set + `w{bits}`/`o{bits}`) | Confine each kernel to merged ids of **one bit length**: tier *b* = rules with `idAB` in `[2^(b-1), 2^b)`, each tier partitioned on its own via ASAP level scheduling, tiers run in order. Mutually exclusive with `level`/`asymmetric`/`chain`. The first kernel of tier N+1 reads N-bit ids and writes N+1 bits; the rest of the tier reads and writes N+1 bits. Full GPT-2: 283 → 299 kernels, **but** ASAP piles most of a tier into its first level (tier 16's first kernel has 8023 rules), which makes Pablo compile time blow up — `--max-merges-per-kernel` (default 500) splits such kernels. |
-| `--max-merges-per-kernel=N` | `500` | (via rule set) | Split any partition group with more than `N` rules into consecutive kernels of about `n/ceil(n/N)` rules. With `--if-test-significant-bits` (and no `--asymmetric-seam`/`--chain-veto`) chunks are filled **by gate key**, keeping each `--chain-partition` tree whole, so rules sharing a gate stay in one kernel; otherwise in rank order. Exact either way: a group's rules have no dependencies or seams among them. Also the default `--key-cluster` move cap. `0` = no cap. No effect on full GPT-2 with plain clean ranges (max 196) or plain `--partition=level` (max 373). |
-| `--key-cluster` | off | `kc1_` | With `--partition=level` and `--if-test-significant-bits`: move rules later, within their compaction segment, so rules sharing a gate key share a kernel. Under `--partition=bit-tier` it runs per tier using global kernel indices (`--if-group-lower-limit`) and the real compaction points (linear/geometric counted across tiers; under `--compaction=by-output-bits` each tier is one segment). |
-| `--key-cluster-cap=N` | `--max-merges-per-kernel` | — | Override key-cluster's move cap: never move a rule into a kernel already holding `N` rules (`0` = none). Rules at their ASAP level are not capped; `--max-merges-per-kernel` splits those. |
-| `--bit-xfrm-limit=N` | `0` (off) | `BPEXfrm_` kernel name (`st_` for subtiers) | Build every merge kernel whose **output ids have at most N bits** (with `--partition=bit-tier`: tiers 9..N) as a bit transformation (`BPEXfrmKernel`, see [Bit-transformation kernels](#bit-transformation-kernels---bit-xfrm-limit)) instead of per-rule gates. Ids over 10 bits are split into subtiers: classes over the low 20−N bits of idA and all N bits of idB, one block per value of idA's high bits. Kernels with `--chain-partition`, `--asymmetric-seam` or `--chain-veto` rules, or under `--indexed-shift`, keep the per-rule body. Replaces `--max-bit-xfrm-limit` and `--full-subtiering-limit`. |
-| `--subtier-gating-bits=K` | `17` (no gates) | `sg{K}_` | Put a subtier block in a `createIf` only when its key shows the keyed id has at least K bits. Gates almost never skip a block (large ids occur in nearly every block), so the default gates none; `0` gates every subtier (10–25% slower in tiers 12–14). |
-| `--subtier-grouping-by-min-ID=N` | `0` (off) | `gm_` | In tiers ≥ N, key a rule with idA > idB on idB's high bits (read at its lookahead), classes over the low bits of idB and all bits of idA: about a third fewer subtiers per kernel in tiers 13–16, but only faster while every subtier is gated. |
-| `--self-merge-block` | off | `smb_` | Resolve a kernel's self-merges (X+X→XX) together: per span L, equality with the next token (XOR, OR-reduce, negate) AND membership in the kernel's X set gates one block that pairs each run left to right and stamps by bit transformation. Merge and bit-transformation kernels; −2% (default backend) to −7% (aggressive) single-threaded on 20 MB of Finnish Wikibooks. |
-| `--bit-frequency-statistics` | off | — | Report how many output tokens have ids of at least N bits, N = 10..16. |
-| `--merge-frequency-statistics` | off | — | Report, per merge id bit tier, the merges made and how many join two ids of at least N bits, N = 10..16 (one counting kernel after each merge kernel). |
-| `--compaction=MODE` | (see text) | (via `L`) | Compaction schedule. `linear`: a `FilterByMask` after every `--compact-base` kernels. `geometric`: after `--compact-base` kernels, then doubling the interval. `by-output-bits`: between two kernels whose output id widths differ (after each bit tier under `--partition=bit-tier`); `--compact-base=N` is then the **minimum kernel number**, so a width change after fewer than N kernels is skipped and compaction waits for the next one. Not given: `linear` if `--compact-base > 0` (`geometric` with `--geometric-compaction`), else none. Conflicting settings (e.g. `--geometric-compaction` with another mode, or `linear`/`geometric` without `--compact-base`) halt with a message. |
-| `--compact-base=N` | `0` (off) | `L{maxLen}` | `linear`/`geometric`: kernels per compaction interval (`0` = no compaction). `by-output-bits`: minimum kernel number for a compaction. `BPE_COMPACT_EVERY` overrides it. Compaction trades a per-point filter cost for cheaper downstream kernels. |
-| `--geometric-compaction` | off | (via `L`) | Same as `--compaction=geometric`; needs `--compact-base > 0`. |
-| `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. Left at its default, it becomes `0` whenever `--if-group-size`, `--if-group-count` or `--if-test-significant-bits` is given. |
-| `--if-group-count=K` | `1` | `g{rules/K}_` | Grouped kernels get **K gates each**; gate size = `rules/K` (scales with kernel). Only active with `--if-group-lower-limit >= 0`. |
-| `--if-group-size=S` | `1` | `g{S}_` | **Fixed** `S` rules per gate regardless of kernel size (gate count = `rules/S`). **Overrides `--if-group-count` when `!= 1`.** `1` = defer to `--if-group-count`. |
-| `--lookahead-in-gate` | off | `la1_` | Build the B-detection `LookAhead` **inside each rule's** `createIf` (skippable on cold blocks) instead of one shared shift hoisted outside all gates. Skippable but **duplicated per rule** (loses the per-lenA dedup). Works with or without grouping. |
-| `--lookahead-in-group` | off | `lg1_` | **Grouped kernels only.** Build the B-detection `LookAhead` **inside each group's** `createIf`, **cached per distinct `lenA`** so the chunk's rules share it. Combines dedup (unlike `--lookahead-in-gate`) with cold-chunk skip (unlike the hoisted shift). Needs `--if-group-lower-limit >= 0`; no effect on ungrouped kernels. |
-
-### Compaction and slot distances
-
-`--compaction` (with `--compact-base=N`) inserts `FilterByMask` points between kernels. Merges kill
-positions but do not shrink the stream, so without it every later kernel keeps
-scanning dead bytes. The filter keeps exactly the live token starts, one position
-each — call those **slots**.
-
-Distances then change meaning: a rule's `LookAhead` distance is the width of its
-left part, and after a squeeze that must be a slot distance.
-`applyCompactionSchedule` rewrites every `lenA`, which needs one fact per token —
-*was it already built when we compacted?* Yes → it owns a position → 1 slot.
-No → it sits on top of several, so sum its parts recursively, stopping at the
-first part that was present (or is a base byte).
-
-Kernels run in order and a compaction happens after a specific kernel, so "which
-kernel built this token" is "when was it built":
-
-```cpp
-if (id < 256) return 1;                              // base byte, from the seed
-auto k = kernelOf.find(id);
-if (k != kernelOf.end() && (long) k->second <= lastCompactKernel)
-    return 1;                                        // built at/before the squeeze
-// otherwise: slotSpan(left part) + slotSpan(right part)
-```
-
-This was previously approximated by `id < frontier` (`frontier = g.hi`), which is
-equivalent **only** when groups tile the id axis in rank order — true for clean
-ranges, false under `--partition=level` where `hi` is a running max. Every id then
-tested as already built, every `lenA` collapsed to 1, and merges whose left part
-postdates the squeeze silently never fired (`Ġrestaurant` → `Ġrestaur` + `ant`;
-3134 tokens instead of 2708 on `webtext_10`). Word prefixes stayed correct because
-their left parts predate the squeeze, which made the failure look selective.
-
-Slot width is a property of a token *measured against a particular squeeze*, so
-the memo is cleared at every compaction point.
-
-### How grouping is meant to help
-
-The early (low-rank) kernels fire on almost every block — common merges — so
-gating them saves nothing; the late (high-rank) kernels rarely fire, so a range
-gate lets most blocks skip them. `--if-group-lower-limit` therefore groups only
-kernels at/after an index. `--lookahead-in-group` follows the same logic: it
-moves the peek-ahead work inside those gates so cold chunks skip it too, while
-`--lookahead-in-gate` moves the peek inside but per-rule (no sharing). The three
-peek placements are mutually exclusive — precedence in the kernel body is
-indexed-nextId > in-group > in-gate > hoisted (default).
-
-### Bit-transformation kernels (`--bit-xfrm-limit`)
-
-For a kernel with an N-bit input id stream, `BPEXfrmKernel` buckets the rules by
-`L = lenA` (the lookahead distance to B's start) and forms one 2N-bit vector per
-bucket: the N id bits at `p` followed by the N id bits at `p+L`, so a rule's
-`(idA, idB)` pair is the value `idA | idB << N`. For each output bit `j`, the
-values of the rules whose `idAB` bit `j` differs from `idA` bit `j` (for `j >= N`:
-whose `idAB` bit `j` is set) form a set, compiled by `cc::Parabix_CC_Compiler`
-over that vector. Then
-
-```
-change_j = OR over L of ( CC_{L,j} AND live AND NOT boundary(p+L) )
-out_j    = in_j XOR change_j
-```
-
-and the union of each bucket's values gives its fire stream, which consumes B's
-start (`live &= ~Advance(fire_L, L)`). This is exact because at most one rule
-fires per position (the frozen id selects `idA`, and rules sharing `idA` share `L`)
-and same-kernel rules never touch each other's positions. Self-merges `X+X` keep a
-per-rule stamp (per-run pairing is not a set membership test) or join
-`--self-merge-block`.
-
-`re::CC` holds codepoints up to `0x10FFFF`, so a pair value has 20 bits. Ids of more
-than 10 bits are split into **subtiers**: the classes take the low 20−N bits of idA
-and all N bits of idB, and the high 2N−20 bits of idA (4 subtiers in the 11-bit tier,
-16 in the 12-bit tier, …) name a rule's subtier. Each subtier present in a kernel is
-one block — its classes ANDed with "idA's high bits at `p` equal the key" — shared by
-every `L`. Every rule belongs to exactly one block, so the result equals the unsplit
-form. By default the blocks are not in `createIf`s (`--subtier-gating-bits`).
-
-### Correctness testing
-
-Every optimization must be **byte-identical** to the baseline. Two ways to check.
-
-**1. Differential vs HuggingFace** (the ground truth), full GPT-2 vocab:
-
-```bash
-cd tokenizer-test
-IN=../tokenizer_files/val_4MB.txt
-python3 compare_bpe.py --no-timing --input=$IN                                   # baseline
-python3 compare_bpe.py --no-timing --input=$IN --parabix-args="--partition=level" # flag under test
-```
-
-`--input` is required. `--parabix-args` forwards its flags verbatim to the binary;
-use the `=` form or argparse swallows the next `--...` token. The run prints
-`Extra tokenizer flags: …` when any are active — no such line means the default
-path was tested. `--no-timing` skips the throughput section, which builds its
-command *without* `--pretokenizer=bytelevel` and would otherwise JIT and measure a
-different pipeline than the one just verified.
-
-**2. Self-consistency** (fast, dev merges) — the same input through two flag
-settings must produce identical tokens:
-
-```bash
-IN=tokenizer_files/val_2MB.txt
-build19/bin/tokenizer --merges=tools/lex/merges.txt "$IN" > /tmp/a.txt
-build19/bin/tokenizer --merges=tools/lex/merges.txt \
-    --if-group-lower-limit=0 --if-group-count=3 --lookahead-in-group "$IN" > /tmp/b.txt
-diff -q /tmp/a.txt /tmp/b.txt && echo IDENTICAL
-```
-
-`tokenizer-test/bench_configs.py --verify` automates this — it hashes each
-config's tokens against the baseline and reports `IDENTICAL` / `DIFFERS` beside
-the timings, so "faster but wrong" is flagged rather than read as a win.
-
-### Performance testing
-
-`tokenizer-test/bench_bpe.py --sweep` drives the binary's `--bench-loop` and
-reports MB/s. Pass the optimization flags through `--parabix-args`:
-
-```bash
-cd tokenizer-test
-BASE="--geometric-compaction --compact-base=15 --if-group-lower-limit=50 --if-group-count=3"
-
-# baseline (hoisted peek)
-python3 bench_bpe.py --sweep \
-    --sweep-source tokenizer_files/val_8MB.txt --sweep-sizes 4 \
-    --parabix-args="$BASE"
-
-# variant under test (in-group cached peek)
-python3 bench_bpe.py --sweep \
-    --sweep-source tokenizer_files/val_8MB.txt --sweep-sizes 4 \
-    --parabix-args="$BASE --lookahead-in-group"
-```
-
-Notes:
-- Distinct cache tags mean the two runs do **not** collide — no wipe needed
-  between them. Wipe (`rm -rf ~/.parabix/objcache/`) only after a **rebuild**.
-- `--lookahead-in-group` is a no-op on ungrouped kernels. Giving `--if-group-size`,
-  `--if-group-count` or `--if-test-significant-bits` without `--if-group-lower-limit`
-  groups every kernel (limit 0); an explicit `--if-group-lower-limit=-1` keeps grouping off.
-- Cross-run absolute MB/s is noisy; trust only **back-to-back** A/B deltas.
-- Confirm a flag engaged by inspecting the IR on a debug build:
-  `build_debug/bin/tokenizer --ShowOptimizedPablo --ToShow="BPEMerge*" --merges=tools/lex/merges.txt <flags> build19/test.txt`.
-
-### Results: id-bit tiers, compaction and bit-transformation kernels (2026-10-01)
-
-Full GPT-2 merges, `--pretokenizer=bytelevel`, one macOS machine. Every
-configuration below produced output byte-identical to `--partition=level`, both on a
-300 KB mixed text/source file and on the first 1 MB of `QA/TestCorpora/Twain.txt`.
-Not yet compared against HuggingFace.
-
-These results predate `--bit-xfrm-limit` (2026-10-06), which replaced
-`--max-bit-xfrm-limit` and its wide-id scheme (an if-block per pair of high bits of
-idA and idB) with subtiers. On 20 MB of Finnish Wikibooks, single-threaded with
-`--compaction=by-output-bits --self-merge-block`, subtiers were 10–13% cheaper than
-that scheme in each of tiers 12–16, and all-tier bit transformation (`--bit-xfrm-limit=16`)
-cut merge-kernel time from 23.2 s (tiers 15–16 per-rule) to 15.7 s at the default
-backend level.
-
-Abbreviations: **LT** = `--partition=bit-tier`;
-**KC** = `--if-test-significant-bits=3 --key-cluster`; **bits** =
-`--compaction=by-output-bits`; **xN** = `--max-bit-xfrm-limit=N` as defined at the
-time, when it selected inputs of **fewer than** N bits (x11 here = today's
-`--max-bit-xfrm-limit=10`). Default
-`--max-merges-per-kernel=500` throughout.
-
-**Throughput**: `--bench-loop=5`, 1 MB Twain, median ms per tokenization from two
-processes. Treat differences under about 5% as noise.
-
-| Config | Kernels | Median ms |
-|---|---|---|
-| `--partition=level` | 283 | 3146 / 3204 |
-| LT, no compaction | 342 | 4213 / 4224 |
-| LT + bits | 342 | 1749 / 1769 |
-| LT + bits + x9 / x10 / x11 | 342 | 1727–1786 / 1720–1728 / 1675–1685 |
-| `--partition=level --compaction=geometric --compact-base=2` (7 points, like LT + bits) | 283 | 1370 / 1406 |
-| `--partition=level` + KC | 297 | 1325 / 1344 |
-| LT + KC, no compaction | 331 | 1371 / 1380 |
-| LT + KC + bits | 331 | 656 / 718 |
-| LT + KC + bits + x9 / x10 / x11 | 331 | 676–677 / 636–651 / 646–649 |
-
-**Bit-transformation kernels, per kernel**: `-EnableCycleCounter` cycles for the
-32 kernels with 8–10-bit inputs, compared position by position:
-
-| Input → output bits | Kernels | LT + bits: per-rule → x11 | LT + KC + bits: per-rule → x11 |
-|---|---|---|---|
-| 8 → 9 | 1 | 0.24× | 0.55× |
-| 9 → 9 | 14 | 0.25× | 0.40× |
-| 9 → 10 | 1 | 0.23× | 0.51× |
-| 10 → 10 | 15 | 0.25× | 0.46× |
-| 10 → 11 | 1 | 0.12× | 0.42× |
-| all 32 | 32 | 0.19× | 0.44× |
-
-Compile time with the object cache off: LT + bits 93.0 s → 94.9 s with x11;
-LT + KC + bits 37.9 s → 37.6 s.
-
-Findings:
-- Compaction gives the large gains. Tiering alone slows LT by 33% and leaves KC
-  unchanged; tiering plus `by-output-bits` compaction makes KC about 2× faster.
-- For LT, tier-boundary compaction is not the best placement: untiered
-  `--partition=level` with geometric compaction at base 2 (also 7 points) beats
-  LT + bits. KC with geometric compaction has not been measured.
-- Bit-transformation kernels are 2–5× cheaper than per-rule kernels, but the
-  8–10-bit kernels are only 3–4% of merge-kernel cycles, so end-to-end time improves
-  by just 2–4%. Most time is in the 11–16-bit kernels, past the 21-bit `re::CC`
-  limit.
-
-**Gated bit transformation for all widths** (2026-10-02). `--max-bit-xfrm-limit=N`
-now means "at most N input bits", and ids over 10 bits are gated by if-blocks on
-their high bits. Same setup as above; xN below uses the new meaning. All
-configurations match `--partition=level` on both inputs.
-
-| Config | Bit-xfrm kernels | Median ms (1 MB Twain) | Compile, cache off |
-|---|---|---|---|
-| LT + bits + x10 | 32 of 342 | 1618 / 1628 | — |
-| LT + bits + x13 | 108 of 342 | 1491 / 1494 | — |
-| LT + bits + x16 | 342 of 342 | **344 / 379** | 15.7 s (93.0 s without) |
-| LT + KC + bits + x10 | 32 of 331 | 655 / 670 | — |
-| LT + KC + bits + x13 | 106 of 331 | 605 / 623 | — |
-| LT + KC + bits + x16 | 331 of 331 | **293 / 301** | 13.6 s (37.9 s without) |
-
-Merge-kernel cycles with x16, relative to the per-rule body of the same partition
-(`-EnableCycleCounter`, 1 MB Twain), by input id width:
-
-| Input bits | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | all |
-|---|---|---|---|---|---|---|---|---|---|---|
-| LT + bits | 0.22× | 0.21× | 0.14× | 0.19× | 0.18× | 0.17× | 0.15× | 0.14× | 0.14× | **0.15×** |
-| LT + KC + bits | 0.55× | 0.41× | 0.43× | 0.44× | 0.41× | 0.36× | 0.34× | 0.32× | 0.28× | **0.32×** |
-
-The gated form is cheapest relative to per-rule kernels at the widest ids, where most
-of the time was. Untiered partitions with x16 (e.g. with geometric compaction) have
-not been benchmarked yet.
+**Speed**, same machine, `bench_bpe.py` with cold caches, median of 10 runs per
+engine on each 4 MB file: 12.7–17.5 ms at 1 thread (10.8–15.4× faster than
+tiktoken, 78–88× faster than HuggingFace 0.23.3), 3.9–5.9 ms at 4 threads
+(13.1–15.8× and 58–86×). Tokenization only: start-up and output are not timed.
+Full table and commands: [tokenizer-test/README.md](tokenizer-test/README.md#reference-results).
 
 ## Testing
 
-`tokenizer-test/` contains Python scripts that compare Parabix output against the
-HuggingFace `tokenizers` library, plus a throughput benchmark. See
-[tokenizer-test/README.md](tokenizer-test/README.md) for setup and usage.
+`tokenizer-test/` holds the scripts that compare against HuggingFace and tiktoken
+and the benchmarks. See [tokenizer-test/README.md](tokenizer-test/README.md).
 
 ## License
 

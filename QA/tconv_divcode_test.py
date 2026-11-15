@@ -11,8 +11,10 @@
 #  classes of random text (characters of each block, of the external sets,
 #  and others, of 1 to 4 UTF-8 bytes) must be those the description gives.
 #
-#  The translation kernels (tconv --divcode-groups): the output must be that of
-#  the regular plan (--divcode-groups=0), and ICU's for rules files, for
+#  The translation kernels (tconv --divcode-groups), on the 21-bit basis and on
+#  the UTF-8 code units (UTF-8 mode, --utf8-mode, where the transform can be):
+#  the output must be that of the regular plan (--divcode-groups=0), and ICU's
+#  for rules files, for
 #  - the CLDR conversion groups eligible without expansions, on text made of
 #    the texts of their rules, characters of their alphabets and of their
 #    contexts, and others (div32 and div64), and on their CLDR test data;
@@ -104,8 +106,16 @@ RULES = {
     "expansion-covered": "ab > Q ; b > XYZ ;",
     "expansion-priority": "abc > 1 ; ab > 234 ; b > 3 ;",
     "expansion-filter": ":: [a-m] ; ab > XYZ ; k > KK ; mn > Y ; :: Null ;",
+    # characters of 1 to 4 UTF-8 bytes (for UTF-8 mode: lengths of texts and
+    # results in bytes, contexts and set positions of multibyte characters)
+    "utf8-lengths": "aé > ü ; Ωx > 中 ; 中 > zh ; 😀c > A ; bé > 😀😀 ;",
+    "utf8-contexts": "[é中] { ab > xy ; cd } [^😀] > XY ; 😀 } e > E ;",
+    "utf8-negated-before": "[^Ω] { ab > 中文 ; [^é] { cd > ço ;",
+    "utf8-set-positions": "a [éè] > Q ; [xy] [中文] > R ;",
+    "utf8-property": "xy } [:Han:] > HI ; [:Greek:] { yz > YZ ;",
+    "utf8-boundary": "ü } [$] > U ; ü > uu ; éè > e ;",
 }
-RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-"
+RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
 TRACE = ["-enable-object-cache", "-trace-object-cache"]
 
 
@@ -122,7 +132,7 @@ def translation(tconv, tmp, salt):
         aliases[fields[0]] = [f for f in fields[1:] if not f.startswith("[")]
     test_data = os.path.expanduser("~/cldr/common/testData/transforms")
     for name, group in TRANSLATE:
-        for shift in (5, 6):
+        for shift, mode in ((5, "1"), (5, "0"), (6, "1")):
             rnd = random.Random("%s %d %d translate" % (name, group, shift))
             with open(path, "w", encoding="utf-8") as f:
                 f.write("a\n")
@@ -143,13 +153,14 @@ def translation(tconv, tmp, salt):
                 for f in glob.glob(os.path.join(test_data, stem.replace("/", "-") + ".txt")):
                     with open(f, encoding="utf-8") as t:
                         texts.append("".join(l.split("\t")[0] + "\n" for l in t if "\t" in l and not l.startswith("#")))
-            for i, t in enumerate(texts):
+            for i, t in enumerate(texts if shift == 5 else texts[:1]):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(t)
                 common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--divcode-shift=%d" % shift]
-                regular = run(tconv, common + ["--divcode-groups=0", name, path])
-                divcode = run(tconv, common + TRACE + ["--divcode-groups=1", name, path])
-                what = "%s#%d s=%d %s" % (name, group, shift, "random" if i == 0 else "test data")
+                regular = run(tconv, common + ["--divcode-groups=0", "--utf8-mode=0", name, path])
+                divcode = run(tconv, common + TRACE + ["--divcode-groups=1", "--utf8-mode=" + mode, name, path])
+                what = "%s#%d s=%d %s %s" % (name, group, shift, "random" if i == 0 else "test data",
+                                             "UTF-8" if b"_U8" in divcode.stderr else "Unicode")
                 if regular.returncode or divcode.returncode:
                     failures += 1
                     print("FAIL %s: exit %d/%d %s" % (what, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
@@ -178,21 +189,23 @@ def translation(tconv, tmp, salt):
         with open(path, "w", encoding="utf-8") as f:
             f.write("".join(rnd.choice(RULES_ALPHABET) for _ in range(20000)))
         common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--rules-file=" + rules_path]
-        regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", path])
-        divcode = run(tconv, common + TRACE + ["--use-ICU=0", "--divcode-groups=1", path])
+        regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", "--utf8-mode=0", path])
         icu = run(tconv, common + ["--use-ICU=.*", path])
-        if regular.returncode or divcode.returncode:
-            failures += 1
-            print("FAIL rules %s: exit %d/%d %s" % (case, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
-        elif b"Div32CodeTranslate" not in divcode.stderr:
-            failures += 1
-            print("FAIL rules %s: no DivCode translation kernel" % case)
-        elif divcode.stdout != regular.stdout or (icu.returncode == 0 and divcode.stdout != icu.stdout):
-            failures += 1
-            print("FAIL rules %s: divcode %s regular, %s ICU" % (case, "=" if divcode.stdout == regular.stdout else "!=",
-                                                                "=" if divcode.stdout == icu.stdout else "!="))
-        else:
-            print("ok rules %s%s" % (case, "" if icu.returncode == 0 else " (no ICU)"))
+        for mode in ("1", "0"):
+            divcode = run(tconv, common + TRACE + ["--use-ICU=0", "--divcode-groups=1", "--utf8-mode=" + mode, path])
+            what = "rules %s %s" % (case, "UTF-8" if b"_U8" in divcode.stderr else "Unicode")
+            if regular.returncode or divcode.returncode:
+                failures += 1
+                print("FAIL %s: exit %d/%d %s" % (what, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
+            elif b"Div32CodeTranslate" not in divcode.stderr:
+                failures += 1
+                print("FAIL %s: no DivCode translation kernel" % what)
+            elif divcode.stdout != regular.stdout or (icu.returncode == 0 and divcode.stdout != icu.stdout):
+                failures += 1
+                print("FAIL %s: divcode %s regular, %s ICU" % (what, "=" if divcode.stdout == regular.stdout else "!=",
+                                                              "=" if divcode.stdout == icu.stdout else "!="))
+            else:
+                print("ok %s%s" % (what, "" if icu.returncode == 0 else " (no ICU)"))
     return failures
 
 

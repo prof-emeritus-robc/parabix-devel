@@ -259,6 +259,16 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         for (const UCD::UnicodeSet & t : src.text) {
             if (marksFilterRunEnd(t)) {problem("texts at the end of a filtered run"); ok = false; break;}
         }
+        if (options.utf8) {
+            //  (The lengths of UTF-8 characters: 1, 2, 3, 4.)
+            static const UCD::UnicodeSet lengths[] = {UCD::UnicodeSet(0, 0x7F), UCD::UnicodeSet(0x80, 0x7FF),
+                                                      UCD::UnicodeSet(0x800, 0xFFFF), UCD::UnicodeSet(0x10000, 0x10FFFF)};
+            for (size_t i = 1; i < src.text.size() && ok; i++) {
+                unsigned n = 0;
+                for (const UCD::UnicodeSet & l : lengths) n += src.text[i].intersects(l) ? 1 : 0;
+                if (n > 1) {problem("text positions of characters of different UTF-8 lengths"); ok = false;}
+            }
+        }
         if (!ok) continue;
         src.result = sr.replacement;
         src.rule = sr.rule;

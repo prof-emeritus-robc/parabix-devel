@@ -54,6 +54,9 @@ struct DivCodeOptions {
     unsigned shift = 5;             // 5: div32, 6: div64
     unsigned maxSetBlocks = 16;     // an explicit context set (or its complement) spans at most this many blocks
     unsigned maxCodeBits = 10;      // at most 2^maxCodeBits - 1 blocks
+    // For UTF-8 code units: each position of a text has characters of one
+    // UTF-8 length (the first, split by blocks, always does).
+    bool utf8 = false;
     // Whether a before context (as given for the regular expression engine)
     // may match differently in the text as converted by the group, against
     // which ICU matches it (or is not known not to).  If not given, no before

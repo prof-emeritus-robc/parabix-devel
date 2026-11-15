@@ -73,6 +73,10 @@ struct DivContextItem {
     // complement) without the boundary (as [^X$]).  (The translation kernel
     // tests every after item within the text.)
     bool guardEnd = false;
+    // The set marks the end of a run of a global filter (see
+    // marksFilterRunEnd): the item also holds at the positions outside the
+    // filter's mask.
+    bool runEnd = false;
     bool present() const {return kind != Kind::None;}
 };
 

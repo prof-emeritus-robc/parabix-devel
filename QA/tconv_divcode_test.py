@@ -10,10 +10,23 @@
 #  bits), with and without external sets, for div32 and div64, the codes and
 #  classes of random text (characters of each block, of the external sets,
 #  and others, of 1 to 4 UTF-8 bytes) must be those the description gives.
+#
+#  The translation kernels (tconv --divcode-groups): the output must be that of
+#  the regular plan (--divcode-groups=0), and ICU's for rules files, for
+#  - the CLDR conversion groups eligible without expansions, on text made of
+#    the texts of their rules, characters of their alphabets and of their
+#    contexts, and others (div32 and div64), and on their CLDR test data;
+#  - rules files of the cases: literal strings with single-character rules
+#    within them (coverage), first sets split by blocks, before and after
+#    contexts (explicit, negated with the text boundary, [^X$], properties),
+#    priority (an after context added by order disambiguation), deletions, and
+#    filters.
+#  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
 #  tconv_divcode_test.py <tconv binary>
 
+import glob
 import json
 import os
 import random
@@ -40,6 +53,123 @@ def valid(cp):
 def sample(rnd, ranges):
     lo, hi = rnd.choice(ranges)
     return rnd.randint(lo, hi)
+
+
+TRANSLATE = [
+    ("Any-Accents", 1), ("Bengali-InterIndic", 1), ("Halfwidth-Fullwidth", 1), ("Hira-Kana", 1),
+    ("ja_Hrkt-ja_Latn/BGN", 2), ("Oriya-InterIndic", 1), ("Latn-Syrc", 1), ("cy-cy_FONIPA", 3),
+    ("dsb-dsb_FONIPA", 2), ("ha-ha_NE", 1), ("my-my_FONIPA", 7), ("my-my_FONIPA", 8), ("pl_FONIPA-ja", 1),
+    ("ru-ja", 1), ("sat_Olck-sat_FONIPA", 2), ("sk_FONIPA-ja", 3),
+]
+RULES = {
+    "strings": "ab > X ; b > Y ; a > Z ; c > ;",
+    "split": "[aä] b > Q ; ä > e ;",
+    # (Results as long as the texts, so that the conversions cannot change what
+    # the before contexts see; single-character rules on other first
+    # characters, so that order disambiguation adds no contexts to them.)
+    "before": "x { ab > PQ ; b > B ;",
+    "after": "ab } y > R ; b > B ;",
+    "negated-before": "[^x] { cd > ST ; d > D ;",
+    "negated-after": "cd } [^y] > T ; d > D ;",
+    "after-without-boundary": "ef } [^y$] > U ; f > F ;",
+    "boundary-after": "gh } [$] > V ; h > H ;",
+    "property-after": "gh } [:Lu:] > V ;",
+    "property-before": "[:Lu:] { ij > wk ; j > k ;",
+    "priority": "abc > 1 ; ab > 2 ; b > 3 ;",
+    "deletion": "abc > z ; xy > ; q > ;",
+    # (A second step, as ICU ignores the global filter of a transform of a
+    # single conversion group.)
+    "filter": ":: [a-m] ; ab > X ; mn > Y ; k > K ; :: Null ;",
+}
+RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-"
+TRACE = ["-enable-object-cache", "-trace-object-cache"]
+
+
+def run(tconv, args):
+    return subprocess.run([tconv] + args, capture_output=True)
+
+
+def translation(tconv, tmp, salt):
+    failures = 0
+    path = os.path.join(tmp, "text.txt")
+    aliases = {}
+    for line in run(tconv, ["--list-transforms"]).stdout.decode("utf-8").splitlines():
+        fields = line.split("  ")
+        aliases[fields[0]] = [f for f in fields[1:] if not f.startswith("[")]
+    test_data = os.path.expanduser("~/cldr/common/testData/transforms")
+    for name, group in TRANSLATE:
+        for shift in (5, 6):
+            rnd = random.Random("%s %d %d translate" % (name, group, shift))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("a\n")
+            r = run(tconv, ["--divcode-codes=%d" % group, "--divcode-shift=%d" % shift, name, path])
+            desc = json.loads(r.stderr.decode("utf-8").splitlines()[0])
+            pieces = list(desc["samples"]) or ["a"]
+            singles = [chr((b << shift) | rnd.randrange(1 << shift)) for b in desc["blocks"] for _ in range(3)]
+            singles = [c for c in singles if not 0xD800 <= ord(c) <= 0xDFFF]
+            context = list(desc["context_chars"])
+            other = list(" .,-\n") + list(OTHER)
+            text = []
+            for _ in range(4000):
+                x = rnd.random()
+                text.append(rnd.choice(pieces) if x < 0.5 else rnd.choice(singles or other) if x < 0.7
+                            else rnd.choice(context or other) if x < 0.8 else rnd.choice(other))
+            texts = ["".join(text)]
+            for stem in [name] + aliases.get(name, []):
+                for f in glob.glob(os.path.join(test_data, stem.replace("/", "-") + ".txt")):
+                    with open(f, encoding="utf-8") as t:
+                        texts.append("".join(l.split("\t")[0] + "\n" for l in t if "\t" in l and not l.startswith("#")))
+            for i, t in enumerate(texts):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(t)
+                common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--divcode-shift=%d" % shift]
+                regular = run(tconv, common + ["--divcode-groups=0", name, path])
+                divcode = run(tconv, common + TRACE + ["--divcode-groups=1", name, path])
+                what = "%s#%d s=%d %s" % (name, group, shift, "random" if i == 0 else "test data")
+                if regular.returncode or divcode.returncode:
+                    failures += 1
+                    print("FAIL %s: exit %d/%d %s" % (what, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
+                elif ("Div%dCodeTranslate" % (1 << shift)).encode() not in divcode.stderr:
+                    failures += 1
+                    print("FAIL %s: no DivCode translation kernel" % what)
+                elif regular.stdout != divcode.stdout:
+                    failures += 1
+                    a, b = regular.stdout.decode("utf-8", "replace"), divcode.stdout.decode("utf-8", "replace")
+                    j = next((j for j in range(min(len(a), len(b))) if a[j] != b[j]), min(len(a), len(b)))
+                    print("FAIL %s: differs at %d: regular %r, divcode %r (input %r)" % (what, j, a[j-10:j+20], b[j-10:j+20],
+                                                                                 t[max(0, j-10):j+20]))
+                else:
+                    print("ok %s (%d characters)" % (what, len(t)))
+    for case, rules in RULES.items():
+        rnd = random.Random(case)
+        rules_path = os.path.join(tmp, case + ".txt")
+        with open(rules_path, "w", encoding="utf-8") as f:
+            f.write(rules + "\n")
+        report = run(tconv, ["--divcode-report", "--rules-file=" + rules_path])
+        groups = [json.loads(l) for l in report.stdout.decode("utf-8").splitlines()]
+        if not groups or not all(g["eligible"] for g in groups):
+            failures += 1
+            print("FAIL rules %s: not eligible: %s" % (case, [g["problems"] for g in groups]))
+            continue
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(rnd.choice(RULES_ALPHABET) for _ in range(20000)))
+        common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--rules-file=" + rules_path]
+        regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", path])
+        divcode = run(tconv, common + TRACE + ["--use-ICU=0", "--divcode-groups=1", path])
+        icu = run(tconv, common + ["--use-ICU=.*", path])
+        if regular.returncode or divcode.returncode:
+            failures += 1
+            print("FAIL rules %s: exit %d/%d %s" % (case, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
+        elif b"Div32CodeTranslate" not in divcode.stderr:
+            failures += 1
+            print("FAIL rules %s: no DivCode translation kernel" % case)
+        elif divcode.stdout != regular.stdout or (icu.returncode == 0 and divcode.stdout != icu.stdout):
+            failures += 1
+            print("FAIL rules %s: divcode %s regular, %s ICU" % (case, "=" if divcode.stdout == regular.stdout else "!=",
+                                                                "=" if divcode.stdout == icu.stdout else "!="))
+        else:
+            print("ok rules %s%s" % (case, "" if icu.returncode == 0 else " (no ICU)"))
+    return failures
 
 
 def main():
@@ -120,6 +250,7 @@ def main():
                 else:
                     print("ok %s#%d s=%d: %d blocks, %d external sets (%s)" % (name, group, shift, len(blocks), len(externals),
                                                                               desc["kernel"]))
+        failures += translation(tconv, tmp, "tconv_divcode_test")
     if failures:
         print("tconv_divcode_test: %d failures" % failures)
         sys.exit(1)

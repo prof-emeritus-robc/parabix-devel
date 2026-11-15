@@ -172,10 +172,12 @@ structure is as follows.
    - **Later text positions** are tested by `Lookahead` of the input pseudo-basis
      streams at their offsets (contiguous: the text has no gaps).
    - **After items** are tested at offset `n + e_r`, past the rule's own gap.
-     An item with the boundary is `¬Lookahead(CC(X))`, which holds past the end
-     of the text, as in ICU. An item that excludes the boundary but would hold
-     on zero bits (`[^X$]`, `guardEnd`) is ANDed with a lookahead of the
-     in-text positions.
+     The test of the item's set is always ANDed with a lookahead of the in-text
+     positions (`InText`), and an item with the boundary is the negation,
+     `¬(Lookahead(CC(X)) ∧ Lookahead(InText))`, which holds past the end of the
+     text, as in ICU. The AND is needed: beyond the text the code is 0, and a set
+     given by its complement (such as `[$]` alone, or a word-boundary set)
+     includes the characters of code 0, so it would see a character there.
    - **Priority:** a rule yields to the matches of the earlier rules at its anchor
      (same leaf, same anchor), as planned.
    - **Accumulators** (Vars escaping the If):
@@ -278,7 +280,12 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
 2. Div32Code/Div64Code kernel and external classes; a test that dumps the code
    bixnum (done: `tconv --divcode-codes`, `QA/tconv_divcode_test.py`).
 3. Translation kernel without expansions (groups where m ≤ n everywhere), with
-   deletion; QA tests; the CLDR comparison.
+   deletion; QA tests; the CLDR comparison. (Done: `tconv --divcode-groups`,
+   `DivCodeTranslate` in `tools/ldml/tconv.cpp`. The output is identical to the
+   regular plan's for the 16 eligible CLDR groups without expansions, on random
+   text and their CLDR test data, under div32 and div64, and to the regular
+   plan's and ICU's for 13 rules files of the cases. The kernels of these groups
+   go from 4–20 to 3–8, typically from 10–12 to 6.)
 4. Count kernel, spreading, gap-aware before contexts; QA tests.
 5. Measurement (§6); choose the default s and whether `--divcode-groups` is on by
    default.

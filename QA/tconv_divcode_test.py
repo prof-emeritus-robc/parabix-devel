@@ -19,8 +19,9 @@
 #  - rules files of the cases: literal strings with single-character rules
 #    within them (coverage), first sets split by blocks, before and after
 #    contexts (explicit, negated with the text boundary, [^X$], properties),
-#    priority (an after context added by order disambiguation), deletions, and
-#    filters.
+#    priority (an after context added by order disambiguation), deletions,
+#    filters, and expansions (positions inserted after the matches, counted by
+#    the Count kernel; before contexts through them).
 #  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
@@ -60,6 +61,14 @@ TRANSLATE = [
     ("ja_Hrkt-ja_Latn/BGN", 2), ("Oriya-InterIndic", 1), ("Latn-Syrc", 1), ("cy-cy_FONIPA", 3),
     ("dsb-dsb_FONIPA", 2), ("ha-ha_NE", 1), ("my-my_FONIPA", 7), ("my-my_FONIPA", 8), ("pl_FONIPA-ja", 1),
     ("ru-ja", 1), ("sat_Olck-sat_FONIPA", 2), ("sk_FONIPA-ja", 3),
+    # with expansions
+    ("Sinh-Latn/UNGEGN", 1), ("Thaa-Latn", 1), ("byn_Ethi-byn_Latn/Xaleget", 1), ("ja_Hrkt-ja_Latn/BGN", 1),
+    ("und_FONIPA-und_FONXSAMP", 1), ("InterIndic-Devanagari", 1), ("Khmr-Latn/UNGEGN", 3), ("si-si_FONIPA", 3),
+    ("Cyrl-Latn", 1), ("tk_Cyrl-tk/BGN", 1), ("InterIndic-Kannada", 1), ("InterIndic-Telugu", 1),
+    ("InterIndic-Malayalam", 1), ("InterIndic-Tamil", 1), ("ky-ky_Latn/BGN", 1), ("Latn-Armn", 1), ("Armn-Latn", 1),
+    ("mn-mn_Latn/BGN", 1), ("si-si_Latn", 3), ("Tamil-InterIndic", 1), ("my-my_FONIPA", 9), ("my-my_FONIPA", 1),
+    ("he-he_Latn/BGN", 1), ("cs-cs_FONIPA", 1), ("dsb-dsb_FONIPA", 1), ("gz_Ethi-Sarb", 1), ("eo-eo_FONIPA", 1),
+    ("de-ASCII", 1), ("zh_Latn_PINYIN-ru", 2),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -80,6 +89,18 @@ RULES = {
     # (A second step, as ICU ignores the global filter of a transform of a
     # single conversion group.)
     "filter": ":: [a-m] ; ab > X ; mn > Y ; k > K ; :: Null ;",
+    # expansions (positions inserted after the matches)
+    "expansion": "ab > XYZ ; c > DE ; b > B ;",
+    "expansion-after": "ab } c > XYZ ; c > C ;",
+    "expansion-negated-after": "ab } [^c] > XYZ ; c > C ;",
+    # (A before context after an expanded match, through the positions inserted:
+    # [bZ] holds for b and for the last character of its conversion alike.)
+    "expansion-before": "ab > XYZ ; [bZ] { cd > KL ;",
+    "expansion-negated-before": "ab > XYZ ; [^bZ] { cd > KL ;",
+    "expansion-single": "ab > Q ; a > XY ;",
+    "expansion-covered": "ab > Q ; b > XYZ ;",
+    "expansion-priority": "abc > 1 ; ab > 234 ; b > 3 ;",
+    "expansion-filter": ":: [a-m] ; ab > XYZ ; k > KK ; mn > Y ; :: Null ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-"
 TRACE = ["-enable-object-cache", "-trace-object-cache"]

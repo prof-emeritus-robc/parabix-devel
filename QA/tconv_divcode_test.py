@@ -22,8 +22,10 @@
 #    within them (coverage), first sets split by blocks, before and after
 #    contexts (explicit, negated with the text boundary, [^X$], properties),
 #    priority (an after context added by order disambiguation), deletions,
-#    filters, and expansions (positions inserted after the matches, counted by
-#    the Count kernel; before contexts through them).
+#    filters, expansions (positions inserted after the matches, counted by
+#    the Count kernel; before contexts through them), one-way overlaps of
+#    string rules (stages: no match within an applied match of an earlier stage),
+#    and contexts of two or more items.
 #  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
@@ -71,6 +73,17 @@ TRANSLATE = [
     ("mn-mn_Latn/BGN", 1), ("si-si_Latn", 3), ("Tamil-InterIndic", 1), ("my-my_FONIPA", 9), ("my-my_FONIPA", 1),
     ("he-he_Latn/BGN", 1), ("cs-cs_FONIPA", 1), ("dsb-dsb_FONIPA", 1), ("gz_Ethi-Sarb", 1), ("eo-eo_FONIPA", 1),
     ("de-ASCII", 1), ("zh_Latn_PINYIN-ru", 2),
+    # with one-way overlaps of string rules (stages)
+    ("Ethi-Latn/ES3842", 1), ("Latn-Ethi/Williamson", 1), ("und_FONIPA-ar", 2), ("und_FONIPA-fa", 2),
+    ("es_FONIPA-ja", 2), ("kk-kk_Latn/BGN", 1), ("uk-uk_Latn/BGN", 1), ("be-be_Latn/BGN", 1), ("bg-bg_Latn/BGN", 1),
+    ("la-la_FONIPA", 1), ("Latn-Geor", 1), ("pl-pl_FONIPA", 2),
+    # with contexts of two or more items (not ro_FONIPA-ja group 2, eligible but
+    # after prefix runs that delete, whose blocking marks keep it on the regular
+    # plan)
+    ("Latn-Cans", 1), ("Gurmukhi-InterIndic", 1), ("InterIndic-ur", 1), ("Kannada-InterIndic", 1), ("Bopo-Latn", 1),
+    ("my-my_Latn", 2), ("Telugu-InterIndic", 1), ("am_FONIPA-am", 8), ("cs_FONIPA-ja", 2), ("es_FONIPA-am", 2),
+    ("es_FONIPA-zh", 3), ("my-my_FONIPA", 5), ("ru-ja", 2), ("ru-zh", 2), ("si-si_FONIPA", 8),
+    ("sk_FONIPA-ja", 2), ("tlh-tlh_FONIPA", 1), ("Latn-Ethi/ALALOC", 1),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -114,8 +127,30 @@ RULES = {
     "utf8-set-positions": "a [éè] > Q ; [xy] [中文] > R ;",
     "utf8-property": "xy } [:Han:] > HI ; [:Greek:] { yz > YZ ;",
     "utf8-boundary": "ü } [$] > U ; ü > uu ; éè > e ;",
+    # one-way overlaps of string rules: a match within an applied match of a
+    # rule of an earlier stage does not apply
+    "stages-chain": "abcd > 1 ; bcd > 2 ; cd > 3 ;",
+    "stages-kana": "kya > キャ ; ya > ヤ ; a > ア ; o > オ ;",
+    "stages-expansion": "abc > X ; bc > QRS ; c > T ;",
+    "stages-deletion": "xab > Z ; ab > ; b > B ;",
+    "stages-after": "abc > 1 ; bc } d > 2 ;",
+    "stages-utf8": "中文字 > 1 ; 文字 > 22 ; 字 > é ;",
+    "stages-filter": ":: [a-m] ; abc > X ; bcd > Y ; k > K ; :: Null ;",
+    # contexts of two or more items (fixed sequences of sets)
+    "ctx2-before": "x y { ab > PQ ; b > B ;",
+    "ctx2-after": "ab } c d > XY ; d > D ;",
+    "ctx2-negated-outer": "[^x] y { ab > PQ ; ab } c [^d] > XY ;",
+    "ctx2-boundary": "[$] x { ab > PQ ; cd } e [$] > XY ;",
+    "ctx3": "x y z { ab > PQ ; cd } e f [^g] > XY ;",
+    "ctx2-after-expansion": "ab } c d > X ; c > CC ;",
+    "ctx2-utf8": "中 文 { ab > 字字 ; ab } é [^ü] > EF ;",
+    "ctx2-property": "[:Han:] x { yz > YZ ; yz } [:Greek:] [:Greek:] > ZY ;",
+    "ctx2-stages": "x { abc > 123 ; bc } d e > 45 ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
+#  (A narrower alphabet for the contexts of several items, which random text
+#  over the full one rarely matches.)
+CTX_ALPHABET = "abcdefgxyz中文éüΩΑ \n"
 TRACE = ["-enable-object-cache", "-trace-object-cache"]
 
 
@@ -187,7 +222,7 @@ def translation(tconv, tmp, salt):
             print("FAIL rules %s: not eligible: %s" % (case, [g["problems"] for g in groups]))
             continue
         with open(path, "w", encoding="utf-8") as f:
-            f.write("".join(rnd.choice(RULES_ALPHABET) for _ in range(20000)))
+            f.write("".join(rnd.choice(CTX_ALPHABET if case.startswith("ctx") else RULES_ALPHABET) for _ in range(20000)))
         common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--rules-file=" + rules_path]
         regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", "--utf8-mode=0", path])
         icu = run(tconv, common + ["--use-ICU=.*", path])

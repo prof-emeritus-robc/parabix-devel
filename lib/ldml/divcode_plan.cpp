@@ -72,37 +72,32 @@ bool includesBoundary(const RE * re) {
     return false;
 }
 
-//  The single item of a context: false (with the reason) if it is not one.
-//  A null or empty context has no item (present = false).
-bool contextItem(RE * re, CharSetAnalysis & sets, bool & present, UCD::UnicodeSet & set, bool & boundary, std::string & why) {
-    present = false;
+//  The items of a context, a fixed sequence of sets (through variables), in
+//  the order written: each its set and whether it includes the text boundary
+//  (the boundary alone: an empty set with it).  False (with the reason) if it
+//  is not such a sequence.  A null context has no items.
+bool contextItems(RE * re, CharSetAnalysis & sets, std::vector<std::pair<UCD::UnicodeSet, bool>> & items, std::string & why) {
     if (re == nullptr) return true;
     if (Seq * seq = dyn_cast<Seq>(re)) {
-        if (seq->empty()) return true;
-        if (seq->size() > 1) {
-            why = "contexts of two or more items";
-            return false;
-        }
-        return contextItem(seq->front(), sets, present, set, boundary, why);
+        for (RE * e : *seq) if (!contextItems(e, sets, items, why)) return false;
+        return true;
     }
     if (isBoundary(re)) {
-        why = "contexts of the text boundary alone";
-        return false;
+        items.emplace_back(UCD::UnicodeSet(), true);
+        return true;
     }
     if (CharSetAnalysis::isSet(re)) {
         if (hasStrings(re)) {
             why = "context sets with strings";
             return false;
         }
-        present = true;
-        set = sets.setOf(re, false);
-        boundary = includesBoundary(re);
+        items.emplace_back(sets.setOf(re, false), includesBoundary(re));
         return true;
     }
     if (Name * n = dyn_cast<Name>(re)) {
-        if (!isFunctionCall(n) && n->getDefinition()) return contextItem(n->getDefinition(), sets, present, set, boundary, why);
+        if (!isFunctionCall(n) && n->getDefinition()) return contextItems(n->getDefinition(), sets, items, why);
     }
-    why = "contexts that are not a set (repetitions, alternatives of sequences, ...)";
+    why = "contexts that are not fixed sequences of sets (repetitions, alternatives of sequences, ...)";
     return false;
 }
 
@@ -175,11 +170,29 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     if (!step.chainRevisitRules.empty()) problem("chain revisits");
     if (!step.markRunEditRules.empty()) problem("mark run edits");
     if (step.hasFrontLetters || step.frontLettersEnd) problem("front-letter revisits");
+    //  The stages of the string rules: one-way overlaps in an acyclic graph
+    //  (see DivRule::stage); others are not eligible.
+    std::vector<unsigned> stageOf(step.stringRules.size(), 1);
+    plan.stages = step.stringRules.empty() ? 0 : 1;
     if (step.stringRules.size() > 1) {
         const StringRuleOverlaps o = analyzeStringRuleOverlaps(step);
         if (!o.pairs.empty()) {
-            problem("string rule overlaps (" + std::to_string(o.oneWay) + " one-way, " + std::to_string(o.twoWay) + " two-way, "
-                    + std::to_string(o.self) + " self)");
+            const std::string counts = " (" + std::to_string(o.oneWay) + " one-way, " + std::to_string(o.twoWay) + " two-way, "
+                                       + std::to_string(o.self) + " self)";
+            if (o.twoWay > 0 || o.self > 0) {
+                problem("string rule overlaps, two-way or self" + counts);
+            } else if (!o.acyclic) {
+                problem("string rule overlaps, cyclic" + counts);
+            } else {
+                plan.overlapPairs = o.oneWay;
+                for (size_t r : o.order) {
+                    for (size_t q : o.predecessors[r]) stageOf[r] = std::max(stageOf[r], stageOf[q] + 1);
+                    plan.stages = std::max(plan.stages, stageOf[r]);
+                }
+                if (plan.stages > options.maxStages) {
+                    problem("string rule overlaps of more than " + std::to_string(options.maxStages) + " stages" + counts);
+                }
+            }
         }
     }
 
@@ -187,23 +200,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     std::set<UCD::codepoint_t> blocks;
     std::vector<std::pair<UCD::UnicodeSet, bool>> contextSets;   // (the set tested, explicit?) for the alphabet
 
-    //  A context item, classified (the alphabet completed later).
-    auto classify = [&](RE * context, RE * engineBefore, bool before, DivContextItem & item) {
-        bool present = false, boundary = false;
-        UCD::UnicodeSet set;
-        std::string why;
-        if (!contextItem(context, sets, present, set, boundary, why)) {
-            problem(why);
-            return;
-        }
-        if (!present) return;
-        if (before) {
-            if (!options.convertedBefore) {
-                problem("before contexts (no check of the converted text)");
-            } else if (options.convertedBefore(step, engineBefore)) {
-                problem("before contexts matched against the converted text");
-            }
-        }
+    //  An item of a context: its set and whether it holds at the text boundary.
+    auto classifyItem = [&](const UCD::UnicodeSet & set, bool boundary, bool before, DivContextItem & item) {
         item.runEnd = marksFilterRunEnd(set);
         //  With the text boundary: tested as the negation of the complement.
         item.negated = boundary;
@@ -226,6 +224,38 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         }
     };
 
+    //  A context, its items classified (the alphabet completed later).
+    auto classify = [&](RE * re, RE * engineBefore, bool before, DivContext & context) {
+        std::vector<std::pair<UCD::UnicodeSet, bool>> items;
+        std::string why;
+        if (!contextItems(re, sets, items, why)) {
+            problem(why);
+            return;
+        }
+        if (items.empty()) return;
+        if (before) {
+            if (!options.convertedBefore) {
+                problem("before contexts (no check of the converted text)");
+            } else if (options.convertedBefore(step, engineBefore)) {
+                problem("before contexts matched against the converted text");
+            }
+            //  (From the item next to the text outward.)
+            std::reverse(items.begin(), items.end());
+        }
+        for (size_t i = 0; i + 1 < items.size(); i++) {
+            if (items[i].second && items[i].first.empty()) {
+                problem("the text boundary within a context");
+                return;
+            }
+            //  (Beyond an inner item, a character must match: not the boundary.)
+            items[i].second = false;
+        }
+        for (const auto & it : items) {
+            context.items.emplace_back();
+            classifyItem(it.first, it.second, before, context.items.back());
+        }
+    };
+
     auto literal = [&](const std::u32string & result) {
         for (char32_t c : result) {
             if (c == StringRuleKept || c == StringRuleDeleted) return false;
@@ -237,7 +267,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     struct Source {
         std::vector<UCD::UnicodeSet> text;
         std::u32string result;
-        DivContextItem before, after;
+        DivContext before, after;
         const ConversionRule * rule = nullptr;
         int stringRule = -1, subgroup = -1;
     };
@@ -279,7 +309,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     }
     for (size_t g = 0; g < step.subgroups.size(); g++) {
         const CharMapSubgroup & sg = step.subgroups[g];
-        DivContextItem before, after;
+        DivContext before, after;
         classify(sg.before, sg.engineBefore, true, before);
         classify(sg.after, nullptr, false, after);
         plan.subgroupContexts.emplace_back(before, after);
@@ -375,6 +405,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             d.before = src.before;
             d.after = src.after;
             d.yieldsTo = yields[i];
+            d.stage = src.stringRule >= 0 ? stageOf[src.stringRule] : 0;
             rules.push_back(std::move(d));
         }
     }
@@ -391,11 +422,16 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     for (UCD::codepoint_t b : plan.blocks) blockList += (blockList.empty() ? "x" : "_x") + hex(b);
     std::string content = "s" + std::to_string(s) + ";" + blockList + ";";
     for (const UCD::UnicodeSet & e : plan.externalSets) appendSet(content, e);
-    auto appendItem = [&](const DivContextItem & item) {
+    auto appendOne = [&](const DivContextItem & item) {
         content += "|" + std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.guardEnd ? "g" : "")
                    + (item.runEnd ? "r" : "");
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);
+    };
+    auto appendItem = [&](const DivContext & context) {
+        content += "(";
+        for (const DivContextItem & item : context.items) appendOne(item);
+        content += ")";
     };
     for (const auto & sc : plan.subgroupContexts) {
         content += ";g";
@@ -403,7 +439,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         appendItem(sc.second);
     }
     for (const DivRule & d : plan.rules) {
-        content += ";r" + std::to_string(d.stringRule) + "," + std::to_string(d.subgroup) + "," + std::to_string(d.anchor) + ":";
+        content += ";r" + std::to_string(d.stringRule) + "," + std::to_string(d.subgroup) + "," + std::to_string(d.anchor) + "@"
+                   + std::to_string(d.stage) + ":";
         for (const UCD::UnicodeSet & t : d.text) appendSet(content, t);
         content += ">";
         for (char32_t c : d.result) content += hex(c) + ",";

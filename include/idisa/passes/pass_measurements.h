@@ -15,32 +15,20 @@
 
 struct PassMeasurement {
     llvm::StringRef Name;
-    uint64_t Index;
     uint64_t Parent;
     uint64_t Count;
     uint64_t ModifiedCount;
     double Mean;
     double M2;
 
-    PassMeasurement(llvm::StringRef name, uint64_t idx, uint64_t parent)
-    : Name(name)
-    , Index(idx)
+    PassMeasurement(llvm::StringRef name, uint64_t parent,
+                    uint64_t count = 0, uint64_t modifiedCount = 0, double mean = 0.0, double m2 = 0.0)
+    : Name(name.data(), name.size())
     , Parent(parent)
-    , Count(0)
-    , ModifiedCount(0)
-    , Mean(0.0)
-    , M2(0.0) {
-
-    }
-
-    PassMeasurement(const PassMeasurement & other, uint64_t idx, uint64_t parent)
-    : Name(other.Name)
-    , Index(idx)
-    , Parent(parent)
-    , Count(other.Count)
-    , ModifiedCount(other.ModifiedCount)
-    , Mean(other.Mean)
-    , M2(other.M2) {
+    , Count(count)
+    , ModifiedCount(modifiedCount)
+    , Mean(mean)
+    , M2(m2) {
 
     }
 
@@ -54,9 +42,9 @@ struct PassMeasurement {
     }
 
     void update(const PassMeasurement & other) {
-        assert (other.Count > 0 && Count > 0);
-        assert (other.Name == Name);
+        assert (other.Name.size() == Name.size() && other.Name.compare(Name) == 0);
         const auto newCount = Count + other.Count;
+        assert (newCount > 0);
         const double dblCount = (double)newCount;
         const auto newMean = (Mean * Count + other.Mean * other.Count) / dblCount;
         const auto delta = other.Mean - Mean;
@@ -76,23 +64,52 @@ struct PassMeasurement {
 
 };
 
-struct MeasurementMapKey {
-    llvm::StringRef Name;
-    uint64_t Index;
 
-    explicit MeasurementMapKey(llvm::StringRef nm, uint64_t idx)
-    : Name(nm.data(), nm.size())
-    , Index(idx) {
-
-    }
-
-    bool operator==(const MeasurementMapKey & Other) const {
-        return (Other.Index == Index) && (Other.Name.size() == Name.size()) && Other.Name.compare(Name) == 0;
-    }
-
-};
 
 struct PassMeasurements {
+
+    struct StringRefHash {
+        std::size_t operator()(const llvm::StringRef & k) const {
+            std::string_view view(k.data(), k.size());
+            return std::hash<std::string_view>{}(view);
+        }
+    };
+
+    struct StringRefEqual {
+        bool operator()(const llvm::StringRef & A, const llvm::StringRef & B) const noexcept {
+            return A.size() == B.size() && A.compare(B) == 0;
+        }
+    };
+
+    struct MeasurementMapKey {
+        llvm::StringRef Name;
+        uint64_t Parent;
+
+        explicit MeasurementMapKey(llvm::StringRef nm, uint64_t parent)
+        : Name(nm.data(), nm.size())
+        , Parent(parent) {
+
+        }
+
+        bool operator==(const MeasurementMapKey & Other) const = delete;
+    };
+
+    struct MeasurementMapKeyHash {
+        std::size_t operator()(const MeasurementMapKey & k) const {
+            uint64_t A = StringRefHash{}(k.Name);
+            const uint64_t B = std::hash<uint64_t>{}(k.Parent);
+            A ^= B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2);
+            return A;
+        }
+    };
+
+    struct MeasurementMapKeyEquals {
+        bool operator()(const MeasurementMapKey & A, const MeasurementMapKey & B) const {
+            return (A.Parent == B.Parent) && StringRefEqual{}(A.Name, B.Name);
+        }
+    };
+
+    using MeasurementMapType = std::unordered_map<MeasurementMapKey, uint64_t, MeasurementMapKeyHash, MeasurementMapKeyEquals>;
 
     struct PassTrackingData {
         uint64_t StartTime = 0;
@@ -103,6 +120,7 @@ struct PassMeasurements {
         PassTrackingData(uint64_t st, uint64_t loc, uint64_t idx)
         : StartTime(st)
         , LinesOfCode (loc)
+        , InnerCycleCount(0)
         , MeasurementIndex(idx) {
 
         }
@@ -120,17 +138,11 @@ struct PassMeasurements {
 
     void endTimerCallback(llvm::StringRef PassId, llvm::Any IR, const bool transformative);
 
-    void endPassTimerCallback(llvm::StringRef PassId, llvm::Any IR, const llvm::PreservedAnalyses & PA) {
-        return endTimerCallback(PassId, IR, !PA.areAllPreserved());
-    }
+    PassMeasurements(llvm::TargetMachine * /* TM */) {
 
-    void endAnalysisTimerCallback(llvm::StringRef PassId, llvm::Any IR) {
-        return endTimerCallback(PassId, IR, false);
-    }
-
-    PassMeasurements(llvm::TargetMachine * TM)
-    : TrackingData(1, {0, 0, MAX_INT})
-    , MeasurementMap{} {
+        TrackingData.emplace_back(0, 0, MAX_INT);
+        assert (Measurements.empty());
+        assert (MeasurementMap.empty());
 
         PIC.registerBeforeNonSkippedPassCallback([this](llvm::StringRef PassId, llvm::Any IR) {
             return startTimerCallback(intern(PassId), IR);
@@ -141,11 +153,11 @@ struct PassMeasurements {
         });
 
         PIC.registerAfterPassCallback([this](llvm::StringRef PassId, llvm::Any IR, const llvm::PreservedAnalyses & PA){
-            return endTimerCallback(intern(PassId), IR, !PA.areAllPreserved());
+            return endTimerCallback(PassId, IR, !PA.areAllPreserved());
         });
 
         PIC.registerAfterAnalysisCallback([this](llvm::StringRef PassId, llvm::Any IR) {
-            return endTimerCallback(intern(PassId), IR, false);
+            return endTimerCallback(PassId, IR, false);
         });
 
 //        registerCodeGenCallback(PIC, static_cast<LLVMTargetMachine &>(*TM));
@@ -168,17 +180,7 @@ struct PassMeasurements {
         return 0;
     }
 
-    uint64_t findOrAddMeasurement(llvm::StringRef PassId, uint64_t parent) {
-        auto f = MeasurementMap.find(MeasurementMapKey(PassId, parent));
-        if (f == MeasurementMap.end()) {
-            const auto idx = Measurements.size();
-            Measurements.emplace_back(PassId, idx, parent);
-            MeasurementMap.insert(std::make_pair(MeasurementMapKey(PassId, parent), idx));
-            return idx;
-        } else {
-            return f->second;
-        }
-    };
+    uint64_t findOrAddMeasurement(llvm::StringRef PassId, uint64_t parent);
 
     void update(PassMeasurements & other);
 
@@ -186,36 +188,15 @@ struct PassMeasurements {
 
     llvm::StringRef intern(const llvm::StringRef string);
 
+    const MeasurementMapType & getMeasurementMap() const {
+        return MeasurementMap;
+    }
+
 private:
 
-    struct StringRefHash {
-        std::size_t operator()(const llvm::StringRef & k) const {
-            return llvm::DenseMapInfo<llvm::StringRef>::getHashValue(k);
-        }
-    };
-
-    struct MeasurementMapKeyHash {
-        std::size_t operator()(const MeasurementMapKey & k) const {
-            const auto a = llvm::DenseMapInfo<uint64_t>::getHashValue(k.Index);
-            const auto b = StringRefHash()(k.Name);
-            return llvm::detail::combineHashValue(a, b);
-        }
-    };
-
-    struct StringRefEqual {
-        bool operator()(const llvm::StringRef & A, const llvm::StringRef & B) const noexcept {
-            return A.size() == B.size() && A.compare(B) == 0;
-        }
-    };
-
-    struct MeasurementMapKeyEquals {
-        bool operator()(const MeasurementMapKey & A, const MeasurementMapKey & B) const {
-            return (A.Index == B.Index) && StringRefEqual()(A.Name, B.Name);
-        }
-    };
 
     std::vector<PassTrackingData> TrackingData;
-    std::unordered_map<MeasurementMapKey, uint64_t, MeasurementMapKeyHash, MeasurementMapKeyEquals> MeasurementMap;
+    MeasurementMapType MeasurementMap;
     std::unordered_set<llvm::StringRef, StringRefHash, StringRefEqual> InternedStrings;
     llvm::BumpPtrAllocator Allocator;
 

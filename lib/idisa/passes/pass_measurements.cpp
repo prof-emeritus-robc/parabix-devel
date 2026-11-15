@@ -6,6 +6,7 @@
 #include <llvm/Support/raw_os_ostream.h>
 #include <boost/container/flat_map.hpp>
 #include <queue>
+#include <thread>
 
 #if (defined(__has_builtin) && __has_builtin(__builtin_readcyclecounter)) || defined(__GNUC__)
 #elif defined(_MSC_VER)
@@ -29,6 +30,7 @@ inline uint64_t getCycleCount() {
 void PassMeasurements::startTimerCallback(llvm::StringRef PassId, llvm::Any IR) {
     assert (TrackingData.size() > 0);
     const auto & td = TrackingData.back();
+    assert ((TrackingData.size() > 1) ^ (td.MeasurementIndex == MAX_INT));
     const auto idx = findOrAddMeasurement(PassId, td.MeasurementIndex);
     const auto loc = getLinesOfCode(IR);
     const auto cc = getCycleCount();
@@ -61,43 +63,55 @@ void PassMeasurements::endTimerCallback(llvm::StringRef PassId, llvm::Any IR, co
     TrackingData.back().InnerCycleCount += total;
 }
 
+uint64_t PassMeasurements::findOrAddMeasurement(llvm::StringRef PassId, uint64_t parent) {
+    auto f = MeasurementMap.find(MeasurementMapKey(PassId, parent));
+    if (f == MeasurementMap.end()) {
+        const auto k = Measurements.size();
+        Measurements.emplace_back(PassId, parent);
+        MeasurementMap.insert(std::make_pair(MeasurementMapKey(PassId, parent), k));
+        return k;
+    } else {
+        return f->second;
+    }
+};
 
 void PassMeasurements::update(PassMeasurements & other) {
+
+    assert (TrackingData.size() == 1);
+    assert (other.TrackingData.size() == 1);
+
     auto & A = Measurements;
     auto & B = other.Measurements;
     if (A.empty()) {
         A.swap(B);
+        MeasurementMap.swap(other.MeasurementMap);
     } else if (B.empty()) {
         return;
     }
 
     const auto m = B.size();
 
-    boost::container::flat_map<uint64_t, uint64_t> M;
-    M.reserve(m);
+    std::vector<uint64_t> M(m, MAX_INT);
 
-    auto addOrUpdateMeasurement = [&](const PassMeasurement & measurement, const uint64_t Parent) {
-        auto key = MeasurementMapKey(measurement.Name, Parent);
-        auto g = MeasurementMap.find(key);
-        uint64_t passIdx;
-        if (g != MeasurementMap.end()) {
-            passIdx = g->second;
-            Measurements[passIdx].update(measurement);
-        } else {
-            passIdx = Measurements.size();
-            Measurements.emplace_back(measurement, passIdx, Parent);
-            MeasurementMap.insert(std::make_pair(key, passIdx));
-        }
-        auto h = M.emplace(measurement.Index, passIdx);
-        assert (h.second);
+    auto addOrUpdateMeasurement = [&](const PassMeasurement & measurement, const uint64_t otherIndex, const uint64_t currentParent) {
+        const auto currentIndex = findOrAddMeasurement(measurement.Name, currentParent);
+        assert (currentIndex < A.size());
+        A[currentIndex].update(measurement);
+        assert (M[otherIndex] == MAX_INT);
+        M[otherIndex] = currentIndex;
     };
 
     std::queue<size_t> Q;
 
     for (size_t i = 0; i < m; ++i) {
         const auto & measurement = B[i];
+        #ifndef NDEBUG
+        auto f = other.MeasurementMap.find(MeasurementMapKey{measurement.Name, measurement.Parent});
+        assert (f != other.MeasurementMap.end());
+        assert (f->second == i);
+        #endif
         if (measurement.Parent == MAX_INT) {
-            addOrUpdateMeasurement(measurement, MAX_INT);
+            addOrUpdateMeasurement(measurement, i, MAX_INT);
         } else {
             Q.push(i);
         }
@@ -105,13 +119,15 @@ void PassMeasurements::update(PassMeasurements & other) {
 
     while (!Q.empty()) {
         const auto k = Q.front();
+        assert (k < m);
         Q.pop();
         const auto & measurement = B[k];
-        auto p = M.find(measurement.Parent);
-        if (p == M.end()) {
+        const auto parent = M[measurement.Parent];
+        if (parent == MAX_INT) {
+            assert (Q.size() > 0);
             Q.push(k);
         } else {
-            addOrUpdateMeasurement(measurement, p->second);
+            addOrUpdateMeasurement(measurement, k, parent);
         }
     }
 

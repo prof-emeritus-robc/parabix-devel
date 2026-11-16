@@ -559,3 +559,35 @@ of stages (initially 8) stay ineligible.
   such groups, each blocked by another limit; Bopo-Latn in
   `tconv_shape_groups_test` is now eligible.
 
+### Measurements (step 4)
+
+The groups made eligible by stages and contexts of several items, on text in
+the source script (8 MB of Twain, transliterated by the reverse transform: 8–23
+MB; Myanmar: a 10 MB Zawgyi file; IPA: `es-es_FONIPA` of the same text). Each
+configuration ran alone. The cycles are execution cycles (CYCLES × EXEC%) at
+`-thread-num=4`; "default" is DivCode in UTF-8 mode where the transform can be
+in it. All three configurations give the same output.
+
+| transform | group kernels, regular / DivCode | DivCode Unicode vs regular | DivCode default vs regular | 1 thread, s: regular / Unicode / default | cold start, s: regular / default |
+|---|--:|--:|--:|--:|--:|
+| my-my_Latn | 86 / 30 | −80.8% | −81.8% | 1.111 / 0.572 / 0.579 | 31.1 / 10.2 |
+| ru-zh | 47 / 19 | −65.3% | −65.4% | 1.022 / 0.770 / 0.761 | 30.5 / 8.4 |
+| uk-uk_Latn/BGN | 33 / 21 | −20.7% | −64.9% | 0.230 / 0.201 / 0.118 | 4.5 / 4.2 |
+| Bopo-Latn | 64 / 21 | −62.5% | −48.0% | 1.283 / 0.950 / 0.968 | 31.5 / 11.2 |
+| Telugu-InterIndic | 13 / 7 | −2.3% | −61.7% | 0.111 / 0.110 / 0.067 | 0.48 / 0.24 |
+| Latn-Ethi/ALALOC | 29 / 21 | −46.4% | −58.9% | 0.263 / 0.184 / 0.161 | 5.1 / 3.9 |
+| Latn-Ethi/Williamson | 16 / 13 | −56.6% | −54.0% | 0.138 / 0.093 / 0.096 | 1.95 / 0.60 |
+| und_FONIPA-ar | 125 / 110 | −49.3% | −52.5% | 1.152 / 1.171 / 1.115 | 21.1 / 17.9 |
+| es_FONIPA-zh | 94 / 72 | −50.8% | −52.1% | 0.539 / 0.405 / 0.410 | 11.2 / 5.7 |
+| bg-bg_Latn/BGN | 29 / 21 | −19.3% | −49.6% | 0.169 / 0.147 / 0.114 | 1.6 / 2.3 |
+| ru-ja | 57 / 20 | −37.9% | −48.9% | 0.481 / 0.369 / 0.338 | 10.2 / 6.7 |
+| Gurmukhi-InterIndic | 10 / 7 | −0.0% | −46.3% | 0.111 / 0.111 / 0.079 | 0.51 / 0.27 |
+| Latn-Cans | 17 / 16 | −47.3% | −38.8% | 0.128 / 0.091 / 0.098 | 1.27 / 0.56 |
+| Ethi-Latn/ES3842 | 42 / 24 | −32.7% | −28.5% | 0.203 / 0.177 / 0.189 | 1.78 / 1.00 |
+| Latn-Geor | 17 / 16 | −10.5% | −13.5% | 0.088 / 0.082 / 0.080 | 0.48 / 0.33 |
+
+All 15 are faster, by 13–82% in execution cycles. The largest groups also
+compile much faster cold (ru-zh, Bopo-Latn and my-my_Latn from about 31 s to
+8–11 s). The Bopomofo, Gurmukhi and Telugu texts are transliterated English,
+so their frequencies are not those of real text.
+

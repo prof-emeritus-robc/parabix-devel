@@ -189,6 +189,31 @@ CLDR test results of the four with test files (the am-* transforms)
 unchanged, with no failing cases. The other test results are those of
 `d97c03f75`.*
 
+*Update (November 15, 2026): DivCode groups by default (`7f5035562` and the
+commits before it; see [ldml-divcode-plan.md](ldml-divcode-plan.md)). The
+eligible conversion groups (76 of the 212 with string rules) are applied by the
+Div32Code kernels, and a transform whose conversion groups are character maps
+or DivCode groups runs in UTF-8 mode. An incremental update planned, counted
+and tested the 236 transforms whose pipelines can use DivCode groups, directly
+or through the transforms they invoke. No status changes (424 of 425); no test
+case fails, and the 217 discrepancies are unchanged.
+
+The kernel counts of 233 transforms change: 141 go down and 92 go up, from
+121,673 kernels in all to 121,484.
+- Down: the groups' own kernels, e.g. my-my_Latn 200 → 144, Bopo-Latn
+  465 → 420, Khmr-Latn/UNGEGN 66 → 54.
+- Up: mostly the transforms now in UTF-8 mode, whose pipelines include its
+  kernels for well-formed UTF-8 and for spreading bytes, e.g.
+  Halfwidth-Fullwidth 11 → 27 (16 of them its group's; in Unicode mode, 7),
+  Bengali-InterIndic 11 → 18, and the Indic-to-Indic transforms through
+  InterIndic (about 225 → 255).
+
+Kernel counts are not the cost: in execution cycles on text in the source
+script, the DivCode groups are faster than the regular plan for all 24
+transforms measured (ldml-divcode-plan.md, §6 and §9), most by 45–80% in UTF-8
+mode. The exception is Halfwidth-Fullwidth, whose expansion of every ASCII
+character to 3 bytes makes UTF-8 mode slower.*
+
 This report covers:
 
 - which transforms tconv implements, and how correct they are against the CLDR

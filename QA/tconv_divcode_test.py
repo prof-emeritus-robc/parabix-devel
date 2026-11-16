@@ -26,7 +26,11 @@
 #    the Count kernel; before contexts through them), one-way overlaps of
 #    string rules (stages: no match within an applied match of an earlier stage),
 #    contexts of two or more items, and before contexts matched against the
-#    converted text (rounds).
+#    converted text (the Converted kernel: its While loop, and the positions
+#    reserved by the Count kernel where the results' lengths differ).  Chains
+#    longer than the regular plan's rounds are compared with ICU only.  The
+#    converted-context cases also run with one thread, and with four threads
+#    and segments of one stride.
 #  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
@@ -163,6 +167,20 @@ RULES = {
     "conv-longer": "pq > Q ; c > xyz ; [z] { d > D ;",
     "conv-string-longer": "pq > QQQ ; [Q] { d > D ;",
     "conv-utf8": "pq > Q ; c > é中 ; [中] { d > Ω ;",
+    # results of different lengths at the dependent positions (the Count
+    # kernel reserves the longest; the rest is deleted), with deletions that
+    # the contexts look through, and in UTF-8 of different lengths
+    "conv-reserve": "pq > Q ; a { b > xyz ; [^a] { b > B ;",
+    "conv-reserve-deletion": "pq > Q ; a { b > aa ; [^a] { b > ;",
+    "conv-reserve-utf8": "pq > Q ; [aé] { b > é中 ; c > ccc ; [^aé] { b > ;",
+    # chains longer than the regular plan's rounds, across blocks and segments
+    # (compared with ICU only)
+    "conv-long-chain": "pq > Q ; a { b > a ; a { c > C ;",
+    "conv-long-toggle": "pq > Q ; [^a] { b > a ; a { b > c ;",
+    "conv-long-deletion": "pq > Q ; a { b > aa ; [^a] { b > ;",
+    # sparse dependent positions (blocks without any, where the kernels' Ifs
+    # are not entered), after deletions, insertions and multibyte characters
+    "conv-sparse": "pq > Q ; c > xy ; é > e ; ü > ; [y] { d > D ; [^y] { d > EE ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
 #  (A narrower alphabet for the contexts of several items, which random text
@@ -245,25 +263,54 @@ def translation(tconv, tmp, salt):
             continue
         with open(path, "w", encoding="utf-8") as f:
             alphabet = CTX_ALPHABET if case.startswith("ctx") else CONV_ALPHABET if case.startswith("conv") else RULES_ALPHABET
-            f.write("".join(rnd.choice(alphabet) for _ in range(20000)))
+            if case.startswith("conv-sparse"):
+                # (Runs of x, then a pattern whose last character, a dependent
+                # position, is the first of a block (of 128, 256 or 512 positions:
+                # characters in Unicode mode, bytes in UTF-8 mode for ASCII)
+                # after a block without any.  The first is "yd": the kernels' Ifs
+                # are not entered before it, so carries into its block from the
+                # blocks before are lost if computed in the Ifs.)
+                text = ""
+                for j in range(1, 200):
+                    pattern = "yd" if j == 1 else rnd.choice(["yd", "yüd", "yüüd", "cd", "éd", "üd", "ücd", "cdd", "x中d", "d"])
+                    text += "x" * (1024 * j - len(text) - len(pattern) + 1) + pattern
+                f.write(text)
+            elif case.startswith("conv-long"):
+                # (Runs of b, up to 3000 long, and of a, c and others.)
+                text = []
+                while len(text) < 60000:
+                    x = rnd.random()
+                    text.extend("b" * rnd.randrange(1, 3000) if x < 0.3 else rnd.choice("ac") * rnd.randrange(1, 4) if x < 0.6
+                                else rnd.choice(alphabet))
+                f.write("".join(text))
+            else:
+                f.write("".join(rnd.choice(alphabet) for _ in range(20000)))
         common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--rules-file=" + rules_path]
+        long_chains = case.startswith("conv-long")
         regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", "--utf8-mode=0", path])
         icu = run(tconv, common + ["--use-ICU=.*", path])
+        configs = [[]]
+        if case.startswith("conv"):
+            configs += [["-thread-num=1"], ["-thread-num=4", "-segment-size=1"]]
         for mode in ("1", "0"):
-            divcode = run(tconv, common + TRACE + ["--use-ICU=0", "--divcode-groups=1", "--utf8-mode=" + mode, path])
-            what = "rules %s %s" % (case, "UTF-8" if b"_U8" in divcode.stderr else "Unicode")
-            if regular.returncode or divcode.returncode:
-                failures += 1
-                print("FAIL %s: exit %d/%d %s" % (what, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
-            elif b"Div32CodeTranslate" not in divcode.stderr:
-                failures += 1
-                print("FAIL %s: no DivCode translation kernel" % what)
-            elif divcode.stdout != regular.stdout or (icu.returncode == 0 and divcode.stdout != icu.stdout):
-                failures += 1
-                print("FAIL %s: divcode %s regular, %s ICU" % (what, "=" if divcode.stdout == regular.stdout else "!=",
-                                                              "=" if divcode.stdout == icu.stdout else "!="))
-            else:
-                print("ok %s%s" % (what, "" if icu.returncode == 0 else " (no ICU)"))
+            for config in configs:
+                divcode = run(tconv, common + TRACE + config + ["--use-ICU=0", "--divcode-groups=1", "--utf8-mode=" + mode, path])
+                what = "rules %s %s%s" % (case, "UTF-8" if b"_U8" in divcode.stderr else "Unicode", " " + " ".join(config) if config else "")
+                if regular.returncode or divcode.returncode:
+                    failures += 1
+                    print("FAIL %s: exit %d/%d %s" % (what, regular.returncode, divcode.returncode, divcode.stderr[-300:]))
+                elif b"Div32CodeTranslate" not in divcode.stderr:
+                    failures += 1
+                    print("FAIL %s: no DivCode translation kernel" % what)
+                elif long_chains and icu.returncode != 0:
+                    failures += 1
+                    print("FAIL %s: no ICU output to compare with" % what)
+                elif (not long_chains and divcode.stdout != regular.stdout) or (icu.returncode == 0 and divcode.stdout != icu.stdout):
+                    failures += 1
+                    print("FAIL %s: divcode %s regular, %s ICU" % (what, "=" if divcode.stdout == regular.stdout else "!=",
+                                                                  "=" if divcode.stdout == icu.stdout else "!="))
+                else:
+                    print("ok %s%s" % (what, "" if icu.returncode == 0 else " (no ICU)"))
     return failures
 
 

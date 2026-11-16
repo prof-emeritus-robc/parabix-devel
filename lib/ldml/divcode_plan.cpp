@@ -151,6 +151,75 @@ UCD::UnicodeSet DivCodePlan::pseudoTest(const UCD::UnicodeSet & set) const {
     return all - pseudoSet(~set);
 }
 
+//  The converted items of a plan, and which characters of the converted rules
+//  propagate (see DivCodePlan::propagating).
+static void classifyConverted(DivCodePlan & plan) {
+    auto sameItem = [](const DivContextItem & a, const DivContextItem & b) {
+        return a.kind == b.kind && a.set == b.set && a.negated == b.negated && a.runEnd == b.runEnd && a.external == b.external
+               && a.guardEnd == b.guardEnd;
+    };
+    auto sameContext = [&](const DivContext & a, const DivContext & b) {
+        if (a.items.size() != b.items.size()) return false;
+        for (size_t i = 0; i < a.items.size(); i++) if (!sameItem(a.items[i], b.items[i])) return false;
+        return true;
+    };
+    UCD::UnicodeSet chars;
+    for (const DivRule & d : plan.rules) {
+        if (!d.converted) continue;
+        const DivContextItem & item = d.before.items[0];
+        bool found = false;
+        for (const DivContextItem & c : plan.convertedItems) found = found || sameItem(c, item);
+        if (!found) plan.convertedItems.push_back(item);
+        chars = chars + d.text[0];
+    }
+    const size_t n = plan.convertedItems.size();
+    plan.consumerIn.assign(n, UCD::UnicodeSet());
+    if (n == 0) return;
+    //  (Very many characters: all taken as propagating.)
+    if (chars.count() > 20000) {
+        plan.propagating = chars;
+        return;
+    }
+    const UCD::UnicodeSet all(0, 0x10FFFF);
+    //  What a later before context sees of an outcome: "D" (deleted), or
+    //  whether its last character is in the set of each item.
+    auto signature = [&](const std::u32string & result) {
+        if (result.empty()) return std::string("D");
+        std::string sig;
+        for (const DivContextItem & item : plan.convertedItems) sig += item.set.contains(result.back()) ? '1' : '0';
+        return sig;
+    };
+    for (const auto & range : chars) {
+        for (UCD::codepoint_t c = range.first; c <= range.second; c++) {
+            //  The converted rules on c (no other rule applies at a dependent
+            //  position): their results; the character itself, unless they have
+            //  the same after context and their before items hold in every state
+            //  (for every character before, and at the text boundary).
+            std::vector<const DivRule *> rules;
+            for (const DivRule & d : plan.rules) if (d.converted && d.text[0].contains(c)) rules.push_back(&d);
+            std::set<std::string> sigs;
+            UCD::UnicodeSet covered;
+            bool boundary = false, sameAfter = true;
+            for (const DivRule * d : rules) {
+                sigs.insert(signature(d->result));
+                const DivContextItem & item = d->before.items[0];
+                covered = covered + (item.negated ? all - item.set : item.set);
+                boundary = boundary || item.negated;
+                sameAfter = sameAfter && sameContext(d->after, rules.front()->after);
+            }
+            if (!(sameAfter && boundary && covered == all)) sigs.insert(signature(std::u32string(1, static_cast<char32_t>(c))));
+            if (sigs.size() > 1) {
+                plan.propagating.insert(c);
+            } else if (*sigs.begin() == "D") {
+                plan.consumerDeleted.insert(c);
+            } else {
+                const std::string & sig = *sigs.begin();
+                for (size_t i = 0; i < n; i++) if (sig[i] == '1') plan.consumerIn[i].insert(c);
+            }
+        }
+    }
+}
+
 DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & options) {
     DivCodePlan plan;
     plan.shift = options.shift;
@@ -473,9 +542,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             appendSet(content, e.chars);
         }
     }
-    plan.rounds = plan.convertedRules > 0 ? options.convertedRounds : 0;
-    content += ";rounds" + std::to_string(plan.rounds);
     plan.contentHash = hex(fnv1a(content), 16);
+    classifyConverted(plan);
 
     for (const auto & p : problems) {
         plan.problems.push_back(p.first + (p.second > 1 ? " (" + std::to_string(p.second) + ")" : ""));

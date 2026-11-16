@@ -593,10 +593,9 @@ so their frequencies are not those of real text.
 
 ## 10. Plan: before contexts matched against the converted text
 
-Status (2026-11-16): the design below replaces a first implementation by rounds
-(commits 799be3d0d and b9113b35f, described under "First implementation:
-rounds"). The design is checked by an experiment. Its kernels are not
-written yet.
+Status (2026-11-16): the design below is implemented (see "Implementation"
+below), replacing a first implementation by rounds (commits 799be3d0d and
+b9113b35f, described under "First implementation: rounds").
 
 ### The problem
 
@@ -953,30 +952,71 @@ streams, spread together. 21 are contexts written in the rules, and 13 are
 complements made by order disambiguation. Most of the complements could be
 derived from the positive streams after spreading.
 
+### Implementation (2026-11-16)
+
+- **Plan** (`divcode_plan`): `DivCodePlan::convertedItems`, `propagating`,
+  `consumerDeleted` and `consumerIn` (the classification above, per character
+  of the converted rules; the character itself counts as an outcome unless the
+  rules on it have the same after context and before items that hold in every
+  state). `rounds` is gone from the plan and its content hash;
+  `--divcode-report` gives `propagating` (InterIndic-Latin 1, ko-ko_Latn/BGN 5,
+  ru_Latn-ru/BGN 6, Ethi-Latn/SERA 0).
+- **Kernels** (`DivCodeTranslate`, modes Count, Translate and Converted):
+  - The dependent positions: a converted rule matches, ignoring its before
+    context; outside the string matches; no other single-character rule
+    applies, nor does a string match begin (no rule yields to a converted
+    rule, so where another applies, they do not). Count and Translate compute
+    them alike.
+  - Count reserves there the largest expansion of the converted rules that
+    match.
+  - Translate applies the other rules, and outputs `Dep` and `Ends` (for each
+    item, the positions just after a converted character in its set and not in
+    it).
+  - Converted: `K1`/`K0` from `Ends`, the consumers' known outcomes and the
+    deleted positions; the `While` loop over the propagating positions (none:
+    no loop); one pass of the converted rules at every dependent position,
+    XORed into Translate's output, with the reserved positions not filled
+    deleted.
+- **Pablo fixes found on the way** (`lib/pablo/passes/codemotionpass.cpp`):
+  - `hoistLoopInvariants` hoisted out of a `While` the readers of a Var assigned
+    only within an If nested in the loop. Every Var assigned in the loop is now
+    a variant.
+  - `sinkIfAcceptableTarget` moved statements with carries (`Advance`,
+    `MatchStar`, ...) into a nested If whose users they were. In blocks where
+    the If is skipped their carries were lost; this showed before the first
+    block entering the If (`¬Advance(1, 1)`, the start of the text, held at a
+    block start). Statements with carries are no longer sunk.
+  - In the kernel: two rules with the same match and change gave `Or(v, x)`
+    twice in a leaf, which the builder built once, dropping what was assigned
+    in between. Each Var is now assigned once per leaf.
+- **Tests** (`QA/tconv_divcode_test.py`): results of different lengths at
+  dependent positions (`conv-reserve*`), chains up to 3000 long compared with
+  ICU (`conv-long-*`), a dependent position at the start of a block before any
+  other (`conv-sparse`, which fails without the sinking fix), and every
+  converted-context case also with one thread and with four threads and
+  segments of one stride. The full ctest suite passes (91 tests).
+
+Measurements (execution cycles, 4 threads; the regular plan's own figures
+vary by up to 12% between runs):
+
+| Transform | DivCode, Unicode (rounds) | DivCode, UTF-8 (rounds) | DivCode kernels, Unicode / UTF-8 (rounds) |
+|---|---|---|---|
+| Ethi-Latn/SERA | −38% (−34%) | −51% (−36%) | 0.73M / 1.22M (1.05M / 1.73M) |
+| InterIndic-Latin | −48% (−22%) | −27% (+62%) | 1.27M / 3.77M (2.26M / 7.78M) |
+| ko-ko_Latn/BGN | −38% (−42%) | −42% (−54%) | 0.09M / 0.32M (0.07M / 0.21M) |
+| Arab-Latn | −24% (−14%) | −50% (−47%) | 0.24M / 0.52M (0.26M / 0.51M) |
+
+InterIndic-Latin in UTF-8 mode, the case the rounds made worse than the regular
+plan, is now 27% better. ko-ko_Latn/BGN's DivCode kernels cost more: it has 5
+propagating characters, so its Converted kernel has a loop, and the kernel is
+an extra pass over its few dependent positions.
+
 ### Steps
 
-1. **After contexts on the spread basis** (independent of the rest): single
-   items tested directly in the Count and translation kernels, rules' own after
-   items at their exact offsets, `DivCodeItems` only for contexts of several
-   items, and only those streams spread. Then the static and dynamic skipping of
-   gap terms, if the measurements show the remaining OR terms matter.
-2. **Plan:** classify the characters of the converted rules as consumers or
-   propagating (the analysis above, in `divcode_plan`), with the largest
-   expansion among each character's outcomes. `--divcode-report`: propagating
-   characters per group. Drop `--converted-context-rounds` from the DivCode plan
-   and its content hash.
-3. **Kernels:** replace the rounds:
-   - Count reserves the largest expansion at dependent positions;
-   - Translate leaves dependent positions, and outputs `In[S]`/`Out[S]` and `Dep`;
-   - the new Converted kernel: `K1`/`K0`, the `While` loop if the group has
-     propagating characters, and one pass of the converted rules.
-4. **Tests:** the converted-context tests, compared with ICU (the regular plan
-   is inexact beyond its rounds), plus:
-   - chains longer than 8 and crossing blocks (the `convwhile` cases as rules
-     files);
-   - outcomes of different lengths at dependent positions (the reserve and its
-     surplus deletions);
-   - 1 and 4 threads, and small segment sizes.
-5. **Measurement:** the four transforms above again, and a worst case (one chain
-   through the text).
-6. **Phase 2:** converted-context string rules.
+1. Done: after contexts of one item tested directly (commit 9ea25c9a3); the
+   classification, the kernels and the tests above.
+2. **Next:** the static and dynamic skipping of the gap terms (see "Kernels:
+   less spreading"), if measurements show the remaining OR terms matter; the
+   cost of the Converted kernel for groups with few dependent positions
+   (ko-ko_Latn/BGN).
+3. **Phase 2:** converted-context string rules.

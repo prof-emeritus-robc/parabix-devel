@@ -593,7 +593,10 @@ so their frequencies are not those of real text.
 
 ## 10. Plan: before contexts matched against the converted text
 
-Status: plan, 2026-11-15.
+Status (2026-11-16): the design below replaces a first implementation by rounds
+(commits 799be3d0d and b9113b35f, described under "First implementation:
+rounds"). The design is checked by an experiment. Its kernels are not
+written yet.
 
 ### The problem
 
@@ -606,9 +609,10 @@ a { c → C` turns `abbbc` into `aaaaC`). `convertedContextMatters` flags a
 context when some conversion of its group changes whether a character is in an
 item's set, deletes a character, or (for items beyond the one next to the rule)
 changes the length of the text. The regular plan applies such rules in a
-correction kernel, in rounds (`--converted-context-rounds`, default 8).
+correction kernel, in a fixed number of rounds (`--converted-context-rounds`,
+default 8), and so differs from ICU on longer chains.
 
-`tconv --divcode-report` now also describes these groups (field `converted`):
+`tconv --divcode-report` describes these groups (field `converted`):
 
 - 65 groups have such contexts; for 30 of them (4,013 rules) it is their only
   problem.
@@ -621,10 +625,8 @@ correction kernel, in rounds (`--converted-context-rounds`, default 8).
 
 Expansion rules out patching the output after the translation, as the regular
 plan's correction kernel does. The Count kernel fixes the gaps of the spread
-text from the matches it finds, so a match of an expanding rule that a later
-round adds or removes would need gaps that the text does not have. The rounds
-must therefore run, identically, in the Count kernel and in the translation
-kernel.
+text from the matches it finds, so the converted contexts must be resolved
+before it counts, and the translation kernel must see the same resolution.
 
 ### Design
 
@@ -641,50 +643,170 @@ result at a + j, and the units of the text beyond M are deleted.
   are covered, or exclusive by order disambiguation. So only the last character
   of each match's result matters, and the deleted units after it.
 
-For an item set S of a converted context, the kernel accumulates, per stage of
-evaluation:
+**Three kinds of positions.** For the item sets S of the converted contexts:
 
-- `End_S`: the applied matches whose result's last character is in S, keyed by
-  the offset of the end of that character;
-- `Within`: all applied matches, by their numbers of units (as the covers do);
-- `Del`: the units deleted, by offset (as the deletion Vars do).
+- **Independent:** no converted rule can match at the position. Its outcome
+  (deleted, or the last character of its result) does not depend on what is
+  before it.
+- **Consumers:** a converted rule can match, so which rule applies depends on
+  the converted character before. But every possible outcome agrees: all are
+  deleted, or all end in characters with the same membership in every S. What
+  the next positions see is therefore known without resolving the position.
+  Example (InterIndic-Latin): `[^[:L:]…] { aa → ̔ā` and the rule applied
+  otherwise both end in `ā`, a letter.
+- **Propagating:** the possible outcomes differ in deletion or set membership,
+  so what the next positions see depends on the state here. Examples: the
+  InterIndic-Latin nukta, deleted only after a non-letter; ko-ko_Latn/BGN `ᄋ`,
+  deleted only at the start of the text.
 
-At the top level, the item holds for the converted character before a position
-where:
+The plan classifies each character of the converted rules (see "Which
+characters propagate" below). Only chains of propagating positions need
+iteration. They are rare, and a third of the groups have none.
 
-- an applied match's last result character in S ends there (`Advance(End_S, e)`),
-- or the character before is an unchanged character of the text in S: the
-  item's test on the input, ANDed with "not within an applied match", moved past
-  the character by `next()` as now,
+**State.** For each item set S, streams that only gain bits:
 
-then through the deleted positions after it (`MatchStar` over `Del`, as `next()`
-does over gaps). A negated item holds where neither does; at the start of the
-text it holds as now.
+- `In[S]`, `Out[S]`: the positions whose converted character is known to be in S,
+  or known not to be;
+- `Del`: the positions known to be deleted;
+- `K1[S]`, `K0[S]`: the positions before which the last converted character is
+  known to be in S, or known not to be:
+  - `K1[S] = MatchStar(next(In[S]), Del)`;
+  - `K0[S] = MatchStar(next(Out[S]) ∨ start, Del)`. A negated set includes the
+    text boundary.
 
-**Rounds.** The converted-context rules are first matched against the text
-itself (round 0, the passes as now). Each further round, up to
-`--converted-context-rounds` (default 8, as the regular plan):
+A converted context reads `K1[S]`, and a negated one reads `K0[S]`, never
+`¬K1[S]`. "Unchanged character in S" is a known outcome too, never
+"in S ∧ ¬Within", so every stream stays monotone.
 
-1. computes the converted-context items at the top level from the matches of
-   the round before;
-2. runs a pass of the If-hierarchy over the leaves of the converted-context
-   rules only, whose before contexts read those items;
-3. accumulates their matches, changes and ends in Vars keyed by round, so that
-   no expression reads a Var assigned after an identical earlier expression (the
-   pitfall of the stage covers).
+**Resolution.**
 
-The output uses the last round's changes of these rules, and every other
-rule's changes once. A chain of k such rules is exact after k rounds, as in the
-regular plan.
+1. **Before the loop:** the outcomes of all independent and consumer positions
+   go into `In`, `Out` and `Del`, from the rules as now. Then `K1` and `K0` are
+   computed.
+2. **The loop**, only if the group has propagating characters. Its condition,
+   the frontier, is the propagating positions not yet evaluated (`Done`) whose
+   `K1[S] ∨ K0[S]` holds. Each iteration:
+   1. evaluates the rules at the frontier: the If-hierarchy over the leaves of
+      the propagating characters, ANDed with the frontier;
+   2. adds their outcomes to `In`, `Out` and `Del`, and the frontier to `Done`;
+   3. extends `K1` and `K0`;
+   4. sets the frontier to the propagating positions that have just become
+      known, which lie after the positions evaluated.
+3. **After the loop:** one pass over the converted rules' leaves, at every
+   dependent position (consumers and propagating), with `K1`/`K0` as their
+   before contexts. This gives their matches and changes, as for any other
+   rule.
 
-- An If around each round, on "some match changed in the round before", skips
-  the rounds once the matches are stable, block by block, at run time.
-- Pablo `While` loops cannot hold the rounds, for the reason the regular plan
-  gives: an `Advance` in a loop takes the carry of the previous block only in
-  its first iteration.
+Chains are exact at any length, as in ICU.
 
-**Which rules depend on the rounds.** A converted-context rule's changes can
-change other rules:
+**Why a Pablo While loop is exact here.** In a `While` (default,
+carry-collapsing mode, `carry_manager.cpp`):
+
+- an `Advance` or `MatchStar` reads its carry from the previous block in the
+  first iteration only;
+- the carry-outs of all iterations are ORed into the carry that the next
+  block's first iteration reads;
+- the loop is entered when its condition has a 1 bit or carries are pending.
+
+This is exact when every loop value only accumulates (ORs in new bits), each
+bit of the condition is an independent start position, and each iteration
+clears the condition's bits and adds new ones only at later positions. The RE
+compiler's loops for `R*` (`pending`, `accum` in `re_compiler.cpp`) have this
+form.
+
+The accumulation is required. If `K1`/`K0` are recomputed from `In`/`Out` in each
+iteration instead of ORed into, the carry from the previous block is lost after
+the first iteration, and a chain of deletions stops one position into the next
+block. Either form below is exact:
+
+- the accumulated values are sources again:
+  `K1 |= MatchStar(next(In) ∨ K1, Del)`;
+- only the new bits propagate (the RE compiler's `pending`):
+  `K1 |= MatchStar(next(newIn) ∨ (K1 ∧ newDel), Del)`.
+
+**Kernels: less spreading.** Two changes cut what is spread and keep the
+resolution out of the Count and translation kernels.
+
+*After contexts on the spread basis.* Before this change, `DivCodeItems` tested
+every distinct after context on the text before it was spread, and all of these
+streams were spread (34 for InterIndic-Latin). In the spread text, the
+translation kernel read an after item past any gap, ORing over the gap lengths
+0..E. Instead:
+
+- **A context of one item** is tested directly, by its CC on the looked-ahead
+  pseudo-basis (spread `Code` and the low bits of `Basis`), as the texts of the
+  rules are tested. `Externals` are read at the offset. The test is ANDed with
+  `InText` there.
+- **A rule's own after item** lies at an exact offset, `N + e`, where e is the
+  rule's expansion: a match in the spread text already requires exactly its own
+  gap (`gapOf(N, e)`), so the other terms of the OR are 0.
+- **The after items of the earlier rules a rule yields to** keep the OR over the
+  gap lengths. When the earlier rule's text is longer or shorter than the
+  rule's, its after item can lie past a gap of another length.
+- **A context of several items** is still chained by `DivCodeItems` on the text
+  before it is spread. Only these streams are spread, and only for the
+  translation kernel. The Count kernel reads them unspread.
+- **The Count kernel** tests single items directly too, so `DivCodeItems` is
+  needed only for contexts of several items.
+
+*Skipping inserted positions.* The OR over gap lengths remains for earlier
+rules and, if contexts of several items were chained in the spread text, for
+inner items. Two ways keep it cheap:
+
+- **Statically:** an inner item can be followed by a gap only if some expanding
+  rule's text can end with a character of its set (E_j, the largest such
+  expansion). With E_j = 0, only the term without a gap remains.
+- **Dynamically:** the terms with gaps can be put in an `If` on "inserted
+  positions in this block or in the lookahead window". The term without a gap
+  stays outside it. Each gap term is ANDed with `gapOf`, which depends on the
+  condition, as an `If` requires. The same `If` can guard `next()`'s `MatchStar`
+  over gaps for before contexts.
+
+The caveat for computing anything on the spread basis: inserted positions have
+all-zero basis bits, which reads as U+0000 (or byte 0). Spread `Code` is 0
+there, but a code or external computed on the spread basis instead of spread
+must be ANDed with the `Spread` mask.
+
+*The resolution in its own kernel, on the spread text.* The Count kernel needs
+to know which rule applies at a dependent position, because the rules'
+expansions can differ. To remove that dependency:
+
+1. **Count** (before spreading) reserves at each dependent position the largest
+   expansion among its possible outcomes (the propagation analysis lists them
+   per character). Count then never needs `K1`/`K0`. Where an outcome with a
+   shorter result applies, the surplus positions are marked deleted, and the
+   existing `Deleted` → `FilterByMask` removes them. For these positions, "a
+   match has exactly its own gap" becomes "at least its own gap, with the
+   surplus deleted".
+2. **Spread:** `Basis`, `Code`, `Externals`, the masks, and the chained after
+   contexts only.
+3. **Translate** (spread): all rules except the converted ones. It leaves the
+   input character and its reserved positions at dependent positions, and
+   outputs, besides `Out` and `Deleted`:
+   - `In[S]` and `Out[S]` per converted item set. Each rule's result is known,
+     so whether its last character is in S is a constant, as for the rounds'
+     `End_S` key. No set (some are properties, such as `[^[:L:]…]`) is tested on
+     the output.
+   - `Dep`, the dependent positions.
+4. **Converted** (spread, new): reads the spread `Basis`, `Code` and `Externals`
+   with lookahead (for its rules' texts and after contexts), and Translate's
+   `Out`, `Deleted`, `In`/`Out` and `Dep`. In the spread text, positions are
+   output positions, so `K1 = MatchStar(Advance(In, 1), Del)`, with no `next()`
+   over character lengths and no gaps. `Del` is `Deleted` plus the surplus, and a
+   reserved position counts as unknown until its position is evaluated. The
+   kernel runs the loop over the propagating positions, then one pass of the
+   converted rules at every dependent position, XORing their results into `Out`.
+   Translate left the input character there, so the changes are constants.
+5. `FilterByMask` as now.
+
+Neither Count nor Translate then has rounds or a loop. A group without
+expansions has no Count kernel and no spread, and the same Translate and
+Converted kernels apply. Phase 2 (converted string rules) fits this split less
+well: the rules that yield to them, and later stages, would move into the
+Converted kernel.
+
+**Which rules depend on the resolution.** A converted-context rule's changes
+can change other rules:
 
 - a rule that yields to it (priority);
 - a string rule of a later stage, whose cover depends on its matches if it is a
@@ -696,13 +818,12 @@ contexts on the same items, so they are flagged together, as
 `convertedContextMatters` flags each.
 
 - **Phase 1:** the converted-context rules are single-character rules that no
-  rule yields to. Then nothing else depends on the rounds: single-character
+  rule yields to. Nothing else depends on their resolution: single-character
   rules cover nothing, and the string rules' covers and the stage passes are
   unaffected.
-- **Phase 2:** converted-context string rules, with the rules that depend on
-  them (those that yield to them, later stages, and the single-character rules
-  within them) evaluated again in each round: the regular plan's "whole
-  groups".
+- **Phase 2:** converted-context string rules. The rules that depend on them
+  (those that yield to them, later stages, and the single-character rules
+  within them) are evaluated in the loop body too.
 
 **Contexts of several items.** Items beyond the one next to the rule need the
 converted characters before the last; within one match's result these are known
@@ -711,37 +832,151 @@ first see only characters a single conversion maps to one character each.
 That is the case the check allows, as it flags length changes for those
 items.
 
+### Experiment: the While loop
+
+`tools/util/convwhile.cpp` (uncommitted) applies sets of single-character
+rules with converted contexts over ASCII, by the loop above. Every position
+with a converted rule is treated as propagating, the worst case. The rule sets:
+
+- a chain (`a { b → a ; a { c → C`);
+- a toggle (`[^a] { b → a ; b → c`);
+- deletions seen through (`x { d → ; x { b → x ; d → D`);
+- a mix of two sets, negations, deletions and rules without contexts.
+
+A checker compares it with an ICU-style left-to-right simulation on texts of up
+to 3 MB, with runs thousands of characters long. Every case matches, with 1
+and 4 threads and segment sizes 1, 3 and 7. The variant that recomputes
+`K1`/`K0` fails as described above.
+
+Cost on 30 MB, one thread, relative to text with no dependent positions:
+
+| Text | Relative cost |
+|---|---|
+| `bxbx…` (chains of one) | 2× |
+| random `abcx` | 8× |
+| random, mixed rules | 20× |
+| all `b` (one chain through the text) | 210× (0.2 s) |
+
+Blocks with no frontier and no pending carries skip the loop. A block where
+every position is in one chain takes as many iterations as the block has
+positions. That cost is linear, and it is the case a fixed number of rounds
+gets wrong.
+
+### Which characters propagate
+
+The analysis (patch saved with the experiment; `tconv --divcode-report` with
+`DIVCODE_PROPAGATION=1`) works per character c of the converted subgroups:
+
+- **States:** the cells of the partition of the characters by the item sets
+  (one representative each), and the text boundary.
+- **Free variables:** the other conditions (after contexts, and before contexts
+  not matched against the converted text), each distinct pattern one variable.
+  Impossible combinations, such as `$x` and `[^$x]` both false, can only make
+  the analysis conservative.
+- **The test:** c propagates if, for some assignment of the variables, the
+  outcome at c (the first rule in order that applies) differs in deletion or
+  set membership between two states.
+- **String rules:** a string rule beginning with c after a state-dependent rule
+  counts as propagating (conservative).
+
+Over every transform:
+
+- 87 groups have converted single-character subgroups (46 also have converted
+  string rules), and 29 of them have no propagating character.
+- Of the 21 eligible groups, 10 have none: Ethi-Latn/SERA, Ethi-Cyrl/Gutgarts,
+  Ethi-Latn/ALALOC, Arab-Latn, sat_Olck-sat_FONIPA, hy-hy_Latn/BGN group 3,
+  uz_Cyrl-uz/BGN, sk-sk_FONIPA, hy-hy_FONIPA and es_FONIPA-am.
+- The other 11 have 29 propagating characters among their 126 converted ones:
+
+| Group | Propagating characters |
+|---|---|
+| InterIndic-Latin | 1 of 37: nukta U+E03C, deleted after a non-letter |
+| ko-ko_Latn/BGN | 5 of 23: ᄋ deleted at the start of the text; ᄎ ᄏ ᄐ ᄑ gain `’` there |
+| ru_Latn-ru/BGN | 6 of 6 |
+| ar-ar_Latn/BGN | 4 of 5 |
+| fa-fa_Latn/BGN | 4 of 4 |
+| Latn-Arab group 2 | 2 of 2 (string rules only, conservative) |
+| blt-blt_FONIPA group 6 | 2 of 2 |
+| my-my_FONIPA group 6 | 2 of 2 |
+| InterIndic-Arabic | 1 of 3 |
+| uz_Latn-uz_Cyrl | 1 of 1 |
+| Laoo-Latn/UNGEGN | 1 of 1 |
+
+- Many propagating characters differ only between the text boundary and the
+  other states, so their chains start at the start of the text, or after a
+  deleted run there.
+- Some groups not yet eligible have many: und_FONIPA-ar group 3 has 29 of 33,
+  all through string rules (conservative), and Latin-ConjoiningJamo group 1 has
+  25 of 26.
+
+### First implementation: rounds (to be replaced)
+
+Commits 799be3d0d (plan: `DivRule::converted`) and b9113b35f (kernels) apply
+the converted-context rules in rounds:
+
+- The rules are first matched against the text itself.
+- Each further round, up to `--converted-context-rounds` (8), recomputes the
+  converted characters from the previous round's matches. It then runs a full
+  pass of the If-hierarchy over the converted rules' leaves, in both the Count
+  and the translation kernels.
+- The output uses the last round's matches.
+
+The 21 CLDR groups and 6 rules files of `QA/tconv_divcode_test.py` match the
+regular plan, and the rules files also match ICU, in both modes. 97 of the 212
+string-rule groups are eligible, against 76 before. Chains longer than 8
+differ from ICU, as in the regular plan.
+
+Measurements (corpora made from the Latin text by Latin-Hangul and
+InterIndic-Arabic; execution cycles, CYCLES × EXEC%, 4 threads, relative to the
+regular plan):
+
+| Transform (corpus) | Regular | DivCode, Unicode | DivCode, UTF-8 | Group kernels |
+|---|---|---|---|---|
+| Ethi-Latn/SERA (14.7 MB) | 3.49M | −34% | −36% | 42 → 19 / 24 |
+| InterIndic-Latin (23.4 MB) | 5.58M | −22% | +62% | 40 → 19 |
+| ko-ko_Latn/BGN (10.9 MB) | 2.01M | −42% | −54% | 42 → 24 |
+| Arab-Latn (14.6 MB) | 9.47M | −14% | −47% | 34 → 24 |
+
+Why the rounds are replaced:
+
+- **They are always run, and inexact.** All 8 rounds run in every block, in two
+  kernels, and chains longer than 8 are still wrong. The resolution above runs
+  only where propagating characters are, and is exact.
+- **InterIndic-Latin in UTF-8 mode.** Its DivCode kernel costs 3.4 times as much
+  as in Unicode mode (7.8M against 2.3M). Yet only its nukta propagates.
+- **Threads.** Wall-clock times with 4 threads do not always follow the cycles:
+  InterIndic-Latin takes 0.138 s (Unicode) and 0.287 s (UTF-8) against 0.123 s.
+  A single large kernel limits the pipeline.
+
+A separate observation: the `Items` streamset of InterIndic-Latin has 34
+streams, spread together. 21 are contexts written in the rules, and 13 are
+complements made by order disambiguation. Most of the complements could be
+derived from the positive streams after spreading.
+
 ### Steps
 
-1. **Plan** (`divcode_plan`):
-   - mark the converted-context rules (`DivRule::converted`), and their items
-     (the sets S), instead of making the group ineligible
-   - accept phase 1's cases (single-character rules that no rule yields to,
-     items as above); report the others with what they need
-   - include `--converted-context-rounds` in the content hash
-   - `--divcode-report`: rounds and converted rules per group; check how many of
-     the 21 groups become eligible
-2. **Kernels:** the rounds in `DivCodeTranslate` (Count and Translate modes, both
-   encodings):
-   - `End_S`, `Within` and `Del` per round
-   - the converted-context items at the top level
-   - one pass per round over the converted rules' leaves
-   - the last round's changes in the output
-   - the If on "changed" around each round
-3. **Tests** (`QA/tconv_divcode_test.py`), in both modes, against the regular
-   plan and ICU:
-   - the cases of §3.1 of the coverage report as rules files:
-     - deletions looked through (`x → ; [^a] { b → B`)
-     - a longer replacement's last character (`c → xyz ; [z] { d → D`)
-     - chains (`a { b → a ; a { c → C`, with chains longer than one round)
-     - the InterIndic-Latin case (`[^[:L:]] { aa → …` after a converted
-       consonant)
-     - expansions of converted-context rules (Count and translation agreeing)
-     - multibyte characters
-   - the CLDR groups made eligible
-4. **Measurement:** Ethi-Latn/SERA, InterIndic-Latin, ko-ko_Latn/BGN and
-   Arab-Latn against the regular plan (execution cycles and single-thread
-   times; cold starts with up to 8 rounds).
-5. **Phase 2:** converted-context string rules, the 9 other groups of the 30,
-   and many of the 35 groups where this is one of several problems.
-
+1. **After contexts on the spread basis** (independent of the rest): single
+   items tested directly in the Count and translation kernels, rules' own after
+   items at their exact offsets, `DivCodeItems` only for contexts of several
+   items, and only those streams spread. Then the static and dynamic skipping of
+   gap terms, if the measurements show the remaining OR terms matter.
+2. **Plan:** classify the characters of the converted rules as consumers or
+   propagating (the analysis above, in `divcode_plan`), with the largest
+   expansion among each character's outcomes. `--divcode-report`: propagating
+   characters per group. Drop `--converted-context-rounds` from the DivCode plan
+   and its content hash.
+3. **Kernels:** replace the rounds:
+   - Count reserves the largest expansion at dependent positions;
+   - Translate leaves dependent positions, and outputs `In[S]`/`Out[S]` and `Dep`;
+   - the new Converted kernel: `K1`/`K0`, the `While` loop if the group has
+     propagating characters, and one pass of the converted rules.
+4. **Tests:** the converted-context tests, compared with ICU (the regular plan
+   is inexact beyond its rounds), plus:
+   - chains longer than 8 and crossing blocks (the `convwhile` cases as rules
+     files);
+   - outcomes of different lengths at dependent positions (the reserve and its
+     surplus deletions);
+   - 1 and 4 threads, and small segment sizes.
+5. **Measurement:** the four transforms above again, and a worst case (one chain
+   through the text).
+6. **Phase 2:** converted-context string rules.

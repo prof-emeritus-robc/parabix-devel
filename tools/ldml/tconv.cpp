@@ -11563,7 +11563,8 @@ public:
     //  over each of its items (a character, then the gap after it); the changes
     //  are moved to their offsets (within a text and the gap after it), and a
     //  pass's covers move each string match over its text, for every pass; the
-    //  dependent positions step past a character.
+    //  dependent positions step past a character; the tests of the after
+    //  items are moved from the largest offset they are tested at.
     static unsigned carryExtentBound(const ldml::DivCodePlan & plan, bool utf8, unsigned E) {
         const unsigned len = utf8 ? 4 : 1;
         size_t items = 0;
@@ -11573,7 +11574,8 @@ public:
             N = std::max(N, unitsOf(d, utf8, plan.shift).N);
         }
         for (const auto & sc : plan.subgroupContexts) items = std::max(items, sc.first.items.size());
-        return static_cast<unsigned>(items) * (len + E) + (plan.stages + 2) * (N + E + len) + len;
+        //  (And the Advances of the tests of after items, by up to N + E.)
+        return static_cast<unsigned>(items) * (len + E) + (plan.stages + 2) * (N + E + len) + len + N + E;
     }
     static Bindings outputsOf(Mode mode, StreamSet * Out, StreamSet * Deleted, StreamSet * Dep, StreamSet * Ends) {
         if (mode == Mode::Count) return Bindings{Binding{"InsertCount", Out}};
@@ -11880,24 +11882,181 @@ void DivCodeTranslate::generatePabloMethod() {
     divCodeAfterContexts(plan, &ruleItem, &subgroupItem);
     const std::vector<PabloAST *> items = mHasItems ? getInputStreamSet("Items") : std::vector<PabloAST *>{};
     const std::vector<size_t> chained = divCodeChainedIndex(plan);
+    //  A context of one item, tested at an offset: its positive test, on the
+    //  pseudo-basis of the character at the offset (of a length its first unit
+    //  gives), within the text.
+    auto positiveTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset) -> PabloAST * {
+        const ldml::DivContextItem & item = context.items[0];
+        PabloAST * const x = item.kind == ldml::DivContextItem::Kind::External ? t.at(ext[item.external], offset)
+                                                                                : t.pseudo(offset, plan.pseudoTest(item.set), 0);
+        return t.b.createAnd(x, t.at(inText, offset));
+    };
+    //  (Negated, not in the set; marking the end of a filtered run, also a
+    //  position of the text outside the mask.)
+    auto finishTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, PabloAST * x) -> PabloAST * {
+        const ldml::DivContextItem & item = context.items[0];
+        x = item.negated ? t.b.createNot(x) : x;
+        if (item.runEnd && mask) x = t.b.createOr(x, t.b.createAnd(t.at(inText, offset), t.b.createNot(t.at(mask, offset))));
+        return x;
+    };
+    auto singleTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset) -> PabloAST * {
+        return finishTest(t, context, offset, positiveTest(t, context, offset));
+    };
+    //  The tests of the contexts of one item at the offsets the leaves test
+    //  them at (see below), by item and offset.
+    std::map<std::pair<size_t, unsigned>, PabloAST *> singles;
     auto itemTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, size_t index) -> PabloAST * {
         //  (A context of several items: whether it holds, from the Items kernel.)
         if (context.items.size() > 1) return t.at(items[chained[index]], offset);
-        const ldml::DivContextItem & item = context.items[0];
-        //  (One item: its positive test, on the pseudo-basis of the character at
-        //  the offset (of a length its first unit gives), within the text.)
-        PabloAST * x = item.kind == ldml::DivContextItem::Kind::External ? t.at(ext[item.external], offset)
-                                                                          : t.pseudo(offset, plan.pseudoTest(item.set), 0);
-        x = t.b.createAnd(x, t.at(inText, offset));
-        x = item.negated ? t.b.createNot(x) : x;
-        //  (The end of a filtered run: a position of the text outside the mask.)
-        if (item.runEnd && mask) x = t.b.createOr(x, t.b.createAnd(t.at(inText, offset), t.b.createNot(t.at(mask, offset))));
-        return x;
+        auto f = singles.find({index, offset});
+        return f != singles.end() ? f->second : singleTest(t, context, offset);
     };
 
     //  The before items, at the top level: tested at the first unit of each
     //  character (not inserted), and moved to the position after its last.
     Tests top{pb, U, code, s, k, mUTF8};
+
+    //  The contexts of one item after the texts, tested once each, at the
+    //  largest offset L the leaves test any of them at: the test at offset o of
+    //  position p is that at L of position p - (L - o), an Advance by L - o.
+    //  A rule tests its own after item past its text and its own gap (N + e),
+    //  and that of an earlier rule it yields to past any gap (N + g, g up to
+    //  the largest expansion); in the text before it is spread, past its text.
+    //  - The positive tests (in the set, within the text) at L are in an
+    //    If-hierarchy on the code at L, as the rules are: each in the If of the
+    //    codes of its set (where it can hold), the smallest the codes of its
+    //    set lie within.  A set given by its complement (see
+    //    DivCodePlan::pseudoTest), which holds for the characters of code 0,
+    //    holds within the text where its complement does not: the test of its
+    //    complement is in the If-hierarchy, and its negation at the top level.
+    //    (An external set: at the top level.)
+    //  - The Advances are at the top level: in an If, their carries would be
+    //    lost in the blocks where it is not entered.
+    //  - The first L - o positions of the text, which no test at L reaches, are
+    //    tested at o directly, in an If entered only at the start of the text
+    //    (and where a segment's carries are rebuilt, where the Advance is 0
+    //    too).
+    //  - The negation and the end of a filtered run are applied at o.
+    {
+        const unsigned E = maxExpansion(plan, mUTF8);
+        std::map<size_t, const ldml::DivContext *> contexts;
+        std::set<std::pair<size_t, unsigned>> uses;
+        for (size_t r = 0; r < plan.rules.size(); r++) {
+            const ldml::DivRule & d = plan.rules[r];
+            if (!needed(r) || !d.after.present() || d.after.items.size() != 1) continue;
+            const Units & u = mUnits[r];
+            contexts.emplace(ruleItem[r], &d.after);
+            if (!mHasSpread) {
+                uses.insert({ruleItem[r], u.N});
+                continue;
+            }
+            uses.insert({ruleItem[r], u.N + u.expansion()});
+            for (unsigned g = 0; g <= E; g++) uses.insert({ruleItem[r], u.N + g});
+        }
+        unsigned L = 0;
+        for (const auto & use : uses) L = std::max(L, use.second);
+        //  The positive tests at L, by item: the codes each can hold at (none:
+        //  at the top level).
+        std::map<size_t, PabloAST *> atL;
+        struct Guarded {
+            Var * var;
+            std::set<unsigned> codes;       // of the pseudo-codepoints tested
+            UCD::UnicodeSet tested;         // the set's, or its complement's
+            bool complement;
+        };
+        std::vector<Guarded> guarded;
+        PabloAST * const inTextL = top.at(inText, L);
+        for (const auto & c : contexts) {
+            const ldml::DivContextItem & item = c.second->items[0];
+            UCD::UnicodeSet tested;
+            bool complement = false;
+            if (item.kind != ldml::DivContextItem::Kind::External) {
+                tested = plan.pseudoTest(item.set);
+                if (!tested.empty() && (tested.min_codepoint() >> s) == 0) {
+                    tested = plan.pseudoSet(~item.set);
+                    complement = true;
+                }
+            }
+            std::set<unsigned> codes;
+            for (const auto & range : tested) {
+                for (unsigned v = range.first >> s; v <= (range.second >> s); v++) codes.insert(v);
+            }
+            if (item.kind == ldml::DivContextItem::Kind::External || codes.empty()) {
+                atL.emplace(c.first, positiveTest(top, *c.second, L));
+                continue;
+            }
+            Var * const v = pb.createVar("afterL" + std::to_string(guarded.size()), zeroes);
+            guarded.push_back(Guarded{v, std::move(codes), std::move(tested), complement});
+            atL.emplace(c.first, complement ? pb.createAnd(inTextL, pb.createNot(v)) : static_cast<PabloAST *>(v));
+        }
+        std::vector<PabloAST *> codeL;
+        for (unsigned i = 0; i < k; i++) codeL.push_back(top.at(code[i], L));
+        //  The tests of the items whose codes lie within prefix (above bit),
+        //  in the scope of b where the code at L is within prefix (cond).
+        std::function<void (PabloBuilder &, Tests &, int, unsigned, PabloAST *, const std::vector<size_t> &)> guard;
+        guard = [&](PabloBuilder & b, Tests & t, int bit, unsigned prefix, PabloAST * cond, const std::vector<size_t> & these) {
+            std::vector<size_t> half[2];
+            for (size_t g : these) {
+                const Guarded & x = guarded[g];
+                const unsigned first = *x.codes.begin() >> bit & 1, last = *x.codes.rbegin() >> bit & 1;
+                if (bit < 0 || first != last) {
+                    //  (The pseudo-codepoints at L; within the text, unless the
+                    //  complement's, negated with InText at the top level.)
+                    PabloAST * const y = t.pseudo(L, x.tested, 0);
+                    b.createAssign(x.var, x.complement ? y : b.createAnd(y, t.at(inText, L)));
+                } else {
+                    half[first].push_back(g);
+                }
+            }
+            if (bit < 0) return;
+            for (unsigned v : {1u, 0u}) {
+                if (half[v].empty()) continue;
+                const unsigned p = (prefix << 1) | v;
+                PabloAST * c = v ? codeL[bit] : b.createNot(codeL[bit]);
+                if (cond) c = b.createAnd(cond, c);
+                if (p == 0) {
+                    //  (Codes other than 0 below.)
+                    PabloAST * any = zeroes;
+                    for (int j = 0; j < bit; j++) any = b.createOr(any, codeL[j]);
+                    c = b.createAnd(c, any);
+                }
+                PabloBuilder body = b.createScope();
+                b.createIf(c, body);
+                Tests inner{body, U, code, s, k, mUTF8};
+                guard(body, inner, bit - 1, p, c, half[v]);
+            }
+        };
+        if (!guarded.empty()) {
+            std::vector<size_t> all(guarded.size());
+            for (size_t g = 0; g < all.size(); g++) all[g] = g;
+            guard(pb, top, static_cast<int>(k) - 1, 0, nullptr, all);
+        }
+        //  The positions before the d-th of the text, and the direct tests there.
+        std::map<unsigned, PabloAST *> before;
+        std::map<std::pair<size_t, unsigned>, Var *> direct;
+        for (const auto & use : uses) {
+            const unsigned d = L - use.second;
+            if (d == 0) continue;
+            if (!before.count(d)) before.emplace(d, pb.createNot(pb.createAdvance(pb.createOnes(), d)));
+            direct.emplace(use, pb.createVar("direct" + std::to_string(direct.size()), zeroes));
+        }
+        if (!direct.empty()) {
+            PabloBuilder body = pb.createScope();
+            pb.createIf(before.rbegin()->second, body);
+            Tests t{body, U, code, s, k, mUTF8};
+            for (const auto & v : direct) {
+                const unsigned d = L - v.first.second;
+                body.createAssign(v.second, body.createAnd(before.at(d), positiveTest(t, *contexts.at(v.first.first), v.first.second)));
+            }
+        }
+        for (const auto & use : uses) {
+            const unsigned d = L - use.second;
+            PabloAST * const x = atL.at(use.first);
+            PabloAST * const positive = d == 0 ? x : pb.createOr(pb.createAdvance(x, d), direct.at(use));
+            singles.emplace(use, finishTest(top, *contexts.at(use.first), use.second, positive));
+        }
+    }
+
     PabloAST * starts = inText;
     if (mUTF8) starts = pb.createAnd(starts, pb.createNot(pb.createAnd(U[7], pb.createNot(U[6]))));
     if (gap) starts = pb.createAnd(starts, pb.createNot(gap));

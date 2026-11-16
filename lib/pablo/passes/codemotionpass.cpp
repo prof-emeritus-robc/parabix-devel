@@ -5,6 +5,7 @@
 #include <pablo/ast/branch.h>
 #include <pablo/ast/ps_assign.h>
 #include <pablo/ast/pe_var.h>
+#include <pablo/ast/pablo_intrinsic.h>
 #include <boost/container/flat_set.hpp>
 #ifndef NDEBUG
 #include <pablo/compiler/pabloverifier.hpp>
@@ -19,6 +20,20 @@ using namespace llvm;
 namespace pablo {
 
 using TypeId = PabloAST::ClassTypeId;
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief isCarryGeneratingStatement
+ *
+ * A statement whose carries flow from one block to the next.  Moved into a nested If, it would be computed only in
+ * the blocks where the If is entered, and its carry out of a block where the If is skipped would be lost (an If is
+ * entered only where its condition or its pending carries are nonzero).
+ ** ------------------------------------------------------------------------------------------------------------- */
+inline static bool isCarryGeneratingStatement(const Statement * const stmt) {
+    if (const IntrinsicCall * const call = dyn_cast<IntrinsicCall>(stmt)) {
+        return call->isCarryProducing();
+    }
+    return isa<CarryProducingStatement>(stmt);
+}
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief ScopeSet
@@ -174,7 +189,9 @@ struct CodeMotionPassContainer {
                 }
             }
             mUsers.clear();
-        } else { // test whether the LCA scope is nested within this scope.
+        } else if (!isCarryGeneratingStatement(stmt)) { // test whether the LCA scope is nested within this scope.
+            //  (Not a statement with carries: in the blocks where the nested scope is not
+            //  entered, its carries would not be computed; see isCarryGeneratingStatement.)
             PabloBlock * temp = scope; assert (scope);
             for (;;) {
                 temp = temp->getPredecessor();
@@ -268,28 +285,32 @@ struct CodeMotionPassContainer {
 
         assert ("Loop variants were not cleared correctly." && mVariants.empty());
 
-        // Assume every escaped Var is tainted but not necessarily a variant. Then iterate
-        // through the loop body and mark any statement that uses a tainted expression as
-        // tainted itself. If a Var is assigned a tainted value, mark the Var as a variant.
+        // Every Var assigned in the loop is a variant, wherever it is assigned (in the
+        // loop body, or in a branch nested in it) and whatever the value: a statement of
+        // the body that reads it sees its value before the loop in the first iteration,
+        // and the value assigned in the later ones. (Marking only the Vars assigned a
+        // tainted value at the top level of the body hoisted the readers of a Var
+        // assigned only within a nested If out of the loop, with the Var's value before
+        // the loop.) Then iterate through the loop body and mark any statement that uses
+        // a tainted expression as tainted itself.
 
         for (const Var * var : loop->getEscaped()) {
             mTainted.insert(var);
+            mVariants.insert(var);
         }
 
         PabloBlock * const nestedBody = loop->getBody();
         for (const Statement * stmt : *nestedBody) {
             if (LLVM_UNLIKELY(isa<Branch>(stmt))) {
-                // Trust that any escaped values of an inner branch is a variant.
+                // Any escaped value of an inner branch is a variant.
                 for (const Var * var : cast<Branch>(stmt)->getEscaped()) {
                     mTainted.insert(var);
+                    mVariants.insert(var);
                 }
             } else if (LLVM_UNLIKELY(isa<Assign>(stmt))) {
-                const Assign * const a = cast<Assign>(stmt);
-                if (LLVM_LIKELY(mTainted.count(a->getValue()))) {
-                    const Var * const var = a->getVariable();
-                    mVariants.insert(var);
-                    mTainted.insert(var);
-                }
+                const Var * const var = cast<Assign>(stmt)->getVariable();
+                mVariants.insert(var);
+                mTainted.insert(var);
             } else {
                 for (unsigned i = 0; i != stmt->getNumOperands(); ++i) {
                     const PabloAST * const op = stmt->getOperand(i);

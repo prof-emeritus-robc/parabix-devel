@@ -326,7 +326,9 @@ void PabloKernel::addAutomaticAttributes() {
             }
         }
     }
-    if (!EnableProvisionalLookAheadStride || (mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
+    // A provisional stride writes into the next segment's output, so its kernel cannot run
+    // segments concurrently: that would undo the point of rebuilding the carries.
+    if (!EnableProvisionalLookAheadStride || hasLocalCarries() || (mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
         return;
     }
     bool hasLookAhead = false;

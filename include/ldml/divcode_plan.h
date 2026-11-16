@@ -148,7 +148,18 @@ struct DivCodePlan {
     size_t sourceRules = 0;                 // string rules + mappings, before splitting
     unsigned stages = 0;                    // the number of stages of the string rules (see DivRule::stage)
     size_t overlapPairs = 0;                // the one-way overlaps of the string rules
-    unsigned rounds = 0;                    // the rounds of the converted rules (0 if none)
+    // The rules with DivRule::converted (doc/ldml-divcode-plan.md §10): the
+    // distinct items of their before contexts, and for the characters of their
+    // texts, those whose possible outcomes at a dependent position (the results
+    // of these rules there, and the character itself if none may apply) differ
+    // in what a later before context sees: deleted, or the sets of
+    // convertedItems their last character is in.  The others (consumers) share
+    // one outcome: deleted (consumerDeleted), or a last character in the set of
+    // item i (consumerIn[i]) or not.
+    std::vector<DivContextItem> convertedItems;
+    UCD::UnicodeSet propagating;
+    UCD::UnicodeSet consumerDeleted;
+    std::vector<UCD::UnicodeSet> consumerIn;
     size_t convertedRules = 0;              // the rules with DivRule::converted
     std::string contentHash;                // of the whole plan
     std::vector<std::string> problems;

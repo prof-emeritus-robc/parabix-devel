@@ -11552,6 +11552,28 @@ public:
             mInputStreamSets.push_back(Binding{"Dep", Dep});
             mInputStreamSets.push_back(Binding{"Ends", Ends});
         }
+        //  Count and Translate have no carries but Advances, so they rebuild
+        //  them at each segment and have no state: their segments can run on
+        //  several threads at once.  (Converted's loop and MatchStars carry
+        //  arbitrarily far.)
+        if (mode != Mode::Converted) addAttribute(kernel::LocalCarries(carryExtentBound(plan, mUTF8, E)));
+    }
+    //  An upper bound on the CarryExtent of Count and Translate (the longest path
+    //  of Advances; the Pablo compiler verifies it): a before context steps
+    //  over each of its items (a character, then the gap after it); the changes
+    //  are moved to their offsets (within a text and the gap after it), and a
+    //  pass's covers move each string match over its text, for every pass; the
+    //  dependent positions step past a character.
+    static unsigned carryExtentBound(const ldml::DivCodePlan & plan, bool utf8, unsigned E) {
+        const unsigned len = utf8 ? 4 : 1;
+        size_t items = 0;
+        unsigned N = 0;
+        for (const ldml::DivRule & d : plan.rules) {
+            items = std::max(items, d.before.items.size());
+            N = std::max(N, unitsOf(d, utf8, plan.shift).N);
+        }
+        for (const auto & sc : plan.subgroupContexts) items = std::max(items, sc.first.items.size());
+        return static_cast<unsigned>(items) * (len + E) + (plan.stages + 2) * (N + E + len) + len;
     }
     static Bindings outputsOf(Mode mode, StreamSet * Out, StreamSet * Deleted, StreamSet * Dep, StreamSet * Ends) {
         if (mode == Mode::Count) return Bindings{Binding{"InsertCount", Out}};
@@ -11886,8 +11908,17 @@ void DivCodeTranslate::generatePabloMethod() {
             PabloAST * const y = pb.createAdvance(mUTF8 ? pb.createAnd(x, top.lengthAt(0, l)) : x, l);
             moved = moved ? pb.createOr(moved, y) : y;
         }
-        //  (Through the positions inserted after a match before it.)
-        return gap ? pb.createMatchStar(moved, gap) : moved;
+        //  (Through the positions inserted after a match before it: at most the
+        //  largest expansion, by Advances so that the carries stay local.)
+        if (gap) {
+            const unsigned E = maxExpansion(plan, mUTF8);
+            PabloAST * through = moved;
+            for (unsigned g = 0; g < E; g++) {
+                through = pb.createAdvance(pb.createAnd(through, gap), 1);
+                moved = pb.createOr(moved, through);
+            }
+        }
+        return moved;
     };
     std::map<std::string, PabloAST *> befores;
     auto itemKey = [&](const ldml::DivContextItem & item) {

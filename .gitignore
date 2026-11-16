@@ -34,6 +34,9 @@ UCD-scripts/generated*
 # Don't track test outputs
 TestOutput*
 
+# Don't track the per-language pretokenizer test inputs
+tools/lex/tokenizer_files/langs/
+
 # Claude working files
 CLAUDE.md
 

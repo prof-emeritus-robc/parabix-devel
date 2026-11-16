@@ -97,9 +97,17 @@ def input_line(text: str, pad: str = "") -> str:
     return f"  Input:{pad} <{len(text)} chars, {len(text.encode())} bytes>\n"
 
 
+def _pretokenizer_arg() -> list[str]:
+    """--pretokenizer=bytelevel, unless --parabix-args already names a pretokenizer:
+    the tokenizer rejects the option given twice."""
+    if any(a.startswith("--pretokenizer") for a in EXTRA_ARGS):
+        return []
+    return ["--pretokenizer=bytelevel"]
+
+
 def _parabix_ids_cmd(input_path: str, strings: bool = False):
     """Spawn the tokenizer binary on a pre-written input file. One subprocess."""
-    cmd = [TOKENIZER, "--pretokenizer=bytelevel", f"--vocab={VOCAB}", f"--merges={MERGES}"]
+    cmd = [TOKENIZER, *_pretokenizer_arg(), f"--vocab={VOCAB}", f"--merges={MERGES}"]
     cmd += EXTRA_ARGS
     if strings:
         cmd.append("--strings")
@@ -185,7 +193,7 @@ def bench_parabix(input_path: str, runs: int):
     rule, across all 50,000) and not the configuration anything validates — so the
     reported MB/s would describe a pipeline nobody has checked."""
     r = subprocess.run(
-        [TOKENIZER, "--pretokenizer=bytelevel", f"--bench-loop={runs}",
+        [TOKENIZER, *_pretokenizer_arg(), f"--bench-loop={runs}",
          f"--vocab={VOCAB}", f"--merges={MERGES}", *EXTRA_ARGS, input_path],
         capture_output=True, encoding="utf-8"
     )

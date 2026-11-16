@@ -1015,8 +1015,19 @@ an extra pass over its few dependent positions.
 
 1. Done: after contexts of one item tested directly (commit 9ea25c9a3); the
    classification, the kernels and the tests above.
-2. **Next:** the static and dynamic skipping of the gap terms (see "Kernels:
-   less spreading"), if measurements show the remaining OR terms matter; the
-   cost of the Converted kernel for groups with few dependent positions
-   (ko-ko_Latn/BGN).
+2. **Measured, not worthwhile** (2026-11-16, after Count and Translate became
+   LocalCarries and the after items of one item were tested once, commit
+   2bef051f7):
+   - The static and dynamic skipping of the gap terms (see "Kernels: less
+     spreading"). An upper bound, from a build without any gap terms (the after
+     items of earlier rules past gaps of 1..E positions, `next()`'s steps over
+     gaps): no change in Translate (within ±4%) for the four transforms above,
+     and only in InterIndic-Latin's Converted kernel in Unicode mode (229K →
+     180K cycles, 1.5% of the transform's 3.28M); no change in wall time. Most
+     matches use the exact term of their own gap, and with the after items
+     tested once, a gap term is a lookahead and an Advance.
+   - The cost of the Converted kernel for groups with few dependent positions
+     (ko-ko_Latn/BGN): 94K of 1.06M cycles (9%) in UTF-8 mode, 30K of 1.26M
+     (2.4%) in Unicode mode, an upper bound on any saving; the only stateful
+     DivCode kernel, but too small a share to limit 4 threads.
 3. **Phase 2:** converted-context string rules.

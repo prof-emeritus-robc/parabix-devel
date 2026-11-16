@@ -1030,4 +1030,117 @@ an extra pass over its few dependent positions.
      (ko-ko_Latn/BGN): 94K of 1.06M cycles (9%) in UTF-8 mode, 30K of 1.26M
      (2.4%) in Unicode mode, an upper bound on any saving; the only stateful
      DivCode kernel, but too small a share to limit 4 threads.
-3. **Phase 2:** converted-context string rules.
+3. **Phase 2:** converted-context string rules (see §11).
+
+## 11. Plan: phase 2, string rules with before contexts matched against the converted text
+
+### Scope
+
+`tconv --divcode-report` over the 453 CLDR transforms (2026-11-16):
+
+- 36 groups have string rules whose before contexts are matched against the
+  converted text ("string rules with before contexts matched against the
+  converted text").
+- For 9 of them it is the only problem: cs_FONIPA-ko #1 (3 rules), es_FONIPA-zh
+  #2 (6), hy_AREVMDA-hy_AREVMDA_FONIPA #1 (2), ja_Latn-ko #2 (60), ja_Latn-ru
+  #3 (1), pl-pl_FONIPA #1 (3), pl_FONIPA-ja #3 (2), ro_FONIPA-ja #3 (1),
+  sk_FONIPA-ja #4 (1).
+- The other 27 have other problems too, mostly two-way or self overlaps and
+  contexts that are not fixed sequences of sets. They are out of scope, as are
+  the 8 groups with "before contexts of two or more items matched against the
+  converted text".
+
+### Families
+
+The rules come in families: order disambiguation splits a rule into variants
+with the same text whose before contexts are complementary, on the same items:
+
+- cs_FONIPA-ko: `" " { ks } [^" "$] → j`, `[$] { ks } [^" "$] → j`,
+  `[^" "$] { ks } [^" "$] → gs`;
+- pl-pl_FONIPA: `$voiceless { rz → ʂ`, `[^$voiceless] { rz } $voiceless → ʂ`,
+  `[^$voiceless] { rz } [^$voiceless] → ʐ`;
+- ja_Latn-ko: `[^$consonant] { u~a → 와`, `[^[^$consonant$]$] { u~a → ᅪ`.
+
+A family is the rules with the same text (the same sets at each position).
+It **covers** its text if, for every after context its rules have, the before
+contexts of the rules with that after context (or none) hold for every
+converted character before it and at the text boundary.
+
+- **Covering family:** where its text matches (with an after context), some
+  rule of the family applies, whatever the converted text is. The match and the
+  positions it covers are certain; only which result is written depends on the
+  converted character before the anchor. Then:
+  - the covers of the string rules, the stage passes and the priorities (rules
+    yielding to the family) are as for a rule without a converted context;
+  - the single-character rules within its matches never apply there;
+  - the results differ only in their characters, their lengths, and the last
+    character the next positions see.
+  This is phase 1's case, generalized from one position to a match of N units.
+- **Non-covering family:** some converted text leaves the text to other rules
+  (shorter strings, single characters), so the covers, later stages and
+  yielding rules depend on the resolution. ja_Latn-ko's `[^$consonant] { wa →
+  와` may be one, if no rule covers `wa` after a consonant. These would move
+  whole regions into the Converted kernel. They are out of scope unless the
+  analysis (step 1) shows they keep most of the 9 groups out.
+
+### Design (covering families)
+
+The positions of a family's match are written in the spread text: units
+`a .. a + N - 1` of the text, then the gap reserved after them.
+
+1. **Planning.** `planDivCodeGroup` groups the converted string rules into
+   families and checks that each covers its text, with the same item sets
+   (`convertedItems`) as phase 1. A non-covering family keeps the problem
+   ("string rules with before contexts matched against the converted text, not
+   covering").
+2. **Propagation.** `classifyConverted` classifies a family as a unit, as a
+   character is now: its outcomes are deletion (an empty result) or the
+   membership of its results' last characters in each item set. A family whose
+   outcomes all agree is a consumer; one whose outcomes differ propagates.
+3. **Count** (before spreading) reserves at the family's match the largest
+   expansion among its results, at its last unit (offset N - 1), as `atLeast`
+   does for the dependent single-character positions now. A family's
+   expansions are known, so this needs no `K1`/`K0`.
+4. **Translate** (spread) treats the family as one string rule without its
+   before context, for its match (text, after context, cover, stage, the rules
+   yielding to it). It writes no changes there: it leaves the text and its
+   reserved positions, and marks the anchor in `Dep`. For a consumer family it
+   adds the known outcome to `Ends` (In/Out at the last position of the
+   reserved span, the positions within it deleted for propagation, so `K1`/`K0`
+   after the match are the same for every outcome).
+5. **Converted** (spread) evaluates the family's rules at their anchors with
+   `K1`/`K0` before the anchor, as for single-character rules: in the loop for
+   propagating families, in the final pass for all. A rule's changes cover the
+   N units and the reserved positions: unit j of its result at a + j (XOR
+   against the text, as Translate does for string rules, including set
+   positions), the surplus up to N + reserve deleted. The loop's frontier and
+   `Done` are at anchors; the outcome is marked at the end of the span.
+6. **Stages.** A family in a later stage is evaluated only at the anchors
+   Translate marked (outside the covers of earlier stages). Its own cover of
+   later stages is certain, so Translate computes it.
+
+The Converted kernel's leaves today skip the earlier/cover/gap checks. They
+need the string rules' offsets and set positions, which the leaf code already
+handles for Translate.
+
+### Steps
+
+1. **Analysis.** In `divcode_plan`, form the families of the 36 groups and
+   report (`--divcode-report`, field `converted_families`) whether each covers
+   its text, and its outcomes. Decide from the counts whether covering
+   families alone bring in most of the 9 groups; if not, revisit the
+   non-covering case before step 2.
+2. **Planning and propagation** for covering families (eligibility, families
+   in `DivRule`, `classifyConverted` over families, the content hash).
+3. **Count and Translate:** the reserve at a family's match; the family as one
+   match for covers, stages and priorities; `Dep` and `Ends` at families.
+4. **Converted:** the families' rules in the loop and the final pass, with
+   multi-unit changes and the surplus deleted.
+5. **Tests** (QA/tconv_divcode_test.py): rules files of families with
+   results of different lengths, empty results (deletions seen through),
+   chains through families' results, a family in a later stage, set positions
+   in the text, UTF-8, sparse dependent positions, one thread and four threads
+   with segments of one stride; the 9 groups in `TRANSLATE` (extended). One
+   case in the default selection, within the time limits.
+6. **Measure** the 9 groups against the regular plan (4 threads, kernel
+   cycles), as in §10.

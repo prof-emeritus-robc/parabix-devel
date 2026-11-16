@@ -60,6 +60,10 @@ struct DivCodeOptions {
     // At most this many stages of string rules with one-way overlaps (see
     // DivRule::stage).
     unsigned maxStages = 8;
+    // The rounds of matching the before contexts that ICU matches against the
+    // converted text (see DivRule::converted); 0: matched against the text
+    // itself, as with tconv --converted-context-rounds=0.
+    unsigned convertedRounds = 8;
     // Whether a before context (as given for the regular expression engine)
     // may match differently in the text as converted by the group, against
     // which ICU matches it (or is not known not to).  If not given, no before
@@ -119,6 +123,13 @@ struct DivRule {
     // highest stage of the rules preceding it (1 if none), and a match applies
     // unless it begins strictly within an applied match of an earlier stage.
     unsigned stage = 0;
+    // A rule whose before context ICU matches against the converted text (it
+    // may match differently there: see convertedContextMatters in tconv):
+    // matched against the text itself first, then again in rounds against the
+    // converted text that the matches of the round before give.  (Phase 1: a
+    // single-character rule, with a before context of one item, that no rule
+    // yields to.)
+    bool converted = false;
     size_t length() const {return text.size();}
     size_t expansion() const {return result.size() > text.size() ? result.size() - text.size() : 0;}
     size_t deletions() const {return text.size() > result.size() ? text.size() - result.size() : 0;}
@@ -137,6 +148,8 @@ struct DivCodePlan {
     size_t sourceRules = 0;                 // string rules + mappings, before splitting
     unsigned stages = 0;                    // the number of stages of the string rules (see DivRule::stage)
     size_t overlapPairs = 0;                // the one-way overlaps of the string rules
+    unsigned rounds = 0;                    // the rounds of the converted rules (0 if none)
+    size_t convertedRules = 0;              // the rules with DivRule::converted
     std::string contentHash;                // of the whole plan
     std::vector<std::string> problems;
     bool eligible() const {return problems.empty();}

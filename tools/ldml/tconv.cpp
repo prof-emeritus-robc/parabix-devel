@@ -2854,9 +2854,11 @@ static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * en
     return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
 }
 
-//  Whether the DivCode kernels apply a plan (an eligible one).
+//  Whether the DivCode kernels apply a plan: an eligible one, without rules
+//  matched in rounds against the converted text (the kernels do not yet run
+//  the rounds).
 static bool divCodeApplies(const ldml::DivCodePlan & plan) {
-    return plan.eligible();
+    return plan.eligible() && plan.convertedRules == 0;
 }
 
 //  The notes of tconv --plan on the before contexts of a conversion group that
@@ -7875,6 +7877,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         ldml::DivCodeOptions options;
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
+        options.convertedRounds = ConvertedContextRounds;
         const ldml::DivCodePlan plan = ldml::planDivCodeGroup(step, options);
         if (divCodeApplies(plan)) return divCodeGroup(plan, U21);
     }
@@ -9586,6 +9589,7 @@ static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
     ldml::DivCodeOptions options;
     options.shift = DivCodeShift;
     options.convertedBefore = convertedBeforeContext;
+    options.convertedRounds = ConvertedContextRounds;
     options.utf8 = true;
     return ldml::planDivCodeGroup(step, options);
 }
@@ -10782,6 +10786,7 @@ static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
     std::string r = "{\"blocks\": " + std::to_string(plan.blocks.size()) + ", \"code_bits\": " + std::to_string(plan.codeBits)
         + ", \"rules\": " + std::to_string(plan.rules.size()) + ", \"max_leaf\": " + std::to_string(maxLeaf)
         + ", \"stages\": " + std::to_string(plan.stages) + ", \"overlap_pairs\": " + std::to_string(plan.overlapPairs)
+        + ", \"converted_rules\": " + std::to_string(plan.convertedRules) + ", \"rounds\": " + std::to_string(plan.rounds)
         + ", \"stage_rules\": [" + [&]() {
               std::vector<size_t> n(plan.stages + 1, 0);
               for (const ldml::DivRule & d : plan.rules) n[d.stage]++;
@@ -10816,6 +10821,7 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
         if (step.stringRules.empty()) continue;
         ldml::DivCodeOptions options;
         options.convertedBefore = convertedBeforeContext;
+        options.convertedRounds = ConvertedContextRounds;
         options.shift = 5;
         const ldml::DivCodePlan p32 = ldml::planDivCodeGroup(step, options);
         options.shift = 6;
@@ -12230,6 +12236,7 @@ static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::Tr
     ldml::DivCodeOptions options;
     options.shift = DivCodeShift;
     options.convertedBefore = convertedBeforeContext;
+    options.convertedRounds = ConvertedContextRounds;
     const ldml::DivCodePlan plan = ldml::planDivCodeGroup(*step, options);
     if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 4) {
         llvm::errs() << "Error: the alphabet of group " << DivCodeCodes << " has " << plan.blocks.size() << " blocks and "

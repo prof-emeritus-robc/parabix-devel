@@ -591,3 +591,157 @@ compile much faster cold (ru-zh, Bopo-Latn and my-my_Latn from about 31 s to
 8–11 s). The Bopomofo, Gurmukhi and Telugu texts are transliterated English,
 so their frequencies are not those of real text.
 
+## 10. Plan: before contexts matched against the converted text
+
+Status: plan, 2026-11-15.
+
+### The problem
+
+ICU matches a before context against the text to the left of its cursor,
+which it has already converted (§3.1 of
+[ldml-tconv-coverage.md](ldml-tconv-coverage.md)). It looks through deleted
+characters, sees the last character of a longer replacement, and sees the
+results of earlier rules of the same kind, so chains propagate (`a { b → a ;
+a { c → C` turns `abbbc` into `aaaaC`). `convertedContextMatters` flags a
+context when some conversion of its group changes whether a character is in an
+item's set, deletes a character, or (for items beyond the one next to the rule)
+changes the length of the text. The regular plan applies such rules in a
+correction kernel, in rounds (`--converted-context-rounds`, default 8).
+
+`tconv --divcode-report` now also describes these groups (field `converted`):
+
+- 65 groups have such contexts; for 30 of them (4,013 rules) it is their only
+  problem.
+- In 21 of the 30, the rules with such contexts are single-character rules,
+  usually few: Ethi-Latn/SERA has 18 such mappings among its 475 rules,
+  InterIndic-Latin 73 among 319, ko-ko_Latn/BGN 18 among 255. In the other 9,
+  string rules have them too (ja_Latn-ko group 2: 60 string rules and 51
+  mappings).
+- 28 of the 30 groups delete, and 28 expand; 13 have stages.
+
+Expansion rules out patching the output after the translation, as the regular
+plan's correction kernel does. The Count kernel fixes the gaps of the spread
+text from the matches it finds, so a match of an expanding rule that a later
+round adds or removes would need gaps that the text does not have. The rounds
+must therefore run, identically, in the Count kernel and in the translation
+kernel.
+
+### Design
+
+**The converted character before a position.** The converted text needs to be
+known at only one place: the last converted character before an anchor, past
+any deleted ones. A match of rule r at anchor a, with N units of text and M
+units of result, writes its result in place in the spread text: unit j of the
+result at a + j, and the units of the text beyond M are deleted.
+
+- Before the text is spread (Count kernel), the result's last character counts
+  as ending at a + min(N, M), where its gap will be inserted. In the spread text
+  (translation kernel) it ends at a + M.
+- Positions inside a match are never anchors of rules that apply there: they
+  are covered, or exclusive by order disambiguation. So only the last character
+  of each match's result matters, and the deleted units after it.
+
+For an item set S of a converted context, the kernel accumulates, per stage of
+evaluation:
+
+- `End_S`: the applied matches whose result's last character is in S, keyed by
+  the offset of the end of that character;
+- `Within`: all applied matches, by their numbers of units (as the covers do);
+- `Del`: the units deleted, by offset (as the deletion Vars do).
+
+At the top level, the item holds for the converted character before a position
+where:
+
+- an applied match's last result character in S ends there (`Advance(End_S, e)`),
+- or the character before is an unchanged character of the text in S: the
+  item's test on the input, ANDed with "not within an applied match", moved past
+  the character by `next()` as now,
+
+then through the deleted positions after it (`MatchStar` over `Del`, as `next()`
+does over gaps). A negated item holds where neither does; at the start of the
+text it holds as now.
+
+**Rounds.** The converted-context rules are first matched against the text
+itself (round 0, the passes as now). Each further round, up to
+`--converted-context-rounds` (default 8, as the regular plan):
+
+1. computes the converted-context items at the top level from the matches of
+   the round before;
+2. runs a pass of the If-hierarchy over the leaves of the converted-context
+   rules only, whose before contexts read those items;
+3. accumulates their matches, changes and ends in Vars keyed by round, so that
+   no expression reads a Var assigned after an identical earlier expression (the
+   pitfall of the stage covers).
+
+The output uses the last round's changes of these rules, and every other
+rule's changes once. A chain of k such rules is exact after k rounds, as in the
+regular plan.
+
+- An If around each round, on "some match changed in the round before", skips
+  the rounds once the matches are stable, block by block, at run time.
+- Pablo `While` loops cannot hold the rounds, for the reason the regular plan
+  gives: an `Advance` in a loop takes the carry of the previous block only in
+  its first iteration.
+
+**Which rules depend on the rounds.** A converted-context rule's changes can
+change other rules:
+
+- a rule that yields to it (priority);
+- a string rule of a later stage, whose cover depends on its matches if it is a
+  string rule;
+- the single-character rules within its matches.
+
+Order disambiguation gives the rules whose contexts it made complementary
+contexts on the same items, so they are flagged together, as
+`convertedContextMatters` flags each.
+
+- **Phase 1:** the converted-context rules are single-character rules that no
+  rule yields to. Then nothing else depends on the rounds: single-character
+  rules cover nothing, and the string rules' covers and the stage passes are
+  unaffected.
+- **Phase 2:** converted-context string rules, with the rules that depend on
+  them (those that yield to them, later stages, and the single-character rules
+  within them) evaluated again in each round: the regular plan's "whole
+  groups".
+
+**Contexts of several items.** Items beyond the one next to the rule need the
+converted characters before the last; within one match's result these are known
+too (keyed by their end offsets). Phase 1 takes contexts whose items beyond the
+first see only characters a single conversion maps to one character each.
+That is the case the check allows, as it flags length changes for those
+items.
+
+### Steps
+
+1. **Plan** (`divcode_plan`):
+   - mark the converted-context rules (`DivRule::converted`), and their items
+     (the sets S), instead of making the group ineligible
+   - accept phase 1's cases (single-character rules that no rule yields to,
+     items as above); report the others with what they need
+   - include `--converted-context-rounds` in the content hash
+   - `--divcode-report`: rounds and converted rules per group; check how many of
+     the 21 groups become eligible
+2. **Kernels:** the rounds in `DivCodeTranslate` (Count and Translate modes, both
+   encodings):
+   - `End_S`, `Within` and `Del` per round
+   - the converted-context items at the top level
+   - one pass per round over the converted rules' leaves
+   - the last round's changes in the output
+   - the If on "changed" around each round
+3. **Tests** (`QA/tconv_divcode_test.py`), in both modes, against the regular
+   plan and ICU:
+   - the cases of §3.1 of the coverage report as rules files:
+     - deletions looked through (`x → ; [^a] { b → B`)
+     - a longer replacement's last character (`c → xyz ; [z] { d → D`)
+     - chains (`a { b → a ; a { c → C`, with chains longer than one round)
+     - the InterIndic-Latin case (`[^[:L:]] { aa → …` after a converted
+       consonant)
+     - expansions of converted-context rules (Count and translation agreeing)
+     - multibyte characters
+   - the CLDR groups made eligible
+4. **Measurement:** Ethi-Latn/SERA, InterIndic-Latin, ko-ko_Latn/BGN and
+   Arab-Latn against the regular plan (execution cycles and single-thread
+   times; cold starts with up to 8 rounds).
+5. **Phase 2:** converted-context string rules, the 9 other groups of the 30,
+   and many of the 35 groups where this is one of several problems.
+

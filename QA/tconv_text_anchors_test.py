@@ -11,12 +11,14 @@
 #  unchanged, ^ 4 ($nd) → | W $1, as an after context).  The expected results are ICU's
 #  (createFromRules, each line a text).
 #
-#  tconv_text_anchors_test.py <tconv binary>
+#  tconv_text_anchors_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("a [^b] \u2192 X ;\n"
          "^ k } g \u2192 Y ;\n"

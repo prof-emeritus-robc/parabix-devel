@@ -9,13 +9,14 @@
 #  ICU's (as given by uconv -x on the same rules), including on a run longer
 #  than a block.
 #
-#  tconv_prefix_runs_test.py <tconv binary>
+#  tconv_prefix_runs_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+
+from tconv_test_mode import EXTENDED
 
 LONG = 600
 
@@ -69,9 +70,7 @@ def main():
                 f.write(text)
             argvs.append([tconv, "--plan", "--rules-file=" + rules])
             argvs.append([tconv, "--rules-file=" + rules, input])
-        # The runs of tconv, three at a time.
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            runs = list(pool.map(lambda argv: subprocess.run(argv, capture_output=True), argvs))
+        runs = [subprocess.run(argv, capture_output=True) for argv in argvs]
         for i, (rule, _, want) in enumerate(CASES):
             plan, run = runs[2 * i: 2 * i + 2]
             if b"prefix runs: " not in plan.stdout or b": implementable" not in plan.stdout:

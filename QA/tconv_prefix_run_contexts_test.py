@@ -8,12 +8,14 @@
 #  item of an after context sees the P that stays in place, as ICU does.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_prefix_run_contexts_test.py <tconv binary>
+#  tconv_prefix_run_contexts_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("^ { t } t \u2192 X ;\n"
          "t \\u0361 \u2192 | t ;\n"

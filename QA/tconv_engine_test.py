@@ -10,14 +10,15 @@
 #  ICU's possessive ones do), and that of tconv's own kernels
 #  (--disable-engine-search-replace).
 #
-#  tconv_engine_test.py <tconv binary>
+#  tconv_engine_test.py <tconv binary> [--extended-testing]
 
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+
+from tconv_test_mode import EXTENDED
 
 TEXT = "abx cd abc. abcd #ab-1; #k-23; #-4; cdcd\nx#a-9;\n"
 
@@ -45,9 +46,7 @@ def main():
             argvs.append([tconv, "--plan", "--rules-file=" + rules])
             argvs.append([tconv, "--rules-file=" + rules, text])
             argvs.append([tconv, "--disable-engine-search-replace", "--rules-file=" + rules, text])
-        # The runs of tconv, three at a time.
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            runs = list(pool.map(lambda argv: subprocess.run(argv, capture_output=True), argvs))
+        runs = [subprocess.run(argv, capture_output=True) for argv in argvs]
         for i, (rule, pattern, replacement) in enumerate(CASES):
             plan, engine, kernels = runs[3 * i: 3 * i + 3]
             want = re.sub(pattern, replacement, TEXT)

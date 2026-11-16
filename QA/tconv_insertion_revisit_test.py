@@ -13,12 +13,14 @@
 #  either not implementable (exit status 2) or as ICU applies them.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_insertion_revisit_test.py <tconv binary>
+#  tconv_insertion_revisit_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("$c = [bcdfg] ;\n"
          "x → X ;\n"

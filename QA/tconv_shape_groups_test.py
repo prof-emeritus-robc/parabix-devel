@@ -12,7 +12,7 @@
 #  or else with tconv's regular plan (--apply-shape-groups=0); and so is tconv
 #  --apply-shape-groups (the default), which applies the same passes itself.  (Skipped without the CLDR transforms.)
 #
-#  tconv_shape_groups_test.py <tconv binary> <icgrep binary>
+#  tconv_shape_groups_test.py <tconv binary> <icgrep binary> [--extended-testing]
 
 import os
 import re
@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+
+from tconv_test_mode import EXTENDED
 
 TRANSFORM = "NumericPinyin-Latin"
 

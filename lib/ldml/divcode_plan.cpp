@@ -225,7 +225,10 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     };
 
     //  A context, its items classified (the alphabet completed later).
-    auto classify = [&](RE * re, RE * engineBefore, bool before, DivContext & context) {
+    //  (converted: whether the before context is matched against the converted
+    //  text, in rounds; allowed only for single-character rules, phase 1.)
+    auto classify = [&](RE * re, RE * engineBefore, bool before, DivContext & context, bool * converted = nullptr,
+                        bool single = false) {
         std::vector<std::pair<UCD::UnicodeSet, bool>> items;
         std::string why;
         if (!contextItems(re, sets, items, why)) {
@@ -236,8 +239,14 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         if (before) {
             if (!options.convertedBefore) {
                 problem("before contexts (no check of the converted text)");
-            } else if (options.convertedBefore(step, engineBefore)) {
-                problem("before contexts matched against the converted text");
+            } else if (options.convertedBefore(step, engineBefore) && options.convertedRounds > 0) {
+                if (!single) {
+                    problem("string rules with before contexts matched against the converted text");
+                } else if (items.size() > 1) {
+                    problem("before contexts of two or more items matched against the converted text");
+                } else if (converted) {
+                    *converted = true;
+                }
             }
             //  (From the item next to the text outward.)
             std::reverse(items.begin(), items.end());
@@ -268,6 +277,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         std::vector<UCD::UnicodeSet> text;
         std::u32string result;
         DivContext before, after;
+        bool converted = false;
         const ConversionRule * rule = nullptr;
         int stringRule = -1, subgroup = -1;
     };
@@ -307,12 +317,15 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         classify(sr.after, nullptr, false, src.after);
         sources.push_back(std::move(src));
     }
+    std::vector<bool> subgroupConverted;
     for (size_t g = 0; g < step.subgroups.size(); g++) {
         const CharMapSubgroup & sg = step.subgroups[g];
         DivContext before, after;
-        classify(sg.before, sg.engineBefore, true, before);
+        bool converted = false;
+        classify(sg.before, sg.engineBefore, true, before, &converted, true);
         classify(sg.after, nullptr, false, after);
         plan.subgroupContexts.emplace_back(before, after);
+        subgroupConverted.push_back(converted);
         for (const CharMapping & m : sg.mappings) {
             const UCD::UnicodeSet chars = m.chars - UCD::UnicodeSet(StringRuleDeleted);
             if (chars.empty()) continue;
@@ -322,6 +335,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             src.result = m.replacement;
             src.before = before;
             src.after = after;
+            src.converted = converted;
             src.subgroup = static_cast<int>(g);
             sources.push_back(std::move(src));
         }
@@ -358,7 +372,13 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             earlier = &step.subgroupPriority[src.subgroup];
         }
         if (earlier) {
-            for (const ConversionRule * e : *earlier) yields[i].push_back(earlierOf(e));
+            for (const ConversionRule * e : *earlier) {
+                yields[i].push_back(earlierOf(e));
+                const DivEarlier & d = yields[i].back();
+                if (d.subgroup >= 0 && subgroupConverted[d.subgroup]) {
+                    problem("rules yielding to rules with before contexts matched against the converted text");
+                }
+            }
         }
     }
 
@@ -406,6 +426,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             d.after = src.after;
             d.yieldsTo = yields[i];
             d.stage = src.stringRule >= 0 ? stageOf[src.stringRule] : 0;
+            d.converted = src.converted;
+            if (d.converted) plan.convertedRules++;
             rules.push_back(std::move(d));
         }
     }
@@ -440,7 +462,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     }
     for (const DivRule & d : plan.rules) {
         content += ";r" + std::to_string(d.stringRule) + "," + std::to_string(d.subgroup) + "," + std::to_string(d.anchor) + "@"
-                   + std::to_string(d.stage) + ":";
+                   + std::to_string(d.stage) + (d.converted ? "c" : "") + ":";
         for (const UCD::UnicodeSet & t : d.text) appendSet(content, t);
         content += ">";
         for (char32_t c : d.result) content += hex(c) + ",";
@@ -451,6 +473,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             appendSet(content, e.chars);
         }
     }
+    plan.rounds = plan.convertedRules > 0 ? options.convertedRounds : 0;
+    content += ";rounds" + std::to_string(plan.rounds);
     plan.contentHash = hex(fnv1a(content), 16);
 
     for (const auto & p : problems) {

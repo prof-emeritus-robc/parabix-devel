@@ -10835,7 +10835,35 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
                       << ", \"eligible\": " << (p32.eligible() ? "true" : "false")
                       << ", \"eligible64\": " << (p64.eligible() ? "true" : "false")
                       << ", \"problems\": [" << problems << "]"
-                      << ", \"div32\": " << divCodeShiftReport(p32) << ", \"div64\": " << divCodeShiftReport(p64) << "}\n";
+                      << ", \"div32\": " << divCodeShiftReport(p32) << ", \"div64\": " << divCodeShiftReport(p64)
+                      << ", \"converted\": " << [&]() {
+                          //  The rules whose before contexts are matched against the
+                          //  converted text (see convertedContextMatters), and what the
+                          //  group's conversions do.
+                          size_t strings = 0, stringsExpanding = 0, subgroups = 0, singles = 0, items = 0;
+                          for (const ldml::StringRule & sr : step.stringRules) {
+                              if (sr.engineBefore && convertedBeforeContext(step, sr.engineBefore)) {
+                                  strings++;
+                                  if (sr.replacement.size() > sr.text.size()) stringsExpanding++;
+                              }
+                          }
+                          for (const ldml::CharMapSubgroup & g : step.subgroups) {
+                              if (g.engineBefore && convertedBeforeContext(step, g.engineBefore)) {
+                                  subgroups++;
+                                  singles += g.mappings.size();
+                              }
+                          }
+                          bool deletes = false, expands = false;
+                          for (const ConversionOutcome & o : conversionOutcomes(step)) {
+                              deletes |= o.length() == 0;
+                              expands |= o.length() > 1;
+                          }
+                          (void)items;
+                          return "{\"string_rules\": " + std::to_string(strings) + ", \"string_rules_expanding\": "
+                                 + std::to_string(stringsExpanding) + ", \"subgroups\": " + std::to_string(subgroups)
+                                 + ", \"mappings\": " + std::to_string(singles) + ", \"group_deletes\": " + (deletes ? "true" : "false")
+                                 + ", \"group_expands\": " + (expands ? "true" : "false") + "}";
+                      }() << "}\n";
     }
     return 0;
 }

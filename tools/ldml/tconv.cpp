@@ -11428,6 +11428,23 @@ static std::vector<const ldml::DivContext *> divCodeAfterContexts(const ldml::Di
     return contexts;
 }
 
+//  For each after context of a plan (see divCodeAfterContexts), its index among
+//  the contexts of several items (SIZE_MAX for a context of one item): those
+//  the Items kernel chains on the text before it is spread.  A context of one
+//  item is tested directly where it is read, in the spread text too.
+static std::vector<size_t> divCodeChainedIndex(const ldml::DivCodePlan & plan) {
+    std::vector<size_t> index;
+    size_t n = 0;
+    for (const ldml::DivContext * c : divCodeAfterContexts(plan)) index.push_back(c->items.size() > 1 ? n++ : SIZE_MAX);
+    return index;
+}
+
+static size_t divCodeChainedCount(const ldml::DivCodePlan & plan) {
+    size_t n = 0;
+    for (const ldml::DivContext * c : divCodeAfterContexts(plan)) if (c->items.size() > 1) n++;
+    return n;
+}
+
 class DivCodeItems final : public PabloKernel {
 public:
     DivCodeItems(LLVMTypeSystemInterface & ts, const ldml::DivCodePlan & plan, const std::string & label,
@@ -11795,12 +11812,16 @@ void DivCodeTranslate::generatePabloMethod() {
     std::vector<size_t> ruleItem, subgroupItem;
     divCodeAfterContexts(plan, &ruleItem, &subgroupItem);
     const std::vector<PabloAST *> items = mHasItems ? getInputStreamSet("Items") : std::vector<PabloAST *>{};
+    const std::vector<size_t> chained = divCodeChainedIndex(plan);
     auto itemTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, size_t index) -> PabloAST * {
         //  (A context of several items: whether it holds, from the Items kernel.)
-        if (context.items.size() > 1) return t.at(items[index], offset);
+        if (context.items.size() > 1) return t.at(items[chained[index]], offset);
         const ldml::DivContextItem & item = context.items[0];
-        //  (One item: its positive test, from the Items kernel.)
-        PabloAST * x = t.at(items[index], offset);
+        //  (One item: its positive test, on the pseudo-basis of the character at
+        //  the offset (of a length its first unit gives), within the text.)
+        PabloAST * x = item.kind == ldml::DivContextItem::Kind::External ? t.at(ext[item.external], offset)
+                                                                          : t.pseudo(offset, plan.pseudoTest(item.set), 0);
+        x = t.b.createAnd(x, t.at(inText, offset));
         x = item.negated ? t.b.createNot(x) : x;
         //  (The end of a filtered run: a position of the text outside the mask.)
         if (item.runEnd && mask) x = t.b.createOr(x, t.b.createAnd(t.at(inText, offset), t.b.createNot(t.at(mask, offset))));
@@ -11904,9 +11925,12 @@ void DivCodeTranslate::generatePabloMethod() {
         //  The matches of rules at their anchors, before their priorities and
         //  covers: of the rules of the pass, and of the earlier rules they yield
         //  to (of any pass), computed as needed.
-        std::map<size_t, PabloAST *> raw;
-        auto rawOf = [&](size_t r) -> PabloAST * {
-            auto f = raw.find(r);
+        //  (own: the match of the rule itself, which in the spread text requires
+        //  exactly its own gap, so its after item is at the exact offset past
+        //  it; otherwise, as an earlier rule another yields to, past any gap.)
+        std::map<std::pair<size_t, bool>, PabloAST *> raw;
+        auto rawOf = [&](size_t r, bool own = false) -> PabloAST * {
+            auto f = raw.find({r, own});
             if (f != raw.end()) return f->second;
             const ldml::DivRule & d = plan.rules[r];
             const Units & u = mUnits[r];
@@ -11915,20 +11939,23 @@ void DivCodeTranslate::generatePabloMethod() {
                 M = b.createAnd(M, t.pseudo(u.offset[i], plan.pseudoSet(d.text[i]), u.length[i]));
             }
             if (mask) for (unsigned o : u.offset) M = b.createAnd(M, t.at(mask, o));
-            if (d.after.present()) M = b.createAnd(M, afterItem(d.after, u.N, ruleItem[r]));
+            if (d.after.present()) {
+                M = b.createAnd(M, own && mHasSpread ? itemTest(t, d.after, u.N + u.expansion(), ruleItem[r])
+                                                     : afterItem(d.after, u.N, ruleItem[r]));
+            }
             if (round > 0 && d.converted) {
                 M = b.createAnd(M, convertedBefore[convertedItem(d.before.items[0])]);
             } else if (PabloAST * bf = beforeOf(d.before)) {
                 M = b.createAnd(M, bf);
             }
-            raw.emplace(r, M);
+            raw.emplace(std::make_pair(r, own), M);
             return M;
         };
         for (size_t r : rules) {
             if (!needed(r)) continue;
             if (round == 0 ? passOf(r) != pass : !plan.rules[r].converted) continue;
             const ldml::DivRule & d = plan.rules[r];
-            PabloAST * M = rawOf(r);
+            PabloAST * M = rawOf(r, true);
             //  The earlier rules it yields to, matching at its anchor.
             PabloAST * earlier = nullptr;
             for (const ldml::DivEarlier & e : d.yieldsTo) {
@@ -12219,9 +12246,9 @@ void DivCodeItems::generatePabloMethod() {
         return pb.createAnd(x, rest);
     };
     std::vector<PabloAST *> out;
+    //  (Only the contexts of several items: see divCodeChainedIndex.)
     for (const ldml::DivContext * c : divCodeAfterContexts(plan)) {
-        //  (One item: its positive test.)
-        out.push_back(pb.createInFile(c->items.size() == 1 ? test(c->items[0], 0) : chain(*c, 0, 0)));
+        if (c->items.size() > 1) out.push_back(pb.createInFile(chain(*c, 0, 0)));
     }
     writeOutputStreamSet("Items", out);
 }
@@ -12229,7 +12256,7 @@ void DivCodeItems::generatePabloMethod() {
 //  The after contexts of a plan (see DivCodeItems), or nullptr if none.
 static StreamSet * DivCodeItemsOf(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label, StreamSet * Basis,
                                   StreamSet * Code, StreamSet * Externals, StreamSet * InText, StreamSet * Mask) {
-    const size_t n = divCodeAfterContexts(plan).size();
+    const size_t n = divCodeChainedCount(plan);
     if (n == 0) return nullptr;
     StreamSet * const Items = P.CreateStreamSet(n);
     P.CreateKernelCall<DivCodeItems>(plan, label, Basis, Code, Externals, InText, Mask, Items);

@@ -3,7 +3,7 @@
 #  SPDX-License-Identifier: OSL-3.0
 #
 #  Smoke test of the Div32Code / Div64Code kernels (doc/ldml-divcode-plan.md):
-#  tconv --divcode-codes=G replaces each character by U+4000 | (the external
+#  tconv --divcode-codes=G replaces each character by U+10000 | (the external
 #  classes it is in << 10) | its code in the alphabet of conversion group G,
 #  and describes the alphabet (shift, blocks, external sets) on the standard
 #  error.  For conversion groups with small and large alphabets (up to 9 code
@@ -25,7 +25,8 @@
 #    filters, expansions (positions inserted after the matches, counted by
 #    the Count kernel; before contexts through them), one-way overlaps of
 #    string rules (stages: no match within an applied match of an earlier stage),
-#    and contexts of two or more items.
+#    contexts of two or more items, and before contexts matched against the
+#    converted text (rounds).
 #  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
@@ -84,6 +85,13 @@ TRANSLATE = [
     ("my-my_Latn", 2), ("Telugu-InterIndic", 1), ("am_FONIPA-am", 8), ("cs_FONIPA-ja", 2), ("es_FONIPA-am", 2),
     ("es_FONIPA-zh", 3), ("my-my_FONIPA", 5), ("ru-ja", 2), ("ru-zh", 2), ("si-si_FONIPA", 8),
     ("sk_FONIPA-ja", 2), ("tlh-tlh_FONIPA", 1), ("Latn-Ethi/ALALOC", 1),
+    # with single-character rules whose before contexts ICU matches against the
+    # converted text (rounds)
+    ("Ethi-Latn/SERA", 1), ("Ethi-Cyrl/Gutgarts", 1), ("Ethi-Latn/ALALOC", 2), ("InterIndic-Latin", 1),
+    ("ko-ko_Latn/BGN", 1), ("Arab-Latn", 1), ("Latn-Arab", 2), ("ar-ar_Latn/BGN", 1), ("fa-fa_Latn/BGN", 1),
+    ("sat_Olck-sat_FONIPA", 4), ("ru_Latn-ru/BGN", 1), ("hy-hy_Latn/BGN", 3), ("uz_Cyrl-uz/BGN", 1),
+    ("uz_Latn-uz_Cyrl", 1), ("InterIndic-Arabic", 1), ("sk-sk_FONIPA", 1), ("Laoo-Latn/UNGEGN", 1),
+    ("blt-blt_FONIPA", 6), ("hy-hy_FONIPA", 1), ("es_FONIPA-am", 1), ("my-my_FONIPA", 6),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -146,11 +154,21 @@ RULES = {
     "ctx2-utf8": "中 文 { ab > 字字 ; ab } é [^ü] > EF ;",
     "ctx2-property": "[:Han:] x { yz > YZ ; yz } [:Greek:] [:Greek:] > ZY ;",
     "ctx2-stages": "x { abc > 123 ; bc } d e > 45 ;",
+    # before contexts matched against the converted text (the string rule pq
+    # makes the groups DivCode groups): deletions looked through, chains,
+    # the last character of a longer replacement, multibyte characters
+    "conv-deletion": "pq > Q ; x > ; [^a] { b > B ;",
+    "conv-string-deletion": "pq > ; [^a] { b > B ;",
+    "conv-chain": "pq > Q ; a { b > a ; a { c > C ;",
+    "conv-longer": "pq > Q ; c > xyz ; [z] { d > D ;",
+    "conv-string-longer": "pq > QQQ ; [Q] { d > D ;",
+    "conv-utf8": "pq > Q ; c > é中 ; [中] { d > Ω ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
 #  (A narrower alphabet for the contexts of several items, which random text
 #  over the full one rarely matches.)
 CTX_ALPHABET = "abcdefgxyz中文éüΩΑ \n"
+CONV_ALPHABET = "abcdpqxzQ中é \n"
 TRACE = ["-enable-object-cache", "-trace-object-cache"]
 
 
@@ -172,7 +190,11 @@ def translation(tconv, tmp, salt):
             with open(path, "w", encoding="utf-8") as f:
                 f.write("a\n")
             r = run(tconv, ["--divcode-codes=%d" % group, "--divcode-shift=%d" % shift, name, path])
-            desc = json.loads(r.stderr.decode("utf-8").splitlines()[0])
+            try:
+                desc = json.loads(r.stderr.decode("utf-8").splitlines()[0])
+            except (ValueError, IndexError):
+                # (No dump of the alphabet: random text of others only.)
+                desc = {"samples": [], "blocks": [], "context_chars": ""}
             pieces = list(desc["samples"]) or ["a"]
             singles = [chr((b << shift) | rnd.randrange(1 << shift)) for b in desc["blocks"] for _ in range(3)]
             singles = [c for c in singles if not 0xD800 <= ord(c) <= 0xDFFF]
@@ -222,7 +244,8 @@ def translation(tconv, tmp, salt):
             print("FAIL rules %s: not eligible: %s" % (case, [g["problems"] for g in groups]))
             continue
         with open(path, "w", encoding="utf-8") as f:
-            f.write("".join(rnd.choice(CTX_ALPHABET if case.startswith("ctx") else RULES_ALPHABET) for _ in range(20000)))
+            alphabet = CTX_ALPHABET if case.startswith("ctx") else CONV_ALPHABET if case.startswith("conv") else RULES_ALPHABET
+            f.write("".join(rnd.choice(alphabet) for _ in range(20000)))
         common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--rules-file=" + rules_path]
         regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", "--utf8-mode=0", path])
         icu = run(tconv, common + ["--use-ICU=.*", path])
@@ -311,11 +334,11 @@ def main():
                     for k, e in enumerate(externals):
                         if any(lo <= cp <= hi for lo, hi in e):
                             ext |= 1 << k
-                    expected = 0x4000 | (ext << 10) | code
+                    expected = 0x10000 | (ext << 10) | code
                     if ord(d) != expected:
                         if bad < 5:
                             print("FAIL %s#%d s=%d: U+%04X at %d: code %d, externals %d; expected %d, %d"
-                                  % (name, group, shift, cp, i, (ord(d) - 0x4000) & 0x3FF, (ord(d) - 0x4000) >> 10, code, ext))
+                                  % (name, group, shift, cp, i, (ord(d) - 0x10000) & 0x3FF, (ord(d) - 0x10000) >> 10, code, ext))
                         bad += 1
                 if bad:
                     failures += 1

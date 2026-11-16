@@ -212,7 +212,7 @@ static cl::opt<bool> DisableEngineSearchReplace("disable-engine-search-replace",
                                                          "expression engine (see engineSearchReplace)"),
                                                 cl::init(false), cl::cat(TconvOptions));
 static cl::opt<unsigned> DivCodeCodes("divcode-codes",
-    cl::desc("Smoke test of the Div32Code/Div64Code kernels: replace each character of the input by U+4000 | (its external "
+    cl::desc("Smoke test of the Div32Code/Div64Code kernels: replace each character of the input by U+10000 | (its external "
              "classes << 10) | its code, in the alphabet of the given conversion group (numbered from 1, as by "
              "--divcode-report) of the transform's own rules; the alphabet is described on the standard error"),
     cl::init(0), cl::cat(TconvOptions), cl::Hidden);
@@ -2854,11 +2854,9 @@ static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * en
     return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
 }
 
-//  Whether the DivCode kernels apply a plan: an eligible one, without rules
-//  matched in rounds against the converted text (the kernels do not yet run
-//  the rounds).
+//  Whether the DivCode kernels apply a plan (an eligible one).
 static bool divCodeApplies(const ldml::DivCodePlan & plan) {
-    return plan.eligible() && plan.convertedRules == 0;
+    return plan.eligible();
 }
 
 //  The notes of tconv --plan on the before contexts of a conversion group that
@@ -11493,7 +11491,10 @@ public:
     , mHasMask(Mask != nullptr)
     , mHasSpread(Spread != nullptr)
     , mHasItems(Items != nullptr) {
-        for (const ldml::DivRule & d : plan.rules) mUnits.push_back(unitsOf(d, mUTF8, plan.shift));
+        for (const ldml::DivRule & d : plan.rules) {
+            mUnits.push_back(unitsOf(d, mUTF8, plan.shift));
+            if (d.converted && convertedItem(d.before.items[0]) == SIZE_MAX) mConvertedItems.push_back(d.before.items[0]);
+        }
         //  The lookahead of the inputs: the units of a text and of an after item
         //  (of up to 4 code units) from the anchor, past the gap after the match
         //  in the spread text.
@@ -11573,12 +11574,17 @@ private:
     struct Key {
         unsigned kind;      // 0: bits above the low ones (value), 1: a bit (value), 2: deleted,
                             // 3: string matches of N units (value) of a stage (offset),
-                            // 4: matches inserting value positions after the offset (Count)
+                            // 4: matches inserting value positions after the offset (Count),
+                            // 5: matches whose result's last character, in the set of the converted item
+                            //    (value), ends at the offset, 6: matches extending over value units
         unsigned offset;
         bool single;
         unsigned value;
+        //  The round of the matches of a converted rule, plus 1 (see
+        //  ldml::DivRule::converted); 0 for the other rules.
+        unsigned round = 0;
         bool operator<(const Key & o) const {
-            return std::tie(kind, offset, single, value) < std::tie(o.kind, o.offset, o.single, o.value);
+            return std::tie(kind, offset, single, value, round) < std::tie(o.kind, o.offset, o.single, o.value, o.round);
         }
     };
     //  The changes of a rule: for each, its key and, for a bit changed where the
@@ -11587,11 +11593,22 @@ private:
         Key key;
         int flip = -1;      // -1: where the rule matches; 0/1: where the text bit (key.value) at the offset is 0/1
     };
-    std::vector<Change> changesOf(size_t r) const;
+    std::vector<Change> changesOf(size_t r, unsigned round = 0) const;
+    std::vector<Change> changesOfRound(size_t r) const;
     //  The rules matched: in Count mode, those expanding, and the string rules
-    //  (whose matches cover the single-character rules within them).
+    //  (whose matches cover the single-character rules within them); all, with
+    //  rounds of converted rules (their converted text depends on all).
     bool needed(size_t r) const {
-        return mMode == Mode::Translate || mUnits[r].expansion() > 0 || mPlan.rules[r].length() > 1;
+        return mMode == Mode::Translate || mPlan.rounds > 0 || mUnits[r].expansion() > 0 || mPlan.rules[r].length() > 1;
+    }
+    //  The distinct items of the before contexts of the converted rules.
+    std::vector<ldml::DivContextItem> mConvertedItems;
+    size_t convertedItem(const ldml::DivContextItem & item) const {
+        for (size_t i = 0; i < mConvertedItems.size(); i++) {
+            const ldml::DivContextItem & c = mConvertedItems[i];
+            if (c.kind == item.kind && c.set == item.set && c.negated == item.negated && c.runEnd == item.runEnd && c.external == item.external) return i;
+        }
+        return SIZE_MAX;
     }
     const ldml::DivCodePlan mPlan;
     const Mode mMode;
@@ -11603,7 +11620,15 @@ private:
     std::vector<Units> mUnits;
 };
 
-std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) const {
+std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r, unsigned round) const {
+    const ldml::DivRule & d = mPlan.rules[r];
+    std::vector<Change> changes = changesOfRound(r);
+    const unsigned tag = d.converted ? round + 1 : 0;
+    for (Change & c : changes) c.key.round = tag;
+    return changes;
+}
+
+std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOfRound(size_t r) const {
     const ldml::DivRule & d = mPlan.rules[r];
     const Units & u = unitsOf(d, mUTF8, mPlan.shift);
     const unsigned s = mPlan.shift, W = mUTF8 ? 8 : 21;
@@ -11615,6 +11640,24 @@ std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) cons
     //  stages before it, which no later pass assigns, as the builder may reuse
     //  an expression over the same Vars computed before a pass assigned them.)
     const unsigned stage = std::max(d.stage, 1u);
+    //  With converted rules: what the converted text before a position needs of
+    //  every match (see the rounds in generatePabloMethod): where its result's
+    //  last character ends (in the spread text, after M units; before the text
+    //  is spread, after min(N, M)), in the set of which converted items, and how
+    //  far the match extends.
+    if (mPlan.rounds > 0) {
+        const bool spread = mMode == Mode::Translate && mHasSpread;
+        if (M > 0) {
+            const unsigned end = spread ? M : std::min(N, M);
+            for (size_t i = 0; i < mConvertedItems.size(); i++) {
+                if (mConvertedItems[i].set.contains(d.result.back())) changes.push_back(Change{Key{5, end, single, static_cast<unsigned>(i)}});
+            }
+        }
+        changes.push_back(Change{Key{6, 0, single, spread ? std::max(N, M) : N}});
+        if (mMode == Mode::Count) {
+            for (unsigned j = M; j < N; j++) changes.push_back(Change{Key{2, j, single, 0}});
+        }
+    }
     if (mMode == Mode::Count) {
         if (M > N) changes.push_back(Change{Key{4, N - 1, single, M - N}});
         if (!single) changes.push_back(Change{Key{3, stage, false, N}});
@@ -11814,9 +11857,11 @@ void DivCodeTranslate::generatePabloMethod() {
     std::map<Key, Var *> vars;
     for (size_t r = 0; r < plan.rules.size(); r++) {
         if (!needed(r)) continue;
-        for (const Change & c : changesOf(r)) {
-            if (vars.count(c.key)) continue;
-            vars.emplace(c.key, pb.createVar("chg" + std::to_string(vars.size()), zeroes));
+        for (unsigned round = 0; round <= (plan.rules[r].converted ? plan.rounds : 0); round++) {
+            for (const Change & c : changesOf(r, round)) {
+                if (vars.count(c.key)) continue;
+                vars.emplace(c.key, pb.createVar("chg" + std::to_string(vars.size()), zeroes));
+            }
         }
     }
 
@@ -11828,7 +11873,11 @@ void DivCodeTranslate::generatePabloMethod() {
     for (size_t r = 0; r < plan.rules.size(); r++) passes = std::max(passes, passOf(r));
     //  A leaf: the rules of a pass anchored at code A, each applying only outside
     //  the applied string matches of the passes before (cover, if any).
-    auto leaf = [&](PabloBuilder & b, unsigned A, PabloAST * leafCond, unsigned pass, PabloAST * cover) {
+    //  (round: 0 for the passes of the stages; from 1, a round of the converted
+    //  rules, whose before contexts are then the items of the converted text,
+    //  convertedBefore.)
+    std::vector<PabloAST *> convertedBefore;
+    auto leaf = [&](PabloBuilder & b, unsigned A, PabloAST * leafCond, unsigned pass, PabloAST * cover, unsigned round) {
         Tests t{b, U, code, s, k, mUTF8};
         //  In the spread text: the gap positions at an offset, the gaps of
         //  exactly g positions from an offset, and an after item at the first
@@ -11867,12 +11916,17 @@ void DivCodeTranslate::generatePabloMethod() {
             }
             if (mask) for (unsigned o : u.offset) M = b.createAnd(M, t.at(mask, o));
             if (d.after.present()) M = b.createAnd(M, afterItem(d.after, u.N, ruleItem[r]));
-            if (PabloAST * bf = beforeOf(d.before)) M = b.createAnd(M, bf);
+            if (round > 0 && d.converted) {
+                M = b.createAnd(M, convertedBefore[convertedItem(d.before.items[0])]);
+            } else if (PabloAST * bf = beforeOf(d.before)) {
+                M = b.createAnd(M, bf);
+            }
             raw.emplace(r, M);
             return M;
         };
         for (size_t r : rules) {
-            if (!needed(r) || passOf(r) != pass) continue;
+            if (!needed(r)) continue;
+            if (round == 0 ? passOf(r) != pass : !plan.rules[r].converted) continue;
             const ldml::DivRule & d = plan.rules[r];
             PabloAST * M = rawOf(r);
             //  The earlier rules it yields to, matching at its anchor.
@@ -11902,7 +11956,7 @@ void DivCodeTranslate::generatePabloMethod() {
             //  found it to: with exactly its expansion inserted after it (none,
             //  if it does not expand).
             if (mHasSpread) M = b.createAnd(M, gapOf(mUnits[r].N, mUnits[r].expansion()));
-            for (const Change & c : changesOf(r)) {
+            for (const Change & c : changesOf(r, round)) {
                 Var * const v = vars.at(c.key);
                 PabloAST * x = M;
                 if (c.flip >= 0) {
@@ -11917,17 +11971,19 @@ void DivCodeTranslate::generatePabloMethod() {
     //  The If-hierarchy on the code bits, from the highest: a subtree of the
     //  codes with the bits above 'bit' given (prefix), entered where a code of
     //  it with rules (other than 0) is.
-    unsigned pass = 1;
+    unsigned pass = 1, round = 0;
     PabloAST * cover = nullptr;
     auto hasRules = [&](unsigned lo, unsigned hi) {
         for (unsigned c = std::max(lo, 1u); c <= std::min<unsigned>(hi, plan.blocks.size()); c++) {
-            for (size_t r : plan.leaves[c - 1]) if (needed(r) && passOf(r) == pass) return true;
+            for (size_t r : plan.leaves[c - 1]) {
+                if (needed(r) && (round == 0 ? passOf(r) == pass : plan.rules[r].converted)) return true;
+            }
         }
         return false;
     };
     std::function<void (PabloBuilder &, int, unsigned, PabloAST *)> subtree = [&](PabloBuilder & b, int bit, unsigned prefix, PabloAST * cond) {
         if (bit < 0) {
-            leaf(b, prefix, cond, pass, cover);
+            leaf(b, prefix, cond, pass, cover, round);
             return;
         }
         for (unsigned v : {1u, 0u}) {
@@ -11972,11 +12028,68 @@ void DivCodeTranslate::generatePabloMethod() {
     //  single-character rules outside the matches of the string rules.
     PabloAST * const covered = coverBefore(passes + 1);
     PabloAST * const uncovered = pb.createNot(covered);
+
+    //  The rounds of the converted rules (see ldml::DivRule::converted): each
+    //  matches their before contexts against the converted text of the matches
+    //  of the round before (tag: that round, plus 1; the other rules, 0), and
+    //  their matches replace those of the round before.  The item of a converted
+    //  context holds where the last converted character before a position is
+    //  in its set: the last character of an applied match's result ending there,
+    //  or a character of the text that no applied match replaces, before it, in
+    //  either case through the units deleted after it.
+    auto atTag = [&](unsigned kind, unsigned tag, const std::function<bool (const Key &)> & which,
+                     const std::function<unsigned (const Key &)> & offsetOf) {
+        PabloAST * x = zeroes;
+        for (const auto & v : vars) {
+            const Key & key = v.first;
+            if (key.kind != kind || (key.round != 0 && key.round != tag) || !which(key)) continue;
+            PabloAST * y = key.single ? pb.createAnd(v.second, uncovered) : v.second;
+            const unsigned o = offsetOf(key);
+            x = pb.createOr(x, o ? pb.createAdvance(y, o) : y);
+        }
+        return x;
+    };
+    auto nextPlain = [&](PabloAST * x) {
+        x = pb.createAnd(x, starts);
+        PabloAST * moved = nullptr;
+        for (unsigned l = 1; l <= maxLen; l++) {
+            PabloAST * const y = pb.createAdvance(mUTF8 ? pb.createAnd(x, top.lengthAt(0, l)) : x, l);
+            moved = moved ? pb.createOr(moved, y) : y;
+        }
+        return moved;
+    };
+    for (round = 1; round <= plan.rounds; round++) {
+        const unsigned tag = round;     // (the matches of round - 1)
+        PabloAST * within = zeroes;
+        for (const auto & v : vars) {
+            const Key & key = v.first;
+            if (key.kind != 6 || (key.round != 0 && key.round != tag)) continue;
+            PabloAST * const y = key.single ? pb.createAnd(v.second, uncovered) : v.second;
+            for (unsigned j = 0; j < key.value; j++) within = pb.createOr(within, j ? pb.createAdvance(y, j) : y);
+        }
+        PabloAST * const deletedUnits = atTag(2, tag, [](const Key &) {return true;}, [](const Key & key) {return key.offset;});
+        convertedBefore.clear();
+        for (size_t i = 0; i < mConvertedItems.size(); i++) {
+            const ldml::DivContextItem & item = mConvertedItems[i];
+            PabloAST * const ends = atTag(5, tag, [&](const Key & key) {return key.value == i;}, [](const Key & key) {return key.offset;});
+            PabloAST * const kept = pb.createAnd(testAt(item), pb.createNot(within));
+            PabloAST * x = pb.createMatchStar(pb.createOr(nextPlain(kept), ends), deletedUnits);
+            if (item.negated) x = pb.createNot(x);
+            if (item.runEnd && mask) x = pb.createOr(x, next(pb.createNot(mask)));
+            convertedBefore.push_back(x);
+        }
+        pass = 1;
+        cover = nullptr;
+        subtree(pb, static_cast<int>(k) - 1, 0, nullptr);
+    }
+    //  (The changes of the converted rules: those of the last round.)
+    const unsigned lastTag = plan.rounds + 1;
+    auto output = [&](const Key & key) {return key.round == 0 || key.round == lastTag;};
     if (mMode == Mode::Count) {
         //  The insertion counts, at the last positions of the matches.
         std::vector<PabloAST *> count(getOutputStreamSet(0)->getNumElements(), zeroes);
         for (const auto & v : vars) {
-            if (v.first.kind != 4) continue;
+            if (v.first.kind != 4 || !output(v.first)) continue;
             PabloAST * x = v.first.single ? pb.createAnd(v.second, uncovered) : v.second;
             if (v.first.offset) x = pb.createAdvance(x, v.first.offset);
             for (unsigned j = 0; j < count.size(); j++) {
@@ -11994,7 +12107,7 @@ void DivCodeTranslate::generatePabloMethod() {
         std::map<unsigned, PabloAST *> deletedAt;
         for (const auto & v : vars) {
             const Key & key = v.first;
-            if (key.single != single || key.kind == 3) continue;
+            if (key.single != single || key.kind == 3 || key.kind == 5 || key.kind == 6 || !output(key)) continue;
             if (key.kind == 2) {
                 deletedAt[key.offset] = deletedAt.count(key.offset) ? pb.createOr(deletedAt[key.offset], v.second) : v.second;
                 continue;
@@ -12192,8 +12305,8 @@ StreamSet * RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, St
 }
 
 //  For the smoke test (--divcode-codes): each character replaced by the
-//  codepoint 0x4000 | (externals << 10) | code, its code (of at most 10 bits)
-//  and the bits of the external classes (at most 4) it is in.
+//  codepoint 0x10000 | (externals << 10) | code, its code (of at most 10 bits)
+//  and the bits of the external classes (at most 6) it is in.
 class DivCodeDumpKernel final : public PabloKernel {
 public:
     DivCodeDumpKernel(LLVMTypeSystemInterface & ts, StreamSet * Code, StreamSet * Externals, StreamSet * U21)
@@ -12212,8 +12325,8 @@ protected:
         for (unsigned b = 0; b < 21; b++) {
             PabloAST * v = pb.createZeroes();
             if (b < code.size() && b < 10) v = code[b];
-            if (b >= 10 && b < 14 && b - 10 < ext.size()) v = ext[b - 10];
-            if (b == 14) v = all;
+            if (b >= 10 && b < 16 && b - 10 < ext.size()) v = ext[b - 10];
+            if (b == 16) v = all;
             pb.createAssign(pb.createExtract(getOutput(0), pb.getInteger(b)), pb.createAnd(v, all));
         }
     }
@@ -12238,9 +12351,9 @@ static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::Tr
     options.convertedBefore = convertedBeforeContext;
     options.convertedRounds = ConvertedContextRounds;
     const ldml::DivCodePlan plan = ldml::planDivCodeGroup(*step, options);
-    if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 4) {
+    if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 6) {
         llvm::errs() << "Error: the alphabet of group " << DivCodeCodes << " has " << plan.blocks.size() << " blocks and "
-                     << plan.externalSets.size() << " external sets (1 to 1023 blocks and at most 4 external sets are dumped)\n";
+                     << plan.externalSets.size() << " external sets (1 to 1023 blocks and at most 6 external sets are dumped)\n";
         return 1;
     }
     //  The alphabet, for the test: shift, blocks, the ranges of the external sets.

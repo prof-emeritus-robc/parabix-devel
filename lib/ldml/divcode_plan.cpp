@@ -246,7 +246,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         plan.problems.push_back("not a conversion group");
         return plan;
     }
-    if (step.stringRules.empty()) problem("no string rules");
+    //  (A group without string rules: only with converted rules, see below.)
     if (!step.captureReplacements.empty()) problem("rules with captures");
     if (!step.insertions.empty()) problem("insertion rules");
     if (!step.deferred.empty()) problem("deferred rules");
@@ -999,6 +999,11 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     }
     plan.contentHash = hex(fnv1a(content), 16);
     classifyConverted(plan);
+    //  A group without string rules is applied by DivCode only for its rules
+    //  with before contexts matched against the converted text, which the
+    //  Converted kernel resolves instead of rounds (doc/ldml-divcode-plan.md
+    //  §12); otherwise its present plan applies it.
+    if (step.stringRules.empty() && !plan.dependent()) problem("no string rules");
 
     for (const auto & p : problems) {
         plan.problems.push_back(p.first + (p.second > 1 ? " (" + std::to_string(p.second) + ")" : ""));

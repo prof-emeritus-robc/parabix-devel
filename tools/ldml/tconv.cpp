@@ -7892,7 +7892,9 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
 }
 
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
-    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter && !step.stringRules.empty()) {
+    //  (A group without string rules: eligible only with rules whose before
+    //  contexts are matched against the converted text, see planDivCodeGroup.)
+    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter) {
         ldml::DivCodeOptions options;
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
@@ -10837,12 +10839,14 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) continue;
         group++;
-        if (step.stringRules.empty()) continue;
         ldml::DivCodeOptions options;
         options.convertedBefore = convertedBeforeContext;
         options.convertedRounds = ConvertedContextRounds;
         options.shift = 5;
         const ldml::DivCodePlan p32 = ldml::planDivCodeGroup(step, options);
+        //  (A group without string rules: only with rules whose before contexts
+        //  are matched against the converted text, see planDivCodeGroup.)
+        if (step.stringRules.empty() && !p32.dependent()) continue;
         options.shift = 6;
         const ldml::DivCodePlan p64 = ldml::planDivCodeGroup(step, options);
         std::string problems;

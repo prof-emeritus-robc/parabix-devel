@@ -1367,3 +1367,31 @@ one default case within the time limits), and the groups brought in, in
 `TRANSLATE` (extended). Checks for each step: only the transforms whose
 groups the step brings in, against ICU on their test data and random text
 of their characters.
+
+### Status (2026-11-17)
+
+**Step 1 done.** `planDivCodeGroup` raises "no string rules" only for a group
+without converted rules (`DivCodePlan::dependent`); `conversionGroup` tries
+DivCode for every group; `--divcode-report` lists the groups without string
+rules that have converted rules. The 10 groups of A are eligible and applied;
+the 10 transforms match ICU (the regular plan, DivCode in Unicode and in the
+default mode) on their test data (5 of them) and on random text of their
+characters. Test: `conv-no-strings` (a chain, a deletion looked through), and
+the 10 groups in `TRANSLATE`.
+
+Execution cycles of the whole transform at 4 threads against the regular plan
+(rounds), as in §11 step 6; outputs identical:
+
+| transform | corpus | DivCode Unicode / UTF-8 | 1 thread, s: regular / Unicode / UTF-8 |
+|---|---|--:|--:|
+| InterIndic-Gurmukhi | InterIndic | −21.8% / −53.2% | 0.147 / 0.126 / 0.093 |
+| Ethi-Latn/Beta_Metsehaf | Ethiopic | −31.9% / −31.9% | 0.260 / 0.222 / 0.223 |
+| Ethi-Latn/Lambdin | Ethiopic | −30.5% / −30.6% | 0.258 / 0.220 / 0.220 |
+| Ethi-Latn/IES_JES_1964 | Ethiopic | −29.4% / −29.5% | 0.261 / 0.226 / 0.227 |
+| Ethi-Latn/Aethiopi | Ethiopic | −27.1% / −29.2% | 0.264 / 0.228 / 0.227 |
+| Kana-Hira | Katakana | −6.8% / −24.2% | 0.402 / 0.380 / 0.332 |
+| es-es_FONIPA | Latin | −7.3% / −7.0% | 0.295 / 0.283 / 0.285 |
+| ru-ru_Latn/BGN | Cyrillic | −5.1% / −5.2% | 0.301 / 0.299 / 0.302 |
+| hy-hy_Latn/BGN (with its group 3, also DivCode) | Armenian | −15.0% / −14.8% | 0.377 / 0.341 / 0.341 |
+
+(Han-Latin/Names: no corpus.) All gain; step 2 can proceed.

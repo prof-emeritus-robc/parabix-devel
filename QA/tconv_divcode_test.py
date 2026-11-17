@@ -117,6 +117,11 @@ TRANSLATE = [
     # (with ^ before contexts no longer matched against the converted text, and
     # a family completed: fallbacks 1 and 2)
     ("ro_FONIPA-ja", 3), ("sk_FONIPA-ja", 4), ("es_FONIPA-zh", 2),
+    # without string rules, with single-character rules whose before contexts
+    # ICU matches against the converted text (doc/ldml-divcode-plan.md §12)
+    ("hy-hy_Latn/BGN", 2), ("Han-Latin/Names", 3), ("Kana-Hira", 1), ("InterIndic-Gurmukhi", 1), ("ru-ru_Latn/BGN", 1),
+    ("es-es_FONIPA", 2), ("Ethi-Latn/Aethiopi", 2), ("Ethi-Latn/Beta_Metsehaf", 2), ("Ethi-Latn/IES_JES_1964", 2),
+    ("Ethi-Latn/Lambdin", 2),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -228,6 +233,9 @@ RULES = {
     # as es_FONIPA-zh's ao), and single-character rules whose contexts split
     # the characters after the text and the boundary before it (as
     # ja_Latn-ko's tz)
+    # a group without string rules (doc/ldml-divcode-plan.md §12): its
+    # converted rules alone (a chain, a deletion looked through)
+    "conv-no-strings": "x > ; c > a ; a { b > a ; [^a] { b > B ;",
     "conv-family-complete": "x > j ; [^jw] { ao > AO ;",
     "conv-family-complete-split": "\\- > ; ' ' { tz } [^ju] > Q ; [^' '$] { t } z > T ; z } [^z] > Z ; z } z > S ;",
 }

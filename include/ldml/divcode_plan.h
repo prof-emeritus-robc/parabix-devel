@@ -87,8 +87,31 @@ struct DivContextItem {
     // marksFilterRunEnd): the item also holds at the positions outside the
     // filter's mask.
     bool runEnd = false;
+    // A before item of a context matched against the converted text, S T*
+    // (doc/ldml-divcode-plan.md §12 step 2): the characters of through (T,
+    // possessively repeated) next to the text are passed over, and the item
+    // tests the converted character before them.  Allowed where no conversion
+    // of the group moves a character into or out of T, so that the positions
+    // of T's characters in the converted text are those of the text's.  The
+    // set of through is tested as an item of throughKind (Explicit or External,
+    // throughExternal).
+    UCD::UnicodeSet through;
+    Kind throughKind = Kind::None;
+    size_t throughExternal = 0;
+    bool hasThrough() const {return throughKind != Kind::None;}
     bool present() const {return kind != Kind::None;}
 };
+
+// The character of a result (not empty) that a before item sees after it: its
+// last, or with a repeated set (DivContextItem::through), its last not in that
+// set (the result's last if all are: a result of characters of the set, passed
+// over as a whole).
+inline char32_t lastSeen(const DivContextItem & item, const std::u32string & result) {
+    if (item.hasThrough()) {
+        for (auto i = result.rbegin(); i != result.rend(); ++i) if (!item.through.contains(*i)) return *i;
+    }
+    return result.back();
+}
 
 // A context: a fixed sequence of items (sets), from the one next to the text
 // outward.  Only the outermost item may hold at the text boundary (negated):

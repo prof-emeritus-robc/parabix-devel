@@ -122,6 +122,8 @@ TRANSLATE = [
     ("hy-hy_Latn/BGN", 2), ("Han-Latin/Names", 3), ("Kana-Hira", 1), ("InterIndic-Gurmukhi", 1), ("ru-ru_Latn/BGN", 1),
     ("es-es_FONIPA", 2), ("Ethi-Latn/Aethiopi", 2), ("Ethi-Latn/Beta_Metsehaf", 2), ("Ethi-Latn/IES_JES_1964", 2),
     ("Ethi-Latn/Lambdin", 2),
+    # with a repeated set in a before context (§12 step 2)
+    ("el-Upper", 1), ("lt-Upper", 1),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -236,6 +238,9 @@ RULES = {
     # a group without string rules (doc/ldml-divcode-plan.md §12): its
     # converted rules alone (a chain, a deletion looked through)
     "conv-no-strings": "x > ; c > a ; a { b > a ; [^a] { b > B ;",
+    # a repeated set in a before context (§12 step 2): S T* { , the characters
+    # of T passed over (with deletions, a multibyte character)
+    "conv-through": "x > ; d > a ; [ab] [éz]* { c > C ;",
     "conv-family-complete": "x > j ; [^jw] { ao > AO ;",
     "conv-family-complete-split": "\\- > ; ' ' { tz } [^ju] > Q ; [^' '$] { t } z > T ; z } [^z] > Z ; z } z > S ;",
 }

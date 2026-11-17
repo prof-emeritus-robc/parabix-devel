@@ -1395,3 +1395,34 @@ Execution cycles of the whole transform at 4 threads against the regular plan
 | hy-hy_Latn/BGN (with its group 3, also DivCode) | Armenian | −15.0% / −14.8% | 0.377 / 0.341 / 0.341 |
 
 (Han-Latin/Names: no corpus.) All gain; step 2 can proceed.
+
+The rounds are replaced by the Converted kernel; its While loop is built only
+where outcomes propagate (`DivCodePlan::propagates`): ru-ru_Latn/BGN,
+hy-hy_Latn/BGN, Kana-Hira and Han-Latin/Names. In the other 6 groups every
+outcome is known, and one pass resolves them.
+
+**Step 2 done.** A before item `S T*` of a context matched against the
+converted text has `DivContextItem::through` (T), with T's set tested as an
+explicit or external set. The planner accepts it when no conversion of the
+group moves a character into or out of T: a text of T's characters gives T's
+characters or nothing; another text, nothing or some character not in T
+(the item then tests the result's last character not in T, `lastSeen`). The
+Converted kernel passes over T's characters (with the positions their
+results fill) as over the deleted positions, and ignores the ends of
+characters just after them. Not yet in UTF-8 mode (the group is then in
+Unicode mode).
+
+- el-Upper and lt-Upper are eligible and applied (the While loop: 9 and 1
+  propagating characters). They match ICU on 20,000 characters of random
+  Greek and Latin text with accents (also with four threads and segments of
+  one stride); no CLDR test data. On 6.5 MB of such text: −2.7% and −3.3% in
+  execution cycles (4 threads); the groups are small within their transforms
+  (NFC, Any-Upper).
+- az-Title and tr-Title are not: U+0345 COMBINING GREEK YPOGEGRAMMENI is
+  case-ignorable (in T) and cased; the rule that lowercases after a cased
+  character keeps it, the one that titlecases at a word start makes it Ι. So
+  whether it is in T in the converted text depends on the converted context
+  itself, and T's positions are not those of the text.
+- Spacedhan-Han needs two items (step 4).
+- Test: `conv-through` (a deletion within the run, a multibyte character of
+  T), and the 2 groups in `TRANSLATE`.

@@ -78,10 +78,23 @@ bool includesBoundary(const RE * re) {
 //  the order written: each its set and whether it includes the text boundary
 //  (the boundary alone: an empty set with it).  False (with the reason) if it
 //  is not such a sequence.  A null context has no items.
-bool contextItems(RE * re, CharSetAnalysis & sets, std::vector<std::pair<UCD::UnicodeSet, bool>> & items, std::string & why) {
+bool contextItems(RE * re, CharSetAnalysis & sets, std::vector<std::pair<UCD::UnicodeSet, bool>> & items, std::string & why,
+                  UCD::UnicodeSet * through = nullptr) {
     if (re == nullptr) return true;
     if (Seq * seq = dyn_cast<Seq>(re)) {
-        for (RE * e : *seq) if (!contextItems(e, sets, items, why)) return false;
+        //  (A before context S T*, T repeated next to the text: through, with
+        //  the items before it.)
+        auto end = seq->end();
+        if (through && seq->size() >= 2) {
+            if (const Rep * rep = dyn_cast<Rep>(seq->back())) {
+                if (rep->getLB() == 0 && rep->getUB() == Rep::UNBOUNDED_REP && CharSetAnalysis::isSet(rep->getRE())
+                        && !hasStrings(rep->getRE())) {
+                    *through = sets.setOf(rep->getRE(), false);
+                    --end;
+                }
+            }
+        }
+        for (auto i = seq->begin(); i != end; ++i) if (!contextItems(*i, sets, items, why)) return false;
         return true;
     }
     if (isBoundary(re)) {
@@ -158,7 +171,7 @@ UCD::UnicodeSet DivCodePlan::pseudoTest(const UCD::UnicodeSet & set) const {
 static void classifyConverted(DivCodePlan & plan) {
     auto sameItem = [](const DivContextItem & a, const DivContextItem & b) {
         return a.kind == b.kind && a.set == b.set && a.negated == b.negated && a.runEnd == b.runEnd && a.external == b.external
-               && a.guardEnd == b.guardEnd;
+               && a.guardEnd == b.guardEnd && a.throughKind == b.throughKind && a.through == b.through;
     };
     auto sameContext = [&](const DivContext & a, const DivContext & b) {
         if (a.items.size() != b.items.size()) return false;
@@ -182,7 +195,7 @@ static void classifyConverted(DivCodePlan & plan) {
     auto signatureOf = [&](const std::u32string & result) {
         if (result.empty()) return std::string("D");
         std::string sig;
-        for (const DivContextItem & item : plan.convertedItems) sig += item.set.contains(result.back()) ? '1' : '0';
+        for (const DivContextItem & item : plan.convertedItems) sig += item.set.contains(lastSeen(item, result)) ? '1' : '0';
         return sig;
     };
     //  The families: their rules' results (one of which applies).
@@ -283,6 +296,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     CharSetAnalysis sets;
     std::set<UCD::codepoint_t> blocks;
     std::vector<std::pair<UCD::UnicodeSet, bool>> contextSets;   // (the set tested, explicit?) for the alphabet
+    std::vector<UCD::UnicodeSet> throughSets;                     // the repeated sets of before items (§12 step 2)
 
     //  An item of a context: its set and whether it holds at the text boundary.
     auto classifyItem = [&](const UCD::UnicodeSet & set, bool boundary, bool before, DivContextItem & item) {
@@ -315,7 +329,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
                         bool single = false) {
         std::vector<std::pair<UCD::UnicodeSet, bool>> items;
         std::string why;
-        if (!contextItems(re, sets, items, why)) {
+        UCD::UnicodeSet through;
+        if (!contextItems(re, sets, items, why, before ? &through : nullptr)) {
             problem(why);
             return;
         }
@@ -334,6 +349,23 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             }
             //  (From the item next to the text outward.)
             std::reverse(items.begin(), items.end());
+            //  (A repeated set next to the text: only for one item matched
+            //  against the converted text, which the Converted kernel passes
+            //  over, §12 step 2.)
+            //  (A problem leaves the context without items: then not converted.)
+            if (!through.empty() && !(converted && *converted && items.size() == 1)) {
+                problem("contexts that are not fixed sequences of sets (a repeated set in a before context "
+                        "not matched against the converted text, or of several items)");
+                if (converted) *converted = false;
+                return;
+            }
+            //  (In UTF-8 mode, the positions of the repeated set's characters
+            //  are not those of their code units: not yet.)
+            if (!through.empty() && options.utf8) {
+                problem("a repeated set in a before context (UTF-8 mode)");
+                if (converted) *converted = false;
+                return;
+            }
         }
         for (size_t i = 0; i + 1 < items.size(); i++) {
             if (items[i].second && items[i].first.empty()) {
@@ -346,6 +378,21 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         for (const auto & it : items) {
             context.items.emplace_back();
             classifyItem(it.first, it.second, before, context.items.back());
+        }
+        if (!through.empty()) {
+            DivContextItem & item = context.items.front();
+            item.through = through;
+            const size_t direct = blockCount(through, s), complement = blockCount(~through, s);
+            if (std::min(direct, complement) <= options.maxSetBlocks) {
+                item.throughKind = DivContextItem::Kind::Explicit;
+                contextSets.emplace_back(direct <= complement ? through : ~through, true);
+            } else {
+                item.throughKind = DivContextItem::Kind::External;
+                auto f = std::find(plan.externalSets.begin(), plan.externalSets.end(), through);
+                item.throughExternal = f - plan.externalSets.begin();
+                if (f == plan.externalSets.end()) plan.externalSets.push_back(through);
+            }
+            throughSets.push_back(through);
         }
     };
 
@@ -529,6 +576,26 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         }
     }
     plan.sourceRules = sources.size();
+    //  The repeated sets of before items (§12 step 2): a text of their
+    //  characters gives their characters or nothing; another text, nothing or
+    //  some character not in them (the item then tests its last such: the
+    //  ones after it are passed over).  So the positions of their characters
+    //  in the converted text are those of the text's, or within a result.
+    for (const UCD::UnicodeSet & t : throughSets) {
+        for (const Source & src : sources) {
+            bool anyT = false, allT = true;
+            for (const UCD::UnicodeSet & u : src.text) {
+                anyT |= u.intersects(t);
+                allT &= u.subset(t);
+            }
+            bool resultT = true;
+            for (char32_t c : src.result) resultT &= t.contains(c);
+            if (!((!anyT && (src.result.empty() || !resultT)) || (allT && resultT))) {
+                problem("conversions changing the repeated set of a before context");
+                break;
+            }
+        }
+    }
 
     //  The earlier rules each source yields to.
     auto earlierOf = [&](const ConversionRule * e) {
@@ -973,6 +1040,10 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
                    + (item.runEnd ? "r" : "");
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);
+        if (item.hasThrough()) {
+            content += "*" + std::to_string(static_cast<int>(item.throughKind)) + "e" + std::to_string(item.throughExternal);
+            appendSet(content, item.through);
+        }
     };
     auto appendItem = [&](const DivContext & context) {
         content += "(";

@@ -11751,7 +11751,8 @@ private:
     size_t convertedItem(const ldml::DivContextItem & item) const {
         for (size_t i = 0; i < mConvertedItems.size(); i++) {
             const ldml::DivContextItem & c = mConvertedItems[i];
-            if (c.kind == item.kind && c.set == item.set && c.negated == item.negated && c.runEnd == item.runEnd && c.external == item.external) return i;
+            if (c.kind == item.kind && c.set == item.set && c.negated == item.negated && c.runEnd == item.runEnd && c.external == item.external
+                    && c.throughKind == item.throughKind && c.through == item.through) return i;
         }
         return SIZE_MAX;
     }
@@ -11818,7 +11819,8 @@ std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) cons
     //  set of each converted item or not), and how far the match extends.
     if (converted && M > 0) {
         for (size_t i = 0; i < mConvertedItems.size(); i++) {
-            const bool in = mConvertedItems[i].set.contains(d.result.back());
+            //  (The character a before item sees after the result, §12 step 2.)
+            const bool in = mConvertedItems[i].set.contains(ldml::lastSeen(mConvertedItems[i], d.result));
             changes.push_back(Change{Key{5, M, single, static_cast<unsigned>(2 * i + (in ? 0 : 1))}});
         }
     }
@@ -12550,11 +12552,36 @@ void DivCodeTranslate::generatePabloMethod() {
             PabloAST * const x = lengths[l - 1] ? pb.createAnd(consumersDeleted, lengths[l - 1]) : consumersDeleted;
             for (unsigned j = 0; j < l; j++) knownDeleted = pb.createOr(knownDeleted, j ? pb.createAdvance(x, j) : x);
         }
+        //  The characters of the repeated set of an item (§12 step 2), with the
+        //  positions their results fill: passed over (as the deleted positions),
+        //  and no end of a character there or just after counts for the item.
+        //  (Where they are in the text: no conversion moves a character into or
+        //  out of the set, see planDivCodeGroup.)
+        std::vector<PabloAST *> through(n, nullptr), afterThrough(n, nullptr);
+        for (size_t i = 0; i < n; i++) {
+            const ldml::DivContextItem & item = mConvertedItems[i];
+            if (!item.hasThrough()) continue;
+            ldml::DivContextItem t;
+            t.kind = item.throughKind;
+            t.set = item.through;
+            t.external = item.throughExternal;
+            PabloAST * chars = pb.createAnd(testAt(t), inText);
+            if (gap) {
+                chars = pb.createAnd(chars, pb.createNot(gap));
+                chars = pb.createOr(chars, pb.createAnd(pb.createMatchStar(pb.createAdvance(chars, 1), gap), gap));
+            }
+            through[i] = chars;
+            afterThrough[i] = pb.createAdvance(chars, 1);
+        }
         std::vector<PabloAST *> endsIn(n), endsOut(n);
         for (size_t i = 0; i < n; i++) {
             PabloAST * const in = pb.createAnd(consumersKept, charsAt(plan.consumerIn[i]));
             endsIn[i] = pb.createOr(ends[2 * i], after(pb, in));
             endsOut[i] = pb.createOr(ends[2 * i + 1], after(pb, pb.createAnd(consumersKept, pb.createNot(in))));
+            if (through[i]) {
+                endsIn[i] = pb.createAnd(endsIn[i], pb.createNot(afterThrough[i]));
+                endsOut[i] = pb.createAnd(endsOut[i], pb.createNot(afterThrough[i]));
+            }
         }
         //  The items known: K1 (in the set) and K0 (not, or the start of the
         //  text), from the ends of the converted characters through the deleted
@@ -12565,8 +12592,9 @@ void DivCodeTranslate::generatePabloMethod() {
         std::vector<Var *> K1(n), K0(n);
         std::vector<PabloAST *> k1(n), k0(n);
         for (size_t i = 0; i < n; i++) {
-            k1[i] = pb.createMatchStar(endsIn[i], knownDeleted);
-            k0[i] = pb.createMatchStar(pb.createOr(endsOut[i], start), knownDeleted);
+            PabloAST * const over = through[i] ? pb.createOr(knownDeleted, through[i]) : knownDeleted;
+            k1[i] = pb.createMatchStar(endsIn[i], over);
+            k0[i] = pb.createMatchStar(pb.createOr(endsOut[i], start), over);
             K1[i] = pb.createVar("K1_" + std::to_string(i), k1[i]);
             K0[i] = pb.createVar("K0_" + std::to_string(i), k0[i]);
         }
@@ -12606,8 +12634,14 @@ void DivCodeTranslate::generatePabloMethod() {
             PabloAST * const del = wb.createOr(Del, o.del);
             wb.createAssign(Del, del);
             for (size_t i = 0; i < n; i++) {
-                wb.createAssign(K1[i], wb.createOr(K1[i], wb.createMatchStar(wb.createOr(o.in[i], K1[i]), del)));
-                wb.createAssign(K0[i], wb.createOr(K0[i], wb.createMatchStar(wb.createOr(o.out[i], K0[i]), del)));
+                PabloAST * in = o.in[i], * out = o.out[i], * over = del;
+                if (through[i]) {
+                    in = wb.createAnd(in, wb.createNot(afterThrough[i]));
+                    out = wb.createAnd(out, wb.createNot(afterThrough[i]));
+                    over = wb.createOr(del, through[i]);
+                }
+                wb.createAssign(K1[i], wb.createOr(K1[i], wb.createMatchStar(wb.createOr(in, K1[i]), over)));
+                wb.createAssign(K0[i], wb.createOr(K0[i], wb.createMatchStar(wb.createOr(out, K0[i]), over)));
             }
             wb.createAssign(Done, wb.createOr(Done, Frontier));
             wb.createAssign(Frontier, wb.createAnd(wb.createAnd(propagating, wb.createNot(Done)), wb.createOr(K1[0], K0[0])));

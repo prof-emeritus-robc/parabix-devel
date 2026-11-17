@@ -10860,6 +10860,8 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
                               }
                               r += std::string(r.empty() ? "" : ", ") + "{\"text\": \"" + jsonEscape(text) + "\", \"rules\": "
                                    + std::to_string(f.stringRules.size()) + ", \"covering\": " + (f.covering ? "true" : "false")
+                                   + (f.covering ? std::string(", \"propagating\": ") + (f.propagating ? "true" : "false")
+                                                   + ", \"deleted\": " + (f.deleted ? "true" : "false") : std::string())
                                    + (f.reason.empty() ? "" : ", \"reason\": \"" + jsonEscape(f.reason) + "\"") + "}";
                           }
                           return r;

@@ -27,10 +27,14 @@
 #    string rules (stages: no match within an applied match of an earlier stage),
 #    contexts of two or more items, and before contexts matched against the
 #    converted text (the Converted kernel: its While loop, and the positions
-#    reserved by the Count kernel where the results' lengths differ).  Chains
-#    longer than the regular plan's rounds are compared with ICU only.  The
-#    converted-context cases also run with one thread, and with four threads
-#    and segments of one stride.
+#    reserved by the Count kernel where the results' lengths differ), and the
+#    families of string rules with such contexts (phase 2: the string rules of
+#    the same text, whose before contexts cover every converted character;
+#    results propagating, known or deleted, of different lengths, in chains,
+#    in a later stage, at set positions, with after contexts, in UTF-8, and at
+#    sparse positions).  Chains longer than the regular plan's rounds are
+#    compared with ICU only.  The converted-context cases also run with one
+#    thread, and with four threads and segments of one stride.
 #  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
@@ -106,6 +110,9 @@ TRANSLATE = [
     ("sat_Olck-sat_FONIPA", 4), ("ru_Latn-ru/BGN", 1), ("hy-hy_Latn/BGN", 3), ("uz_Cyrl-uz/BGN", 1),
     ("uz_Latn-uz_Cyrl", 1), ("InterIndic-Arabic", 1), ("sk-sk_FONIPA", 1), ("Laoo-Latn/UNGEGN", 1),
     ("blt-blt_FONIPA", 6), ("hy-hy_FONIPA", 1), ("es_FONIPA-am", 1), ("my-my_FONIPA", 6),
+    # with families of string rules whose before contexts are matched against
+    # the converted text (phase 2)
+    ("cs_FONIPA-ko", 1), ("hy_AREVMDA-hy_AREVMDA_FONIPA", 1), ("pl-pl_FONIPA", 1), ("pl_FONIPA-ja", 3),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -191,18 +198,43 @@ RULES = {
     # sparse dependent positions (blocks without any, where the kernels' Ifs
     # are not entered), after deletions, insertions and multibyte characters
     "conv-sparse": "pq > Q ; c > xy ; é > e ; ü > ; [y] { d > D ; [^y] { d > EE ;",
+    # families: string rules of the same text with before contexts matched
+    # against the converted text, which together cover every character (the
+    # match is certain; its result depends on the converted text).  A result
+    # whose last character is in a context's set and one that is not
+    # (propagating: the Converted kernel's loop, through chains of matches),
+    # results of different lengths (the Count kernel reserves the longest),
+    # deleted (the contexts look through them), all alike (known outcome) or
+    # all deleted, in a later stage, at set positions, with after contexts,
+    # with converted single-character rules, in UTF-8, and at sparse positions
+    "conv-family": "a { bc > a ; bc > b ;",
+    "conv-family-lengths": "a { bc > xya ; bc > B ;",
+    "conv-family-deletion": "a { bc > ; [^a] { bc > a ; bc > Q ;",
+    "conv-family-known": "a { bc > xa ; bc > ya ; [a] { d > D ;",
+    "conv-family-deleted": "x { bc > ; bc > ; [^a] { d > D ;",
+    "conv-family-stage": "abc > 1 ; a { bc > a ; bc > b ;",
+    "conv-family-sets": "a { b[cd] > a ; b[cd] > b ;",
+    "conv-family-after": "a { bc } x > a ; bc } x > b ; bc > c ;",
+    "conv-family-single": "a { bc > a ; bc > b ; a { d > a ; d > D ;",
+    "conv-family-utf8": "é { b中 > é ; b中 > Ω中 ;",
+    "conv-sparse-family": "c > xy ; é > e ; ü > ; [y] { dx > y ; dx > EE ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
 #  (A narrower alphabet for the contexts of several items, which random text
 #  over the full one rarely matches.)
 CTX_ALPHABET = "abcdefgxyz中文éüΩΑ \n"
 CONV_ALPHABET = "abcdpqxzQ中é \n"
+#  (The pieces of the text of the family cases, the texts of their families
+#  among them a fifth of the time: chains of matches, mostly shorter than the
+#  regular plan's rounds.)
+FAMILY_PIECES = ["a", "b", "c", "d", "x", "é", "中", "Ω", "Q", " ", "\n", "abc"]
+FAMILY_TEXTS = {"conv-family-sets": ["bc", "bd"], "conv-family-utf8": ["b中"]}
 TRACE = ["-enable-object-cache", "-trace-object-cache"]
 
 #  The default selection (all of them with --extended-testing).
 DEFAULT_GROUPS = [("tk_Cyrl-tk/BGN", 1, 5)]
 DEFAULT_TRANSLATE = []
-DEFAULT_RULES = ["expansion-before", "stages-chain", "conv-sparse"]
+DEFAULT_RULES = ["expansion-before", "stages-chain", "conv-sparse", "conv-family"]
 #  (The configurations of the converted-context cases.)
 CONV_CONFIGS = [["-thread-num=1"], ["-thread-num=4", "-segment-size=1"]]
 DEFAULT_CONV_CONFIGS = [["-thread-num=4", "-segment-size=1"]]
@@ -368,6 +400,9 @@ def rules_case(tconv, tmp, salt, case, rules):
                 pattern = "yd" if j == 1 else rnd.choice(["yd", "yüd", "yüüd", "cd", "éd", "üd", "ücd", "cdd", "x中d", "d"])
                 text += "x" * (1024 * j - len(text) - len(pattern) + 1) + pattern
             f.write(text)
+        elif case.startswith("conv-family"):
+            texts = FAMILY_TEXTS.get(case, ["bc"])
+            f.write("".join(rnd.choice(texts) if rnd.random() < 0.2 else rnd.choice(FAMILY_PIECES) for _ in range(8000)))
         elif case.startswith("conv-long"):
             # (Runs of b, up to 3000 long, and of a, c and others.)
             text = []

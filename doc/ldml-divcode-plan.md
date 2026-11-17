@@ -1144,3 +1144,31 @@ handles for Translate.
    case in the default selection, within the time limits.
 6. **Measure** the 9 groups against the regular plan (4 threads, kernel
    cycles), as in §10.
+
+### Status (2026-11-16)
+
+- **Step 1:** covering families alone bring in 4 of the 9 groups:
+  cs_FONIPA-ko #1, hy_AREVMDA-hy_AREVMDA_FONIPA #1, pl-pl_FONIPA #1 and
+  pl_FONIPA-ja #3. The other 5 have a non-covering family: es_FONIPA-zh #2
+  (`ao`, before `[^jw]` only), ja_Latn-ko #2 (`tji~`, `tzu~`, `tz`: before `" "`
+  and the text boundary only), ja_Latn-ru #3 (﷠), ro_FONIPA-ja #3 and
+  sk_FONIPA-ja #4 (`^ { ia }`). Decision: implement covering families (steps
+  2–6), then analyse completing the non-covering ones with a fallback.
+- **Steps 2–4** (e2eb574e0): the 4 groups match the regular plan on random
+  text and the CLDR test data (div32 and div64, UTF-8 and Unicode). The
+  Converted kernel's loop must run when only families propagate
+  (`DivCodePlan::propagates`): without it, a family match after another
+  (cs_FONIPA-ko `ksks`) was not evaluated.
+- **Step 5:** the `conv-family*` and `conv-sparse-family` rules files (results
+  propagating, known and deleted; lengths, deletions, chains, a later stage,
+  set positions, after contexts, converted single-character rules, UTF-8,
+  sparse positions), compared with the regular plan and ICU, one thread and
+  four threads with segments of one stride; the 4 groups in `TRANSLATE`.
+  `conv-family` is in the default selection (2.8 s cold, 0.94 s warm); with
+  the loop condition reverted it fails.
+- **A pipeline hang found on the way:** with the loop missing, an invalid UTF-8
+  input made the pipeline spin, even with one thread, on the pre-invocation
+  lock of `NFC_Initial_Insertion8x1+wkmsk+CMCompressed` (a state-free kernel
+  through LocalCarries; not with `-LocalCarries=0`): its lock for segment 1
+  was never released. The wrong output only exposed it; the pipeline bug is
+  open.

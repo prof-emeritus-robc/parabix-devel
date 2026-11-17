@@ -2756,6 +2756,10 @@ struct ConversionOutcome {
     //  If keptAt >= 0: the character itself is kept, at index keptAt of the
     //  result (out is the rest).
     int keptAt = -1;
+    //  An empty outcome of a unit of a string rule's match whose whole result
+    //  is not empty: the converted text before the positions after the match
+    //  is not empty either (see convertedContextMatters).
+    bool partial = false;
     size_t length() const {return out.size() + (keptAt >= 0 ? 1 : 0);}
     //  The characters of the result: those of out, and the characters kept.
     UCD::UnicodeSet resultChars() const {
@@ -2774,8 +2778,14 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
             if (!chars.empty()) outcomes.push_back(ConversionOutcome{chars, m.replacement});
         }
     }
+    //  (Whether a result keeps or writes some character.)
+    auto nonEmpty = [](const std::u32string & replacement) {
+        for (char32_t c : replacement) if (c != ldml::StringRuleDeleted) return true;
+        return false;
+    };
     for (const ldml::StringRule & sr : step.stringRules) {
         const size_t n = sr.text.size(), m = sr.replacement.size();
+        const bool partial = nonEmpty(sr.replacement);
         for (size_t j = 0; j < n; j++) {
             std::u32string out;
             if (j + 1 < n) {
@@ -2789,7 +2799,7 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
                 continue;
             }
             if (!out.empty() && out.front() == ldml::StringRuleDeleted) out = out.substr(1);
-            outcomes.push_back(ConversionOutcome{sr.text[j], out});
+            outcomes.push_back(ConversionOutcome{sr.text[j], out, -1, out.empty() && partial});
         }
         if (!sr.run.empty()) outcomes.push_back(ConversionOutcome{sr.run, std::u32string()});
     }
@@ -2797,6 +2807,7 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
     //  rules: Ti by Ri, or an insertion around a kept character).
     auto textOutcomes = [&](const std::vector<UCD::UnicodeSet> & text, const std::u32string & replacement) {
         const size_t n = text.size(), m = replacement.size();
+        const bool partial = nonEmpty(replacement);
         for (size_t j = 0; j < n; j++) {
             std::u32string out;
             if (j + 1 < n) {
@@ -2804,7 +2815,7 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
             } else if (j < m) {
                 out = replacement.substr(j);
             }
-            outcomes.push_back(ConversionOutcome{text[j], out});
+            outcomes.push_back(ConversionOutcome{text[j], out, -1, out.empty() && partial});
         }
     };
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
@@ -2831,14 +2842,19 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
 //  character is in the set of an item (the last character of its converted
 //  text, for the item adjacent to the rule), deletes a character (the context
 //  then sees the characters before it), or (for the items further from the
-//  rule) changes the length of the text.
+//  rule) changes the length of the text.  An item adjacent to the rule that is
+//  only the text boundary (^, [$]) changes only where all the converted text
+//  before it may be deleted: not by the units of a string rule's match whose
+//  whole result is not empty (ConversionOutcome::partial).
 static bool convertedContextMatters(const FusedContexts & before, const std::vector<ConversionOutcome> & outcomes) {
     for (const FusedContext & alt : before) {
         const size_t B = alt.size();
         for (size_t k = 0; k < B; k++) {
             const size_t d = B - k;     // 1: adjacent to the rule
             const UCD::UnicodeSet & S = alt[k].chars;
+            const bool boundaryOnly = d == 1 && S.empty() && alt[k].boundary && !alt[k].star;
             for (const ConversionOutcome & o : outcomes) {
+                if (boundaryOnly && o.partial) continue;
                 if (o.length() == 0) return true;
                 if (d > 1 && o.length() != 1) return true;
                 //  The last character kept: whether it is in the set does not change.

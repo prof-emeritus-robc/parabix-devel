@@ -1447,3 +1447,27 @@ el-Title and lt-Title stay out (U+0345, step 2); the others have other
 problems. Test: `conv-after-engine` (a repetition, a set with a string, both
 at the end of the text), and pl_FONIPA-ja #2 and blt-blt_FONIPA #5 in
 `TRANSLATE`, with the 3 others.
+
+**Step 4 not done: measured not worthwhile** (2026-11-17). Its 5 groups:
+
+- es-ar, es-fa, es_419-ar, es_419-fa: one rule each,
+  `$Boundary [^Velow] { e } [^$Vowel]* $Vowel → ə`. Its conversion of `e`
+  changes what `[^Velow]` sees, so the context depends on the converted text,
+  but a chain needs punctuation between the characters (` ,e,e`). The
+  transforms' work is in `es-es_FONIPA`, which they invoke.
+- Spacedhan-Han: one subgroup with `[:letter:] [:mark:]* [mark set] {` (S T*
+  U), which would need the two-item outcomes and step 2's passing over
+  together.
+
+Two items would make each converted character's outcome a pair (the last two
+characters written, through deletions): `K1`/`K0` per item and distance, in
+the planner's signatures, Translate's ends, and the Converted kernel and its
+loop. The most complex step, for 5 groups of one rule each, in transforms
+whose time is elsewhere. They stay on the regular plan.
+
+**Outcome of §12.** 14 of the 24 groups are applied by DivCode instead of
+rounds (step 1: 10, step 2: 2, step 3: 2). Step 3 also brought in 3 groups
+with string rules outside the scope: ru-ru_Latn/BGN #2 (rounds before),
+und_FONIPA-chr #1 and vec-vec_FONIPA #2 (no converted contexts). The other 10
+stay on the regular plan: az-Title, tr-Title, el-Title and lt-Title (U+0345,
+step 2), the 5 groups of step 4, and ConjoiningJamo-Latin.

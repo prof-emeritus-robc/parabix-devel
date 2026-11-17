@@ -320,6 +320,7 @@ public:
     void normalCompletionCheck(KernelBuilder & b);
 
     void writeInsufficientIOExit(KernelBuilder & b);
+    void releasePreInvocationLockAtInsufficientIO(KernelBuilder & b);
     void writeJumpToNextPartition(KernelBuilder & b);
 
     void computeFullyProcessedItemCounts(KernelBuilder & b, Value * const terminated);

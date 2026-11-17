@@ -1285,3 +1285,85 @@ ja_Latn-ru #3 stays on the regular plan.
 
 Of the 9 groups of §11's scope, 7 are applied by DivCode; ja_Latn-ko #2 is
 eligible but after deleting prefix runs, and ja_Latn-ru #3 stays out.
+
+## 12. Plan: groups without string rules whose before contexts are matched against the converted text
+
+### Scope
+
+On the regular plan, a group whose before contexts are matched against the
+converted text is implemented with rounds (`ConvertedContextRounds`, 8). DivCode
+replaces the rounds by the Converted kernel (§10: its While loop for the
+propagating characters), but only for groups with string rules: the planner
+raises "no string rules", and `RulePipelineBuilder::conversionGroup` tries
+DivCode only when `step.stringRules` is not empty.
+
+24 groups have no string rules and before contexts matched against the
+converted text (survey of 2026-11-17, `--plan` and a temporary
+`--divcode-report` of all groups). By what keeps them from DivCode:
+
+| | groups | contexts |
+|---|---|---|
+| A. only "no string rules" (10) | hy-hy_Latn/BGN (5 converted rules, 2 propagating), Han-Latin/Names (2, 1), Kana-Hira (5, 1), InterIndic-Gurmukhi (3, 0), ru-ru_Latn/BGN (13, 8), es-es_FONIPA (3, 0), Ethi-Latn/{Aethiopi, Beta_Metsehaf, IES_JES_1964, Lambdin} (14, 0 each) | fixed sequences of sets |
+| B. a repeated set in a before context (5) | az-Title, tr-Title (`[:cased:] [:caseignorable:]* {`), el-Upper (`[:greek:] [marks]* {`), lt-Upper (`[:softdotted:] [marks]* {`), Spacedhan-Han (`[:letter:] [:mark:]* {`) | before: `S T*` |
+| C. B and an after context that is not a fixed sequence (4) | el-Title (`} [:caseignorable:]* [:cased:]`), lt-Title (`} [^…]* [:ccc=Above:]`), pl_FONIPA-ja #2 (`t ͡* {`, `} (?!(ʂa \| … \| ʂ))`), blt-blt_FONIPA (`$C { } $V123`, a set with strings) | after: repetitions, negative lookahead |
+| D. before contexts of two items (4) | es-ar, es-fa, es_419-ar, es_419-fa (`$Boundary [^Vowel] { } [^$Vowel]* $Vowel`) | before: 2 items; after: `T* S` |
+| E. out of scope (1) | ConjoiningJamo-Latin (`[^$latinMedialEnd] k {`, insertion rules, 170 converted contexts) | |
+
+### Steps
+
+1. **Groups without string rules (A, 10 groups).** Drop the planner's "no
+   string rules" problem and the `stringRules` condition in
+   `conversionGroup`, for groups with converted rules (`plan.dependent()`):
+   a group of single-character rules without them stays on its present path.
+   Report such groups in `--divcode-report`. Their single-character rules
+   are phase 1's: Translate leaves the dependent positions, Converted
+   resolves them, with the While loop for the 4 groups with propagating
+   characters (ru-ru_Latn/BGN has 8). Check what the empty set of string
+   rules leaves in the kernels (stages, covers, the Count kernel without
+   expansions of string rules), the groups after deleting prefix runs (not
+   applied, as ja_Latn-ko #2), and the transforms whose mode changes
+   (`utf8DivCodePlan`: a group now eligible in UTF-8 mode may move the
+   transform to UTF-8 mode). Verify: the 10 transforms against ICU on their
+   test data and on random text of their converted characters; measure
+   against the regular plan (rounds) as in §11 step 6. If DivCode does not
+   gain on these, stop here.
+2. **A repeated set in a before context (B, and the before contexts of C).**
+   A before item `S T*` (`FusedItem::star`, from `ContextExpansion`) holds
+   where the last converted character not in T is in S. In the Converted
+   kernel this is the look-through that deletions already have: `K1`/`K0`
+   (the items known in and out) are carried by `MatchStar` through the
+   deleted positions and, for such an item, through the positions whose
+   converted character is in T. Exact if no conversion of the group changes
+   whether a character is in T (as `convertedContextMatters` checks for the
+   sets of the items): then the positions in T are those of the text's
+   characters in T (the case-ignorable characters and the marks are not
+   converted by the Title and Upper transforms; to be checked per group).
+   Otherwise the item's T is an item of the outcomes (`convertedItems`),
+   known at the dependent positions only after their evaluation (the loop).
+   In Translate (contexts matched against the text itself), `S T*` is a
+   `MatchStar` of S's positions through T's. Brings in the 5 groups of B.
+3. **After contexts that are not fixed sequences (C, and the after contexts
+   of D).** ICU matches after contexts against the text as it is, so any
+   after context can be computed beforehand by the regular expression
+   engine, as the regular plan computes them (`matchPositions`): a stream
+   marking the positions where it holds after the anchor, an external of
+   the DivCode kernels (`DivContextItem::Kind::Stream`, tested at the
+   anchor). Covers repetitions, sets with strings and negative lookaheads.
+   One engine kernel per distinct context. Brings in the 4 groups of C
+   (with step 2).
+4. **Before contexts of two items (D).** The item at distance 2 sees the
+   converted character before the one the item at distance 1 sees: the
+   outcomes of the converted characters are then pairs (the last two
+   characters written, through deletions), so `K1`/`K0` per item and per
+   distance, the distance-2 ones carried from the end of the character
+   before. Only for the 4 es-* groups (variants of one rule); do after
+   measuring 1–3, if they gain.
+
+ConjoiningJamo-Latin (E) has insertion rules and 170 converted contexts, of
+two items; it stays on the regular plan.
+
+Tests for each step: rules files of the shapes (QA/tconv_divcode_test.py,
+one default case within the time limits), and the groups brought in, in
+`TRANSLATE` (extended). Checks for each step: only the transforms whose
+groups the step brings in, against ICU on their test data and random text
+of their characters.

@@ -365,6 +365,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         const ConversionRule * rule = nullptr;
         int stringRule = -1, subgroup = -1;
         int family = -1;                    // a covering family applied (DivRule::family)
+        int synthetic = -1;                 // a rule completing a family: the source of a rule of it
     };
     std::vector<Source> sources;
 
@@ -569,6 +570,284 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         }
     }
 
+    //  Completion (doc/ldml-divcode-plan.md §11, fallback 2): a family whose
+    //  before contexts miss some converted characters (or the text boundary),
+    //  for an after region, is completed by a synthetic rule for them, whose
+    //  result is what the rules of the group give its text there.  That result
+    //  is evaluated as ICU applies the rules, from the first position of the
+    //  text: the rule matching at a position (its text, its after context on
+    //  the text and the after region, its before context on the characters
+    //  written so far, or on the missing characters before them), less those
+    //  yielding to another rule matching there; none, the character is kept.
+    //  The evaluation fails (the family is left as it is) where a test is not
+    //  the same for all the characters of a region, a context has more than one
+    //  item beyond the text, or a match extends beyond the text.
+    if (DivCodeFamilies) {
+        const UCD::UnicodeSet all(0, 0x10FFFF);
+        //  Where an item holds: the characters, and whether the boundary.
+        auto holdsSet = [&](const DivContextItem & item, UCD::UnicodeSet & chars, bool & boundary) {
+            chars = item.negated ? ~item.set : item.set;
+            boundary = item.negated;
+        };
+        for (size_t f = 0; f < plan.convertedFamilies.size(); f++) {
+            DivConvertedFamily & family = plan.convertedFamilies[f];
+            if (family.covering || familyMembers[f].empty()) continue;
+            const std::vector<size_t> members = familyMembers[f];
+            const Source & front = sources[members.front()];
+            //  (A literal text, rules of one before item.)
+            std::u32string text;
+            bool simple = true;
+            for (const UCD::UnicodeSet & t : front.text) {
+                if (t.count() != 1) {simple = false; break;}
+                text.push_back(t.front().first);
+            }
+            bool several = false;
+            for (size_t j : members) {
+                simple &= sources[j].before.items.size() <= 1 && (!sources[j].before.present() || sources[j].converted);
+                several |= sources[j].after.items.size() > 1;
+            }
+            if (!simple) continue;
+            //  The after regions, as the items after the text (the characters and
+            //  whether the boundary), with the after context of the synthetic
+            //  rule: the characters the first items of the after contexts of its
+            //  rules distinguish, and the end of the text; with an after context
+            //  of several items, each after context of its rules (as the coverage
+            //  check groups them).
+            struct Region {
+                std::vector<std::pair<UCD::UnicodeSet, bool>> items;
+                DivContext after;
+            };
+            std::vector<Region> regions;
+            auto sameItems = [](const DivContext & a, const DivContext & b) {
+                if (a.items.size() != b.items.size()) return false;
+                for (size_t k = 0; k < a.items.size(); k++) {
+                    if (!(a.items[k].set == b.items[k].set) || a.items[k].negated != b.items[k].negated) return false;
+                }
+                return true;
+            };
+            if (several) {
+                for (size_t j : members) {
+                    const DivContext & a = sources[j].after;
+                    if (!a.present()) continue;
+                    bool seen = false;
+                    for (const Region & r : regions) seen |= sameItems(r.after, a);
+                    if (seen) continue;
+                    Region r;
+                    r.after = a;
+                    for (const DivContextItem & item : a.items) {
+                        UCD::UnicodeSet c; bool cb;
+                        holdsSet(item, c, cb);
+                        r.items.emplace_back(c, cb);
+                    }
+                    regions.push_back(std::move(r));
+                }
+            } else {
+                std::vector<UCD::UnicodeSet> sets{all};
+                for (size_t j : members) {
+                    if (!sources[j].after.present()) continue;
+                    UCD::UnicodeSet a; bool ab;
+                    holdsSet(sources[j].after.items[0], a, ab);
+                    std::vector<UCD::UnicodeSet> refined;
+                    for (const UCD::UnicodeSet & r : sets) {
+                        if (!(r & a).empty()) refined.push_back(r & a);
+                        if (!(r - a).empty()) refined.push_back(r - a);
+                    }
+                    sets = std::move(refined);
+                }
+                for (const UCD::UnicodeSet & r : sets) {
+                    Region region;
+                    region.items.emplace_back(r, false);
+                    if (!(r == all)) {
+                        region.after.items.emplace_back();
+                        classifyItem(r, false, false, region.after.items.back());
+                    }
+                    regions.push_back(std::move(region));
+                }
+                Region end;
+                end.items.emplace_back(UCD::UnicodeSet(), true);
+                //  (Only beyond the text: negated, of all characters.)
+                end.after.items.emplace_back();
+                classifyItem(UCD::UnicodeSet(), true, false, end.after.items.back());
+                regions.push_back(std::move(end));
+            }
+            //  Whether an item holds for all of (chars, boundary): 1, for none: 0,
+            //  otherwise -1.
+            auto test = [&](const DivContextItem & item, const UCD::UnicodeSet & chars, bool boundary) {
+                UCD::UnicodeSet in; bool inBoundary;
+                holdsSet(item, in, inBoundary);
+                const bool some = !(chars & in).empty() || (boundary && inBoundary);
+                const bool every = chars.subset(in) && (!boundary || inBoundary);
+                return every ? 1 : some ? -1 : 0;
+            };
+            std::vector<Source> added;
+            std::string why;
+            for (const Region & region : regions) {
+                //  The before contexts of the rules whose after contexts hold there.
+                UCD::UnicodeSet covered; bool coveredBoundary = false; bool any = false;
+                for (size_t j : members) {
+                    const Source & m = sources[j];
+                    if (m.after.present()) {
+                        if (several ? !sameItems(m.after, region.after)
+                                    : test(m.after.items[0], region.items[0].first, region.items[0].second) != 1) continue;
+                    }
+                    any = true;
+                    if (!m.before.present()) {covered = all; coveredBoundary = true; continue;}
+                    UCD::UnicodeSet b; bool bb;
+                    holdsSet(m.before.items[0], b, bb);
+                    covered = covered + b;
+                    coveredBoundary |= bb;
+                }
+                if (!any || (covered == all && coveredBoundary)) continue;
+                //  The cases to evaluate: the items after the text and the missing
+                //  characters before it, split where a rule's context tells their
+                //  characters apart (at most a few times).
+                struct Case {
+                    std::vector<std::pair<UCD::UnicodeSet, bool>> items;
+                    UCD::UnicodeSet missing;
+                    bool missingBoundary;
+                };
+                std::vector<Case> cases{{region.items, all - covered, !coveredBoundary}};
+                size_t evaluated = 0;
+                while (!cases.empty() && why.empty()) {
+                if (++evaluated > 32) {why = "too many cases"; break;}
+                const Case current = cases.back();
+                cases.pop_back();
+                const UCD::UnicodeSet & missing = current.missing;
+                const bool missingBoundary = current.missingBoundary;
+                //  (A split: of the missing characters (-1) or of item k after the
+                //  text, by where an item of a rule holds.)
+                int splitAt = -2;
+                UCD::UnicodeSet splitChars; bool splitBoundary = false;
+                auto split = [&](int at, const DivContextItem & item) {
+                    splitAt = at;
+                    holdsSet(item, splitChars, splitBoundary);
+                };
+                //  Evaluate the text there.
+                std::u32string out;
+                bool ok = true;
+                size_t p = 0;
+                while (p < text.size() && ok) {
+                    std::vector<size_t> matching;
+                    for (size_t i = 0; i < sources.size() && ok; i++) {
+                        const Source & src = sources[i];
+                        if (src.text.size() > text.size() - p) {
+                            //  (A match beyond the text: only if it cannot match.)
+                            bool can = true;
+                            for (size_t k = 0; k + p < text.size() && can; k++) can = src.text[k].contains(text[p + k]);
+                            if (can && !(src.text[text.size() - p] & current.items[0].first).empty()) {ok = false; why = "a match beyond the text";}
+                            continue;
+                        }
+                        bool textMatches = true;
+                        for (size_t k = 0; k < src.text.size() && textMatches; k++) textMatches = src.text[k].contains(text[p + k]);
+                        if (!textMatches) continue;
+                        //  The after context: within the text, then the region's
+                        //  items; beyond them, it must hold whatever follows.
+                        int a = 1;
+                        for (size_t k = 0; k < src.after.items.size() && a == 1; k++) {
+                            const size_t q = p + src.text.size() + k;
+                            if (q < text.size()) {
+                                a = test(src.after.items[k], UCD::UnicodeSet(text[q]), false);
+                            } else if (q - text.size() < current.items.size()) {
+                                const auto & it = current.items[q - text.size()];
+                                a = test(src.after.items[k], it.first, it.second);
+                                if (a < 0) split(static_cast<int>(q - text.size()), src.after.items[k]);
+                            } else if (test(src.after.items[k], all, true) != 1) {
+                                ok = false;
+                                why = "an after context beyond the items of the region";
+                            }
+                        }
+                        if (!ok || splitAt != -2) break;
+                        //  The before context: the last character written, or the
+                        //  missing characters (nothing written yet).
+                        int b = 1;
+                        if (src.before.present()) {
+                            if (src.before.items.size() > 1) {ok = false; why = "a before context of several items"; break;}
+                            if (out.empty()) {
+                                b = test(src.before.items[0], missing, missingBoundary);
+                                if (b < 0) {split(-1, src.before.items[0]); break;}
+                            } else {
+                                b = test(src.before.items[0], UCD::UnicodeSet(out.back()), false);
+                            }
+                        }
+                        if (a == 1 && b == 1) matching.push_back(i);
+                    }
+                    if (!ok || splitAt != -2) break;
+                    //  Less those yielding to another matching there.
+                    std::vector<size_t> applies;
+                    for (size_t i : matching) {
+                        bool yielding = false;
+                        for (size_t q : matching) {
+                            if (q == i) continue;
+                            for (const DivEarlier & e : yields[i]) {
+                                if ((e.stringRule >= 0 && e.stringRule == sources[q].stringRule)
+                                        || (e.subgroup >= 0 && e.subgroup == sources[q].subgroup && e.chars.contains(text[p]))) {
+                                    yielding = true;
+                                }
+                            }
+                        }
+                        if (!yielding) applies.push_back(i);
+                    }
+                    if (applies.size() > 1) {ok = false; why = "more than one rule applies"; break;}
+                    if (applies.empty()) {
+                        out.push_back(text[p]);
+                        p++;
+                    } else {
+                        out += sources[applies.front()].result;
+                        p += sources[applies.front()].text.size();
+                    }
+                }
+                if (!ok) break;
+                if (splitAt != -2) {
+                    //  The two cases: where the rule's item holds, and where not.
+                    for (bool in : {true, false}) {
+                        Case c = current;
+                        auto & target = splitAt < 0 ? c.missing : c.items[splitAt].first;
+                        bool & targetBoundary = splitAt < 0 ? c.missingBoundary : c.items[splitAt].second;
+                        target = in ? (target & splitChars) : (target - splitChars);
+                        targetBoundary = targetBoundary && (in == splitBoundary);
+                        if (!target.empty() || targetBoundary) cases.push_back(std::move(c));
+                    }
+                    continue;
+                }
+                //  The synthetic rule: the missing characters before, the items
+                //  of the case after.
+                Source src;
+                src.text = front.text;
+                src.result = out;
+                src.converted = true;
+                src.synthetic = static_cast<int>(members.front());
+                src.before.items.emplace_back();
+                classifyItem(missing, missingBoundary, true, src.before.items.back());
+                if (!(current.items.size() == 1 && current.items[0].first == all && !current.items[0].second)) {
+                    for (const auto & it : current.items) {
+                        src.after.items.emplace_back();
+                        classifyItem(it.first, it.second, false, src.after.items.back());
+                    }
+                }
+                added.push_back(std::move(src));
+                }
+                if (!why.empty()) break;
+            }
+            if (!why.empty()) {
+                family.reason += "; not completed: " + why;
+                continue;
+            }
+            //  (Yielding as the rules of the family do to the rules outside it.)
+            std::vector<DivEarlier> outsideYields;
+            for (const DivEarlier & e : yields[members.front()]) {
+                if (e.stringRule >= 0 && std::find(family.stringRules.begin(), family.stringRules.end(), e.stringRule) != family.stringRules.end()) continue;
+                outsideYields.push_back(e);
+            }
+            for (Source & src : added) {
+                familyMembers[f].push_back(sources.size());
+                yields.push_back(outsideYields);
+                sources.push_back(std::move(src));
+            }
+            family.covering = true;
+            family.completed = added.size();
+        }
+    }
+
     //  The covering families applied: their rules yield to the same rules
     //  outside them, and a rule yielding to one of them yields to all.  The
     //  string rules with converted before contexts outside them are problems.
@@ -664,10 +943,12 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             d.before = src.before;
             d.after = src.after;
             d.yieldsTo = yields[i];
-            d.stage = src.stringRule >= 0 ? stageOf[src.stringRule] : 0;
+            //  (A synthetic rule: the stage of the rules of its family.)
+            const int stageRule = src.synthetic >= 0 ? sources[src.synthetic].stringRule : src.stringRule;
+            d.stage = stageRule >= 0 ? stageOf[stageRule] : 0;
             //  (Phase 1: single-character rules; a string rule's flag is for its
             //  family, DivConvertedFamily.)
-            d.converted = src.converted && src.stringRule < 0;
+            d.converted = src.converted && src.stringRule < 0 && src.synthetic < 0;
             if (d.converted) plan.convertedRules++;
             d.family = src.family;
             if (d.family >= 0) plan.familyRules++;

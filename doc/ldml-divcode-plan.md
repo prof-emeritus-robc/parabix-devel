@@ -1249,3 +1249,39 @@ Three fallbacks, in order of cost:
 Recommendation: fallback 1 (small; 2 groups), then fallback 2 (3 families of
 ja_Latn-ko and 1 of es_FONIPA-zh; 2 groups). That brings in 8 of the 9 groups;
 ja_Latn-ru #3 stays on the regular plan.
+
+### Status of the fallbacks (2026-11-17)
+
+- **Fallback 1** (7291400d9): an adjacent before item that is only the text
+  boundary is affected only by whole deletions (`ConversionOutcome::partial`).
+  ro_FONIPA-ja #3 and sk_FONIPA-ja #4 are eligible and applied. The contexts of
+  5 other transforms are no longer matched against the converted text; all 7
+  match ICU on their test data and random text.
+- **Fallback 2**: `planDivCodeGroup` completes a non-covering family with
+  synthetic rules (`DivConvertedFamily::completed`). For each after region it
+  takes the converted characters (and boundary) the before contexts miss, and
+  evaluates the group's own rules on the family's literal text as ICU applies
+  them: the rule matching at each position (text, after context on the text
+  and the region's items, before context on what is written so far or on the
+  missing characters), less those yielding to another matching there; none,
+  the character kept. A test that differs within a region (an after item, or
+  the missing characters) splits it (at most 32 cases); a match beyond the
+  text, or a context beyond the region's items that does not always hold,
+  leaves the family as it is. The synthetic rules' before contexts are
+  disjoint from the family's; they yield as its rules do to the rules outside
+  it, and take its stage.
+  - es_FONIPA-zh #2 (`ao`, 2 synthetic rules: the text kept) is eligible and
+    applied; it matches ICU on random text around `ao`, `jao`, `wao`, `aon`.
+  - ja_Latn-ko #2 (`tji~` 4, `tzu~` 3, `tz` 4, propagating) is eligible, but
+    not applied: it follows prefix runs that delete, after which
+    `RulePipelineBuilder::conversionGroup` keeps the regular plan (as for
+    ro_FONIPA-ja #2). With the regular plan it matches ICU on its test data.
+  - es_FONIPA-zh #1 has 4 families completed (`ei̯`, `eu̯`, `ou̯`, `ui`) but
+    other problems (two-way and self overlaps); its `jo` is not completed (a
+    match beyond the text).
+  - Tests: `conv-family-complete` (the text kept) and
+    `conv-family-complete-split` (regions split), and the 3 groups in
+    `TRANSLATE`.
+
+Of the 9 groups of §11's scope, 7 are applied by DivCode; ja_Latn-ko #2 is
+eligible but after deleting prefix runs, and ja_Latn-ru #3 stays out.

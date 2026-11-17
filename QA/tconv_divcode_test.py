@@ -32,7 +32,8 @@
 #    the same text, whose before contexts cover every converted character;
 #    results propagating, known or deleted, of different lengths, in chains,
 #    in a later stage, at set positions, with after contexts, in UTF-8, and at
-#    sparse positions).  Chains longer than the regular plan's rounds are
+#    sparse positions; families completed where their before contexts miss
+#    characters, the text kept or given by single-character rules there).  Chains longer than the regular plan's rounds are
 #    compared with ICU only.  The converted-context cases also run with one
 #    thread, and with four threads and segments of one stride.
 #  The kernels must be used (their names in the trace of the object cache).
@@ -113,6 +114,9 @@ TRANSLATE = [
     # with families of string rules whose before contexts are matched against
     # the converted text (phase 2)
     ("cs_FONIPA-ko", 1), ("hy_AREVMDA-hy_AREVMDA_FONIPA", 1), ("pl-pl_FONIPA", 1), ("pl_FONIPA-ja", 3),
+    # (with ^ before contexts no longer matched against the converted text, and
+    # a family completed: fallbacks 1 and 2)
+    ("ro_FONIPA-ja", 3), ("sk_FONIPA-ja", 4), ("es_FONIPA-zh", 2),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -218,6 +222,14 @@ RULES = {
     "conv-family-single": "a { bc > a ; bc > b ; a { d > a ; d > D ;",
     "conv-family-utf8": "é { b中 > é ; b中 > Ω中 ;",
     "conv-sparse-family": "c > xy ; é > e ; ü > ; [y] { dx > y ; dx > EE ;",
+    # families completed (doc/ldml-divcode-plan.md §11, fallback 2): before
+    # contexts that miss some converted characters, completed by synthetic
+    # rules with the result the other rules give there: none (the text kept,
+    # as es_FONIPA-zh's ao), and single-character rules whose contexts split
+    # the characters after the text and the boundary before it (as
+    # ja_Latn-ko's tz)
+    "conv-family-complete": "x > j ; [^jw] { ao > AO ;",
+    "conv-family-complete-split": "\\- > ; ' ' { tz } [^ju] > Q ; [^' '$] { t } z > T ; z } [^z] > Z ; z } z > S ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
 #  (A narrower alphabet for the contexts of several items, which random text
@@ -228,7 +240,10 @@ CONV_ALPHABET = "abcdpqxzQ中é \n"
 #  among them a fifth of the time: chains of matches, mostly shorter than the
 #  regular plan's rounds.)
 FAMILY_PIECES = ["a", "b", "c", "d", "x", "é", "中", "Ω", "Q", " ", "\n", "abc"]
-FAMILY_TEXTS = {"conv-family-sets": ["bc", "bd"], "conv-family-utf8": ["b中"]}
+FAMILY_TEXTS = {"conv-family-sets": ["bc", "bd"], "conv-family-utf8": ["b中"], "conv-family-complete": ["ao"],
+                "conv-family-complete-split": ["tz"]}
+FAMILY_CASE_PIECES = {"conv-family-complete": ["a", "o", "j", "w", "x", "n", "ao", " ", "\n"],
+                      "conv-family-complete-split": ["t", "z", "j", "u", "a", "-", " ", "\n", "tz", "tzz", "zz"]}
 TRACE = ["-enable-object-cache", "-trace-object-cache"]
 
 #  The default selection (all of them with --extended-testing).
@@ -402,7 +417,8 @@ def rules_case(tconv, tmp, salt, case, rules):
             f.write(text)
         elif case.startswith("conv-family"):
             texts = FAMILY_TEXTS.get(case, ["bc"])
-            f.write("".join(rnd.choice(texts) if rnd.random() < 0.2 else rnd.choice(FAMILY_PIECES) for _ in range(8000)))
+            pieces = FAMILY_CASE_PIECES.get(case, FAMILY_PIECES)
+            f.write("".join(rnd.choice(texts) if rnd.random() < 0.2 else rnd.choice(pieces) for _ in range(8000)))
         elif case.startswith("conv-long"):
             # (Runs of b, up to 3000 long, and of a, c and others.)
             text = []

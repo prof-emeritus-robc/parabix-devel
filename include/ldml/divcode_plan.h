@@ -163,6 +163,9 @@ struct DivConvertedFamily {
     std::vector<int> stringRules;           // indices in TransformStep::stringRules, in rule order
     bool covering = false;
     std::string reason;                     // why it does not cover its text, or is not applied
+    // The synthetic rules completing it (§11, fallback 2): for the converted
+    // characters its before contexts miss, the result the group's rules give.
+    size_t completed = 0;
     bool propagating = false;
     bool deleted = false;
     std::vector<bool> in;

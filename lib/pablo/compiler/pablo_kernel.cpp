@@ -341,7 +341,8 @@ void PabloKernel::addAutomaticAttributes() {
 }
 
 bool PabloKernel::isCachable() const {
-    return (mFlags & Kernel::KernelFlags::RequiresIllustratorObject) == 0;
+    // (The progress checks of the Whiles are not in the kernels' names: not cached.)
+    return (mFlags & Kernel::KernelFlags::RequiresIllustratorObject) == 0 && !CheckWhileProgress;
 }
 
 void PabloKernel::linkExternalMethods(KernelBuilder & b) {

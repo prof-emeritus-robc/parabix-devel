@@ -11987,7 +11987,7 @@ void DivCodeTranslate::generatePabloMethod() {
             }
             Var * const v = pb.createVar("afterL" + std::to_string(guarded.size()), zeroes);
             guarded.push_back(Guarded{v, std::move(codes), std::move(tested), complement});
-            atL.emplace(c.first, complement ? pb.createAnd(inTextL, pb.createNot(v)) : static_cast<PabloAST *>(v));
+            atL.emplace(c.first, v);
         }
         std::vector<PabloAST *> codeL;
         for (unsigned i = 0; i < k; i++) codeL.push_back(top.at(code[i], L));
@@ -12030,6 +12030,14 @@ void DivCodeTranslate::generatePabloMethod() {
             std::vector<size_t> all(guarded.size());
             for (size_t g = 0; g < all.size(); g++) all[g] = g;
             guard(pb, top, static_cast<int>(k) - 1, 0, nullptr, all);
+        }
+        //  (A set given by its complement: within the text where its complement
+        //  is not, after the hierarchy assigns the complement's test: a
+        //  statement reads a Var's value at its place in the program.)
+        for (const auto & c : contexts) {
+            for (const Guarded & x : guarded) {
+                if (x.complement && atL.at(c.first) == x.var) atL[c.first] = pb.createAnd(inTextL, pb.createNot(x.var));
+            }
         }
         //  The positions before the d-th of the text, and the direct tests there.
         std::map<unsigned, PabloAST *> before;

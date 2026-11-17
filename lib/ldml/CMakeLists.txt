@@ -30,5 +30,7 @@ DEPS
     re.transforms
     re.unicode
     unicode.core
+    unicode.algo
+    unicode.data
     slaballocator
 )

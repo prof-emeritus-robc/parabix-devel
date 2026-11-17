@@ -168,6 +168,10 @@ struct DivConvertedFamily {
     std::vector<bool> in;
 };
 
+// Whether covering families are planned (phase 2; tconv --divcode-families):
+// otherwise their groups keep the problem, as before phase 2.
+extern bool DivCodeFamilies;
+
 struct DivCodePlan {
     unsigned shift = 5;
     std::vector<UCD::codepoint_t> blocks;   // ascending; the code of blocks[i] is i + 1

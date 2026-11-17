@@ -220,6 +220,11 @@ static cl::opt<bool> DivCodeGroups("divcode-groups",
     cl::desc("Apply the conversion groups eligible for DivCode kernels (see --divcode-report) by them (see "
              "doc/ldml-divcode-plan.md; default on, --divcode-groups=0 for the regular plan)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool, true> DivCodeFamilies("divcode-families",
+    cl::desc("Plan the families of string rules with before contexts matched against the converted text that cover "
+             "their texts (doc/ldml-divcode-plan.md §11; default on, --divcode-families=0 keeps their groups on the "
+             "regular plan)"),
+    cl::location(ldml::DivCodeFamilies), cl::init(true), cl::cat(TconvOptions));
 static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32, the default) "
                                       "or 6 (div64)"),
                                       cl::init(5), cl::cat(TconvOptions));

@@ -1166,9 +1166,34 @@ handles for Translate.
   four threads with segments of one stride; the 4 groups in `TRANSLATE`.
   `conv-family` is in the default selection (2.8 s cold, 0.94 s warm); with
   the loop condition reverted it fails.
+- **Step 6** (measurements below): all 4 are faster, by 9–89% in execution
+  cycles, almost all of it phase 2's own.
 - **A pipeline hang found on the way:** with the loop missing, an invalid UTF-8
   input made the pipeline spin, even with one thread, on the pre-invocation
   lock of `NFC_Initial_Insertion8x1+wkmsk+CMCompressed` (a state-free kernel
   through LocalCarries; not with `-LocalCarries=0`): its lock for segment 1
   was never released. The wrong output only exposed it; the pipeline bug is
   open.
+
+### Measurements (step 6)
+
+Text in the source script, as in the step 4 measurements: Armenian and Latin (8–14 MB of
+Twain), and IPA from `cs-cs_FONIPA` and `pl-pl_FONIPA` of the Latin text (10
+MB; the Czech has 12150 `ks`, 232 of them in `ksks`). Execution cycles of the
+whole transform (CYCLES × EXEC%) at `-thread-num=4`, each configuration
+alone. "Without families" is DivCode with `--divcode-families=0`: the family
+groups on the regular plan, the others DivCode, as before phase 2. All
+configurations give the same output.
+
+| transform | group kernels, regular / DivCode | DivCode Unicode / UTF-8 vs regular | phase 2 alone (vs without families), Unicode / UTF-8 | 1 thread, s: regular / Unicode / UTF-8 | cold start, s: regular / DivCode |
+|---|--:|--:|--:|--:|--:|
+| pl_FONIPA-ja | 48 / 42 | −88.6% / −88.6% | −88.6% / −88.6% | 0.742 / 0.137 / 0.137 | 13.6 / 1.05 |
+| pl-pl_FONIPA | 39 / 20 (UTF-8 23) | −34.1% / −68.8% | −32.0% / −67.8% | 0.239 / 0.178 / 0.116 | 5.5 / 3.8–4.0 |
+| hy_AREVMDA-hy_AREVMDA_FONIPA | 37 / 30 | −32.9% / −32.5% | (the only DivCode group) | 0.263 / 0.196 / 0.197 | 3.35 / 1.5 |
+| cs_FONIPA-ko | 31 / 17 | −8.9% / −8.7% | (the only DivCode group) | 1.052 / 0.980 / 0.989 | 7.7 / 7.4–7.6 |
+
+pl_FONIPA-ja's group 3 on the regular plan dominates the transform (its
+converted contexts take the regular plan's rounds): DivCode removes almost all
+of it, and the cold start drops from 13.6 s to 1 s. pl-pl_FONIPA can run in
+UTF-8 mode only once its family group is DivCode. cs_FONIPA-ko's time is
+mostly outside the conversion group (the Latin-to-Hangul steps and NFC).

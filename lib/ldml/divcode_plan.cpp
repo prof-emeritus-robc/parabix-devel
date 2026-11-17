@@ -18,6 +18,8 @@ using namespace llvm;
 
 namespace ldml {
 
+bool DivCodeFamilies = true;
+
 namespace {
 
 //  The blocks (cp >> shift) a set spans.
@@ -573,6 +575,11 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     for (size_t f = 0; f < plan.convertedFamilies.size(); f++) {
         DivConvertedFamily & family = plan.convertedFamilies[f];
         if (!family.covering) continue;
+        if (!DivCodeFamilies) {
+            family.covering = false;
+            family.reason = "families disabled (--divcode-families=0)";
+            continue;
+        }
         const std::vector<size_t> & members = familyMembers[f];
         auto inFamily = [&](int stringRule) {
             return std::find(family.stringRules.begin(), family.stringRules.end(), stringRule) != family.stringRules.end();

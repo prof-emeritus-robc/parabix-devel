@@ -9615,7 +9615,8 @@ static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
     return ldml::planDivCodeGroup(step, options);
 }
 static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
-                                        StreamSet * Basis, std::vector<StreamSet *> & Masks);
+                                        StreamSet * Basis, std::vector<StreamSet *> & Masks,
+                                        const std::vector<StreamSet *> & afterStreams = {});
 
 const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEntry * entry) {
     const std::string name = entry->canonicalName;
@@ -10808,6 +10809,7 @@ static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
         + ", \"rules\": " + std::to_string(plan.rules.size()) + ", \"max_leaf\": " + std::to_string(maxLeaf)
         + ", \"stages\": " + std::to_string(plan.stages) + ", \"overlap_pairs\": " + std::to_string(plan.overlapPairs)
         + ", \"converted_rules\": " + std::to_string(plan.convertedRules) + ", \"propagating\": " + std::to_string(plan.propagating.count())
+        + ", \"after_streams\": " + std::to_string(plan.afterStreams.size())
         + ", \"stage_rules\": [" + [&]() {
               std::vector<size_t> n(plan.stages + 1, 0);
               for (const ldml::DivRule & d : plan.rules) n[d.stage]++;
@@ -11972,6 +11974,10 @@ void DivCodeTranslate::generatePabloMethod() {
     auto itemTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, size_t index) -> PabloAST * {
         //  (A context of several items: whether it holds, from the Items kernel.)
         if (context.items.size() > 1) return t.at(items[chained[index]], offset);
+        //  (An after context computed by the engine: at the anchor, §12 step 3.)
+        if (context.items[0].kind == ldml::DivContextItem::Kind::Stream) {
+            return t.at(ext[plan.externalSets.size() + context.items[0].external], 0);
+        }
         auto f = singles.find({index, offset});
         return f != singles.end() ? f->second : singleTest(t, context, offset);
     };
@@ -12008,6 +12014,7 @@ void DivCodeTranslate::generatePabloMethod() {
         for (size_t r = 0; r < plan.rules.size(); r++) {
             const ldml::DivRule & d = plan.rules[r];
             if (!needed(r) || !d.after.present() || d.after.items.size() != 1) continue;
+            if (d.after.items[0].kind == ldml::DivContextItem::Kind::Stream) continue;
             const Units & u = mUnits[r];
             contexts.emplace(ruleItem[r], &d.after);
             if (!mHasSpread) {
@@ -12863,11 +12870,24 @@ static StreamSet * DivCodeItemsOf(PipelineBuilder & P, const ldml::DivCodePlan &
 //  (Masks: the filter masks, the innermost last, kept in step with the text) or
 //  on the basis bits of UTF-8 code units.
 static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
-                                        StreamSet * Basis, std::vector<StreamSet *> & Masks) {
+                                        StreamSet * Basis, std::vector<StreamSet *> & Masks,
+                                        const std::vector<StreamSet *> & afterStreams) {
     const bool utf8 = Basis->getNumElements() == 8;
     StreamSet * Code = DivCodeOf(P, plan, Basis);
     SHOW_BIXNUM(Code);
     StreamSet * Externals = DivCodeExternalsOf(P, plan, Basis);
+    //  (The after contexts computed by the engine, after the external sets'
+    //  classes: see ldml::DivContextItem::Kind::Stream.)
+    if (!afterStreams.empty()) {
+        std::vector<std::pair<StreamSet *, std::vector<uint32_t>>> selections;
+        if (Externals) {
+            std::vector<uint32_t> all(Externals->getNumElements());
+            for (uint32_t i = 0; i < all.size(); i++) all[i] = i;
+            selections.emplace_back(Externals, all);
+        }
+        for (StreamSet * a : afterStreams) selections.emplace_back(a, std::vector<uint32_t>{0});
+        Externals = streamutils::Select(P, selections);
+    }
     StreamSet * InText = P.CreateStreamSet(1);
     P.CreateKernelCall<TextPositions>(Basis, InText);
     StreamSet * const Mask = Masks.empty() ? nullptr : Masks.back();
@@ -12944,7 +12964,13 @@ static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCode
 }
 
 StreamSet * RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21) {
-    return DivCodeGroupPipeline(mP, plan, mGroupLabel, U21, mMasks);
+    //  (The after contexts computed by the engine: the anchors, characters of
+    //  any kind, after which each matches.)
+    std::vector<StreamSet *> afterStreams;
+    for (re::RE * after : plan.afterStreams) {
+        afterStreams.push_back(matchPositions(nullptr, after, {UCD::UnicodeSet(0, 0x10FFFF)}, U21));
+    }
+    return DivCodeGroupPipeline(mP, plan, mGroupLabel, U21, mMasks, afterStreams);
 }
 
 //  For the smoke test (--divcode-codes): each character replaced by the

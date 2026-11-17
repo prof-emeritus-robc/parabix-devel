@@ -11,6 +11,7 @@
 #include <re/adt/adt.h>
 #include <re/adt/re_name.h>
 #include <ldml/transform_rules.h>
+#include <ldml/transform_rules_printer.h>
 #include "charset_analysis.h"
 
 using namespace re;
@@ -558,7 +559,25 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         DivContext before, after;
         bool converted = false;
         classify(sg.before, sg.engineBefore, true, before, &converted, true);
-        classify(sg.after, nullptr, false, after);
+        //  An after context that is not a fixed sequence of sets (repetitions,
+        //  sets with strings, lookaheads): computed by the regular expression
+        //  engine as the anchors it holds after (§12 step 3; in Unicode mode).
+        std::vector<std::pair<UCD::UnicodeSet, bool>> fixedItems;
+        std::string notFixed;
+        if (sg.after && sg.engineAfter && !contextItems(sg.after, sets, fixedItems, notFixed)) {
+            if (options.utf8) {
+                problem("an after context computed by the regular expression engine (UTF-8 mode)");
+            } else {
+                DivContextItem item;
+                item.kind = DivContextItem::Kind::Stream;
+                item.external = plan.afterStreams.size();
+                plan.afterStreams.push_back(sg.engineAfter);
+                plan.afterStreamKeys.push_back(sg.sourceRules.empty() ? std::to_string(g) : printRule(sg.sourceRules.front()));
+                after.items.push_back(item);
+            }
+        } else {
+            classify(sg.after, nullptr, false, after);
+        }
         plan.subgroupContexts.emplace_back(before, after);
         subgroupConverted.push_back(converted);
         for (const CharMapping & m : sg.mappings) {
@@ -810,6 +829,12 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
                         //  The after context: within the text, then the region's
                         //  items; beyond them, it must hold whatever follows.
                         int a = 1;
+                        //  (An after context computed by the engine: not evaluated here.)
+                        if (src.after.present() && src.after.items[0].kind == DivContextItem::Kind::Stream) {
+                            ok = false;
+                            why = "an after context computed by the regular expression engine";
+                            break;
+                        }
                         for (size_t k = 0; k < src.after.items.size() && a == 1; k++) {
                             const size_t q = p + src.text.size() + k;
                             if (q < text.size()) {
@@ -1035,10 +1060,12 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     for (UCD::codepoint_t b : plan.blocks) blockList += (blockList.empty() ? "x" : "_x") + hex(b);
     std::string content = "s" + std::to_string(s) + ";" + blockList + ";";
     for (const UCD::UnicodeSet & e : plan.externalSets) appendSet(content, e);
+    for (const std::string & k : plan.afterStreamKeys) content += "{" + k + "}";
     auto appendOne = [&](const DivContextItem & item) {
         content += "|" + std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.guardEnd ? "g" : "")
                    + (item.runEnd ? "r" : "");
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
+        else if (item.kind == DivContextItem::Kind::Stream) content += "s" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);
         if (item.hasThrough()) {
             content += "*" + std::to_string(static_cast<int>(item.throughKind)) + "e" + std::to_string(item.throughExternal);

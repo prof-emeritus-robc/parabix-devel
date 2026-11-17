@@ -124,6 +124,8 @@ TRANSLATE = [
     ("Ethi-Latn/Lambdin", 2),
     # with a repeated set in a before context (§12 step 2)
     ("el-Upper", 1), ("lt-Upper", 1),
+    # with after contexts computed by the regular expression engine (§12 step 3)
+    ("pl_FONIPA-ja", 2), ("blt-blt_FONIPA", 5), ("ru-ru_Latn/BGN", 2), ("und_FONIPA-chr", 1), ("vec-vec_FONIPA", 2),
 ]
 RULES = {
     "strings": "ab > X ; b > Y ; a > Z ; c > ;",
@@ -241,6 +243,9 @@ RULES = {
     # a repeated set in a before context (§12 step 2): S T* { , the characters
     # of T passed over (with deletions, a multibyte character)
     "conv-through": "x > ; d > a ; [ab] [éz]* { c > C ;",
+    # after contexts that are not fixed sequences of sets (§12 step 3: by the
+    # regular expression engine): a repetition, a set with a string
+    "conv-after-engine": "x > ; a { b } c* d > B ; a { q } [{zz} p] > Q ;",
     "conv-family-complete": "x > j ; [^jw] { ao > AO ;",
     "conv-family-complete-split": "\\- > ; ' ' { tz } [^ju] > Q ; [^' '$] { t } z > T ; z } [^z] > Z ; z } z > S ;",
 }

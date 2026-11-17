@@ -1426,3 +1426,24 @@ Unicode mode).
 - Spacedhan-Han needs two items (step 4).
 - Test: `conv-through` (a deletion within the run, a multibyte character of
   T), and the 2 groups in `TRANSLATE`.
+
+**Step 3 done.** A subgroup's after context that is not a fixed sequence of
+sets (repetitions, sets with strings, lookaheads) is computed by the regular
+expression engine: `matchPositions(nullptr, after, {all}, U21)` marks the
+anchors after which it matches, appended to the DivCode kernels' externals
+(`DivContextItem::Kind::Stream`, `DivCodePlan::afterStreams`), and tested at
+the anchor. Single-character rules only (a string rule's still a problem);
+not yet in UTF-8 mode. `--divcode-report` gives `after_streams`.
+
+Of the 24 groups with such after contexts, 5 become eligible and are
+applied; all match ICU on their test data (4 of them) and random text of
+their characters, in every configuration:
+
+- pl_FONIPA-ja #2 and blt-blt_FONIPA #5 (the targets of C);
+- ru-ru_Latn/BGN #2, und_FONIPA-chr #1 and vec-vec_FONIPA #2: groups with
+  string rules whose only problem was such a context.
+
+el-Title and lt-Title stay out (U+0345, step 2); the others have other
+problems. Test: `conv-after-engine` (a repetition, a set with a string, both
+at the end of the text), and pl_FONIPA-ja #2 and blt-blt_FONIPA #5 in
+`TRANSLATE`, with the 3 others.

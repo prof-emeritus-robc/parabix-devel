@@ -74,11 +74,15 @@ struct DivCodeOptions {
 // A context item: holds at a position whose character is in set, or, if
 // negated, whose character is not in set (and at the text boundary).
 struct DivContextItem {
-    enum class Kind {None, Explicit, External};
+    // Stream: a whole after context that is not a fixed sequence of sets,
+    // computed by the regular expression engine (DivCodePlan::afterStreams,
+    // index external; doc/ldml-divcode-plan.md §12 step 3): holds at the
+    // anchors (of a single-character rule) after which it matches.
+    enum class Kind {None, Explicit, External, Stream};
     Kind kind = Kind::None;
     UCD::UnicodeSet set;
     bool negated = false;
-    size_t external = 0;            // index in DivCodePlan::externalSets
+    size_t external = 0;            // index in DivCodePlan::externalSets (Stream: in afterStreams)
     // An after item whose set includes the characters of code 0 (given by its
     // complement) without the boundary (as [^X$]).  (The translation kernel
     // tests every after item within the text.)
@@ -203,6 +207,11 @@ struct DivCodePlan {
     std::vector<UCD::codepoint_t> blocks;   // ascending; the code of blocks[i] is i + 1
     unsigned codeBits = 0;
     std::vector<UCD::UnicodeSet> externalSets;
+    // The after contexts computed by the regular expression engine (the
+    // engine's forms, see DivContextItem::Kind::Stream), and their rules as
+    // written (for the plan's hash).
+    std::vector<re::RE *> afterStreams;
+    std::vector<std::string> afterStreamKeys;
     std::vector<DivRule> rules;             // by leaf (anchor code), in rule order within a leaf
     std::vector<std::vector<size_t>> leaves;    // leaves[code - 1]: the rules anchored there
     // The context items (before, after) of each subgroup of the step, for the

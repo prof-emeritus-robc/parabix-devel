@@ -1197,3 +1197,55 @@ converted contexts take the regular plan's rounds): DivCode removes almost all
 of it, and the cold start drops from 13.6 s to 1 s. pl-pl_FONIPA can run in
 UTF-8 mode only once its family group is DivCode. cs_FONIPA-ko's time is
 mostly outside the conversion group (the Latin-to-Hangul steps and NFC).
+
+### Fallback analysis: the non-covering families (2026-11-17)
+
+The 5 groups left out have 6 non-covering families. Why each before context
+is matched against the converted text (`convertedContextMatters`), and what
+applies to the family's text where its before context does not hold:
+
+| group | family | why converted | where the before context fails |
+|---|---|---|---|
+| ro_FONIPA-ja #3, sk_FONIPA-ja #4 | `^ { ia → ヤ` | string rules with results shorter than their texts: their inner units are modelled as deleted, and any deletion makes every before context converted | `i` → イ (before `a`), `a` → ア |
+| es_FONIPA-zh #2 | `[^jw] { ao } [^n]`, `… } n $vowel` → `au̯` | `j` → `i` (before `an`), `jau̯` → `iau̯`, `wa…` → `ua…` | nothing: `a` and `o` have no rules |
+| ja_Latn-ko #2 | `" "`/`^ { tji~ \| tzu~ \| tz }` (4 rules each, by after context) | deletions: `' - ^ ̂` always, `t`/`d` before `ji`/`zu`, `w` after a consonant | `t` by its single-character rules with the complementary before context `[^" "$]` (→ ᄐ), then the rules of the other units (single-character rules and covering families: `i~`, `zu`) |
+| ja_Latn-ru #3 | `﷠ { [̂̄] ~e → е` | `﷠` is written by the group (`i` before a mark, a mark after `﷠`) | the mark deleted, `~` kept, then `e` by `e [^$lengthMarker] → э` or the string rule `e $lengthMarker → эй`, which starts at the family's last unit and extends past it |
+
+Three fallbacks, in order of cost:
+
+1. **Boundary items and partial deletions** (ro_FONIPA-ja, sk_FONIPA-ja). A
+   before context whose item is only the text boundary (`^`, `[$]`) changes
+   only where all the converted text before it can be deleted: by a conversion
+   whose whole result is empty. The inner units of a string rule with a
+   non-empty result never empty the text before. Refining
+   `convertedContextMatters` so (for boundary-only items, only whole
+   deletions count) makes `^ { ia` an ordinary before context: both groups are
+   then eligible without the Converted kernel (no other problems). This also
+   changes the regular plan's classification (fewer rounds), which must stay
+   exact: the CLDR corpus check and the DivCode tests cover it.
+2. **Completion by the rules that apply** (es_FONIPA-zh, ja_Latn-ko). Where a
+   family's before contexts miss some converted characters, give it synthetic
+   members for the missing regions: for each after context of the family and
+   each region (the converted characters, or the boundary, not covered), the
+   result of the rules that apply at its units in order. The completion holds
+   if, for each such region, the rules applied are determined: the first
+   unit's rule by the region (its before context implied by the region), the
+   later units' rules by the family's text and its after context (no rule's
+   after context reaching beyond them, no string rule starting within the text
+   and extending past it), and the results of covering families met within
+   the text by the converted characters before them, which the evaluation
+   gives. The family then covers its text, and phase 2 applies as it is. For
+   es_FONIPA-zh the synthetic member is the identity (`[jw] { ao } … → ao`);
+   for ja_Latn-ko, `[^" "$] { tz } [^ju] → ᄐ` followed by `z`'s result, and so
+   on. The evaluation is a small interpreter over the plan's own rules
+   (`DivRule`: text, contexts, priority), run while planning.
+3. **Matches whose extent depends on the converted text** (ja_Latn-ru). Where
+   the family fails, a string rule starts at its last unit and extends past
+   it (`e $lengthMarker`), so the positions covered depend on the outcome.
+   Completion would need the family split by the character after its text,
+   with members of different lengths (not a family of one text). Not worth it
+   for one group of one rule.
+
+Recommendation: fallback 1 (small; 2 groups), then fallback 2 (3 families of
+ja_Latn-ko and 1 of es_FONIPA-zh; 2 groups). That brings in 8 of the 9 groups;
+ja_Latn-ru #3 stays on the regular plan.

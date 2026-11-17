@@ -165,30 +165,43 @@ static void classifyConverted(DivCodePlan & plan) {
     };
     UCD::UnicodeSet chars;
     for (const DivRule & d : plan.rules) {
-        if (!d.converted) continue;
+        if (!d.converted && (d.family < 0 || !d.before.present())) continue;
         const DivContextItem & item = d.before.items[0];
         bool found = false;
         for (const DivContextItem & c : plan.convertedItems) found = found || sameItem(c, item);
         if (!found) plan.convertedItems.push_back(item);
-        chars = chars + d.text[0];
+        if (d.converted) chars = chars + d.text[0];
     }
     const size_t n = plan.convertedItems.size();
     plan.consumerIn.assign(n, UCD::UnicodeSet());
     if (n == 0) return;
+    //  What a later before context sees of an outcome: "D" (deleted), or
+    //  whether its last character is in the set of each item.
+    auto signatureOf = [&](const std::u32string & result) {
+        if (result.empty()) return std::string("D");
+        std::string sig;
+        for (const DivContextItem & item : plan.convertedItems) sig += item.set.contains(result.back()) ? '1' : '0';
+        return sig;
+    };
+    //  The families: their rules' results (one of which applies).
+    for (size_t f = 0; f < plan.convertedFamilies.size(); f++) {
+        DivConvertedFamily & family = plan.convertedFamilies[f];
+        std::set<std::string> sigs;
+        for (const DivRule & d : plan.rules) if (d.family == static_cast<int>(f)) sigs.insert(signatureOf(d.result));
+        if (sigs.empty()) continue;
+        family.propagating = sigs.size() > 1;
+        family.deleted = !family.propagating && *sigs.begin() == "D";
+        family.in.assign(n, false);
+        if (!family.propagating && !family.deleted) for (size_t i = 0; i < n; i++) family.in[i] = (*sigs.begin())[i] == '1';
+    }
+    if (chars.empty()) return;
     //  (Very many characters: all taken as propagating.)
     if (chars.count() > 20000) {
         plan.propagating = chars;
         return;
     }
     const UCD::UnicodeSet all(0, 0x10FFFF);
-    //  What a later before context sees of an outcome: "D" (deleted), or
-    //  whether its last character is in the set of each item.
-    auto signature = [&](const std::u32string & result) {
-        if (result.empty()) return std::string("D");
-        std::string sig;
-        for (const DivContextItem & item : plan.convertedItems) sig += item.set.contains(result.back()) ? '1' : '0';
-        return sig;
-    };
+    auto signature = signatureOf;
     for (const auto & range : chars) {
         for (UCD::codepoint_t c = range.first; c <= range.second; c++) {
             //  The converted rules on c (no other rule applies at a dependent
@@ -309,7 +322,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             if (!options.convertedBefore) {
                 problem("before contexts (no check of the converted text)");
             } else if (options.convertedBefore(step, engineBefore) && options.convertedRounds > 0) {
-                if (!single) {
+                if (!single && !converted) {
                     problem("string rules with before contexts matched against the converted text");
                 } else if (items.size() > 1) {
                     problem("before contexts of two or more items matched against the converted text");
@@ -349,6 +362,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         bool converted = false;
         const ConversionRule * rule = nullptr;
         int stringRule = -1, subgroup = -1;
+        int family = -1;                    // a covering family applied (DivRule::family)
     };
     std::vector<Source> sources;
 
@@ -382,9 +396,111 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         src.result = sr.replacement;
         src.rule = sr.rule;
         src.stringRule = static_cast<int>(r);
-        classify(sr.before, sr.engineBefore, true, src.before);
+        classify(sr.before, sr.engineBefore, true, src.before, &src.converted);
         classify(sr.after, nullptr, false, src.after);
         sources.push_back(std::move(src));
+    }
+    //  The families of the string rules with before contexts matched against
+    //  the converted text (see DivConvertedFamily), and their sources.
+    std::vector<std::vector<size_t>> familyMembers;
+    {
+        //  Where an item holds: the characters, and whether the text boundary.
+        struct Space {
+            UCD::UnicodeSet chars;
+            bool boundary;
+        };
+        const UCD::UnicodeSet all(0, 0x10FFFF);
+        auto holds = [&](const DivContext & context) {
+            if (!context.present()) return Space{all, true};
+            const DivContextItem & item = context.items[0];
+            return item.negated ? Space{~item.set, true} : Space{item.set, false};
+        };
+        std::vector<bool> done(sources.size(), false);
+        for (size_t i = 0; i < sources.size(); i++) {
+            if (sources[i].stringRule < 0 || !sources[i].converted || done[i]) continue;
+            familyMembers.emplace_back();
+            std::vector<size_t> & members = familyMembers.back();
+            for (size_t j = 0; j < sources.size(); j++) {
+                if (sources[j].stringRule >= 0 && sources[j].text == sources[i].text) {
+                    members.push_back(j);
+                    done[j] = true;
+                }
+            }
+            DivConvertedFamily f;
+            for (size_t j : members) f.stringRules.push_back(sources[j].stringRule);
+            for (size_t j : members) {
+                const Source & m = sources[j];
+                if (m.before.present() && !m.converted) f.reason = "a rule with a before context matched against the text itself";
+                if (m.before.items.size() > 1) f.reason = "a before context of several items";
+            }
+            //  (An after context of several items: the rules with the same after
+            //  context, and those without one, cover as a group.  Sufficient,
+            //  not necessary.)
+            bool several = false;
+            for (size_t j : members) several |= sources[j].after.items.size() > 1;
+            auto sameItems = [](const DivContext & a, const DivContext & b) {
+                if (a.items.size() != b.items.size()) return false;
+                for (size_t k = 0; k < a.items.size(); k++) {
+                    if (!(a.items[k].set == b.items[k].set) || a.items[k].negated != b.items[k].negated) return false;
+                }
+                return true;
+            };
+            if (f.reason.empty() && several) {
+                f.covering = true;
+                for (size_t j : members) {
+                    Space before{UCD::UnicodeSet(), false};
+                    for (size_t q : members) {
+                        if (sources[q].after.present() && !sameItems(sources[q].after, sources[j].after)) continue;
+                        const Space b = holds(sources[q].before);
+                        before.chars = before.chars + b.chars;
+                        before.boundary |= b.boundary;
+                    }
+                    if (!(before.chars == all && before.boundary)) {
+                        f.covering = false;
+                        f.reason = "an after context of several items, the before contexts of its rules miss "
+                                   + std::to_string((all - before.chars).count()) + " characters"
+                                   + (before.boundary ? "" : " and the text boundary");
+                        break;
+                    }
+                }
+            } else if (f.reason.empty()) {
+                //  The regions of the characters after the text that the after
+                //  contexts distinguish, and the end of the text.
+                std::vector<UCD::UnicodeSet> regions{all};
+                for (size_t j : members) {
+                    const Space a = holds(sources[j].after);
+                    std::vector<UCD::UnicodeSet> refined;
+                    for (const UCD::UnicodeSet & r : regions) {
+                        const UCD::UnicodeSet in = r & a.chars, out = r - a.chars;
+                        if (!in.empty()) refined.push_back(in);
+                        if (!out.empty()) refined.push_back(out);
+                    }
+                    regions = std::move(refined);
+                }
+                auto check = [&](const std::function<bool (const Space &)> & afterHolds, const std::string & where) {
+                    Space before{UCD::UnicodeSet(), false};
+                    bool any = false;
+                    for (size_t j : members) {
+                        if (!afterHolds(holds(sources[j].after))) continue;
+                        any = true;
+                        const Space b = holds(sources[j].before);
+                        before.chars = before.chars + b.chars;
+                        before.boundary |= b.boundary;
+                    }
+                    if (!any || (before.chars == all && before.boundary)) return true;
+                    const UCD::UnicodeSet missing = all - before.chars;
+                    f.reason = where + ", the before contexts miss " + std::to_string(missing.count()) + " characters"
+                               + (before.boundary ? "" : " and the text boundary");
+                    return false;
+                };
+                f.covering = true;
+                for (const UCD::UnicodeSet & r : regions) {
+                    if (!check([&](const Space & a) {return r.subset(a.chars);}, "before some characters")) {f.covering = false; break;}
+                }
+                if (f.covering) f.covering = check([](const Space & a) {return a.boundary;}, "at the end of the text");
+            }
+            plan.convertedFamilies.push_back(std::move(f));
+        }
     }
     std::vector<bool> subgroupConverted;
     for (size_t g = 0; g < step.subgroups.size(); g++) {
@@ -451,6 +567,53 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         }
     }
 
+    //  The covering families applied: their rules yield to the same rules
+    //  outside them, and a rule yielding to one of them yields to all.  The
+    //  string rules with converted before contexts outside them are problems.
+    for (size_t f = 0; f < plan.convertedFamilies.size(); f++) {
+        DivConvertedFamily & family = plan.convertedFamilies[f];
+        if (!family.covering) continue;
+        const std::vector<size_t> & members = familyMembers[f];
+        auto inFamily = [&](int stringRule) {
+            return std::find(family.stringRules.begin(), family.stringRules.end(), stringRule) != family.stringRules.end();
+        };
+        auto outside = [&](size_t i) {
+            std::set<std::string> r;
+            for (const DivEarlier & e : yields[i]) {
+                if (e.stringRule >= 0 && inFamily(e.stringRule)) continue;
+                std::string key = std::to_string(e.stringRule) + "," + std::to_string(e.subgroup) + ":";
+                for (const auto & range : e.chars) key += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
+                r.insert(key);
+            }
+            return r;
+        };
+        bool applied = true;
+        for (size_t j : members) {
+            if (outside(j) != outside(members.front())) {
+                family.reason = "its rules yield to different rules";
+                applied = false;
+                break;
+            }
+        }
+        for (size_t i = 0; i < sources.size() && applied; i++) {
+            if (std::find(members.begin(), members.end(), i) != members.end()) continue;
+            size_t n = 0;
+            for (const DivEarlier & e : yields[i]) n += e.stringRule >= 0 && inFamily(e.stringRule) ? 1 : 0;
+            if (n > 0 && n < members.size()) {
+                family.reason = "a rule yields to some of its rules";
+                applied = false;
+            }
+        }
+        if (!applied) {
+            family.covering = false;
+            continue;
+        }
+        for (size_t j : members) sources[j].family = static_cast<int>(f);
+    }
+    for (const Source & src : sources) {
+        if (src.stringRule >= 0 && src.converted && src.family < 0) problem("string rules with before contexts matched against the converted text");
+    }
+
     //  The alphabet: the blocks of the texts, of the explicit context sets (or
     //  their complements), and of the characters of earlier single-character
     //  rules.
@@ -495,8 +658,12 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
             d.after = src.after;
             d.yieldsTo = yields[i];
             d.stage = src.stringRule >= 0 ? stageOf[src.stringRule] : 0;
-            d.converted = src.converted;
+            //  (Phase 1: single-character rules; a string rule's flag is for its
+            //  family, DivConvertedFamily.)
+            d.converted = src.converted && src.stringRule < 0;
             if (d.converted) plan.convertedRules++;
+            d.family = src.family;
+            if (d.family >= 0) plan.familyRules++;
             rules.push_back(std::move(d));
         }
     }
@@ -531,7 +698,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     }
     for (const DivRule & d : plan.rules) {
         content += ";r" + std::to_string(d.stringRule) + "," + std::to_string(d.subgroup) + "," + std::to_string(d.anchor) + "@"
-                   + std::to_string(d.stage) + (d.converted ? "c" : "") + ":";
+                   + std::to_string(d.stage) + (d.converted ? "c" : "") + (d.family >= 0 ? "f" + std::to_string(d.family) : "") + ":";
         for (const UCD::UnicodeSet & t : d.text) appendSet(content, t);
         content += ">";
         for (char32_t c : d.result) content += hex(c) + ",";

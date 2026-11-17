@@ -130,9 +130,42 @@ struct DivRule {
     // single-character rule, with a before context of one item, that no rule
     // yields to.)
     bool converted = false;
+    // A rule of a covering family (DivCodePlan::convertedFamilies, phase 2): its
+    // index, or -1.  The family's match is certain; which of its rules applies
+    // (by its before context, matched against the converted text) is resolved
+    // as for the converted rules.
+    int family = -1;
     size_t length() const {return text.size();}
     size_t expansion() const {return result.size() > text.size() ? result.size() - text.size() : 0;}
     size_t deletions() const {return text.size() > result.size() ? text.size() - result.size() : 0;}
+};
+
+// A family of string rules (doc/ldml-divcode-plan.md §11): the string rules of
+// a group with the same text (the same sets at each position), some of whose
+// before contexts are matched against the converted text.  It covers its text
+// if, wherever the text matches with an after context of its rules, some rule
+// of the family applies whatever the converted text before it is: for each
+// region of the characters after the text (and the end of the text) that the
+// after contexts of its rules distinguish, the before contexts of the rules
+// whose after contexts hold there (or which have none) hold for every
+// character before it and at the text boundary, or no rule's after context
+// holds there.  Then the match is certain, and only its result depends on the
+// converted text.
+//
+// A covering family is applied (DivRule::family) if its rules yield to the same
+// rules outside it, and every rule yielding to one of them yields to all.  Its
+// outcomes, as for the characters of the converted rules: the family
+// propagates if its results differ in what a later before context sees
+// (deleted, or the sets of DivCodePlan::convertedItems their last characters
+// are in); otherwise its results are all deleted (deleted) or their last
+// characters are in the set of item i or not (in[i]).
+struct DivConvertedFamily {
+    std::vector<int> stringRules;           // indices in TransformStep::stringRules, in rule order
+    bool covering = false;
+    std::string reason;                     // why it does not cover its text, or is not applied
+    bool propagating = false;
+    bool deleted = false;
+    std::vector<bool> in;
 };
 
 struct DivCodePlan {
@@ -157,11 +190,26 @@ struct DivCodePlan {
     // one outcome: deleted (consumerDeleted), or a last character in the set of
     // item i (consumerIn[i]) or not.
     std::vector<DivContextItem> convertedItems;
+    // The families of the string rules with before contexts matched against
+    // the converted text (phase 2: see DivConvertedFamily).
+    std::vector<DivConvertedFamily> convertedFamilies;
     UCD::UnicodeSet propagating;
     UCD::UnicodeSet consumerDeleted;
     std::vector<UCD::UnicodeSet> consumerIn;
     size_t convertedRules = 0;              // the rules with DivRule::converted
-    std::string contentHash;                // of the whole plan
+    size_t familyRules = 0;                 // the rules with DivRule::family
+    // Whether some rule's before context is matched against the converted text
+    // (the Converted kernel: doc/ldml-divcode-plan.md §10, §11).
+    bool dependent() const {return convertedRules > 0 || familyRules > 0;}
+    // Whether some outcome depends on the converted character before it: the
+    // characters of propagating, or the matches of a family whose results
+    // differ (the Converted kernel's loop evaluates them in order).
+    bool propagates() const {
+        if (!propagating.empty()) return true;
+        for (const DivConvertedFamily & f : convertedFamilies) if (f.propagating) return true;
+        return false;
+    }
+    std::string contentHash;               // of the whole plan
     std::vector<std::string> problems;
     bool eligible() const {return problems.empty();}
     // The code of a codepoint (0 if not in a block of the alphabet).

@@ -10840,6 +10840,30 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
                       << ", \"eligible64\": " << (p64.eligible() ? "true" : "false")
                       << ", \"problems\": [" << problems << "]"
                       << ", \"div32\": " << divCodeShiftReport(p32) << ", \"div64\": " << divCodeShiftReport(p64)
+                      << ", \"converted_families\": [" << [&]() {
+                          //  (Phase 2: see ldml::DivConvertedFamily.)
+                          std::string r;
+                          for (const ldml::DivConvertedFamily & f : p32.convertedFamilies) {
+                              std::string text;
+                              for (const auto & set : step.stringRules[f.stringRules[0]].text) {
+                                  std::string one;
+                                  for (const auto & range : set) {
+                                      if (one.size() > 40) break;
+                                      for (UCD::codepoint_t c = range.first; c <= range.second && one.size() <= 40; c++) {
+                                          if (c < 0x80) {one += static_cast<char>(c); continue;}
+                                          const unsigned n = c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+                                          one += static_cast<char>((0xF00u >> n) | (c >> (6 * (n - 1))));
+                                          for (unsigned i = n - 1; i-- > 0; ) one += static_cast<char>(0x80 | ((c >> (6 * i)) & 0x3F));
+                                      }
+                                  }
+                                  text += (set.count() == 1 ? one : "[" + one + "]");
+                              }
+                              r += std::string(r.empty() ? "" : ", ") + "{\"text\": \"" + jsonEscape(text) + "\", \"rules\": "
+                                   + std::to_string(f.stringRules.size()) + ", \"covering\": " + (f.covering ? "true" : "false")
+                                   + (f.reason.empty() ? "" : ", \"reason\": \"" + jsonEscape(f.reason) + "\"") + "}";
+                          }
+                          return r;
+                      }() << "]"
                       << ", \"converted\": " << [&]() {
                           //  The rules whose before contexts are matched against the
                           //  converted text (see convertedContextMatters), and what the
@@ -11641,7 +11665,7 @@ public:
         for (const ldml::DivRule & d : plan.rules) if (unitsOf(d, utf8, plan.shift).deletions() > 0) return true;
         //  (With converted rules and insertions: the reserved positions that their
         //  results do not fill.)
-        return plan.convertedRules > 0 && maxExpansion(plan, utf8) > 0;
+        return plan.dependent() && maxExpansion(plan, utf8) > 0;
     }
 protected:
     void generatePabloMethod() override;
@@ -11658,7 +11682,10 @@ private:
                             //    converted rules (where these do not apply),
                             // 8: the converted rules' matches ignoring their before contexts, with value
                             //    the expansion (Count: at the offset of the count; Translate: 0),
-                            // 10: the converted rules' matches (Converted), extending over value units
+                            // 10: the converted rules' matches (Converted), extending over value units,
+                            // 11: the matches of a family's rules ignoring their before contexts (Count: at the
+                            //     offset of the count, with value the expansion; Translate: of N units (offset)
+                            //     of family value)
         unsigned offset;
         bool single;
         unsigned value;
@@ -11685,7 +11712,7 @@ private:
     //  Converted mode, the converted rules.
     bool needed(size_t r) const {
         const ldml::DivRule & d = mPlan.rules[r];
-        if (mMode == Mode::Converted) return d.converted;
+        if (mMode == Mode::Converted) return d.converted || d.family >= 0;
         if (mMode == Mode::Translate) return true;
         return d.converted || mUnits[r].expansion() > 0 || d.length() > 1 || onConverted(r);
     }
@@ -11717,7 +11744,7 @@ std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) cons
     const uint32_t low = (1u << s) - 1;
     const unsigned N = u.N, M = static_cast<unsigned>(u.result.size());
     const bool single = d.length() == 1;
-    const bool converted = mPlan.convertedRules > 0;
+    const bool converted = mPlan.dependent();
     std::vector<Change> changes;
     //  (The applied string matches, by stage: each cover reads the Vars of the
     //  stages before it, which no later pass assigns, as the builder may reuse
@@ -11726,6 +11753,8 @@ std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) cons
     if (mMode == Mode::Count) {
         //  (A converted rule: the positions it may need, at its last unit.)
         if (d.converted) return {Change{Key{8, N - 1, true, u.expansion()}}};
+        //  (A rule of a family: the positions it may need, and its certain match.)
+        if (d.family >= 0) return {Change{Key{11, N - 1, false, u.expansion()}}, Change{Key{3, stage, false, N}}};
         if (M > N) changes.push_back(Change{Key{4, N - 1, single, M - N}});
         if (!single) changes.push_back(Change{Key{3, stage, false, N}});
         if (onConverted(r)) changes.push_back(Change{Key{7, 0, true, 0}});
@@ -11733,6 +11762,11 @@ std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) cons
     }
     //  (Translate: a converted rule, only where it may apply.)
     if (mMode == Mode::Translate && d.converted) return {Change{Key{8, 0, true, 0}}};
+    //  (Translate: a rule of a family, its match, which is certain, as a cover:
+    //  Converted applies its changes.)
+    if (mMode == Mode::Translate && d.family >= 0) {
+        return {Change{Key{11, N, false, static_cast<unsigned>(d.family)}}, Change{Key{6, 0, false, N}}, Change{Key{3, stage, false, N}}};
+    }
     for (unsigned j = 0; j < std::max(N, M); j++) {
         if (j >= M) {
             changes.push_back(Change{Key{2, j, single, 0}});
@@ -12117,7 +12151,7 @@ void DivCodeTranslate::generatePabloMethod() {
     //  (Created at the top level before the hierarchy: not those of the
     //  converted rules, matched against the converted text.)
     if (mMode != Mode::Converted) {
-        for (const ldml::DivRule & d : plan.rules) if (!d.converted) beforeOf(d.before);
+        for (const ldml::DivRule & d : plan.rules) if (!d.converted && d.family < 0) beforeOf(d.before);
         for (const auto & sc : plan.subgroupContexts) beforeOf(sc.first);
     }
 
@@ -12146,6 +12180,9 @@ void DivCodeTranslate::generatePabloMethod() {
     //  converted character before a position is in the set of each item (or,
     //  negated, not), as resolved so far.
     std::vector<PabloAST *> convertedBefore;
+    //  In Converted mode, where the converted rules apply (their dependent
+    //  positions) and where the rules of the families do (their matches).
+    PabloAST * convertedAt = nullptr, * familiesAt = nullptr;
     //  A leaf: the rules of a pass anchored at code A, each applying only outside
     //  the applied string matches of the passes before (cover, if any).
     auto leaf = [&](PabloBuilder & b, unsigned A, PabloAST * leafCond, unsigned pass, PabloAST * cover) {
@@ -12192,12 +12229,13 @@ void DivCodeTranslate::generatePabloMethod() {
             }
             if (mask) for (unsigned o : u.offset) M = b.createAnd(M, t.at(mask, o));
             if (d.after.present()) {
-                M = b.createAnd(M, own && mHasSpread && !d.converted ? itemTest(t, d.after, u.N + u.expansion(), ruleItem[r])
-                                                                      : afterItem(d.after, u.N, ruleItem[r]));
+                M = b.createAnd(M, own && mHasSpread && !d.converted && d.family < 0 ? itemTest(t, d.after, u.N + u.expansion(), ruleItem[r])
+                                                                                     : afterItem(d.after, u.N, ruleItem[r]));
             }
-            //  (A converted rule: its before context only in Converted mode.)
-            if (d.converted) {
-                if (mMode == Mode::Converted) M = b.createAnd(M, convertedBefore[convertedItem(d.before.items[0])]);
+            //  (A converted rule, or a rule of a family: its before context only in
+            //  Converted mode.)
+            if (d.converted || d.family >= 0) {
+                if (mMode == Mode::Converted && d.before.present()) M = b.createAnd(M, convertedBefore[convertedItem(d.before.items[0])]);
             } else if (PabloAST * bf = beforeOf(d.before)) {
                 M = b.createAnd(M, bf);
             }
@@ -12214,14 +12252,22 @@ void DivCodeTranslate::generatePabloMethod() {
             if (!inPass(r, pass)) continue;
             const ldml::DivRule & d = plan.rules[r];
             PabloAST * M = rawOf(r, true);
+            if (mMode == Mode::Converted) M = b.createAnd(M, d.family >= 0 ? familiesAt : convertedAt);
             //  (Converted mode: only at the dependent positions, where no other
-            //  rule applies.)
-            if (mMode != Mode::Converted) {
+            //  rule applies but the earlier rules of the same family.)
+            {
                 //  The earlier rules it yields to, matching at its anchor.
                 PabloAST * earlier = nullptr;
                 for (const ldml::DivEarlier & e : d.yieldsTo) {
                     PabloAST * x = nullptr;
-                    if (e.stringRule >= 0) {
+                    if (mMode == Mode::Converted) {
+                        for (size_t q : rules) {
+                            const ldml::DivRule & eq = plan.rules[q];
+                            if (d.family >= 0 && eq.stringRule == e.stringRule && eq.family == d.family) {
+                                x = x ? b.createOr(x, rawOf(q)) : rawOf(q);
+                            }
+                        }
+                    } else if (e.stringRule >= 0) {
                         for (size_t q : rules) {
                             if (plan.rules[q].stringRule == e.stringRule) x = x ? b.createOr(x, rawOf(q)) : rawOf(q);
                         }
@@ -12238,13 +12284,16 @@ void DivCodeTranslate::generatePabloMethod() {
                     if (x) earlier = earlier ? b.createOr(earlier, x) : x;
                 }
                 if (earlier) M = b.createAnd(M, b.createNot(earlier));
+            }
+            if (mMode != Mode::Converted) {
                 //  (Not beginning strictly within an applied match of a pass before.)
                 if (cover) M = b.createAnd(M, b.createNot(cover));
                 //  In the spread text, a rule applies only where the Count kernel
                 //  found it to: with exactly its expansion inserted after it (none,
                 //  if it does not expand).  (A converted rule: with the positions
                 //  reserved at its dependent position.)
-                if (mHasSpread && !d.converted) M = b.createAnd(M, gapOf(mUnits[r].N, mUnits[r].expansion()));
+                //  (A rule of a family: with the positions reserved for the family.)
+                if (mHasSpread && !d.converted && d.family < 0) M = b.createAnd(M, gapOf(mUnits[r].N, mUnits[r].expansion()));
             }
             for (const Change & c : changesOf(r)) {
                 //  (In the loop, only the outcomes: not the bits of the output.)
@@ -12352,8 +12401,8 @@ void DivCodeTranslate::generatePabloMethod() {
     //  matches, ignoring its before context, outside the string matches, and no
     //  other single-character rule applies nor a string match begins.
     PabloAST * dep = nullptr;
-    if (plan.convertedRules > 0 && mMode != Mode::Converted) {
-        dep = pb.createAnd(anchored(8), pb.createNot(pb.createOr(anchored(7), anchored(3))));
+    if (plan.dependent() && mMode != Mode::Converted) {
+        dep = plan.convertedRules == 0 ? zeroes : pb.createAnd(anchored(8), pb.createNot(pb.createOr(anchored(7), anchored(3))));
     }
     if (mMode == Mode::Count) {
         //  The insertion counts, at the last positions of the matches.
@@ -12369,11 +12418,13 @@ void DivCodeTranslate::generatePabloMethod() {
         //  At the dependent positions (where no other match ends), the largest
         //  expansion of the converted rules that match there: atLeast[e], where
         //  one of at least e does.
+        //  (And at the matches of a family, the largest expansion of its rules
+        //  matching there, ignoring their before contexts.)
         if (dep && maxExp > 0) {
             std::vector<PabloAST *> atLeast(maxExp + 2, zeroes);
             for (const auto & v : vars) {
-                if (v.first.kind != 8 || v.first.value == 0) continue;
-                PabloAST * x = pb.createAnd(v.second, dep);
+                if ((v.first.kind != 8 && v.first.kind != 11) || v.first.value == 0) continue;
+                PabloAST * x = v.first.kind == 8 ? pb.createAnd(v.second, dep) : static_cast<PabloAST *>(v.second);
                 if (v.first.offset) x = pb.createAdvance(x, v.first.offset);
                 for (unsigned e = 1; e <= v.first.value; e++) atLeast[e] = pb.createOr(atLeast[e], x);
             }
@@ -12396,7 +12447,13 @@ void DivCodeTranslate::generatePabloMethod() {
     if (mMode == Mode::Converted) {
         base = getInputStreamSet("Prev");
         deletedBefore = getInputStreamSet("PrevDeleted")[0];
-        PabloAST * const depIn = getInputStreamSet("Dep")[0];
+        //  (Dep: the dependent positions of the converted rules, and the matches
+        //  of the families whose outcomes are known (consumers) and not.)
+        const std::vector<PabloAST *> deps = getInputStreamSet("Dep");
+        PabloAST * const depIn = deps[0];
+        PabloAST * const depAll = pb.createOr(depIn, pb.createOr(deps[1], deps[2]));
+        convertedAt = depIn;
+        familiesAt = pb.createOr(deps[1], deps[2]);
         const std::vector<PabloAST *> ends = getInputStreamSet("Ends");
         PabloAST * const start = pb.createNot(pb.createAdvance(pb.createOnes(), 1));
         //  (An item marking the end of a filtered run also holds after a
@@ -12410,8 +12467,9 @@ void DivCodeTranslate::generatePabloMethod() {
         auto charsAt = [&](const UCD::UnicodeSet & set) -> PabloAST * {
             return set.empty() ? zeroes : top.pseudo(0, plan.pseudoSet(set), 0);
         };
-        PabloAST * const propagating = pb.createAnd(depIn, charsAt(plan.propagating));
-        PabloAST * const consumers = pb.createAnd(depIn, pb.createNot(propagating));
+        PabloAST * const propagatingChars = pb.createAnd(depIn, charsAt(plan.propagating));
+        PabloAST * const consumers = pb.createAnd(depIn, pb.createNot(propagatingChars));
+        PabloAST * const propagating = pb.createOr(propagatingChars, deps[2]);
         std::vector<PabloAST *> lengths;
         for (unsigned l = 1; l <= maxLen; l++) lengths.push_back(mUTF8 ? top.lengthAt(0, l) : nullptr);
         //  The positions after the characters beginning at x.
@@ -12457,7 +12515,9 @@ void DivCodeTranslate::generatePabloMethod() {
         //  character before the next position is the same either way).
         PabloAST * const consumersDeleted = pb.createAnd(consumers, charsAt(plan.consumerDeleted));
         PabloAST * const consumersKept = pb.createAnd(consumers, pb.createNot(consumersDeleted));
-        PabloAST * knownDeleted = pb.createOr(deletedBefore, unfilled(pb, after(pb, consumers)));
+        //  (And the positions of the matches of the families whose results are
+        //  all deleted: Ends' last stream.)
+        PabloAST * knownDeleted = pb.createOr(pb.createOr(deletedBefore, ends[2 * n]), unfilled(pb, after(pb, consumers)));
         for (unsigned l = 1; l <= maxLen; l++) {
             PabloAST * const x = lengths[l - 1] ? pb.createAnd(consumersDeleted, lengths[l - 1]) : consumersDeleted;
             for (unsigned j = 0; j < l; j++) knownDeleted = pb.createOr(knownDeleted, j ? pb.createAdvance(x, j) : x);
@@ -12497,7 +12557,7 @@ void DivCodeTranslate::generatePabloMethod() {
         //  outcomes to the known items, which then hold at later positions.
         //  Every Var only gains bits (the loop's carries from the previous
         //  block reach its first iteration only).
-        if (!plan.propagating.empty()) {
+        if (plan.propagates()) {
             std::map<Key, Var *> loopVars;
             for (const auto & v : vars) {
                 const unsigned kind = v.first.kind;
@@ -12529,14 +12589,14 @@ void DivCodeTranslate::generatePabloMethod() {
         //  resolved.
         contexts(pb);
         target = &vars;
-        subtree(pb, static_cast<int>(k) - 1, 0, depIn);
+        subtree(pb, static_cast<int>(k) - 1, 0, depAll);
         PabloAST * fired = zeroes;
         for (const auto & v : vars) {
             if (v.first.kind != 10) continue;
             fired = pb.createOr(fired, v.second);
             surplus = pb.createOr(surplus, unfilled(pb, pb.createAdvance(v.second, v.first.value)));
         }
-        surplus = pb.createOr(surplus, unfilled(pb, after(pb, pb.createAnd(depIn, pb.createNot(fired)))));
+        surplus = pb.createOr(surplus, unfilled(pb, after(pb, pb.createAnd(depAll, pb.createNot(fired)))));
     }
 
     std::vector<PabloAST *> out(W, nullptr);
@@ -12604,8 +12664,43 @@ void DivCodeTranslate::generatePabloMethod() {
         ends[2 * i] = pb.createOr(ends[2 * i], nextPlain(pb.createAnd(unchanged, test)));
         ends[2 * i + 1] = pb.createOr(ends[2 * i + 1], nextPlain(pb.createAnd(unchanged, pb.createNot(test))));
     }
+    //  The matches of the families (the anchors of their rules, which Converted
+    //  applies), known (consumers) or not; for the consumers, the outcome at
+    //  the first position after the match and the positions reserved after it
+    //  (the result's last character), or the positions of the match and those
+    //  reserved, deleted.
+    PabloAST * familyKnown = zeroes, * familyPropagating = zeroes, * familyDeleted = zeroes;
+    for (const auto & v : vars) {
+        if (v.first.kind != 11) continue;
+        const ldml::DivConvertedFamily & family = plan.convertedFamilies[v.first.value];
+        if (family.propagating) {
+            familyPropagating = pb.createOr(familyPropagating, v.second);
+            continue;
+        }
+        familyKnown = pb.createOr(familyKnown, v.second);
+        //  (The units of the text, then the reserved positions, to the first
+        //  position after them.)
+        PabloAST * span = zeroes;
+        for (unsigned j = 0; j < v.first.offset; j++) span = pb.createOr(span, j ? pb.createAdvance(v.second, j) : static_cast<PabloAST *>(v.second));
+        PabloAST * through = pb.createAdvance(v.second, v.first.offset);
+        PabloAST * end = gap ? pb.createAnd(through, pb.createNot(gap)) : through;
+        if (gap) {
+            for (unsigned g = 0; g < maxExp; g++) {
+                PabloAST * const inGap = pb.createAnd(through, gap);
+                span = pb.createOr(span, inGap);
+                through = pb.createAdvance(inGap, 1);
+                end = pb.createOr(end, pb.createAnd(through, pb.createNot(gap)));
+            }
+        }
+        if (family.deleted) {
+            familyDeleted = pb.createOr(familyDeleted, span);
+        } else {
+            for (size_t i = 0; i < n; i++) ends[2 * i + (family.in[i] ? 0 : 1)] = pb.createOr(ends[2 * i + (family.in[i] ? 0 : 1)], end);
+        }
+    }
+    ends.push_back(familyDeleted);
     for (PabloAST *& e : ends) e = pb.createInFile(e);
-    writeOutputStreamSet("Dep", std::vector<PabloAST *>{pb.createInFile(dep)});
+    writeOutputStreamSet("Dep", std::vector<PabloAST *>{pb.createInFile(dep), pb.createInFile(familyKnown), pb.createInFile(familyPropagating)});
     writeOutputStreamSet("Ends", ends);
 }
 
@@ -12752,8 +12847,10 @@ static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCode
     //  With converted rules: their dependent positions, and the ends of the
     //  converted characters by the sets of their items (see DivCodeTranslate).
     const size_t convertedItems = DivCodeTranslate::convertedItemsOf(plan).size();
-    StreamSet * const Dep = plan.convertedRules > 0 ? P.CreateStreamSet(1) : nullptr;
-    StreamSet * const Ends = plan.convertedRules > 0 ? P.CreateStreamSet(2 * convertedItems) : nullptr;
+    //  (Dep: of the converted rules, and of the families known and not; Ends:
+    //  by item, in the set and not, and the matches of families deleted.)
+    StreamSet * const Dep = plan.dependent() ? P.CreateStreamSet(3) : nullptr;
+    StreamSet * const Ends = plan.dependent() ? P.CreateStreamSet(2 * convertedItems + 1) : nullptr;
     StreamSet * const SpreadTextMask = Masks.empty() ? nullptr : Masks.back();
     P.CreateKernelCall<DivCodeTranslate>(plan, label, DivCodeTranslate::Mode::Translate, Basis, Code, Externals, InText,
                                          SpreadTextMask, SpreadMask, Items, Out, Deleted, Dep, Ends);

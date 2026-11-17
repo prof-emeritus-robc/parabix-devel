@@ -1,9 +1,50 @@
-# uconv errata
+# ICU and uconv issues
 
-Known cases where the output of ICU's `uconv` command differs from what ICU itself
-produces for the same transform, through its API, on the whole text. These matter
-when `uconv` is used as the reference for tconv's output. Observed with
-`uconv v2.1`, ICU 78.3.
+Known cases where ICU's output for a transform is not what the transform's
+rules specify (UTS #35 Part 2), or where the output of ICU's `uconv` command
+differs from what ICU itself produces through its API on the whole text. These
+matter wherever ICU or `uconv` is the reference for tconv's output.
+
+## ICU
+
+Observed with ICU 78.3 (`Transliterator::createFromRules`, as `tconv
+--use-ICU` calls it) and with `uconv v2.1`, ICU 77.1.
+
+- **A global filter is ignored when the rules make a single rule set.** A
+  global filter (`:: [set] ;` before the rules) restricts the whole transform
+  to the characters of the set: the rules apply to each run of those
+  characters, and no rule's text can match a character outside them. ICU
+  applies it only when the rules have at least one `::` transform besides the
+  filter. When they make a single rule set (only the filter and conversion
+  rules), the rules apply to every character of the text, as if there were no
+  filter (presumably because ICU then makes a plain `RuleBasedTransliterator`,
+  without the filter it parsed; not checked in ICU's source):
+
+  ```
+  rules                                      input   ICU   per the filter (tconv)
+  :: [a-m] ; x > Y ;                         x       Y     x
+  :: [a-m] ; a > Y ; x > Z ;                 ax      YZ    Yx
+  :: [a-m] ; ax > Y ;                        ax      Y     ax
+  :: [a-m] ; xa > Y ; a > A ;                xa      Y     xA
+  :: [a-m] ; x > Y ; :: Null ;               x       x     x
+  :: [a-m] ; :: Null ; x > Y ; :: Null ;     x       x     x
+  ```
+
+  With any other `::` transform (`:: Null ;` suffices) the filter applies.
+  tconv follows the rules: it applies the filter in both cases. Its tests
+  compare such rules with ICU through an added `:: Null ;` step
+  (`QA/tconv_divcode_test.py`, case `filter`).
+
+  **CLDR.** Three CLDR transforms have this form: `am_Ethi-am_Ethi/Geminate`
+  and `sgw_Ethi-Ethi/Gurage_2013` (`:: [:Ethiopic:] ;`) and `mn-mn_Latn/MNS`
+  (`::[[:Cyrl:]];`). None of their rules' texts has a character outside its
+  filter, so ICU's output is the same with and without it: tconv and ICU
+  agree on their CLDR test data and on random text mixing their characters
+  with punctuation, Latin letters and combining marks (2026-11-17).
+
+## uconv
+
+Observed with `uconv v2.1`, ICU 78.3.
 
 - **`uconv -x` transliterates the text in pieces, cut after many characters that
   are not line ends.** `uconv` does not apply the transliterator to the input as

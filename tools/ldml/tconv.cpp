@@ -100,6 +100,7 @@
 #include <re/adt/adt.h>
 #include <re/transforms/resolve_possessive.h>
 #include <re/analysis/re_analysis.h>
+#include <re/analysis/nullable.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
@@ -2775,6 +2776,13 @@ struct ConversionOutcome {
     //  is not empty: the converted text before the positions after the match
     //  is not empty either (see convertedContextMatters).
     bool partial = false;
+    //  Whether the unit may be the last of its match (false only where it is
+    //  known not to be): the converted text before the position after a match
+    //  ends with what its last unit writes, and positions within a match are
+    //  not anchors of other rules (the match covers them), so the empty outcome
+    //  of a unit that is not the last of a match whose result is not empty is
+    //  never what the item of a context adjacent to a rule sees.
+    bool last = true;
     size_t length() const {return out.size() + (keptAt >= 0 ? 1 : 0);}
     //  The characters of the result: those of out, and the characters kept.
     UCD::UnicodeSet resultChars() const {
@@ -2814,7 +2822,7 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
                 continue;
             }
             if (!out.empty() && out.front() == ldml::StringRuleDeleted) out = out.substr(1);
-            outcomes.push_back(ConversionOutcome{sr.text[j], out, -1, out.empty() && partial});
+            outcomes.push_back(ConversionOutcome{sr.text[j], out, -1, out.empty() && partial, j + 1 == n});
         }
         if (!sr.run.empty()) outcomes.push_back(ConversionOutcome{sr.run, std::u32string()});
     }
@@ -2834,7 +2842,27 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
         }
     };
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) textOutcomes(r.first, r.firstReplacement);
+        //  With a capture that cannot be empty, the units of T0 are never the last
+        //  of a match, and the match's result is not empty (the capture is kept,
+        //  or moved): an empty outcome of a unit of T0 is partial, and not last.
+        bool captureFollows = false;
+        for (re::RE * c : set.captures) captureFollows |= !re::isNullable(c);
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            if (!captureFollows) {
+                textOutcomes(r.first, r.firstReplacement);
+                continue;
+            }
+            const size_t n = r.first.size(), m = r.firstReplacement.size();
+            for (size_t j = 0; j < n; j++) {
+                std::u32string out;
+                if (j + 1 < n) {
+                    if (j < m) out = r.firstReplacement.substr(j, 1);
+                } else if (j < m) {
+                    out = r.firstReplacement.substr(j);
+                }
+                outcomes.push_back(ConversionOutcome{r.first[j], out, -1, out.empty(), false});
+            }
+        }
         //  (Those of each variant.)
         std::vector<const std::vector<ldml::BoundaryReplacement> *> lists{&set.replacements};
         for (const auto & v : set.variants) lists.push_back(&v.replacements);
@@ -2870,6 +2898,9 @@ static bool convertedContextMatters(const FusedContexts & before, const std::vec
             const bool boundaryOnly = d == 1 && S.empty() && alt[k].boundary && !alt[k].star;
             for (const ConversionOutcome & o : outcomes) {
                 if (boundaryOnly && o.partial) continue;
+                //  (An empty unit within a match that writes something, not its
+                //  last: never what an adjacent item sees; see ConversionOutcome.)
+                if (d == 1 && o.length() == 0 && o.partial && !o.last) continue;
                 if (o.length() == 0) return true;
                 if (d > 1 && o.length() != 1) return true;
                 //  The last character kept: whether it is in the set does not change.

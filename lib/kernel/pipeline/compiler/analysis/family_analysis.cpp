@@ -2,6 +2,16 @@
 
 namespace kernel {
 
+// A family kernel removed from the pipeline (its outputs are unread) is reported
+// only as debug output: in debug builds, or with -EnablePipelineAsserts.
+static bool reportRemovedFamilyKernels() {
+    #ifndef NDEBUG
+    return true;
+    #else
+    return codegen::DebugOptionIsSet(codegen::EnablePipelineAsserts);
+    #endif
+}
+
 void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
 
     // Any non-call-by-family kernel K initialization (termination) function ought to be compiled into the
@@ -79,28 +89,30 @@ void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
                 // We still need to consume the input argument even if this kernel has been
                 // removed from the program. However, it now refers to a "deleted" entry node.
                 assert (kernelId == PipelineOutput);
-                BEGIN_SCOPED_REGION
-                SmallVector<char, 256> tmp;
-                raw_svector_ostream out(tmp);
+                if (LLVM_UNLIKELY(reportRemovedFamilyKernels())) {
+                    SmallVector<char, 256> tmp;
+                    raw_svector_ostream out(tmp);
 
-                out << "Warning: " << obj->getName()
-                    << " is explicitly called "
-                    << mPipelineKernel->getName();
+                    out << "Warning: " << obj->getName()
+                        << " is explicitly called "
+                        << mPipelineKernel->getName();
 
-                if (ref.isFamilyCall()) {
-                    out << " as a family kernel";
-                } else {
-                    out << " and contains family kernel calls";
+                    if (ref.isFamilyCall()) {
+                        out << " as a family kernel";
+                    } else {
+                        out << " and contains family kernel calls";
+                    }
+
+                    out << " but it was removed from the pipeline due to having no returned or"
+                           " internally read outputs nor being marked as side effecting.\n";
+                    errs() << out.str();
                 }
-
-                out << " but it was removed from the pipeline due to having no returned or"
-                       " internally read outputs nor being marked as side effecting.\n";
-                errs() << out.str();
-                END_SCOPED_REGION
 found_kernel_in_graph:
                 if (ref.isFamilyCall()) {
 
-                    unsigned flags = FamilyScalarData::CaptureStoreInKernelState;
+                    // A removed kernel has no state in the pipeline to store its
+                    // family arguments in; they are only consumed.
+                    unsigned flags = (kernelId == PipelineOutput) ? 0 : FamilyScalarData::CaptureStoreInKernelState;
                     if (LLVM_LIKELY(obj->getSharedStateType())) {
                         flags |= FamilyScalarData::CaptureSharedStateObject;
                     }

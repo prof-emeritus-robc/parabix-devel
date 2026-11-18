@@ -12,6 +12,10 @@
 #  repeated set in the before context (X T*): chains through it, conversions
 #  into and out of T and a deletion within the run, a negated X at the start of
 #  the text, an item between the run and the rule, an expansion ending in T.
+#  Then insertion rules, whose before contexts see the converted text up to
+#  and including the position, and whose texts the next positions see: chains
+#  alternating insertions and conversions, with deletions within them, a
+#  repeated set in an insertion's context, and two insertion rules in order.
 #  The first two cases (all with --extended-testing) also with one thread and
 #  with four threads and segments of one stride.
 #  The expected results are ICU's (createFromRules, each line a text).
@@ -86,6 +90,28 @@ CASES = [
         ("qb", "amq"),
         ("qbbbbbbbbbbbbbbbbb", "amqaqaqaqaqaqaqaqaq"),
         ("ambmb", "amqma"),
+    ]),
+    ("a { } c → b ;\nd { } c → b ;\nb { c → d ;", [
+        ("accccccccccccc", "abdbdbdbdbdbdbdbdbdbdbdbdbd"),
+        ("ac", "abd"),
+        ("dc", "dbd"),
+        ("c", "c"),
+    ]),
+    ("x → ;\na { } c → b ;\nd { } c → b ;\nb { c → d ;", [
+        ("axcxcxcxcxcxcxcxcxcxc", "abdbdbdbdbdbdbdbdbdbd"),
+        ("axc", "abd"),
+        ("acx", "abd"),
+    ]),
+    ("a m* { } c → b ;\nb m { c → a ;\np b { c → q ;", [
+        ("ammc", "ammbc"),
+        ("pac", "pabc"),
+        ("amcmc", "ambcmc"),
+    ]),
+    ("[ab] { } c → x ;\na { } [cd] → y ;\nx { c → a ;\ny { d → b ;", [
+        ("acccccccccccc", "axaxaxaxaxaxaxaxaxaxaxaxa"),
+        ("adcdcdcdcdcd", "aybxaybxaybxaybxaybxayb"),
+        ("bc", "bxa"),
+        ("ad", "ayb"),
     ]),
 ]
 

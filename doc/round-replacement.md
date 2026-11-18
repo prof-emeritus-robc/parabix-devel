@@ -110,7 +110,15 @@ Results:
 - Newly resolved by default: ky-ky_FONIPA (and ky-am, ky-ar, ky-chr, ky-fa through it), Grek-Latn, Latn-Grek/UNGEGN, Spacedhan-Han, and the Title groups of class 1D: az-Title, tr-Title, el-Title, lt-Title. All identical to the rounds on random text of their scripts (and ky's CLDR test data), and to ICU except Spacedhan-Han, which differs with the rounds as well: an ICU issue (`::` transforms misplaced in the backward direction, doc/ICU-uconv-issues.md).
 - Correction kernels: ky-ky_FONIPA 6,167 Pablo lines against 11,016 at 8 rounds; az-Title 1,346 against 18,172.
 
-Next increments for this class: insertion rules (ConjoiningJamo-Latin), then converted string rules (hy-hy_Latn/BGN #1, blt-blt_FONIPA #2, Latn-Kana; with class 1A).
+**Third increment (2026-11-17): insertion rules.** An insertion rule matches its before context against the converted text up to and including its position's character, without the text it inserts there (`FusedInsertion`), and its text follows that character's outcome. The state gains `C`, the same as `Y` for the character's outcome only; the insertion rules are decided on `C` (`T` with the after context and eligibility, `F` without them or with the context known out; a rule applies where it holds and every earlier one is known not to), and `Y` is the inserted text's value (its last characters, then `C` beyond its length; a run item passing over the whole text continues into `C`) where one applies, or `C` where every possible one agrees. A position is deleted (or passed over by a run item) when its character is and no text (or only a text all in the item's set) is inserted. The positions where an insertion rule may apply are dependent.
+
+The loop's body is factored: the subgroups with the same mappings (differing in their contexts) have the same outcomes, so their decisions are combined first (where one of them applies; where each is known not to or is not a candidate), and the outcomes are evaluated once per class of mappings, not per subgroup; likewise the insertion rules by their texts. ConjoiningJamo-Latin's 170 converted subgroups have 17 distinct mappings: its kernel went from 174,798 Pablo lines unfactored to 25,208 (uz_Cyrl-uz_Latn 1,798, ky-ky_FONIPA 4,540).
+
+- `QA/tconv_converted_while_test.py`: chains alternating insertions and conversions, with deletions within them, a repeated set in an insertion's context, two insertion rules in order; ICU's results, which the rounds fail on 4 lines.
+- Newly resolved by default: ConjoiningJamo-Latin (and Hang-Latn, Jamo-Latn through it), the Han-Latin groups (Han-Latin/Names, Hani-Latn, Hant-Latn, Jpan-Latn) and Han-Spacedhan. Identical to the rounds and to ICU on random text of their scripts, except Han-Spacedhan, which differs from ICU with the rounds as well (an ICU issue: the filter of its first `::` transform also applies to the next one, doc/ICU-uconv-issues.md).
+- ConjoiningJamo-Latin on 5 MB of jamo (NFD of random Hangul syllables), 1 thread: cold compilation 3.38 s against 12.87 s at 8 rounds, warm run 0.19 s against 0.35 s (−46%); its correction kernel 25,208 Pablo lines against 62,329.
+
+Next increment for this class: converted string rules (hy-hy_Latn/BGN #1, blt-blt_FONIPA #2, Latn-Kana; with class 1A).
 
 ### 1D. A repeated set in a before context whose membership the conversions change (S T*)
 
@@ -227,6 +235,6 @@ Checks so far:
 ## Recommended order
 
 1. Section 4: the `DeferredPlan` blocking closure as a While loop (or one `MatchStar`). Small, exact, also fixes chains longer than 9. In progress (see its status).
-2. Section 1, in the regular `FusedRules` correction kernel: a monotone three-valued While loop for single-character subgroups first (classes 1C–1E, 21 groups), reusing the DivCode §10 formulation, then string-match selection (class 1A, then section 2). Lift `--whole-group-rules` once the body is not unrolled. In progress: subgroups with fixed items or a repeated set, and no insertion rules, done (see the status in 1C; this also covers the Title groups of 1D).
+2. Section 1, in the regular `FusedRules` correction kernel: a monotone three-valued While loop for single-character subgroups first (classes 1C–1E, 21 groups), reusing the DivCode §10 formulation, then string-match selection (class 1A, then section 2). Lift `--whole-group-rules` once the body is not unrolled. In progress: subgroups and insertion rules with fixed items or a repeated set done (see the status in 1C; this also covers the Title groups of 1D); converted string rules remain.
 3. Class 1B: let DivCode follow prefix runs that delete (brings in ja_Latn-ko #2 and ro_FONIPA-ja #2).
 4. Section 3: only after measuring rounds against real Japanese and Persian text; the redesign is large.

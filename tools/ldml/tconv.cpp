@@ -3802,8 +3802,8 @@ struct FusedRulesConfig {
     bool staged = false;
     //  A correction kernel whose rules matched against the converted text are
     //  all single-character rules (subgroups) with before contexts of fixed
-    //  items, possibly with a repeated set, and without insertion rules (see
-    //  resolvableByWhile): their before
+    //  items, possibly with a repeated set, as are those of its insertion rules
+    //  (see resolvableByWhile): their before
     //  contexts are resolved by a While loop, exactly, instead of in rounds (see
     //  FusedRules::generatePabloMethod).  The rounds remain for the selection of
     //  the string matches, which does not depend on the converted text.
@@ -4031,10 +4031,22 @@ struct FusedSubgroupPlan {
 //  The resolution of the before contexts of a correction kernel by a While loop
 //  (FusedRulesConfig::resolve): possible if the rules matched against the
 //  converted text are all subgroups whose before contexts are fixed sequences
-//  of items, possibly with a repeated set (S T*, see ContextExpansion), and the
-//  kernel has no insertion rules.
+//  of items, possibly with a repeated set (S T*, see ContextExpansion), as are
+//  those of the insertion rules.
 static bool resolvableByWhile(const FusedRulesConfig & c) {
-    if (!ConvertedContextWhile || c.rounds == 0 || c.staged || c.matchOnly || !c.insertions.empty()) return false;
+    if (!ConvertedContextWhile || c.rounds == 0 || c.staged || c.matchOnly) return false;
+    auto starsOk = [](const FusedContexts & before) {
+        for (const FusedContext & alt : before) {
+            for (size_t k = 0; k < alt.size(); k++) {
+                //  (A repetition has the item beyond it before it: see ContextExpansion.)
+                if (alt[k].star && (k == 0 || alt[k - 1].star)) return false;
+            }
+        }
+        return true;
+    };
+    for (const FusedInsertion & ins : c.insertions) {
+        if (!starsOk(ins.before)) return false;
+    }
     for (const FusedStringRule & r : c.strings) {
         if (r.converted) return false;
     }
@@ -4042,14 +4054,9 @@ static bool resolvableByWhile(const FusedRulesConfig & c) {
     for (const FusedSubgroup & g : c.subgroups) {
         if (!g.converted) continue;
         any = true;
-        for (const FusedContext & alt : g.before) {
-            for (size_t k = 0; k < alt.size(); k++) {
-                //  (A repetition has the item beyond it before it: see ContextExpansion.)
-                if (alt[k].star && (k == 0 || alt[k - 1].star)) return false;
-            }
-        }
+        if (!starsOk(g.before)) return false;
     }
-    return any;
+    return any || !c.insertions.empty();
 }
 
 //  An item of the before contexts resolved by the While loop, and the greatest
@@ -4088,9 +4095,15 @@ static bool resolvedItemAt(const FusedContext & alt, size_t k, ResolvedItem & it
 static std::vector<ResolvedItem> resolvedItems(const FusedRulesConfig & c) {
     std::vector<ResolvedItem> items;
     std::map<std::string, size_t> index;
+    std::vector<const FusedContexts *> contexts;
     for (const FusedSubgroup & g : c.subgroups) {
-        if (!g.converted) continue;
-        for (const FusedContext & alt : g.before) {
+        if (g.converted) contexts.push_back(&g.before);
+    }
+    //  (An insertion rule's item at distance d: the d-th last character up to
+    //  and including the position, see FusedInsertion.)
+    for (const FusedInsertion & ins : c.insertions) contexts.push_back(&ins.before);
+    for (const FusedContexts * before : contexts) {
+        for (const FusedContext & alt : *before) {
             const unsigned B = static_cast<unsigned>(alt.size());
             for (unsigned k = 0; k < B; k++) {
                 ResolvedItem at;
@@ -5120,6 +5133,13 @@ void FusedRules::generatePabloMethod() {
                 dep = pb.createOr(dep, cand[g]);
                 atBase[g] = zeroes;
             }
+            //  (And where an insertion rule may apply.)
+            const size_t numIns = mConfig.insertions.size();
+            std::vector<PabloAST *> notInsAfter(numIns);
+            for (size_t i = 0; i < numIns; i++) {
+                dep = pb.createOr(dep, insAfter[i]);
+                notInsAfter[i] = pb.createNot(insAfter[i]);
+            }
             //  The base outcome of each position: where no converted subgroup
             //  applies (the state given, the string rules and the other subgroups),
             //  its length and its characters.
@@ -5245,8 +5265,12 @@ void FusedRules::generatePabloMethod() {
             //  (The initial values are kept as expressions: an expression over the
             //  Vars built before the loop would be reused for the same expression
             //  in its body.)
+            //  With insertion rules, C is the same as Y without the text inserted at
+            //  the position (the converted text up to and including the position's
+            //  character, against which the insertion rules match their before
+            //  contexts, see FusedInsertion); without them, C is Y.
             struct ItemVars {
-                std::vector<Var *> Y[2], K[2];      // [0]: known out, [1]: known in
+                std::vector<Var *> Y[2], C[2], K[2];      // [0]: known out, [1]: known in
                 Var * Thru = nullptr;
                 PabloAST * thru0 = nullptr;
             };
@@ -5267,6 +5291,7 @@ void FusedRules::generatePabloMethod() {
                         k.push_back(pb.createMatchStar(pb.createOr(pb.createAdvance(y, 1), startOf(item, in)), j == 1 ? over1 : del0));
                         const std::string suffix = std::to_string(varCount++);
                         vars[x].Y[in].push_back(pb.createVar("Y" + suffix, y));
+                        vars[x].C[in].push_back(numIns ? pb.createVar("C" + suffix, y) : vars[x].Y[in].back());
                         vars[x].K[in].push_back(pb.createVar("K" + suffix, k.back()));
                     }
                 }
@@ -5291,6 +5316,24 @@ void FusedRules::generatePabloMethod() {
                 }
                 return b.createAnd(cand[g], match);
             };
+            //  Whether insertion rule i's before context is known to hold (in) or
+            //  known not to (!in), with its after context, from C (by item, polarity
+            //  and distance).
+            auto insKnown = [&](PabloBuilder & b, size_t i, bool in, const std::function<PabloAST *(size_t, int, unsigned)> & C) {
+                PabloAST * match = in ? zeroes : ones;
+                for (const FusedContext & alt : mConfig.insertions[i].before) {
+                    PabloAST * m = in ? ones : zeroes;
+                    const unsigned B = static_cast<unsigned>(alt.size());
+                    for (unsigned k = 0; k < B; k++) {
+                        ResolvedItem at;
+                        if (!resolvedItemAt(alt, k, at)) continue;
+                        PabloAST * const v = C(itemIndex.at(at.key()), in, B - k);
+                        m = in ? b.createAnd(m, v) : b.createOr(m, v);
+                    }
+                    match = in ? b.createOr(match, m) : b.createAnd(match, m);
+                }
+                return in ? b.createAnd(insAfter[i], match) : b.createOr(notInsAfter[i], match);
+            };
 
             //  The loop.  Each iteration decides the converted subgroups at the
             //  positions whose items are known, and adds the outcomes to the state:
@@ -5298,54 +5341,75 @@ void FusedRules::generatePabloMethod() {
             //  position not yet decided, where every possible outcome agrees (so
             //  only chains of positions whose outcomes differ take iterations).
             //  It ends when no item becomes known.
-            PabloBuilder wb = pb.createScope();
+            //  The converted subgroups by their mappings: those with the same
+            //  mappings (differing in their contexts) have the same outcomes, so
+            //  their decisions are combined before the outcomes are (where one of
+            //  them applies; where each does not or has the outcome).
+            std::vector<std::vector<size_t>> classes;
             {
-                std::vector<PabloAST *> T(numGroups, nullptr), F(numGroups, nullptr);
+                std::map<std::string, size_t> classIndex;
                 for (size_t g = 0; g < numGroups; g++) {
                     if (!cand[g]) continue;
-                    T[g] = known(wb, g, true);
-                    F[g] = known(wb, g, false);
+                    std::string key;
+                    for (const ldml::CharMapping & m : mConfig.subgroups[g].mappings) {
+                        key += setKey(m.chars) + ">";
+                        for (char32_t c : m.replacement) key += std::to_string(c) + ",";
+                        key += ";";
+                    }
+                    const auto f = classIndex.emplace(key, classes.size());
+                    if (f.second) classes.emplace_back();
+                    classes[f.first->second].push_back(g);
+                }
+            }
+            const size_t numClasses = classes.size();
+            PabloBuilder wb = pb.createScope();
+            {
+                //  Where a subgroup of each class is known to apply (TC), and where
+                //  every one is known not to or is not a candidate (RC).
+                std::vector<PabloAST *> TC(numClasses), RC(numClasses);
+                for (size_t c = 0; c < numClasses; c++) {
+                    TC[c] = zeroes;
+                    RC[c] = ones;
+                    for (size_t g : classes[c]) {
+                        TC[c] = wb.createOr(TC[c], known(wb, g, true));
+                        RC[c] = wb.createAnd(RC[c], wb.createOr(notCand[g], known(wb, g, false)));
+                    }
                 }
                 //  The positions known to have an outcome: of the subgroup that
-                //  applies, or of all the possible ones (given, for each subgroup, at
-                //  its candidates, and for the base).
-                auto settled = [&](const std::vector<PabloAST *> & byGroup, PabloAST * base) {
+                //  applies, or of all the possible ones (given for each class, and
+                //  for the base).
+                auto settled = [&](const std::vector<PabloAST *> & byClass, PabloAST * base) {
                     PabloAST * any = zeroes;
                     PabloAST * all = base;
-                    for (size_t g = 0; g < numGroups; g++) {
-                        if (!cand[g]) continue;
-                        any = wb.createOr(any, wb.createAnd(T[g], byGroup[g]));
-                        all = wb.createAnd(all, wb.createOr(wb.createOr(notCand[g], F[g]), byGroup[g]));
+                    for (size_t c = 0; c < numClasses; c++) {
+                        any = wb.createOr(any, wb.createAnd(TC[c], byClass[c]));
+                        all = wb.createAnd(all, wb.createOr(RC[c], byClass[c]));
                     }
                     return wb.createOr(any, all);
                 };
+                auto mappingsOf = [&](size_t c) -> const FusedSubgroup & {return mConfig.subgroups[classes[c].front()];};
                 //  The positions known to be deleted.
-                std::vector<PabloAST *> gDel(numGroups, nullptr);
-                for (size_t g = 0; g < numGroups; g++) {
-                    if (cand[g]) gDel[g] = wb.createAnd(cand[g], classAt(0, mappingLengthChars(mConfig.subgroups[g], 0)));
-                }
-                PabloAST * const del = wb.createOr(KDel, settled(gDel, baseDeleted));
-                wb.createAssign(KDel, del);
+                std::vector<PabloAST *> cDel(numClasses);
+                for (size_t c = 0; c < numClasses; c++) cDel[c] = classAt(0, mappingLengthChars(mappingsOf(c), 0));
+                PabloAST * const delChar = settled(cDel, baseDeleted);
                 //  The positions known to be passed over by each run item.
                 std::vector<PabloAST *> thru(items.size(), nullptr);
                 for (size_t x = 0; x < items.size(); x++) {
                     if (!items[x].run) continue;
-                    std::vector<PabloAST *> gThru(numGroups, nullptr);
-                    for (size_t g = 0; g < numGroups; g++) {
-                        if (!cand[g]) continue;
+                    std::vector<PabloAST *> cThru(numClasses);
+                    for (size_t c = 0; c < numClasses; c++) {
                         PabloAST * t = zeroes;
-                        for (unsigned l : mappingLengths(mConfig.subgroups[g])) {
-                            if (l >= 1) t = wb.createOr(t, classAt(0, mappingItemChars(mConfig.subgroups[g], items[x], l, 1, 2)));
+                        for (unsigned l : mappingLengths(mappingsOf(c))) {
+                            if (l >= 1) t = wb.createOr(t, classAt(0, mappingItemChars(mappingsOf(c), items[x], l, 1, 2)));
                         }
-                        gThru[g] = wb.createAnd(cand[g], t);
+                        cThru[c] = t;
                     }
-                    thru[x] = wb.createOr(vars[x].Thru, settled(gThru, baseThrough(x)));
-                    wb.createAssign(vars[x].Thru, thru[x]);
+                    thru[x] = settled(cThru, baseThrough(x));
                 }
-                //  The outcome of subgroup g (at its candidates) for item x at
-                //  distance j, known in (in) or known out (!in).
-                auto outcomeOf = [&](size_t g, size_t x, unsigned j, int in) -> PabloAST * {
-                    const FusedSubgroup & sg = mConfig.subgroups[g];
+                //  The outcome of the subgroups of class c for item x at distance j,
+                //  known in (in) or known out (!in).
+                auto outcomeOf = [&](size_t c, size_t x, unsigned j, int in) -> PabloAST * {
+                    const FusedSubgroup & sg = mappingsOf(c);
                     const std::vector<Var *> & K = vars[x].K[in];
                     PabloAST * v = zeroes;
                     for (unsigned l : mappingLengths(sg)) {
@@ -5358,7 +5422,7 @@ void FusedRules::generatePabloMethod() {
                         }
                         v = wb.createOr(v, w);
                     }
-                    return wb.createAnd(cand[g], v);
+                    return v;
                 };
                 std::vector<std::pair<Var *, PabloAST *>> newY;
                 for (size_t x = 0; x < items.size(); x++) {
@@ -5370,14 +5434,97 @@ void FusedRules::generatePabloMethod() {
                             //  a run item passing over at distance 1: as before it).
                             PabloAST * base = wb.createOr(baseValue(wb, x, j, in, k), wb.createAnd(baseDeleted, K[j - 1]));
                             if (items[x].run && j == 1) base = wb.createOr(base, wb.createAnd(baseThrough(x), K[0]));
-                            std::vector<PabloAST *> byGroup(numGroups, nullptr);
-                            for (size_t g = 0; g < numGroups; g++) {
-                                if (cand[g]) byGroup[g] = outcomeOf(g, x, j, in);
-                            }
-                            Var * const Y = vars[x].Y[in][j - 1];
-                            newY.emplace_back(Y, wb.createOr(Y, settled(byGroup, base)));
+                            std::vector<PabloAST *> byClass(numClasses);
+                            for (size_t c = 0; c < numClasses; c++) byClass[c] = outcomeOf(c, x, j, in);
+                            Var * const C = vars[x].C[in][j - 1];
+                            newY.emplace_back(C, wb.createOr(C, settled(byClass, base)));
                         }
                     }
+                }
+                PabloAST * del = delChar;
+                if (numIns) {
+                    //  The insertion rules, decided on the characters' outcomes; then
+                    //  the full outcomes: the text inserted by the rule that applies,
+                    //  after the character's outcome, or the character's outcome where
+                    //  none does; or where every possible one agrees.
+                    std::vector<std::vector<PabloAST *>> newC[2];
+                    for (int in = 0; in <= 1; in++) newC[in].resize(items.size());
+                    {
+                        size_t a = 0;
+                        for (size_t x = 0; x < items.size(); x++) {
+                            for (int in = 0; in <= 1; in++) {
+                                for (unsigned j = 1; j <= items[x].depth; j++) newC[in][x].push_back(newY[a++].second);
+                            }
+                        }
+                    }
+                    for (const auto & c : newY) wb.createAssign(c.first, c.second);
+                    auto cOf = [&](size_t x, int in, unsigned d) {return newC[in][x][d - 1];};
+                    std::vector<PabloAST *> insT(numIns), insF(numIns), applies(numIns);
+                    PabloAST * noneBefore = ones;
+                    for (size_t i = 0; i < numIns; i++) {
+                        insT[i] = insKnown(wb, i, true, cOf);
+                        insF[i] = insKnown(wb, i, false, cOf);
+                        applies[i] = wb.createAnd(insT[i], noneBefore);
+                        noneBefore = wb.createAnd(noneBefore, insF[i]);
+                    }
+                    //  By the texts inserted: where a rule inserting it applies, and
+                    //  where every such rule is known not to.
+                    std::vector<std::u32string> texts;
+                    std::vector<PabloAST *> textApplies, textF;
+                    for (size_t i = 0; i < numIns; i++) {
+                        const std::u32string & t = mConfig.insertions[i].text;
+                        const size_t n = std::find(texts.begin(), texts.end(), t) - texts.begin();
+                        if (n == texts.size()) {
+                            texts.push_back(t);
+                            textApplies.push_back(zeroes);
+                            textF.push_back(ones);
+                        }
+                        textApplies[n] = wb.createOr(textApplies[n], applies[i]);
+                        textF[n] = wb.createAnd(textF[n], insF[i]);
+                    }
+                    //  The value of text n for item x at distance j.
+                    auto insValue = [&](size_t n, size_t x, unsigned j, int in) -> PabloAST * {
+                        const std::u32string & t = texts[n];
+                        const unsigned m = static_cast<unsigned>(t.size());
+                        if (j > m) return newC[in][x][j - m - 1];
+                        const int o = replacementOutcome(t, items[x], j);
+                        return o == 2 ? newC[in][x][0] : (o == in ? ones : zeroes);
+                    };
+                    newY.clear();
+                    for (size_t x = 0; x < items.size(); x++) {
+                        for (int in = 0; in <= 1; in++) {
+                            for (unsigned j = 1; j <= items[x].depth; j++) {
+                                PabloAST * applied = zeroes;
+                                PabloAST * all = newC[in][x][j - 1];
+                                for (size_t n = 0; n < texts.size(); n++) {
+                                    PabloAST * const v = insValue(n, x, j, in);
+                                    applied = wb.createOr(applied, wb.createAnd(textApplies[n], v));
+                                    all = wb.createAnd(all, wb.createOr(textF[n], v));
+                                }
+                                Var * const Y = vars[x].Y[in][j - 1];
+                                newY.emplace_back(Y, wb.createOr(Y, wb.createOr(applied, all)));
+                            }
+                        }
+                    }
+                    //  Deleted, or passed over by a run item: the character's outcome
+                    //  so, and no text inserted (or a text all in the item's set).
+                    del = wb.createAnd(delChar, noneBefore);
+                    for (size_t x = 0; x < items.size(); x++) {
+                        if (!items[x].run) continue;
+                        PabloAST * ok = ones;
+                        for (size_t i = 0; i < numIns; i++) {
+                            const std::u32string & t = mConfig.insertions[i].text;
+                            if (t.empty() || replacementOutcome(t, items[x], 1) != 2) ok = wb.createAnd(ok, insF[i]);
+                        }
+                        thru[x] = wb.createAnd(wb.createOr(thru[x], delChar), ok);
+                    }
+                }
+                del = wb.createOr(KDel, del);
+                wb.createAssign(KDel, del);
+                for (size_t x = 0; x < items.size(); x++) {
+                    if (!items[x].run) continue;
+                    thru[x] = wb.createOr(vars[x].Thru, thru[x]);
+                    wb.createAssign(vars[x].Thru, thru[x]);
                 }
                 for (const auto & a : newY) wb.createAssign(a.first, a.second);
                 //  K[1] and K[0] from the new state, through the deleted positions
@@ -5400,9 +5547,16 @@ void FusedRules::generatePabloMethod() {
                 wb.createAssign(Progress, progress);
             }
             pb.createWhile(Progress, wb);
-            //  The converted subgroups apply where their before contexts hold.
+            //  The converted subgroups apply where their before contexts hold, and
+            //  each insertion rule where its contexts hold and no earlier one's do.
             for (size_t g = 0; g < numGroups; g++) {
                 if (cand[g]) atOf[g] = known(pb, g, true);
+            }
+            auto finalC = [&](size_t x, int in, unsigned d) -> PabloAST * {return vars[x].C[in][d - 1];};
+            PabloAST * noneBefore = ones;
+            for (size_t i = 0; i < numIns; i++) {
+                insAt[i] = pb.createAnd(insKnown(pb, i, true, finalC), noneBefore);
+                noneBefore = pb.createAnd(noneBefore, insKnown(pb, i, false, finalC));
             }
         } else {
             //  Round 0: the before contexts matched against the text itself.

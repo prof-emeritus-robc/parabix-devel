@@ -111,6 +111,17 @@ Observed with ICU 78.3 (`Transliterator::createFromRules`, as `tconv
     first, which makes the space U+3000, and the inverse rules, which delete
     only U+0020, leave it: `乏 U+0020 乬` gives `乏 U+3000 乬`, tconv `乏乬`.
 
+- **The filter of a `::` transform also applies to the `::` transforms that
+  follow it directly.** ICU makes consecutive `::` transforms one element of
+  the compound, with the filter of the first written before all of them:
+  `Han-Spacedhan` (`:: [set] nfkc ; :: fullwidth-halfwidth ;`, then its rules)
+  has the elements `[set] nfkc;fullwidth-halfwidth` and `%Pass`, so
+  fullwidth-halfwidth applies only to the characters of the set. U+3000 is not
+  in it: `乏 U+3000 乬` and `a U+3000 b` keep U+3000 in ICU, while tconv, which
+  applies the filter to `nfkc` only, gives U+0020. (Also noted in
+  ldml-tconv-coverage.md, "A filtered first step": `::[x] Null ;
+  ::fullwidth-halfwidth ;` leaves `．` U+FF0E unchanged.)
+
   The others agree with ICU on the same decomposed words: their rules give
   the same results whether NFC is applied before or after them.
 

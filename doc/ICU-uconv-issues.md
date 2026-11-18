@@ -87,8 +87,8 @@ Observed with ICU 78.3 (`Transliterator::createFromRules`, as `tconv
   a rule set after a `::` transform are `Latin-Bopomofo.xml`,
   `byn-Ethi-t-byn-latn-m0-tekie-alibekit.xml`, `und-Ethi-t-und-latn.xml` and
   the `und-Ethi-t-und-latn-m0-*` (Aethiopica, ALALOC, Beta_Metsehaf,
-  IES_JES_1964, Lambdin) and `und-Ethi-t-und-cyrl-m0-gutgarts.xml`. It shows
-  in two:
+  IES_JES_1964, Lambdin), `und-Ethi-t-und-cyrl-m0-gutgarts.xml` and
+  `Han-Spacedhan.xml`. It shows in three:
 
   - `Bopo-Latn` (Bopomofo-Latin): the forward rules are a rule set (`[ln] { v
     → ü`), `:: Latin-NumericPinyin(NumericPinyin-Latin) ;`, and the rules
@@ -104,6 +104,12 @@ Observed with ICU 78.3 (`Transliterator::createFromRules`, as `tconv
     (composed to `ä` first, then `sä → ሰ`), and tconv `ሳ̈ል` (`sa → ሳ`, the
     mark left). On precomposed input both give `ሰል`. 65 of 99 short words of
     decomposed Latin differ.
+  - `Spacedhan-Han` (forward `:: [set] nfkc ; :: fullwidth-halfwidth ;`, then
+    rules inserting a space between Han and other letters, whose inverses
+    delete it): backward, ICU (its built-in transliterator, elements
+    `halfwidth-fullwidth;[set] NFKD` then `%Pass`) applies halfwidth-fullwidth
+    first, which makes the space U+3000, and the inverse rules, which delete
+    only U+0020, leave it: `乏 U+0020 乬` gives `乏 U+3000 乬`, tconv `乏乬`.
 
   The others agree with ICU on the same decomposed words: their rules give
   the same results whether NFC is applied before or after them.

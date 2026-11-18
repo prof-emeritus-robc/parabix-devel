@@ -8,9 +8,12 @@
 #  whose before contexts have two or three items, in chains longer than the
 #  default 8 rounds; a deletion seen through, and the first character of an
 #  expansion seen at distance 2; negated sets at the start of the text, and
-#  the rules of one character made exclusive by order disambiguation.  The
-#  first two cases (all with --extended-testing) also with one thread and with
-#  four threads and segments of one stride.
+#  the rules of one character made exclusive by order disambiguation.  Then a
+#  repeated set in the before context (X T*): chains through it, conversions
+#  into and out of T and a deletion within the run, a negated X at the start of
+#  the text, an item between the run and the rule, an expansion ending in T.
+#  The first two cases (all with --extended-testing) also with one thread and
+#  with four threads and segments of one stride.
 #  The expected results are ICU's (createFromRules, each line a text).
 #
 #  tconv_converted_while_test.py <tconv binary> [--extended-testing]
@@ -54,6 +57,35 @@ CASES = [
         ("aaabbbbbbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaaaaaaaaa"),
         ("bbaaaaaaaaaaaa", "bbabaaaaaaaaaa"),
         ("abab", "abaa"),
+    ]),
+    ("a m* { b → a ;", [
+        ("ambmbmbmbmbmbmbmbmbmbmb", "amamamamamamamamamamama"),
+        ("mmb", "mmb"),
+        ("abmmmb", "aammma"),
+        ("bab", "baa"),
+    ]),
+    ("x → m ;\nn → ;\na m* { b → c ;\nc m* { b → a ;\nm → x ;", [
+        ("axb", "amc"),
+        ("anb", "ac"),
+        ("amb", "axb"),
+        ("axnmbxbnbxbmbxbnb", "amxbmbbmbxbmbb"),
+    ]),
+    ("[^q] m* { b → q ;", [
+        ("b", "q"),
+        ("mmb", "mmq"),
+        ("qmb", "qmb"),
+        ("bmbmbmbmbmbmbmbmbmbmb", "qmbmqmbmqmbmqmbmqmbmq"),
+    ]),
+    ("a m* c { b → a ;\nb m* c { c → b ;", [
+        ("amcb", "amca"),
+        ("amcc", "amcc"),
+        ("acbcbcbcbc", "acacacacac"),
+        ("mcb", "mcb"),
+    ]),
+    ("q → am ;\na m* { b → q ;\nq m* { b → a ;", [
+        ("qb", "amq"),
+        ("qbbbbbbbbbbbbbbbbb", "amqaqaqaqaqaqaqaqaq"),
+        ("ambmb", "amqma"),
     ]),
 ]
 

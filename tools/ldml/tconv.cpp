@@ -3802,7 +3802,8 @@ struct FusedRulesConfig {
     bool staged = false;
     //  A correction kernel whose rules matched against the converted text are
     //  all single-character rules (subgroups) with before contexts of fixed
-    //  items, and without insertion rules (see resolvableByWhile): their before
+    //  items, possibly with a repeated set, and without insertion rules (see
+    //  resolvableByWhile): their before
     //  contexts are resolved by a While loop, exactly, instead of in rounds (see
     //  FusedRules::generatePabloMethod).  The rounds remain for the selection of
     //  the string matches, which does not depend on the converted text.
@@ -4030,7 +4031,8 @@ struct FusedSubgroupPlan {
 //  The resolution of the before contexts of a correction kernel by a While loop
 //  (FusedRulesConfig::resolve): possible if the rules matched against the
 //  converted text are all subgroups whose before contexts are fixed sequences
-//  of items, and the kernel has no insertion rules.
+//  of items, possibly with a repeated set (S T*, see ContextExpansion), and the
+//  kernel has no insertion rules.
 static bool resolvableByWhile(const FusedRulesConfig & c) {
     if (!ConvertedContextWhile || c.rounds == 0 || c.staged || c.matchOnly || !c.insertions.empty()) return false;
     for (const FusedStringRule & r : c.strings) {
@@ -4041,35 +4043,60 @@ static bool resolvableByWhile(const FusedRulesConfig & c) {
         if (!g.converted) continue;
         any = true;
         for (const FusedContext & alt : g.before) {
-            for (const FusedItem & item : alt) {
-                if (item.star) return false;
+            for (size_t k = 0; k < alt.size(); k++) {
+                //  (A repetition has the item beyond it before it: see ContextExpansion.)
+                if (alt[k].star && (k == 0 || alt[k - 1].star)) return false;
             }
         }
     }
     return any;
 }
 
-//  An item of the before contexts resolved by the While loop: its set, whether
-//  it holds before the start of the text, and the greatest distance before the
-//  position at which a context has it (the j-th last character of the converted
-//  text before the position, for j = 1 .. depth).
+//  An item of the before contexts resolved by the While loop, and the greatest
+//  distance before the position at which a context has it (the j-th last
+//  character of the converted text before the position, for j = 1 .. depth).
+//  A plain item: whether that character is in its set (or, if there is none,
+//  whether it holds before the text: boundary).  A run item (run), a repeated
+//  set with the item beyond it (X T* in text order): going back from that
+//  character over the characters of the set (chars, T), whether the first other
+//  one is in the set of the item beyond (beyond, X; or, if there is none, whether
+//  it holds before the text: boundary, X's).
 struct ResolvedItem {
     UCD::UnicodeSet chars;
     bool boundary;
     unsigned depth;
+    bool run = false;
+    UCD::UnicodeSet beyond;
+    std::string key() const {
+        return (run ? "r" + setKey(beyond) + "|" : "p") + setKey(chars) + (boundary ? "$" : "");
+    }
 };
+
+//  The item of an alternative at index k (the repetition at k with the item
+//  beyond it, at k - 1, as one run item), or none: the item beyond a repetition.
+static bool resolvedItemAt(const FusedContext & alt, size_t k, ResolvedItem & item) {
+    if (k + 1 < alt.size() && alt[k + 1].star) return false;
+    item = ResolvedItem{alt[k].chars, alt[k].boundary, 0};
+    if (alt[k].star) {
+        item.run = true;
+        item.beyond = alt[k - 1].chars;
+        item.boundary = alt[k - 1].boundary;
+    }
+    return true;
+}
 
 static std::vector<ResolvedItem> resolvedItems(const FusedRulesConfig & c) {
     std::vector<ResolvedItem> items;
-    std::map<std::pair<std::string, bool>, size_t> index;
+    std::map<std::string, size_t> index;
     for (const FusedSubgroup & g : c.subgroups) {
         if (!g.converted) continue;
         for (const FusedContext & alt : g.before) {
             const unsigned B = static_cast<unsigned>(alt.size());
             for (unsigned k = 0; k < B; k++) {
-                const auto key = std::make_pair(setKey(alt[k].chars), alt[k].boundary);
-                const auto f = index.emplace(key, items.size());
-                if (f.second) items.push_back(ResolvedItem{alt[k].chars, alt[k].boundary, 0});
+                ResolvedItem at;
+                if (!resolvedItemAt(alt, k, at)) continue;
+                const auto f = index.emplace(at.key(), items.size());
+                if (f.second) items.push_back(at);
                 ResolvedItem & item = items[f.first->second];
                 item.depth = std::max(item.depth, B - k);
             }
@@ -4095,11 +4122,27 @@ static UCD::UnicodeSet mappingLengthChars(const FusedSubgroup & g, unsigned leng
     return chars;
 }
 
-static UCD::UnicodeSet mappingSlotChars(const FusedSubgroup & g, unsigned length, unsigned i, const UCD::UnicodeSet & set, bool in) {
+//  How a replacement of length l >= j settles a resolved item at distance j
+//  (from its character at index l - j): known not to hold (0), known to hold
+//  (1), or, for a run item whose characters there and before are all in its
+//  set, as the item holds before the position (2).
+static int replacementOutcome(const std::u32string & r, const ResolvedItem & x, unsigned j) {
+    const int top = static_cast<int>(r.size()) - static_cast<int>(j);
+    if (!x.run) return x.chars.contains(static_cast<UCD::codepoint_t>(r[top])) ? 1 : 0;
+    for (int i = top; i >= 0; i--) {
+        const UCD::codepoint_t c = static_cast<UCD::codepoint_t>(r[i]);
+        if (!x.chars.contains(c)) return x.beyond.contains(c) ? 1 : 0;
+    }
+    return 2;
+}
+
+//  The characters of a subgroup whose replacements have length l and settle
+//  item x at distance j as given (see replacementOutcome).
+static UCD::UnicodeSet mappingItemChars(const FusedSubgroup & g, const ResolvedItem & x, unsigned l, unsigned j, int outcome) {
     UCD::UnicodeSet chars;
     for (const ldml::CharMapping & m : g.mappings) {
-        if (m.replacement.size() != length) continue;
-        if (set.contains(static_cast<UCD::codepoint_t>(m.replacement[i])) == in) chars = chars + m.chars;
+        if (m.replacement.size() != l) continue;
+        if (replacementOutcome(m.replacement, x, j) == outcome) chars = chars + m.chars;
     }
     return chars;
 }
@@ -4159,8 +4202,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
                 add(mappingLengthChars(g, l));
                 for (const ResolvedItem & item : items) {
                     for (unsigned j = 1; j <= std::min(item.depth, l); j++) {
-                        add(mappingSlotChars(g, l, l - j, item.chars, true));
-                        add(mappingSlotChars(g, l, l - j, item.chars, false));
+                        for (int outcome = 0; outcome <= (item.run ? 2 : 1); outcome++) add(mappingItemChars(g, item, l, j, outcome));
                     }
                 }
             }
@@ -5124,49 +5166,108 @@ void FusedRules::generatePabloMethod() {
                 return in ? m : pb.createAnd(inText, pb.createNot(m));
             };
 
-            //  The state, by item and distance j (1 .. depth): YI and YO, the
-            //  positions at which the j-th last character of the converted text up
-            //  to and including the position is known to be in the item's set (or,
-            //  if there is none, the item holds before the text), or known not to
-            //  be; K1 and K0, the same for the converted text before the position;
-            //  and KDel, the positions known to be deleted.  Every Var only gains
-            //  bits: in a While loop, the carries of the previous block reach the
-            //  first iteration only (doc/ldml-divcode-plan.md §10).
-            //
-            //  Before the loop, the positions where no converted subgroup applies.
-            //  (The initial values are kept as expressions: an expression over the
-            //  Vars built before the loop would be reused for the same expression
-            //  in its body.)
             const std::vector<ResolvedItem> items = resolvedItems(mConfig);
-            std::map<std::pair<std::string, bool>, size_t> itemIndex;
-            for (size_t x = 0; x < items.size(); x++) itemIndex.emplace(std::make_pair(setKey(items[x].chars), items[x].boundary), x);
+            std::map<std::string, size_t> itemIndex;
+            for (size_t x = 0; x < items.size(); x++) itemIndex.emplace(items[x].key(), x);
             PabloAST * const independent = pb.createAnd(inText, pb.createNot(dep));
             PabloAST * const del0 = pb.createAnd(baseDeleted, independent);
             //  At the start of the text: an item holds there (K1) or not (K0).
             auto startOf = [&](const ResolvedItem & item, bool in) {
                 return item.boundary == in ? firstPosition : zeroes;
             };
+            //  The positions whose base outcome has length l >= j and settles item x
+            //  at distance j as given (see replacementOutcome).
+            std::map<std::tuple<size_t, unsigned, unsigned, int>, PabloAST *> baseMemo;
+            auto baseOutcome = [&](size_t x, unsigned l, unsigned j, int outcome) -> PabloAST * {
+                PabloAST *& memo = baseMemo[std::make_tuple(x, l, j, outcome)];
+                if (memo) return memo;
+                const ResolvedItem & item = items[x];
+                const int top = static_cast<int>(l - j);
+                PabloAST * r;
+                if (!item.run) {
+                    r = outcome == 2 ? zeroes : baseIn(top, item.chars, outcome == 1);
+                } else {
+                    //  Going back from slot top: the first slot not in the set is in
+                    //  the set beyond (1) or not (0), or all are in the set (2).
+                    PabloAST * found[2] = {zeroes, zeroes};
+                    PabloAST * all = ones;
+                    for (int i = top; i >= 0; i--) {
+                        PabloAST * const inT = baseIn(i, item.chars, true);
+                        PabloAST * const first = pb.createAnd(all, pb.createNot(inT));
+                        PabloAST * const inX = baseIn(i, item.beyond, true);
+                        found[1] = pb.createOr(found[1], pb.createAnd(first, inX));
+                        found[0] = pb.createOr(found[0], pb.createAnd(first, pb.createNot(inX)));
+                        all = pb.createAnd(all, inT);
+                    }
+                    r = outcome == 2 ? all : found[outcome];
+                }
+                memo = pb.createAnd(baseLength[l], r);
+                return memo;
+            };
+            //  The positions whose base outcome passes over a run item at distance 1
+            //  (all its characters in the item's set).
+            auto baseThrough = [&](size_t x) -> PabloAST * {
+                PabloAST * t = zeroes;
+                for (unsigned l = 1; l < baseLength.size(); l++) {
+                    if (baseLength[l] != zeroes) t = pb.createOr(t, baseOutcome(x, l, 1, 2));
+                }
+                return t;
+            };
+            //  The value of item x at distance j (known in, or known out) for the
+            //  base outcome, given the items before the position (K, by distance).
+            //  At distance 1, a run item's passing over is left to the caller (the
+            //  positions passed over, through which K is carried).
+            auto baseValue = [&](PabloBuilder & b, size_t x, unsigned j, int in, const std::vector<PabloAST *> & K) -> PabloAST * {
+                PabloAST * y = zeroes;
+                for (unsigned l = 1; l < baseLength.size(); l++) {
+                    if (baseLength[l] == zeroes) continue;
+                    if (l >= j) {
+                        y = b.createOr(y, baseOutcome(x, l, j, in));
+                        if (items[x].run && j > 1) y = b.createOr(y, b.createAnd(baseOutcome(x, l, j, 2), K[0]));
+                    } else {
+                        y = b.createOr(y, b.createAnd(baseLength[l], K[j - l - 1]));
+                    }
+                }
+                return y;
+            };
+
+            //  The state, by item and distance j (1 .. depth): Y[1] and Y[0], the
+            //  positions at which item x at distance j from the next position is
+            //  known to hold, or known not to, given the converted text up to and
+            //  including the position; K[1] and K[0], the same before the position;
+            //  KDel, the positions known to be deleted; and for each run item,
+            //  Thru, the positions known to be passed over (all their characters in
+            //  its set).  Every Var only gains bits: in a While loop, the carries of
+            //  the previous block reach the first iteration only
+            //  (doc/ldml-divcode-plan.md §10).
+            //
+            //  Before the loop, the positions where no converted subgroup applies.
+            //  (The initial values are kept as expressions: an expression over the
+            //  Vars built before the loop would be reused for the same expression
+            //  in its body.)
             struct ItemVars {
-                std::vector<Var *> Y[2], K[2];      // [0]: known out (YO, K0), [1]: known in (YI, K1)
+                std::vector<Var *> Y[2], K[2];      // [0]: known out, [1]: known in
+                Var * Thru = nullptr;
+                PabloAST * thru0 = nullptr;
             };
             std::vector<ItemVars> vars(items.size());
             unsigned varCount = 0;
             for (size_t x = 0; x < items.size(); x++) {
                 const ResolvedItem & item = items[x];
+                PabloAST * over1 = del0;
+                if (item.run) {
+                    vars[x].thru0 = pb.createAnd(baseThrough(x), independent);
+                    over1 = pb.createOr(del0, vars[x].thru0);
+                    vars[x].Thru = pb.createVar("Thru" + std::to_string(x), vars[x].thru0);
+                }
                 for (int in = 0; in <= 1; in++) {
-                    std::vector<PabloAST *> k(item.depth + 1, nullptr);
+                    std::vector<PabloAST *> k;
                     for (unsigned j = 1; j <= item.depth; j++) {
-                        PabloAST * y = zeroes;
-                        for (unsigned l = 1; l < baseLength.size(); l++) {
-                            if (baseLength[l] == zeroes) continue;
-                            PabloAST * const v = l >= j ? baseIn(l - j, item.chars, in) : k[j - l];
-                            y = pb.createOr(y, pb.createAnd(baseLength[l], v));
-                        }
-                        y = pb.createAnd(y, independent);
-                        k[j] = pb.createMatchStar(pb.createOr(pb.createAdvance(y, 1), startOf(item, in)), del0);
+                        PabloAST * const y = pb.createAnd(baseValue(pb, x, j, in, k), independent);
+                        k.push_back(pb.createMatchStar(pb.createOr(pb.createAdvance(y, 1), startOf(item, in)), j == 1 ? over1 : del0));
                         const std::string suffix = std::to_string(varCount++);
                         vars[x].Y[in].push_back(pb.createVar("Y" + suffix, y));
-                        vars[x].K[in].push_back(pb.createVar("K" + suffix, k[j]));
+                        vars[x].K[in].push_back(pb.createVar("K" + suffix, k.back()));
                     }
                 }
             }
@@ -5174,15 +5275,16 @@ void FusedRules::generatePabloMethod() {
             Var * const Progress = pb.createVar("Progress", dep);
 
             //  Whether a converted subgroup's before context is known to hold at
-            //  each position (in), or known not to (!in), from K1 and K0.
+            //  each position (in), or known not to (!in), from K[1] and K[0].
             auto known = [&](PabloBuilder & b, size_t g, bool in) -> PabloAST * {
                 PabloAST * match = in ? zeroes : ones;
                 for (const FusedContext & alt : mConfig.subgroups[g].before) {
                     PabloAST * m = in ? ones : zeroes;
                     const unsigned B = static_cast<unsigned>(alt.size());
                     for (unsigned k = 0; k < B; k++) {
-                        const size_t x = itemIndex.at(std::make_pair(setKey(alt[k].chars), alt[k].boundary));
-                        PabloAST * const v = vars[x].K[in][B - k - 1];
+                        ResolvedItem at;
+                        if (!resolvedItemAt(alt, k, at)) continue;
+                        PabloAST * const v = vars[itemIndex.at(at.key())].K[in][B - k - 1];
                         m = in ? b.createAnd(m, v) : b.createOr(m, v);
                     }
                     match = in ? b.createOr(match, m) : b.createAnd(match, m);
@@ -5204,28 +5306,55 @@ void FusedRules::generatePabloMethod() {
                     T[g] = known(wb, g, true);
                     F[g] = known(wb, g, false);
                 }
+                //  The positions known to have an outcome: of the subgroup that
+                //  applies, or of all the possible ones (given, for each subgroup, at
+                //  its candidates, and for the base).
+                auto settled = [&](const std::vector<PabloAST *> & byGroup, PabloAST * base) {
+                    PabloAST * any = zeroes;
+                    PabloAST * all = base;
+                    for (size_t g = 0; g < numGroups; g++) {
+                        if (!cand[g]) continue;
+                        any = wb.createOr(any, wb.createAnd(T[g], byGroup[g]));
+                        all = wb.createAnd(all, wb.createOr(wb.createOr(notCand[g], F[g]), byGroup[g]));
+                    }
+                    return wb.createOr(any, all);
+                };
                 //  The positions known to be deleted.
-                PabloAST * anyDel = zeroes;
-                PabloAST * allDel = baseDeleted;
+                std::vector<PabloAST *> gDel(numGroups, nullptr);
                 for (size_t g = 0; g < numGroups; g++) {
-                    if (!cand[g]) continue;
-                    PabloAST * const gDel = classAt(0, mappingLengthChars(mConfig.subgroups[g], 0));
-                    anyDel = wb.createOr(anyDel, wb.createAnd(T[g], gDel));
-                    allDel = wb.createAnd(allDel, wb.createOr(wb.createOr(notCand[g], F[g]), gDel));
+                    if (cand[g]) gDel[g] = wb.createAnd(cand[g], classAt(0, mappingLengthChars(mConfig.subgroups[g], 0)));
                 }
-                PabloAST * const del = wb.createOr(KDel, wb.createOr(anyDel, allDel));
+                PabloAST * const del = wb.createOr(KDel, settled(gDel, baseDeleted));
                 wb.createAssign(KDel, del);
+                //  The positions known to be passed over by each run item.
+                std::vector<PabloAST *> thru(items.size(), nullptr);
+                for (size_t x = 0; x < items.size(); x++) {
+                    if (!items[x].run) continue;
+                    std::vector<PabloAST *> gThru(numGroups, nullptr);
+                    for (size_t g = 0; g < numGroups; g++) {
+                        if (!cand[g]) continue;
+                        PabloAST * t = zeroes;
+                        for (unsigned l : mappingLengths(mConfig.subgroups[g])) {
+                            if (l >= 1) t = wb.createOr(t, classAt(0, mappingItemChars(mConfig.subgroups[g], items[x], l, 1, 2)));
+                        }
+                        gThru[g] = wb.createAnd(cand[g], t);
+                    }
+                    thru[x] = wb.createOr(vars[x].Thru, settled(gThru, baseThrough(x)));
+                    wb.createAssign(vars[x].Thru, thru[x]);
+                }
                 //  The outcome of subgroup g (at its candidates) for item x at
                 //  distance j, known in (in) or known out (!in).
                 auto outcomeOf = [&](size_t g, size_t x, unsigned j, int in) -> PabloAST * {
                     const FusedSubgroup & sg = mConfig.subgroups[g];
+                    const std::vector<Var *> & K = vars[x].K[in];
                     PabloAST * v = zeroes;
                     for (unsigned l : mappingLengths(sg)) {
                         PabloAST * w;
                         if (l >= j) {
-                            w = classAt(0, mappingSlotChars(sg, l, l - j, items[x].chars, in));
+                            w = classAt(0, mappingItemChars(sg, items[x], l, j, in));
+                            if (items[x].run) w = wb.createOr(w, wb.createAnd(classAt(0, mappingItemChars(sg, items[x], l, j, 2)), K[0]));
                         } else {
-                            w = wb.createAnd(classAt(0, mappingLengthChars(sg, l)), vars[x].K[in][j - l - 1]);
+                            w = wb.createAnd(classAt(0, mappingLengthChars(sg, l)), K[j - l - 1]);
                         }
                         v = wb.createOr(v, w);
                     }
@@ -5234,30 +5363,25 @@ void FusedRules::generatePabloMethod() {
                 std::vector<std::pair<Var *, PabloAST *>> newY;
                 for (size_t x = 0; x < items.size(); x++) {
                     for (int in = 0; in <= 1; in++) {
+                        const std::vector<Var *> & K = vars[x].K[in];
+                        const std::vector<PabloAST *> k(K.begin(), K.end());
                         for (unsigned j = 1; j <= items[x].depth; j++) {
-                            //  The base outcome.
-                            PabloAST * y = wb.createAnd(baseDeleted, vars[x].K[in][j - 1]);
-                            for (unsigned l = 1; l < baseLength.size(); l++) {
-                                if (baseLength[l] == zeroes) continue;
-                                PabloAST * const v = l >= j ? baseIn(l - j, items[x].chars, in) : vars[x].K[in][j - l - 1];
-                                y = wb.createOr(y, wb.createAnd(baseLength[l], v));
-                            }
-                            //  ... where no converted subgroup applies, or every one that
-                            //  may apply agrees; or the outcome of one that applies.
-                            PabloAST * applied = zeroes;
+                            //  The base outcome (a deleted position: the item before it;
+                            //  a run item passing over at distance 1: as before it).
+                            PabloAST * base = wb.createOr(baseValue(wb, x, j, in, k), wb.createAnd(baseDeleted, K[j - 1]));
+                            if (items[x].run && j == 1) base = wb.createOr(base, wb.createAnd(baseThrough(x), K[0]));
+                            std::vector<PabloAST *> byGroup(numGroups, nullptr);
                             for (size_t g = 0; g < numGroups; g++) {
-                                if (!cand[g]) continue;
-                                PabloAST * const o = outcomeOf(g, x, j, in);
-                                y = wb.createAnd(y, wb.createOr(wb.createOr(notCand[g], F[g]), o));
-                                applied = wb.createOr(applied, wb.createAnd(T[g], o));
+                                if (cand[g]) byGroup[g] = outcomeOf(g, x, j, in);
                             }
                             Var * const Y = vars[x].Y[in][j - 1];
-                            newY.emplace_back(Y, wb.createOr(Y, wb.createOr(y, applied)));
+                            newY.emplace_back(Y, wb.createOr(Y, settled(byGroup, base)));
                         }
                     }
                 }
                 for (const auto & a : newY) wb.createAssign(a.first, a.second);
-                //  K1 and K0 from the new state, through the deleted positions.
+                //  K[1] and K[0] from the new state, through the deleted positions
+                //  (and those a run item passes over).
                 PabloAST * progress = zeroes;
                 size_t a = 0;
                 for (size_t x = 0; x < items.size(); x++) {
@@ -5265,10 +5389,11 @@ void FusedRules::generatePabloMethod() {
                         for (unsigned j = 1; j <= items[x].depth; j++) {
                             Var * const K = vars[x].K[in][j - 1];
                             PabloAST * const y = newY[a++].second;
+                            PabloAST * const over = (items[x].run && j == 1) ? wb.createOr(del, thru[x]) : del;
                             PabloAST * const src = wb.createOr(wb.createOr(wb.createAdvance(y, 1), startOf(items[x], in)), K);
-                            PabloAST * const k = wb.createOr(K, wb.createMatchStar(src, del));
-                            progress = wb.createOr(progress, wb.createAnd(k, wb.createNot(K)));
-                            wb.createAssign(K, k);
+                            PabloAST * const kk = wb.createOr(K, wb.createMatchStar(src, over));
+                            progress = wb.createOr(progress, wb.createAnd(kk, wb.createNot(K)));
+                            wb.createAssign(K, kk);
                         }
                     }
                 }

@@ -38,7 +38,7 @@ one pipeline run for `--lines`, and more kernels that can run in parallel.
 | Run ends | `ldml::FilterRunEndMark` (U+FDD2), `marksFilterRunEnd` | an after context's boundary set matching at the end of a filter run |
 | Insertions under a filter | `mInsertAnywhere`, eligibility (`insertionsEligible`) | an insertion rule inserts only before a filtered character |
 | Per-line runs | `applyToInput` | `--lines`: one pipeline run per line |
-| Engine regions | `RE_Compiler` region start and follow streams | anchors only (`^` at a region start, `$` at a region follow); lookarounds are not bounded by regions |
+| Engine regions | `RE_Compiler` region start and follow streams | matches confined to regions: every class, `.` and external is intersected with the region span `SpanUpTo(starts, follows)`, so matches and lookaround bodies (lookbehinds too) stop at region boundaries; `^` and `$` are the region start and follow; the lookahead chain kernels and region reversal take the follows as barriers |
 | Kernel masks | `StreamMask` (Zeroing, PassThru) | class and property kernels (done) |
 
 ## The interface
@@ -67,14 +67,15 @@ struct TransformMask {
     StreamSet * apply = nullptr;        // 1: the transform applies here
     MaskKind kind = MaskKind::PassThru; // outside: unchanged (PassThru) or 0 (Zeroing)
     ContextScope scope = ContextScope::Text;
-    StreamSet * regionStarts = nullptr; // optional: explicit region starts
 };
 ```
 
-- **Region starts and follows** are derived from the mask unless given:
+- **Region starts and follows** are derived from the mask:
   `start = apply ∧ ¬Advance(apply)` and `follow = ¬apply ∧ Advance(apply)`.
-  Explicit starts allow adjacent regions, which runs alone cannot express (two
-  function arguments side by side).
+- **Regions are not adjacent.** Each region's follow is a position outside
+  every region (a line break, or a character outside the mask). This is the
+  precondition for fully functional division into regions (see step 5). Two
+  function arguments side by side are therefore not two regions as they stand.
 - **Positions.** A transform under a PassThru mask may insert or delete
   positions within its runs. It returns its insertion and deletion masks (or one
   position map), so the caller can keep its other streams in step, as
@@ -102,7 +103,7 @@ struct TransformMask {
 | Class and property kernels | done (no contexts) | the same |
 | Fused kernels (contexts by Advance and Lookahead, While loop, star items) | apply mask on the anchors; contexts unchanged; run ends for boundary sets | contexts cut at region boundaries: an item at distance d holds only if no region start lies in (p − d, p]; after items only up to the follow; `MatchStar` runs stop at starts; `start` (the text start) becomes the region start |
 | DivCode kernels | as fused | as fused (the converted-context loop's start is the region start) |
-| Regular expression engine (`matchPositions`) | the apply mask on the matches | region start and follow streams (anchors exist), and bounded lookarounds (new in `RE_Compiler`) |
+| Regular expression engine (`matchPositions`) | the apply mask on the matches | region start and follow streams: matches, lookarounds and anchors confined to regions, which must not be adjacent (step 5) |
 | Normalization (NFD, NFC, FCD) | the mask as a composition barrier, replacing `BarrierMark` substitution | the same (no contexts beyond combining sequences) |
 | Case maps (lc, uc, tc; `maskedStringOverrides`) | per character | per character; Final_Sigma (Any-Lower) bounded by the region |
 | Insertion and deletion stages (spreads, filters) | return their position maps | the same |
@@ -129,8 +130,19 @@ transforms it can affect, and against ICU.
 4. **Fused kernels and DivCode with region scope.** Bounded before and after
    contexts, the While loop's start and run items, and the correction kernel's
    rounds. Test with rules files whose contexts reach across line boundaries.
-5. **Engine lookarounds bounded by regions** (`RE_Compiler`). Lookbehinds and
-   lookaheads stop at the region start and follow.
+5. **Engine regions.** Done, for regions that are not adjacent. The engine
+   confines matches, lookaheads and lookbehinds to the regions given by start and
+   follow streams (see Engine regions above). icgrep's lines were checked on
+   2026-11-18: nothing crosses a line break in the byte, UTF-8-indexed and
+   Unicode-indexed modes, with `-z`, and with `-Unicode-lines`. Adjacent
+   regions, where one region's follow is on the next region's start, are not
+   separated:
+   - **Region span.** `SpanUpTo(starts, follows)`, i.e. follows − starts, is one
+     span across both regions. For regions [0,3) and [3,6):
+     0b1001000 − 0b0001001 = 0b111111.
+   - **Chain kernels.** The lookahead chain kernels and region reversal treat a
+     follow as a position outside every region, so they would also exclude the
+     second region's first character.
 6. **Normalization with a mask**, replacing the barrier substitution in
    `barrierNormalization`. One masked NFD/NFC kernel set, shared by every
    filter.
@@ -138,8 +150,9 @@ transforms it can affect, and against ICU.
    the insertion eligibility into text scope, and retire the special cases one at
    a time.
 8. **Function calls by masks.** `&T($k)` on a captured character applies T at the
-   marked position, in region scope with an explicit region start for each
-   argument, as the case maps are now, but for any transform tconv implements.
+   marked position, in region scope with each argument a region (separated
+   from its neighbours, see the open question on adjacent arguments), as the
+   case maps are now, but for any transform tconv implements.
    Deferred calls in shape groups use the same.
 9. **Masked kernels skipping blocks without mask bits** (a Pablo `If` on the
    mask), and narrower masks where the work is rare (case maps' expanding
@@ -167,6 +180,9 @@ transforms it can affect, and against ICU.
 - **The position map.** A pair of insertion and deletion masks, or one
   spread-and-filter description, so that a chain of transforms composes their
   maps once instead of each caller re-spreading its streams?
+- **Adjacent arguments.** Regions must not be adjacent, so how are function
+  arguments side by side separated: by a position inserted between them and
+  deleted afterwards, or by applying them in separate passes?
 - **Where the type lives.** `TransformMask` in the library (with kernel support
   for region scope) or in tconv's pipeline builder until a second tool needs it?
 - **UTF-8 mode.** Mask conventions per code unit, and how they combine with the

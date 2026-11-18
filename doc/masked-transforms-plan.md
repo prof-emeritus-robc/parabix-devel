@@ -5,7 +5,9 @@ property kernels, is done (`MaskKind`, `StreamMask` in
 `include/kernel/unicode/charclasses.h`, commit fc7aaa956) and used by tconv's
 case-map marks (c85065bb7). Step 2, the pipeline-level `TransformMask` with
 position maps, is done in tconv (`TransformMask`, `PositionMap`,
-`TransformMasks` in `tools/ldml/tconv.cpp`).
+`TransformMasks` in `tools/ldml/tconv.cpp`). Step 3, `--lines` in one run for
+the transforms whose components support region scope, is done
+(`regionScopeProblem`, `pushRegions`, `--lines-regions`).
 
 ## Goal
 
@@ -39,7 +41,7 @@ one pipeline run for `--lines`, and more kernels that can run in parallel.
 | Classes outside the mask | `OutsideMask` kernel | a class also holds outside the filter |
 | Run ends | `ldml::FilterRunEndMark` (U+FDD2), `marksFilterRunEnd` | an after context's boundary set matching at the end of a filter run |
 | Insertions under a filter | `mInsertAnywhere`, eligibility (`insertionsEligible`) | an insertion rule inserts only before a filtered character |
-| Per-line runs | `applyToInput` | `--lines`: one pipeline run per line |
+| Per-line runs | `applyToInput` | `--lines`: one pipeline run per line, for the transforms not supporting region scope (`regionScopeProblem`) |
 | Engine regions | `RE_Compiler` region start and follow streams | matches confined to regions: every class, `.` and external is intersected with the region span `SpanUpTo(starts, follows)`, so matches and lookaround bodies (lookbehinds too) stop at region boundaries; `^` and `$` are the region start and follow; the lookahead chain kernels and region reversal take the follows as barriers |
 | Kernel masks | `StreamMask` (Zeroing, PassThru) | class and property kernels (done) |
 
@@ -142,6 +144,40 @@ transforms it can affect, and against ICU.
    - The others keep the per-line runs. Check equality with the per-line runs on
      the CLDR test data of those transforms, and measure; the per-line runs pay a
      full pipeline invocation per line.
+
+   Done. With `--lines`, a transform whose components all support region scope
+   (`regionScopeProblem`, shown by `--plan --lines`) is applied in one run: the
+   builders push a mask of region scope outside every filter (`pushRegions`),
+   the characters other than the line feeds, which pass through unchanged.
+   `--lines-regions=0` keeps the per-line runs. No kernel bounds contexts yet
+   (step 4), so the components supported are those that cannot see past a line:
+   - the class kernels; the case maps (Any-Upper, Any-Lower, Any-Title: neither
+     Final_Sigma's contexts nor a word crosses a line feed); NFD, NFKD, NFC and
+     NFKC (each run of the mask normalized by itself by the barrier
+     substitution); Any-Hex and its forms, Any-Remove, Any-Null;
+   - conversion groups without revisits, insertions, deferred rules, prefix
+     runs, chain revisits, mark run edits, capture replacements or front
+     letters, whose contexts are *line-bound*. A match lies within the mask. In
+     the text, the position beyond a line holds a line feed where the line as a
+     text has its end, which a class matches if it has U+FFFF (as in ICU), and
+     an anchor matches too. So the outermost item of a context (a class, an
+     alternation or difference of classes and the anchor of its end) must match
+     both the line feed and the end, or neither. An inner item must match
+     neither. A lookaround of such an item (as the engine has a complement)
+     must match both or neither. No item may match a mark of tconv's or the
+     deletion mark.
+
+   Of the 252 CLDR transforms with test data, 112 are applied in one run. The
+   others have contexts that are not line-bound (e.g. `[$ \-] {`, which matches
+   at the start of a line taken as a text but not after a line feed), capture
+   replacements, prefix runs or insertion rules. On the test data of the 112,
+   one run gives the output of the per-line runs, also with `-thread-num=4
+   -segment-size=1` (`tconv_lines_regions_test` covers the edges). Warm run times
+   on the largest test data, per-line runs to one run: 0.45 s to 0.04 s
+   (und-Ethi-t-sgw-ethi-m0-gurage-2013, 8532 lines), 0.22 s to 0.05 s
+   (es-419-fonipa-t-es-fonipa), 0.24 s to 0.05 s (ug-fonipa-t-ug); 36.8 s to
+   27.2 s for am-Ethi-t-am-ethi-m0-geminate, whose 7718 string rules take about
+   27 s to analyze either way.
 4. **Fused kernels and DivCode with region scope.** Bounded before and after
    contexts, the While loop's start and run items, and the correction kernel's
    rounds. Test with rules files whose contexts reach across line boundaries.

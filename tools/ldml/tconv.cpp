@@ -221,6 +221,10 @@ static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied b
                                    cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> LinesRegions("lines-regions",
+    cl::desc("With --lines, apply a transform whose components all support region scope (see --plan --lines) in one run "
+             "over the whole input, each line a region of a mask (default on; --lines-regions=0 for one run per line)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(TconvOptions));
@@ -1518,7 +1522,9 @@ public:
     const TransformMask & operator[](size_t i) const {return mMasks[i];}
     //  The innermost mask's positions, or nullptr without a filter.
     StreamSet * active() const {return mMasks.empty() ? nullptr : mMasks.back().apply;}
-    void push(StreamSet * apply) {mMasks.push_back(TransformMask{apply});}
+    void push(StreamSet * apply, ContextScope scope = ContextScope::Text) {
+        mMasks.push_back(TransformMask{apply, MaskKind::PassThru, scope});
+    }
     void pop() {mMasks.pop_back();}
     //  A mask outside all others (taken out by popOutermost).
     void pushOutermost(StreamSet * apply) {mMasks.insert(mMasks.begin(), TransformMask{apply});}
@@ -8077,6 +8083,10 @@ public:
     //  stages of no kernels (for --kernel-counts: a transform that invokes them
     //  runs them as ICU stages, outside its pipelines).
     void omitICUBuiltIns() {mOmitICUBuiltIns = true;}
+    //  The lines of U21 as regions (see --lines and regionScopeProblem): a mask
+    //  of region scope, outside every filter, of the characters other than the
+    //  line feeds, which pass through unchanged.
+    void pushRegions(StreamSet * U21);
 private:
     //  Filters.  As in ICU, a filter selects the characters of the text that a
     //  transform may change, once, when the transform is applied: the steps of
@@ -8202,6 +8212,12 @@ static const ldml::TransformPlan & finalSigmaPlan() {
         return ldml::planTransform(ldml::DisambiguateOrder(rules));
     }();
     return plan;
+}
+
+void RulePipelineBuilder::pushRegions(StreamSet * U21) {
+    assert (mMasks.empty());
+    StreamSet * const lines = classes({UCD::UnicodeSet(0, 0x10FFFF) - UCD::UnicodeSet(0x0A)}, U21);
+    mMasks.push(lines, ContextScope::Region);
 }
 
 void RulePipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21) {
@@ -11090,6 +11106,14 @@ public:
                         std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
     : mMasks(P), mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
+    //  The lines as regions, as in Unicode mode (see RulePipelineBuilder::pushRegions).
+    void pushRegions(StreamSet * Basis) {
+        assert (mMasks.empty());
+        pushFilter(UCD::UnicodeSet(0, 0x10FFFF) - UCD::UnicodeSet(0x0A), Basis);
+        std::vector<StreamSet *> streams = mMasks.applyStreams();
+        mMasks.pop();
+        mMasks.push(streams.back(), ContextScope::Region);
+    }
     //  The steps of an analysis (of a transform named name, or a rules file).
     StreamSet * applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis);
 private:
@@ -11378,17 +11402,20 @@ StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet
 //  kernel::WellFormedUTF8 and codegen::UTF8Errors).
 static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                      const ldml::TransformEntry * entry, StreamSet * Basis,
-                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
+                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr, bool regions = false) {
     UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
-    return builder.transform(entry, kernel::WellFormedUTF8(P, Basis));
+    StreamSet * const text = kernel::WellFormedUTF8(P, Basis);
+    if (regions) builder.pushRegions(text);
+    return builder.transform(entry, text);
 }
 
 static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
-                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry,
+                                                  bool regions = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
-    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream));
+    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream), nullptr, regions);
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
     return P.compile();
 }
@@ -12157,13 +12184,15 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
 }
 
 static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
-                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry,
+                                                  bool regions = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
+    if (regions) builder.pushRegions(U21);
     StreamSet * const Result = builder.transform(entry, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
@@ -12432,24 +12461,184 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
 //  A pipeline for a transform compiled from an ad hoc rules file (--rules-file),
 //  given its already-computed analysis (see TransformAnalyzer::analyzeRulesFile).
 static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver, const ldml::TransformRegistry & registry,
-                                                               TransformAnalyzer & analyzer, const TransformAnalysis & a) {
+                                                               TransformAnalyzer & analyzer, const TransformAnalysis & a,
+                                                               bool regions = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
+    if (regions) builder.pushRegions(U21);
     StreamSet * const Result = builder.applyAnalysis(a, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
+//  Region scope (see --lines and doc/masked-transforms-plan.md, step 3): the
+//  reason a transform cannot be applied to the regions of a mask (each line)
+//  in one run, as each region by itself, or "" if it can: every component it
+//  uses must keep to the region of each position, seeing nothing outside it.
+//  The components supported are the class kernels; the case maps (Any-Upper,
+//  Any-Lower and Any-Title: neither the Final_Sigma context nor a word crosses
+//  a line feed); the normalization forms other than FCD and FCC (each run of a
+//  mask normalized by itself, see barrierNormalization); Any-Hex (and its
+//  forms), Any-Remove and Any-Null; and conversion groups without revisits
+//  whose rules have line-bound contexts, if any.  The n characters of a match
+//  are all within the mask, and a context is line-bound if it has no anchors
+//  and none of its classes matches a line feed (or a mark of tconv's, such as
+//  FilterRunEndMark, which can stand for one), so that it matches within the
+//  line as it does at the end of the line taken as a text.  The filters of the
+//  transform (within the mask) and the transforms it invokes are as well.  Each
+//  line is then a region; the line feeds, outside the mask, pass through
+//  unchanged.
+static std::string regionScopeProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                      const ldml::TransformEntry * entry);
+
+static std::string regionScopeProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                      const TransformAnalysis & a) {
+    if (!a.implementable) return "not implementable by the regular plan";
+    //  A context is line-bound if it matches a line within the text as it
+    //  matches the line taken as a text: in the text, the position beyond the
+    //  line (after its end, or before its start) holds a line feed, or is
+    //  beyond the text.  An item of one position (a class, or an alternation or
+    //  difference of classes, see single) matches the line feed if its set has
+    //  it, and beyond the line if it has U+FFFF (as in ICU, see
+    //  UnicodeSet::matches) or the anchor of that end (Start in a before
+    //  context, End in an after one).  The outermost item of a context (the
+    //  last of an after context, the first of a before context) may reach the
+    //  position beyond the line, and must match both or neither; an inner item
+    //  must match neither, so that the outermost cannot reach past it.  A
+    //  lookaround (toward the outside of the context) of an item holds or fails
+    //  on the line feed as beyond the end if the item matches both or neither.
+    //  No item may match a mark of tconv's (which can stand for a position
+    //  outside a filter, e.g. FilterRunEndMark) or the deletion mark.  Other
+    //  constructs (e.g. anchors elsewhere) are not line-bound.
+    static const UCD::UnicodeSet marks = UCD::UnicodeSet(0xD800, 0xDFFF) + UCD::UnicodeSet(0xFDD0, 0xFDEF);
+    struct Single {
+        UCD::UnicodeSet set;
+        bool beyond = false;
+    };
+    std::function<std::optional<Single> (const re::RE *, bool)> single = [&](const re::RE * re, bool after) -> std::optional<Single> {
+        if (const re::CC * cc = llvm::dyn_cast<re::CC>(re)) return Single{*cc, cc->contains(0xFFFF)};
+        if (llvm::isa<re::Any>(re)) return Single{UCD::UnicodeSet(0, 0x10FFFF), false};
+        if ((after && llvm::isa<re::End>(re)) || (!after && llvm::isa<re::Start>(re))) return Single{UCD::UnicodeSet(), true};
+        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
+            if (n->getDefinition() == nullptr) return std::nullopt;
+            return single(n->getDefinition(), after);
+        }
+        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+            Single u;
+            for (const re::RE * r : *alt) {
+                const std::optional<Single> s = single(r, after);
+                if (!s) return std::nullopt;
+                u.set = u.set + s->set;
+                u.beyond |= s->beyond;
+            }
+            return u;
+        }
+        if (const re::Diff * d = llvm::dyn_cast<re::Diff>(re)) {
+            const std::optional<Single> l = single(d->getLH(), after), r = single(d->getRH(), after);
+            if (!l || !r) return std::nullopt;
+            return Single{l->set - r->set, l->beyond && !r->beyond};
+        }
+        return std::nullopt;
+    };
+    std::function<bool (const re::RE *, bool, bool)> lineBound = [&](const re::RE * re, bool after, bool outermost) -> bool {
+        if (re == nullptr) return true;
+        if (const std::optional<Single> s = single(re, after)) {
+            if (s->set.intersects(marks)) return false;
+            const bool lf = s->set.contains(0x0A);
+            return lf == s->beyond && (!lf || outermost);
+        }
+        if (const re::Seq * seq = llvm::dyn_cast<re::Seq>(re)) {
+            const size_t n = seq->size();
+            for (size_t i = 0; i < n; i++) {
+                const size_t outer = after ? n - 1 : 0;
+                if (!lineBound((*seq)[i], after, outermost && i == outer)) return false;
+            }
+            return true;
+        }
+        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+            for (const re::RE * r : *alt) if (!lineBound(r, after, outermost)) return false;
+            return true;
+        }
+        if (const re::Rep * rep = llvm::dyn_cast<re::Rep>(re)) return lineBound(rep->getRE(), after, false);
+        if (const re::Assertion * a = llvm::dyn_cast<re::Assertion>(re)) {
+            const auto toward = after ? re::Assertion::Kind::LookAhead : re::Assertion::Kind::LookBehind;
+            const std::optional<Single> s = single(a->getAsserted(), after);
+            return s && a->getKind() == toward && !s->set.intersects(marks) && s->set.contains(0x0A) == s->beyond;
+        }
+        if (const re::Capture * c = llvm::dyn_cast<re::Capture>(re)) return lineBound(c->getCapturedRE(), after, outermost);
+        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
+            return n->getDefinition() && lineBound(n->getDefinition(), after, outermost);
+        }
+        return false;
+    };
+    //  (The contexts as the engine matches them, with their variables expanded,
+    //  where the plan has them.)
+    auto contextsBound = [&](const re::RE * before, const re::RE * after, const re::RE * engineBefore, const re::RE * engineAfter) {
+        return lineBound(engineBefore ? engineBefore : before, false, true) && lineBound(engineAfter ? engineAfter : after, true, true);
+    };
+    auto revisits = [](const ldml::RuleSide * result) {
+        if (result == nullptr || !result->hasCursor()) return false;
+        if (result->getCursorOffset() != 0) return true;
+        re::RE * const rv = result->getResultToRevisit();
+        return rv != nullptr && !(llvm::isa<re::Seq>(rv) && llvm::cast<re::Seq>(rv)->empty());
+    };
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
+            if (used == nullptr) return "unknown transform " + step.transform.getText();
+            const std::string p = regionScopeProblem(registry, analyzer, used);
+            if (!p.empty()) return used->canonicalName + ": " + p;
+            continue;
+        }
+        if (!step.insertions.empty()) return "insertion rules";
+        if (!step.deferred.empty() || !step.copyCaptures.empty()) return "deferred rules";
+        if (!step.prefixRuns.empty()) return "prefix runs";
+        if (!step.chainRevisitRules.empty()) return "chain revisits";
+        if (!step.markRunEditRules.empty()) return "mark run edits";
+        if (!step.captureReplacements.empty()) return "capture replacements";
+        if (step.hasFrontLetters || step.frontLettersEnd) return "front-letter revisits";
+        for (const ldml::CharMapSubgroup & s : step.subgroups) {
+            if (!contextsBound(s.before, s.after, s.engineBefore, s.engineAfter)) return "a context not bound to the line";
+        }
+        for (const ldml::StringRule & r : step.stringRules) {
+            if (!contextsBound(r.before, r.after, r.engineBefore, r.engineAfter)) return "a context not bound to the line";
+        }
+        for (const ldml::ConversionRule * r : step.rules) {
+            if (revisits(r->getRightSide())) return "a rule with a revisit";
+        }
+    }
+    return "";
+}
+
+static std::string regionScopeProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                      const ldml::TransformEntry * entry) {
+    if (entry->isBuiltIn()) {
+        static const std::vector<std::string> supported = {
+            "Any-Null", "Any-Upper", "Any-Lower", "Any-Title", "Any-NFD", "Any-NFKD", "Any-NFC", "Any-NFKC",
+            "Any-Remove", "Any-Hex", "Any-Hex/Java", "Any-Hex/Unicode", "Any-Hex/C", "Any-Hex/XML", "Any-Hex/XML10",
+            "Any-Hex/Perl"};
+        if (std::find(supported.begin(), supported.end(), entry->canonicalName) != supported.end()) return "";
+        return "the built-in " + entry->canonicalName;
+    }
+    return regionScopeProblem(registry, analyzer, analyzer.analyze(entry));
+}
+
+//  The line printed by --plan --lines.
+static void printRegionScope(const std::string & problem) {
+    toolio::out() << "  region scope (--lines): " << (problem.empty() ? "supported, one run" : "per-line runs: " + problem) << "\n";
+}
+
 //  Applies a transform function to the input: the whole text, or with --lines,
 //  each line as a text of its own (given through a pipe), followed by its line
-//  break.
-static void applyToInput(const std::function<void (int)> & fn, int fd) {
-    if (!Lines) {
+//  break; with regions, the function applies to each line as a region of the
+//  whole text (see regionScopeProblem), in one run.
+static void applyToInput(const std::function<void (int)> & fn, int fd, bool regions = false) {
+    if (!Lines || regions) {
         fn(fd);
         return;
     }
@@ -14558,6 +14747,7 @@ static int run(int argc, char *argv[]) {
         if (DivCodeReport) return printDivCodeReportOf(RulesFile, a);
         if (ShowPlan) {
             printPlan("rules file " + RulesFile, a);
+            if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, a));
             return a.implementable ? 0 : 2;
         }
         //  Not implementable: applied by ICU (unless --use-ICU=0).
@@ -14608,19 +14798,23 @@ static int run(int argc, char *argv[]) {
             applyToInput(runner, MainInput.fd);
             return finishOutput();
         }
+        //  (With --lines, the lines as regions where every component supports it.)
+        const bool regions = Lines && LinesRegions && regionScopeProblem(registry, analyzer, a).empty();
         //  (In UTF-8 mode, where its steps can be: see TransformAnalyzer::mode.)
         if (UTF8Mode && analyzer.modeOf(a).utf8) {
             auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
             StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
             P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
             UTF8PipelineBuilder builder(P, registry, analyzer);
-            StreamSet * const Result = builder.applyAnalysis("rules", a, kernel::WellFormedUTF8(P, BasisOf(P, ByteStream)));
+            StreamSet * const text = kernel::WellFormedUTF8(P, BasisOf(P, ByteStream));
+            if (regions) builder.pushRegions(text);
+            StreamSet * const Result = builder.applyAnalysis("rules", a, text);
             P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
-            applyToInput(pipelineRunner(P.compile()), MainInput.fd);
+            applyToInput(pipelineRunner(P.compile()), MainInput.fd, regions);
             return finishOutput();
         }
-        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
-        applyToInput(pipelineRunner(fn), MainInput.fd);
+        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a, regions);
+        applyToInput(pipelineRunner(fn), MainInput.fd, regions);
         return finishOutput();
     }
 
@@ -14687,6 +14881,7 @@ static int run(int argc, char *argv[]) {
                         printShapeStep(step);
                     }
                 }
+                if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
                 return 0;
             }
             //  (The transforms invoked by their shape groups, within filters
@@ -14708,14 +14903,17 @@ static int run(int argc, char *argv[]) {
                 printPlan(label, a, &shapeChoice(registry, analyzer, entry), note);
                 if (!groups.applicable) toolio::out() << "  (not entirely by shape groups: " << groups.reason << ")\n";
                 printMode(analyzer, entry);
+                if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
                 return 0;
             }
             printPlan(label, a);
             toolio::out() << "  not by shape groups: " << groups.reason << "\n";
+            if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
             return 2;
         }
         printPlan(label, a);
         if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry);
+        if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
@@ -14799,9 +14997,12 @@ static int run(int argc, char *argv[]) {
                         && impl->second != Transform::HexC && impl->second != Transform::HexXML && impl->second != Transform::HexXML10
                         && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode
                         && impl->second != Transform::Remove;
-    TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
-                               : (UTF8Mode && analyzer.mode(entry).utf8) ? generateUTF8Pipeline(driver, registry, analyzer, entry)
-                               : generateRulePipeline(driver, registry, analyzer, entry);
-    applyToInput(pipelineRunner(fn), MainInput.fd);
+    //  (With --lines, the lines as regions where every component supports it,
+    //  by the rule pipeline.)
+    const bool regions = Lines && LinesRegions && regionScopeProblem(registry, analyzer, entry).empty();
+    TransformFunctionType fn = direct && !regions ? generatePipeline(driver, impl->second)
+                               : (UTF8Mode && analyzer.mode(entry).utf8) ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
+                               : generateRulePipeline(driver, registry, analyzer, entry, regions);
+    applyToInput(pipelineRunner(fn), MainInput.fd, regions);
     return finishOutput();
 }

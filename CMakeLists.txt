@@ -1041,6 +1041,11 @@ add_test(
   COMMAND python3 tconv_converted_star_contexts_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_converted_while_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_converted_while_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_run_moves_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_run_moves_test.py ${BIN_DIR}/tconv)

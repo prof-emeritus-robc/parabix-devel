@@ -91,6 +91,21 @@ The correction kernel already computes the j-th last converted character (`membe
 | es_419-ar | 1 | 0 | 1 | 1 | 11 | 11,190 / 2,790 | (not reported) |
 | es_419-fa | 1 | 0 | 1 | 1 | 11 | 7,779 / 1,717 | (not reported) |
 
+**Status (2026-11-17): first increment implemented.** A correction kernel whose converted rules are all single-character subgroups with before contexts of fixed items (any number), and which has no insertion rules, resolves them by a While loop instead of rounds (`FusedRulesConfig::resolve`, `resolvableByWhile`; `--converted-context-while`, default on, `=0` for the rounds; kernel signature `W`). The string matches and the coverage of the subgroups do not depend on the converted text there, so they are settled as after the rounds, before the loop.
+
+- **Outcomes.** Each position has a base outcome (the state given, the string rules and the other subgroups; slots compiled as in `matchConverted`), and each converted subgroup that may apply there (its positions without its before context) has its own, from static classes of its mappings: the characters whose replacements have length l, and whose slot i is in an item's set or not (`mappingLengthChars`, `mappingSlotChars`, added to `fusedClassSets`).
+- **State**, per item (set, boundary) and distance j = 1 .. depth (`resolvedItems`), all accumulating: `YI`/`YO`, the j-th last converted character up to and including the position known in the set or known not; `K1`/`K0`, the same before the position, `MatchStar(Advance(Y) ∨ start ∨ K, KDel)`; `KDel`, the positions known deleted. A position of length l < j reads `K[j − l]`: the distance-2 streams come from the end of the character before, as planned.
+- **The loop.** Each iteration evaluates the subgroups' contexts from `K1`/`K0` (`T` = ∨ alternatives ∧ items `K1`, `F` = ∧ alternatives ∨ items `K0`) and adds to the state the outcome of a subgroup known to apply, or of the base where all are known not to, or of any position whose possible outcomes all agree (consumers need no iteration). It ends when no `K1`/`K0` bit is added. Before the loop, the state of the positions where no converted subgroup may apply.
+
+Results:
+
+- Exact at any length: `QA/tconv_converted_while_test.py` (chains of two and three items longer than 8, a deletion and an expansion seen at distance 2, negated sets at the start of the text; with one thread and with four threads and segments of one stride) matches ICU, where the rounds fail 3 of its lines; also on random texts with chains of up to 3000 across blocks, and with dependent positions at block starts after blocks with none.
+- Groups of this table now resolved: uz_Cyrl-uz_Latn #1 and the es-ar, es-fa, es_419-ar, es_419-fa group. Still on rounds: hy-hy_Latn/BGN #1, blt-blt_FONIPA #2 and Latn-Kana (a converted string rule), ky-ky_FONIPA (a repeated set, `S T*`), ConjoiningJamo-Latin (54 insertion rules).
+- The mechanism also applies to correction kernels of the other classes with only such subgroups: by default 45 transforms have one (Latin-InterIndic and the Latn-* Indic transforms through it, und_FONIPA-ar and the *-ar transforms, my-my_FONIPA, Hans-Hant, Latn-Ethi/SERA, NumericPinyin-Latin, ps-ps_Latn/BGN, Zawgyi-my, the es-* groups, uz_Cyrl-uz_Latn); 122 with `--divcode-groups=0`. On the CLDR test data where there is some, and on random text of each script, the output is identical to the rounds' for all of them (Zawgyi-my not yet checked: its compilation takes too long), and identical to ICU's except Latin-InterIndic, Latn-Ethi/SERA and Bopo-Latn, which differ from ICU with the rounds as well (to be investigated separately).
+- Cost, uz_Cyrl-uz_Latn: the correction kernel has 2,250 Pablo lines against 6,916 at 8 rounds; execution cycles (4 threads, 5 MB of random Cyrillic) 205,853 against 381,735 (−46%); hy-hy_Latn/BGN's two resolved kernels −55% and −59%. Whole transforms: cold compilation and warm run time unchanged within noise (uz_Cyrl-uz_Latn, es-ar, hy-hy_Latn/BGN), as their class kernels dominate.
+
+Next increments for this class: a repeated set in an item (`S T*`, ky-ky_FONIPA, and class 1D), insertion rules (ConjoiningJamo-Latin), then converted string rules (with class 1A).
+
 ### 1D. A repeated set in a before context whose membership the conversions change (S T*)
 
 U+0345 is case-ignorable and cased: whether it is in T in the converted text depends on the converted context itself. In a While loop T becomes an outcome item: the run through T is a `MatchStar` over known-in-T and deleted positions, stopping at positions not yet decided. The Title groups have 1,500 to 3,000 rules each, so nine copies are costly to compile.
@@ -206,6 +221,6 @@ Checks so far:
 ## Recommended order
 
 1. Section 4: the `DeferredPlan` blocking closure as a While loop (or one `MatchStar`). Small, exact, also fixes chains longer than 9. In progress (see its status).
-2. Section 1, in the regular `FusedRules` correction kernel: a monotone three-valued While loop for single-character subgroups first (classes 1C–1E, 21 groups), reusing the DivCode §10 formulation, then string-match selection (class 1A, then section 2). Lift `--whole-group-rules` once the body is not unrolled.
+2. Section 1, in the regular `FusedRules` correction kernel: a monotone three-valued While loop for single-character subgroups first (classes 1C–1E, 21 groups), reusing the DivCode §10 formulation, then string-match selection (class 1A, then section 2). Lift `--whole-group-rules` once the body is not unrolled. In progress: subgroups with fixed items and no insertion rules done (see the status in 1C).
 3. Class 1B: let DivCode follow prefix runs that delete (brings in ja_Latn-ko #2 and ro_FONIPA-ja #2).
 4. Section 3: only after measuring rounds against real Japanese and Persian text; the redesign is large.

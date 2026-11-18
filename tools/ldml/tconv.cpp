@@ -152,6 +152,11 @@ static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::desc("Rounds of matching before contexts against the converted text, which the conversions of a group may change "
              "(exact for chains of up to this many such rules; 0 matches them against the text itself)"),
     cl::init(8), cl::cat(TconvOptions));
+static cl::opt<bool> ConvertedContextWhile("converted-context-while",
+    cl::desc("Resolve the before contexts matched against the converted text in a correction kernel of single-character rules "
+             "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
+             "§1; default on, --converted-context-while=0 for the rounds)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool, true> CaptureVariants("capture-variants",
     cl::desc("Merge MultipleCaptureMultipleReplacement rules differing only in one character of a text and their results "
              "into one set, matched once (see ldml::MultipleCaptureMultipleReplacementSet::variants)"),
@@ -3795,6 +3800,13 @@ struct FusedRulesConfig {
     //  round, of the rules applied where selected, are given (without the state
     //  in).
     bool staged = false;
+    //  A correction kernel whose rules matched against the converted text are
+    //  all single-character rules (subgroups) with before contexts of fixed
+    //  items, and without insertion rules (see resolvableByWhile): their before
+    //  contexts are resolved by a While loop, exactly, instead of in rounds (see
+    //  FusedRules::generatePabloMethod).  The rounds remain for the selection of
+    //  the string matches, which does not depend on the converted text.
+    bool resolve = false;
 };
 
 //  The results of the rules of a conversion group, accumulated by its fused
@@ -4015,6 +4027,83 @@ struct FusedSubgroupPlan {
     }
 };
 
+//  The resolution of the before contexts of a correction kernel by a While loop
+//  (FusedRulesConfig::resolve): possible if the rules matched against the
+//  converted text are all subgroups whose before contexts are fixed sequences
+//  of items, and the kernel has no insertion rules.
+static bool resolvableByWhile(const FusedRulesConfig & c) {
+    if (!ConvertedContextWhile || c.rounds == 0 || c.staged || c.matchOnly || !c.insertions.empty()) return false;
+    for (const FusedStringRule & r : c.strings) {
+        if (r.converted) return false;
+    }
+    bool any = false;
+    for (const FusedSubgroup & g : c.subgroups) {
+        if (!g.converted) continue;
+        any = true;
+        for (const FusedContext & alt : g.before) {
+            for (const FusedItem & item : alt) {
+                if (item.star) return false;
+            }
+        }
+    }
+    return any;
+}
+
+//  An item of the before contexts resolved by the While loop: its set, whether
+//  it holds before the start of the text, and the greatest distance before the
+//  position at which a context has it (the j-th last character of the converted
+//  text before the position, for j = 1 .. depth).
+struct ResolvedItem {
+    UCD::UnicodeSet chars;
+    bool boundary;
+    unsigned depth;
+};
+
+static std::vector<ResolvedItem> resolvedItems(const FusedRulesConfig & c) {
+    std::vector<ResolvedItem> items;
+    std::map<std::pair<std::string, bool>, size_t> index;
+    for (const FusedSubgroup & g : c.subgroups) {
+        if (!g.converted) continue;
+        for (const FusedContext & alt : g.before) {
+            const unsigned B = static_cast<unsigned>(alt.size());
+            for (unsigned k = 0; k < B; k++) {
+                const auto key = std::make_pair(setKey(alt[k].chars), alt[k].boundary);
+                const auto f = index.emplace(key, items.size());
+                if (f.second) items.push_back(ResolvedItem{alt[k].chars, alt[k].boundary, 0});
+                ResolvedItem & item = items[f.first->second];
+                item.depth = std::max(item.depth, B - k);
+            }
+        }
+    }
+    return items;
+}
+
+//  Of the characters of the mappings of a subgroup: those whose replacements
+//  have a length (0: deleted), and of these, those whose replacements have a
+//  character in a set (in), or not (!in), at an index.
+static std::set<unsigned> mappingLengths(const FusedSubgroup & g) {
+    std::set<unsigned> lengths;
+    for (const ldml::CharMapping & m : g.mappings) lengths.insert(static_cast<unsigned>(m.replacement.size()));
+    return lengths;
+}
+
+static UCD::UnicodeSet mappingLengthChars(const FusedSubgroup & g, unsigned length) {
+    UCD::UnicodeSet chars;
+    for (const ldml::CharMapping & m : g.mappings) {
+        if (m.replacement.size() == length) chars = chars + m.chars;
+    }
+    return chars;
+}
+
+static UCD::UnicodeSet mappingSlotChars(const FusedSubgroup & g, unsigned length, unsigned i, const UCD::UnicodeSet & set, bool in) {
+    UCD::UnicodeSet chars;
+    for (const ldml::CharMapping & m : g.mappings) {
+        if (m.replacement.size() != length) continue;
+        if (set.contains(static_cast<UCD::codepoint_t>(m.replacement[i])) == in) chars = chars + m.chars;
+    }
+    return chars;
+}
+
 //  The character classes that a fused kernel uses (computed by a
 //  CharClassesKernel and looked ahead in the fused kernel), each once.
 static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
@@ -4059,6 +4148,23 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         }
         for (const FusedSubgroupPlan::Large & l : plan.large) add(l.chars);
         for (const auto & k : plan.byInsertion) add(k.second);
+    }
+    if (c.resolve) {
+        //  The outcomes of the converted subgroups for the items (see the While
+        //  loop in FusedRules::generatePabloMethod).
+        const std::vector<ResolvedItem> items = resolvedItems(c);
+        for (const FusedSubgroup & g : c.subgroups) {
+            if (!g.converted) continue;
+            for (unsigned l : mappingLengths(g)) {
+                add(mappingLengthChars(g, l));
+                for (const ResolvedItem & item : items) {
+                    for (unsigned j = 1; j <= std::min(item.depth, l); j++) {
+                        add(mappingSlotChars(g, l, l - j, item.chars, true));
+                        add(mappingSlotChars(g, l, l - j, item.chars, false));
+                    }
+                }
+            }
+        }
     }
     return sets;
 }
@@ -4199,6 +4305,7 @@ private:
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
             if (c.staged) s += "T";
+            if (c.resolve) s += "W";
             for (const FusedRulesConfig::Selection & sel : c.selection) {
                 s += "/" + std::to_string(sel.length) + (sel.selfOverlapping ? "s" : "");
                 for (size_t p : sel.predecessors) s += "." + std::to_string(p);
@@ -4946,20 +5053,248 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
             return;
         }
-        //  Round 0: the before contexts matched against the text itself.
-        matchConverted(none, none);
-        settle();
-        //  Each further round: the converted text from the results so far (with the
-        //  texts inserted), and the before contexts matched against it.  (A rule
-        //  whose before context sees the result of another such rule is right after
-        //  as many rounds as such rules precede it in a chain.)
-        for (unsigned round = 1; round <= mConfig.rounds; round++) {
+        if (mConfig.resolve) {
+            //  The before contexts of the converted subgroups resolved by a While
+            //  loop (doc/round-replacement.md §1; the form of doc/ldml-divcode-plan.md
+            //  §10), exact at any chain length.
+            //
+            //  The string matches that apply, and the positions of the subgroups not
+            //  covered by them, as after the rounds: they do not depend on the
+            //  converted text (no string rule is converted).  The candidates of a
+            //  converted subgroup are its positions without its before context.
+            const size_t numGroups = mConfig.subgroups.size();
+            for (unsigned round = 0; round <= mConfig.rounds; round++) {
+                for (size_t g = 0; g < numGroups; g++) {
+                    if (mConfig.subgroups[g].converted) atOf[g] = ats[g];
+                }
+                settle();
+            }
+            std::vector<PabloAST *> cand(numGroups, nullptr), notCand(numGroups, nullptr), atBase = atOf;
+            PabloAST * dep = zeroes;                    // the positions where a converted subgroup may apply
+            for (size_t g = 0; g < numGroups; g++) {
+                if (!mConfig.subgroups[g].converted) continue;
+                cand[g] = atOf[g];
+                notCand[g] = pb.createNot(cand[g]);
+                dep = pb.createOr(dep, cand[g]);
+                atBase[g] = zeroes;
+            }
+            //  The base outcome of each position: where no converted subgroup
+            //  applies (the state given, the string rules and the other subgroups),
+            //  its length and its characters.
             Results base = stateIn();
-            addResults(base, firstOf, atOf);
-            Results res = base;
-            addInsertions(res, insAt);
-            matchConverted(res, base);
+            addResults(base, firstOf, atBase);
+            unsigned maxInsert = 0;
+            PabloAST * anyInsert = zeroes;
+            for (const auto & k : base.insert) {
+                maxInsert = std::max(maxInsert, k.first);
+                anyInsert = pb.createOr(anyInsert, k.second);
+            }
+            std::vector<std::vector<PabloAST *>> slot(maxInsert + 1, std::vector<PabloAST *>(21));
+            PabloAST * changed0 = zeroes;
+            for (unsigned b = 0; b < 21; b++) {
+                slot[0][b] = pb.createXor(basis[b], base.changes[0][b]);
+                changed0 = pb.createOr(changed0, base.changes[0][b]);
+            }
+            for (unsigned i = 1; i <= maxInsert; i++) {
+                for (unsigned b = 0; b < 21; b++) {
+                    PabloAST * const c = i < base.changes.size() ? base.changes[i][b] : zeroes;
+                    slot[i][b] = ((DeletionMark >> b) & 1) ? pb.createNot(c) : c;
+                }
+            }
+            std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> slotCompiler(maxInsert + 1);
+            for (unsigned i = 0; i <= maxInsert; i++) slotCompiler[i] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(slot[i]);
+            auto slotClass = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                if (set.empty()) return zeroes;
+                return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
+            };
+            PabloAST * const baseDeleted = pb.createAnd(inText, pb.createAnd(pb.createNot(anyInsert),
+                                                        pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark)))));
+            std::vector<PabloAST *> baseLength(maxInsert + 2, zeroes);     // [l]: l characters (l >= 1)
+            baseLength[1] = pb.createAnd(pb.createAnd(inText, pb.createNot(baseDeleted)), pb.createNot(anyInsert));
+            for (const auto & k : base.insert) baseLength[k.first + 1] = pb.createOr(baseLength[k.first + 1], k.second);
+            //  Whether slot i of the base outcome is in a set, or not.
+            auto baseIn = [&](unsigned i, const UCD::UnicodeSet & set, bool in) -> PabloAST * {
+                const UCD::UnicodeSet inReplaced = set & replaced;
+                PabloAST * m;
+                if (i == 0) {
+                    m = pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)), pb.createAnd(changed0, slotClass(0, inReplaced)));
+                } else {
+                    m = slotClass(i, inReplaced);
+                }
+                return in ? m : pb.createAnd(inText, pb.createNot(m));
+            };
+
+            //  The state, by item and distance j (1 .. depth): YI and YO, the
+            //  positions at which the j-th last character of the converted text up
+            //  to and including the position is known to be in the item's set (or,
+            //  if there is none, the item holds before the text), or known not to
+            //  be; K1 and K0, the same for the converted text before the position;
+            //  and KDel, the positions known to be deleted.  Every Var only gains
+            //  bits: in a While loop, the carries of the previous block reach the
+            //  first iteration only (doc/ldml-divcode-plan.md §10).
+            //
+            //  Before the loop, the positions where no converted subgroup applies.
+            //  (The initial values are kept as expressions: an expression over the
+            //  Vars built before the loop would be reused for the same expression
+            //  in its body.)
+            const std::vector<ResolvedItem> items = resolvedItems(mConfig);
+            std::map<std::pair<std::string, bool>, size_t> itemIndex;
+            for (size_t x = 0; x < items.size(); x++) itemIndex.emplace(std::make_pair(setKey(items[x].chars), items[x].boundary), x);
+            PabloAST * const independent = pb.createAnd(inText, pb.createNot(dep));
+            PabloAST * const del0 = pb.createAnd(baseDeleted, independent);
+            //  At the start of the text: an item holds there (K1) or not (K0).
+            auto startOf = [&](const ResolvedItem & item, bool in) {
+                return item.boundary == in ? firstPosition : zeroes;
+            };
+            struct ItemVars {
+                std::vector<Var *> Y[2], K[2];      // [0]: known out (YO, K0), [1]: known in (YI, K1)
+            };
+            std::vector<ItemVars> vars(items.size());
+            unsigned varCount = 0;
+            for (size_t x = 0; x < items.size(); x++) {
+                const ResolvedItem & item = items[x];
+                for (int in = 0; in <= 1; in++) {
+                    std::vector<PabloAST *> k(item.depth + 1, nullptr);
+                    for (unsigned j = 1; j <= item.depth; j++) {
+                        PabloAST * y = zeroes;
+                        for (unsigned l = 1; l < baseLength.size(); l++) {
+                            if (baseLength[l] == zeroes) continue;
+                            PabloAST * const v = l >= j ? baseIn(l - j, item.chars, in) : k[j - l];
+                            y = pb.createOr(y, pb.createAnd(baseLength[l], v));
+                        }
+                        y = pb.createAnd(y, independent);
+                        k[j] = pb.createMatchStar(pb.createOr(pb.createAdvance(y, 1), startOf(item, in)), del0);
+                        const std::string suffix = std::to_string(varCount++);
+                        vars[x].Y[in].push_back(pb.createVar("Y" + suffix, y));
+                        vars[x].K[in].push_back(pb.createVar("K" + suffix, k[j]));
+                    }
+                }
+            }
+            Var * const KDel = pb.createVar("KDel", del0);
+            Var * const Progress = pb.createVar("Progress", dep);
+
+            //  Whether a converted subgroup's before context is known to hold at
+            //  each position (in), or known not to (!in), from K1 and K0.
+            auto known = [&](PabloBuilder & b, size_t g, bool in) -> PabloAST * {
+                PabloAST * match = in ? zeroes : ones;
+                for (const FusedContext & alt : mConfig.subgroups[g].before) {
+                    PabloAST * m = in ? ones : zeroes;
+                    const unsigned B = static_cast<unsigned>(alt.size());
+                    for (unsigned k = 0; k < B; k++) {
+                        const size_t x = itemIndex.at(std::make_pair(setKey(alt[k].chars), alt[k].boundary));
+                        PabloAST * const v = vars[x].K[in][B - k - 1];
+                        m = in ? b.createAnd(m, v) : b.createOr(m, v);
+                    }
+                    match = in ? b.createOr(match, m) : b.createAnd(match, m);
+                }
+                return b.createAnd(cand[g], match);
+            };
+
+            //  The loop.  Each iteration decides the converted subgroups at the
+            //  positions whose items are known, and adds the outcomes to the state:
+            //  of the subgroup that applies, or of the base where none does; or, at a
+            //  position not yet decided, where every possible outcome agrees (so
+            //  only chains of positions whose outcomes differ take iterations).
+            //  It ends when no item becomes known.
+            PabloBuilder wb = pb.createScope();
+            {
+                std::vector<PabloAST *> T(numGroups, nullptr), F(numGroups, nullptr);
+                for (size_t g = 0; g < numGroups; g++) {
+                    if (!cand[g]) continue;
+                    T[g] = known(wb, g, true);
+                    F[g] = known(wb, g, false);
+                }
+                //  The positions known to be deleted.
+                PabloAST * anyDel = zeroes;
+                PabloAST * allDel = baseDeleted;
+                for (size_t g = 0; g < numGroups; g++) {
+                    if (!cand[g]) continue;
+                    PabloAST * const gDel = classAt(0, mappingLengthChars(mConfig.subgroups[g], 0));
+                    anyDel = wb.createOr(anyDel, wb.createAnd(T[g], gDel));
+                    allDel = wb.createAnd(allDel, wb.createOr(wb.createOr(notCand[g], F[g]), gDel));
+                }
+                PabloAST * const del = wb.createOr(KDel, wb.createOr(anyDel, allDel));
+                wb.createAssign(KDel, del);
+                //  The outcome of subgroup g (at its candidates) for item x at
+                //  distance j, known in (in) or known out (!in).
+                auto outcomeOf = [&](size_t g, size_t x, unsigned j, int in) -> PabloAST * {
+                    const FusedSubgroup & sg = mConfig.subgroups[g];
+                    PabloAST * v = zeroes;
+                    for (unsigned l : mappingLengths(sg)) {
+                        PabloAST * w;
+                        if (l >= j) {
+                            w = classAt(0, mappingSlotChars(sg, l, l - j, items[x].chars, in));
+                        } else {
+                            w = wb.createAnd(classAt(0, mappingLengthChars(sg, l)), vars[x].K[in][j - l - 1]);
+                        }
+                        v = wb.createOr(v, w);
+                    }
+                    return wb.createAnd(cand[g], v);
+                };
+                std::vector<std::pair<Var *, PabloAST *>> newY;
+                for (size_t x = 0; x < items.size(); x++) {
+                    for (int in = 0; in <= 1; in++) {
+                        for (unsigned j = 1; j <= items[x].depth; j++) {
+                            //  The base outcome.
+                            PabloAST * y = wb.createAnd(baseDeleted, vars[x].K[in][j - 1]);
+                            for (unsigned l = 1; l < baseLength.size(); l++) {
+                                if (baseLength[l] == zeroes) continue;
+                                PabloAST * const v = l >= j ? baseIn(l - j, items[x].chars, in) : vars[x].K[in][j - l - 1];
+                                y = wb.createOr(y, wb.createAnd(baseLength[l], v));
+                            }
+                            //  ... where no converted subgroup applies, or every one that
+                            //  may apply agrees; or the outcome of one that applies.
+                            PabloAST * applied = zeroes;
+                            for (size_t g = 0; g < numGroups; g++) {
+                                if (!cand[g]) continue;
+                                PabloAST * const o = outcomeOf(g, x, j, in);
+                                y = wb.createAnd(y, wb.createOr(wb.createOr(notCand[g], F[g]), o));
+                                applied = wb.createOr(applied, wb.createAnd(T[g], o));
+                            }
+                            Var * const Y = vars[x].Y[in][j - 1];
+                            newY.emplace_back(Y, wb.createOr(Y, wb.createOr(y, applied)));
+                        }
+                    }
+                }
+                for (const auto & a : newY) wb.createAssign(a.first, a.second);
+                //  K1 and K0 from the new state, through the deleted positions.
+                PabloAST * progress = zeroes;
+                size_t a = 0;
+                for (size_t x = 0; x < items.size(); x++) {
+                    for (int in = 0; in <= 1; in++) {
+                        for (unsigned j = 1; j <= items[x].depth; j++) {
+                            Var * const K = vars[x].K[in][j - 1];
+                            PabloAST * const y = newY[a++].second;
+                            PabloAST * const src = wb.createOr(wb.createOr(wb.createAdvance(y, 1), startOf(items[x], in)), K);
+                            PabloAST * const k = wb.createOr(K, wb.createMatchStar(src, del));
+                            progress = wb.createOr(progress, wb.createAnd(k, wb.createNot(K)));
+                            wb.createAssign(K, k);
+                        }
+                    }
+                }
+                wb.createAssign(Progress, progress);
+            }
+            pb.createWhile(Progress, wb);
+            //  The converted subgroups apply where their before contexts hold.
+            for (size_t g = 0; g < numGroups; g++) {
+                if (cand[g]) atOf[g] = known(pb, g, true);
+            }
+        } else {
+            //  Round 0: the before contexts matched against the text itself.
+            matchConverted(none, none);
             settle();
+            //  Each further round: the converted text from the results so far (with the
+            //  texts inserted), and the before contexts matched against it.  (A rule
+            //  whose before context sees the result of another such rule is right after
+            //  as many rounds as such rules precede it in a chain.)
+            for (unsigned round = 1; round <= mConfig.rounds; round++) {
+                Results base = stateIn();
+                addResults(base, firstOf, atOf);
+                Results res = base;
+                addInsertions(res, insAt);
+                matchConverted(res, base);
+                settle();
+            }
         }
     }
 
@@ -8247,6 +8582,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     };
     std::vector<Move> moves;
     auto applyFused = [&](FusedRulesConfig && config, StreamSet * allowedAt) {
+        config.resolve = resolvableByWhile(config);
         const FusedLayout layout(config, state);
         FusedState out;
         for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));

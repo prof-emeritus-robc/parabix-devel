@@ -1411,4 +1411,23 @@ aee
 <grepcase regexp="(?|(a)(?|(a)|(c))b)" datafile="branch_reset" greplines="7"/>
 <grepcase regexp="(?|(a)|(c)(d))(e)\3" datafile="branch_reset" greplines="8 9"/>
 <grepcase regexp="(a)\1(?|(b)|(c))" datafile="branch_reset" greplines="7"/>
+<datafile id="lookahead_chain_properties">b, d
+b d
+bd
+b-x d
+b
+d
+bé d
+b αd
+b_d
+b..d
+b.c.d
+bcd
+b5d
+</datafile>
+<grepcase regexp="b(?=\W*d)" datafile="lookahead_chain_properties" greplines="1 2 3 10"/>
+<grepcase regexp="b(?=\P{L}+d)" datafile="lookahead_chain_properties" greplines="1 2 9 10 13"/>
+<grepcase regexp="b(?![^\w]*d)" datafile="lookahead_chain_properties" greplines="4 5 7 8 9 11 12 13"/>
+<grepcase regexp="b(?=(?:\Wc|\W)*d)" datafile="lookahead_chain_properties" greplines="1 2 3 10 11"/>
+<grepcase regexp="b(?=(?:\p{Greek}c)*d)" datafile="lookahead_chain_properties" greplines="3"/>
 </greptest>

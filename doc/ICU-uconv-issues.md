@@ -42,6 +42,72 @@ Observed with ICU 78.3 (`Transliterator::createFromRules`, as `tconv
   agree on their CLDR test data and on random text mixing their characters
   with punctuation, Latin letters and combining marks (2026-11-17).
 
+  **The inverse filter.** The same holds in the backward direction, for the
+  inverse filter `:: ( [set] ) ;` at the end of rules that are otherwise a
+  single rule set. `Latn-Ethi/SERA` (the backward direction of
+  `und-Ethi-t-und-latn-m0-sera.xml`) has the inverse filter
+  ``:: ([-!#',.:<>?`0-9A-Za-z]) ;``, without `;`, and the rule
+  `፤ ↔ \; ;`. Read backward, `;` is outside the filter and stays as it is
+  (tconv), but ICU converts every `;` to `፤` (`a;` gives `አ፤`, tconv `አ;`).
+  The same rules written forward show it is this issue: with the filter
+  ``:: [\-!#',.:<>?`0-9A-Za-z] ;`` and the rules `\; → ፤ ; a → አ ;`, ICU
+  gives `አ፤` on `a;`, and with `:: Null ;` added, `አ;`. Of the CLDR files
+  with an inverse filter and no other `::` transform, the other two do not
+  show it: `am-Ethi-t-am-brai.xml` (no backward rule has text outside
+  `[:Braille:]`; Braille-Ethiopic/Amharic agrees with ICU on random Braille
+  mixed with ASCII punctuation) and `und-Ethi-t-und-latn-m0-es3842.xml`
+  (forward only).
+
+- **In the backward direction, ICU puts a `::` transform before the rule set
+  it follows.** UTS #35 inverts a compound transform by inverting each step
+  and reversing their order: `p ↔ q ; :: X (Y) ; R` read backward is `R⁻¹`,
+  then `Y`, then `p ← q`. ICU (`createFromRules(…, UTRANS_REVERSE)`, and so
+  the CLDR backward transforms) builds the steps in another order: the
+  elements of the compound are `Y`, `R⁻¹`, `p ← q`, so `Y` applies to the text
+  before the rules that should feed it.
+
+  ```
+  rules (forward)                                              backward on   ICU    per UTS #35 (tconv)
+  :: Latin-NumericPinyin(NumericPinyin-Latin) ; a1 ↔ X ;       X             a1     ā
+  p ↔ q ; :: Latin-NumericPinyin(NumericPinyin-Latin) ;
+          a1 ↔ X ;                                             qX            pa1    pā
+  ```
+
+  ICU's compound alternates blocks of `::` transforms and rule sets
+  (`[ids₀, rules₀, ids₁, rules₁, …]`), and in the backward direction it
+  prepends each block to its list as it reads them. So each block of `::`
+  transforms comes out paired with, and placed before, the inverse of the rule
+  set that followed it, not the one that preceded it. The order is right when
+  the `::` transforms are symmetric around the rules (`:: NFD (NFC) ; rules ;
+  :: NFC (NFD) ;`, as in most CLDR files) and wrong when the rules end with a
+  rule set after a `::` transform. (Observed through `getElement` on the
+  transliterators; not checked in ICU's source.)
+
+  **CLDR.** Among the CLDR files read in both directions, those that end with
+  a rule set after a `::` transform are `Latin-Bopomofo.xml`,
+  `byn-Ethi-t-byn-latn-m0-tekie-alibekit.xml`, `und-Ethi-t-und-latn.xml` and
+  the `und-Ethi-t-und-latn-m0-*` (Aethiopica, ALALOC, Beta_Metsehaf,
+  IES_JES_1964, Lambdin) and `und-Ethi-t-und-cyrl-m0-gutgarts.xml`. It shows
+  in two:
+
+  - `Bopo-Latn` (Bopomofo-Latin): the forward rules are a rule set (`[ln] { v
+    → ü`), `:: Latin-NumericPinyin(NumericPinyin-Latin) ;`, and the rules
+    between pinyin with numeric tones and Bopomofo. Backward, ICU applies
+    NumericPinyin-Latin first, to the Bopomofo text, where it does nothing, so
+    the result keeps numeric tones: `ㄅㄚˇ` gives `ba3` (tconv `bǎ`), `ㄓㄨㄥ`
+    `zhong1` (tconv `zhōng`). The file itself notes it: "currently in reverse it
+    only goes back to Latin with numeric tones (not sure why); ok but would
+    rather have marks."
+  - `byn_Latn-byn_Ethi/Tekie_Alibekit` (forward `:: NFD (NFC) ;` then the
+    rules): backward, ICU applies NFC before the rules instead of after them.
+    On decomposed input this changes the result: `s a U+0308 l` gives `ሰል`
+    (composed to `ä` first, then `sä → ሰ`), and tconv `ሳ̈ል` (`sa → ሳ`, the
+    mark left). On precomposed input both give `ሰል`. 65 of 99 short words of
+    decomposed Latin differ.
+
+  The others agree with ICU on the same decomposed words: their rules give
+  the same results whether NFC is applied before or after them.
+
 ## uconv
 
 Observed with `uconv v2.1`, ICU 78.3.

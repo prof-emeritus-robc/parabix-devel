@@ -157,6 +157,11 @@ static cl::opt<bool> ConvertedContextWhile("converted-context-while",
              "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
              "§1; default on, --converted-context-while=0 for the rounds)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> CaseMapMarks("case-map-marks",
+    cl::desc("Apply the case mappings that the function calls of a group's rules expand to (&Any-Lower($1), ...) at the "
+             "positions marked where they apply, after the group, instead of as the changes of their characters "
+             "(default on; Unicode mode, see CaseMapSplit)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> UCDPropertyKernels("ucd-property-kernels",
     cl::desc("Compute the Unicode properties of a group's rules each by a kernel of its own (UnicodePropertyKernelBuilder, "
              "shared and cached across transforms), and the classes of the fused kernels made of them from their streams, "
@@ -3655,6 +3660,7 @@ struct FusedSubgroup {
     int match = -1;
     int afterMatch = -1;
     bool converted = false;     // as for FusedStringRule
+    bool caseMaps = false;      // its case mappings may be applied by marks (see CaseMapSplit)
 };
 
 //  An insertion rule (see ldml::InsertionRule) in a correction kernel, at the
@@ -3813,6 +3819,9 @@ struct FusedRulesConfig {
     //  FusedRules::generatePabloMethod).  The rounds remain for the selection of
     //  the string matches, which does not depend on the converted text.
     bool resolve = false;
+    //  The case mappings marked in the state given or by the subgroups (see
+    //  CaseMapSplit), whose outcomes a correction kernel takes into account.
+    std::set<unsigned> marks;
 };
 
 //  The results of the rules of a conversion group, accumulated by its fused
@@ -3826,7 +3835,139 @@ struct FusedState {
     std::map<unsigned, StreamSet *> insertions;
     StreamSet * spans = nullptr;
     StreamSet * starts = nullptr;
+    //  The positions marked for each case mapping (see CaseMapSplit).
+    std::map<unsigned, StreamSet *> marks;
 };
+
+//  Case mappings applied at marked positions.  A subgroup of a fused kernel
+//  whose mappings map more than CaseMapMinChars characters each to its full
+//  case mapping (lc, uc or tc), as the expansion of a function call &Any-Lower($1),
+//  &Any-Upper($1) or &Any-Title($1) gives them (see ldml::ExpandFunctionCalls),
+//  marks the positions where these apply, instead of writing their changes;
+//  the group then applies the case mapping at the marked positions
+//  (RulePipelineBuilder::maskedStringOverrides), with the classes of the case
+//  mapping shared by every transform.  Its other mappings (literal) are
+//  applied as before.  (--case-map-marks; see RulePipelineBuilder::conversionGroup.)
+static constexpr size_t CaseMapMinChars = 64;
+static constexpr unsigned CaseMapCount = 3;
+static const UCD::property_t CaseMapProperty[CaseMapCount] = {UCD::lc, UCD::uc, UCD::tc};
+static const char * const CaseMapName[CaseMapCount] = {"lc", "uc", "tc"};
+
+struct CaseMapData {
+    UCD::UnicodeSet reflexive;                              // mapped to themselves
+    std::map<UCD::codepoint_t, std::u32string> changed;     // the others, with their values
+    unsigned maxLength = 1;
+};
+
+static const CaseMapData & caseMapData(unsigned p) {
+    static std::unique_ptr<CaseMapData> data[CaseMapCount];
+    if (!data[p]) {
+        data[p] = std::make_unique<CaseMapData>();
+        auto * const obj = cast<UCD::StringOverridePropertyObject>(UCD::getPropertyObject(CaseMapProperty[p]));
+        data[p]->reflexive = obj->GetReflexiveSet();
+        for (const auto & range : UCD::UnicodeSet(0, 0x10FFFF) - data[p]->reflexive) {
+            for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
+                const std::u32string v = obj->GetU32StringValue(cp);
+                data[p]->changed.emplace(cp, v);
+                data[p]->maxLength = std::max<unsigned>(data[p]->maxLength, static_cast<unsigned>(v.size()));
+            }
+        }
+    }
+    return *data[p];
+}
+
+static std::u32string caseMapValue(unsigned p, UCD::codepoint_t cp) {
+    const CaseMapData & d = caseMapData(p);
+    const auto f = d.changed.find(cp);
+    return f == d.changed.end() ? std::u32string(1, static_cast<char32_t>(cp)) : f->second;
+}
+
+//  The mappings of a subgroup split into a case mapping (caseMap, or -1 if
+//  none applies) and the rest (literal).
+struct CaseMapSplit {
+    int caseMap = -1;
+    std::vector<ldml::CharMapping> literal;
+    UCD::UnicodeSet literalAll;     // the characters of the literal mappings
+};
+
+struct FusedSubgroup;
+static CaseMapSplit caseMapSplit(const FusedSubgroup & g);
+
+//  The characters (of any) whose case mapping p has length l.
+static UCD::UnicodeSet caseMapLengthChars(unsigned p, unsigned l) {
+    const CaseMapData & d = caseMapData(p);
+    UCD::UnicodeSet s = l == 1 ? d.reflexive : UCD::UnicodeSet();
+    for (const auto & c : d.changed) {
+        if (c.second.size() == l) s.insert(c.first);
+    }
+    return s;
+}
+
+//  The changes of case mapping p at index i of its values, by bit (as the
+//  group's changes: at index 0, of the character; at the others, of the
+//  deletion mark that fills a position inserted; see conversionGroup).
+static const std::vector<UCD::UnicodeSet> & caseMapChangeSets(unsigned p, unsigned i) {
+    static std::map<std::pair<unsigned, unsigned>, std::vector<UCD::UnicodeSet>> memo;
+    std::vector<UCD::UnicodeSet> & sets = memo[{p, i}];
+    if (sets.empty()) {
+        sets.assign(21, UCD::UnicodeSet());
+        for (const auto & c : caseMapData(p).changed) {
+            if (c.second.size() <= i) continue;
+            const UCD::codepoint_t diff = (i == 0 ? c.first : DeletionMark) ^ static_cast<UCD::codepoint_t>(c.second[i]);
+            for (unsigned b = 0; b < 21; b++) {
+                if ((diff >> b) & 1) sets[b].insert(c.first);
+            }
+        }
+    }
+    return sets;
+}
+
+//  The characters whose case mapping p has a character in a set (in), or not
+//  (!in), at index i.
+static UCD::UnicodeSet caseMapSlotChars(unsigned p, unsigned i, const UCD::UnicodeSet & set, bool in) {
+    const CaseMapData & d = caseMapData(p);
+    UCD::UnicodeSet s;
+    if (i == 0) s = in ? (d.reflexive & set) : (d.reflexive - set);
+    for (const auto & c : d.changed) {
+        if (c.second.size() > i && set.contains(static_cast<UCD::codepoint_t>(c.second[i])) == in) s.insert(c.first);
+    }
+    return s;
+}
+
+static CaseMapSplit caseMapSplit(const FusedSubgroup & g) {
+    CaseMapSplit split;
+    if (!g.caseMaps) {
+        split.literal = g.mappings;
+        return split;
+    }
+    //  The case mapping that most characters follow, if more than CaseMapMinChars.
+    size_t best = CaseMapMinChars;
+    for (unsigned p = 0; p < CaseMapCount; p++) {
+        size_t n = 0;
+        for (const ldml::CharMapping & m : g.mappings) {
+            bool all = true;
+            for (const auto & range : m.chars) {
+                for (UCD::codepoint_t cp = range.first; all && cp <= range.second; cp++) all = caseMapValue(p, cp) == m.replacement;
+            }
+            if (all) n += m.chars.count();
+        }
+        if (n > best) {
+            best = n;
+            split.caseMap = static_cast<int>(p);
+        }
+    }
+    for (const ldml::CharMapping & m : g.mappings) {
+        bool all = split.caseMap >= 0;
+        for (const auto & range : m.chars) {
+            for (UCD::codepoint_t cp = range.first; all && cp <= range.second; cp++) all = caseMapValue(split.caseMap, cp) == m.replacement;
+        }
+        if (!all) {
+            split.literal.push_back(m);
+            split.literalAll = split.literalAll + m.chars;
+        }
+    }
+    return split;
+}
 
 //  The input lookahead and outputs of a fused kernel.
 struct FusedLayout {
@@ -3835,6 +3976,7 @@ struct FusedLayout {
     unsigned changePositions = 0;   // the positions i of the replacements, with outputs
     std::set<unsigned> insertCounts;
     std::vector<StreamSet *> sourceSets;
+    std::set<unsigned> marks;               // the case mappings marked (given, or by its subgroups)
     FusedLayout(const FusedRulesConfig & c, const FusedState & in) {
         for (const FusedStringRule & r : c.strings) {
             const unsigned n = r.text.size(), m = r.resultLength();
@@ -3852,7 +3994,9 @@ struct FusedLayout {
             if (g.match < 0 && g.afterMatch < 0) {
                 for (const FusedContext & a : g.after) lookahead = std::max<unsigned>(lookahead, a.size());
             }
-            for (const ldml::CharMapping & m : g.mappings) {
+            const CaseMapSplit split = caseMapSplit(g);
+            if (split.caseMap >= 0 && !c.matchOnly) marks.insert(static_cast<unsigned>(split.caseMap));
+            for (const ldml::CharMapping & m : split.literal) {
                 changePositions = std::max<unsigned>(changePositions, std::max<size_t>(m.replacement.size(), 1));
                 if (m.replacement.size() > 1) insertCounts.insert(m.replacement.size() - 1);
             }
@@ -3860,6 +4004,7 @@ struct FusedLayout {
         if (!c.matchOnly || c.staged) {
             changePositions = std::max<unsigned>(changePositions, in.changes.size());
             for (const auto & k : in.insertions) insertCounts.insert(k.first);
+            for (const auto & k : in.marks) marks.insert(k.first);
         }
         //  An insertion of m characters after a position whose converted text has
         //  k + 1 characters (k inserted after it) or none (deleted, the first
@@ -3937,7 +4082,25 @@ struct FusedSubgroupPlan {
     std::vector<UCD::UnicodeSet> mux;
     std::vector<std::vector<UCD::UnicodeSet>> indexBits;
     std::map<unsigned, UCD::UnicodeSet> insertIndices;
-    explicit FusedSubgroupPlan(const FusedSubgroup & g) {
+    //  With a case mapping applied by marks (see CaseMapSplit): which, and the
+    //  characters of the other mappings, from which alone the changes are made
+    //  (all is still the characters of every mapping).
+    int caseMap = -1;
+    UCD::UnicodeSet literalAll;
+    explicit FusedSubgroupPlan(const FusedSubgroup & sg) {
+        const CaseMapSplit split = caseMapSplit(sg);
+        if (split.caseMap >= 0) {
+            FusedSubgroup lit = sg;
+            lit.caseMaps = false;
+            lit.mappings = split.literal;
+            *this = FusedSubgroupPlan(lit);
+            caseMap = split.caseMap;
+            literalAll = split.literalAll;
+            all = UCD::UnicodeSet();
+            for (const ldml::CharMapping & m : sg.mappings) all = all + m.chars;
+            return;
+        }
+        const FusedSubgroup & g = sg;
         size_t total = 0;
         bool small = false;
         for (const ldml::CharMapping & mp : g.mappings) {
@@ -4165,6 +4328,69 @@ static UCD::UnicodeSet mappingItemChars(const FusedSubgroup & g, const ResolvedI
     return chars;
 }
 
+//  A converted subgroup's outcomes in the While loop: of its literal mappings,
+//  and of its case mapping (if any, see CaseMapSplit) outside their characters.
+struct SubgroupOutcomes {
+    FusedSubgroup literal;
+    int caseMap = -1;
+    UCD::UnicodeSet literalAll;
+    std::set<unsigned> lengths;     // of either
+};
+static SubgroupOutcomes subgroupOutcomes(const FusedSubgroup & g);
+
+//  The same for case mapping p (of any character, see CaseMapSplit).
+static UCD::UnicodeSet caseMapItemChars(unsigned p, const ResolvedItem & x, unsigned l, unsigned j, int outcome) {
+    const CaseMapData & d = caseMapData(p);
+    UCD::UnicodeSet chars;
+    if (l == 1 && j == 1) {
+        //  (The characters mapped to themselves.)
+        if (!x.run) {
+            chars = outcome == 1 ? (d.reflexive & x.chars) : outcome == 0 ? (d.reflexive - x.chars) : UCD::UnicodeSet();
+        } else {
+            chars = outcome == 2 ? (d.reflexive & x.chars) : outcome == 1 ? ((d.reflexive & x.beyond) - x.chars)
+                                                                         : (d.reflexive - x.chars - x.beyond);
+        }
+    }
+    for (const auto & c : d.changed) {
+        if (c.second.size() == l && replacementOutcome(c.second, x, j) == outcome) chars.insert(c.first);
+    }
+    return chars;
+}
+
+static SubgroupOutcomes subgroupOutcomes(const FusedSubgroup & g) {
+    SubgroupOutcomes o;
+    const CaseMapSplit split = caseMapSplit(g);
+    o.literal = g;
+    o.literal.caseMaps = false;
+    o.literal.mappings = split.literal;
+    o.caseMap = split.caseMap;
+    o.literalAll = split.literalAll;
+    o.lengths = mappingLengths(o.literal);
+    if (o.caseMap >= 0) {
+        for (unsigned l = 1; l <= caseMapData(o.caseMap).maxLength; l++) o.lengths.insert(l);
+    }
+    return o;
+}
+
+//  The sets of the items of the before contexts matched against the converted
+//  text, for the outcomes of the positions marked for case mappings.
+static std::vector<UCD::UnicodeSet> convertedItemSets(const FusedRulesConfig & c) {
+    std::vector<UCD::UnicodeSet> sets;
+    auto addContexts = [&](const FusedContexts & before) {
+        for (const FusedContext & alt : before) {
+            for (const FusedItem & item : alt) sets.push_back(item.chars);
+        }
+    };
+    for (const FusedStringRule & r : c.strings) {
+        if (r.converted) addContexts(r.before);
+    }
+    for (const FusedSubgroup & g : c.subgroups) {
+        if (g.converted) addContexts(g.before);
+    }
+    for (const FusedInsertion & ins : c.insertions) addContexts(ins.before);
+    return sets;
+}
+
 //  The character classes that a fused kernel uses (computed by a
 //  CharClassesKernel and looked ahead in the fused kernel), each once.
 static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
@@ -4209,6 +4435,19 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         }
         for (const FusedSubgroupPlan::Large & l : plan.large) add(l.chars);
         for (const auto & k : plan.byInsertion) add(k.second);
+        if (plan.caseMap >= 0) add(plan.literalAll);
+    }
+    if (c.rounds > 0 && !c.marks.empty()) {
+        //  The outcomes of the positions marked for case mappings (their lengths,
+        //  and whether their characters are in the sets of the items).
+        const std::vector<UCD::UnicodeSet> itemSets = convertedItemSets(c);
+        for (unsigned p : c.marks) {
+            const unsigned maxLength = caseMapData(p).maxLength;
+            for (unsigned l = 1; l <= maxLength; l++) add(caseMapLengthChars(p, l));
+            for (unsigned i = 0; i < maxLength; i++) {
+                for (const UCD::UnicodeSet & set : itemSets) add(caseMapSlotChars(p, i, set, true));
+            }
+        }
     }
     if (c.resolve) {
         //  The outcomes of the converted subgroups for the items (see the While
@@ -4216,11 +4455,17 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         const std::vector<ResolvedItem> items = resolvedItems(c);
         for (const FusedSubgroup & g : c.subgroups) {
             if (!g.converted) continue;
-            for (unsigned l : mappingLengths(g)) {
-                add(mappingLengthChars(g, l));
+            const SubgroupOutcomes o = subgroupOutcomes(g);
+            if (o.caseMap >= 0) add(o.literalAll);
+            for (unsigned l : o.lengths) {
+                add(mappingLengthChars(o.literal, l));
+                if (o.caseMap >= 0) add(caseMapLengthChars(o.caseMap, l));
                 for (const ResolvedItem & item : items) {
                     for (unsigned j = 1; j <= std::min(item.depth, l); j++) {
-                        for (int outcome = 0; outcome <= (item.run ? 2 : 1); outcome++) add(mappingItemChars(g, item, l, j, outcome));
+                        for (int outcome = 0; outcome <= (item.run ? 2 : 1); outcome++) {
+                            add(mappingItemChars(o.literal, item, l, j, outcome));
+                            if (o.caseMap >= 0) add(caseMapItemChars(o.caseMap, item, l, j, outcome));
+                        }
                     }
                 }
             }
@@ -4335,8 +4580,8 @@ static bool propertyFormula(const UCD::UnicodeSet & set, const std::vector<std::
 class PropertyClasses final : public pablo::PabloKernel {
 public:
     PropertyClasses(LLVMTypeSystemInterface & ts, std::vector<std::string> names, std::vector<PropertyFormula> formulas,
-                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes)
-    : PropertyClasses(ts, signature(names, formulas), std::move(formulas), U21, props, classes) {}
+                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes, StreamMask mask = StreamMask())
+    : PropertyClasses(ts, signature(names, formulas) + maskSuffix(mask), std::move(formulas), U21, props, classes, mask) {}
     bool hasSignature() const override { return true; }
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
@@ -4362,17 +4607,19 @@ protected:
             if (!f.in.empty()) u = pb.createOr(u, ccc.compileCC(re::makeCC(f.in, &cc::Unicode), pb));
             out.push_back(pb.createInFile(u));
         }
-        writeOutputStreamSet("Classes", out);
+        assignMasked(pb, *this, out, "Classes", mHasMask, mMaskKind);
     }
 private:
     PropertyClasses(LLVMTypeSystemInterface & ts, std::string && sig, std::vector<PropertyFormula> && formulas,
-                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes)
-    : PabloKernel(ts, "PropertyClasses_" + getStringHash(sig), [&] {
+                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes, StreamMask mask)
+    : PabloKernel(ts, "PropertyClasses_" + getStringHash(sig) + maskSuffix(mask), [&] {
           Bindings b{Binding{"U21", U21}};
           for (size_t k = 0; k < props.size(); k++) b.emplace_back("P" + std::to_string(k), props[k]);
+          addMaskInputs(mask, b);
           return b;
-      }(), {Binding{"Classes", classes}}),
-      mFormulas(std::move(formulas)), mNumProps(props.size()), mSignature(std::move(sig)) {}
+      }(), {maskedOutput(mask, "Classes", classes)}),
+      mFormulas(std::move(formulas)), mNumProps(props.size()), mHasMask(mask.mask != nullptr), mMaskKind(mask.kind),
+      mSignature(std::move(sig)) {}
     static std::string signature(const std::vector<std::string> & names, const std::vector<PropertyFormula> & formulas) {
         std::string s = "PropertyClasses";
         for (const std::string & n : names) s += "|" + n;
@@ -4385,6 +4632,8 @@ private:
     }
     const std::vector<PropertyFormula> mFormulas;
     const size_t mNumProps;
+    const bool mHasMask;
+    const MaskKind mMaskKind;
     const std::string mSignature;
 };
 
@@ -4429,6 +4678,11 @@ private:
           return v;
       }()),
       mCoverageIn(mConfig.coverage && in.spans != nullptr),
+      mMarksIn([&] {
+          std::set<unsigned> v;
+          for (const auto & k : in.marks) v.insert(k.first);
+          return v;
+      }()),
       mSignature(std::move(sig)) {
         //  Other than a correction kernel, a kernel matches fixed sequences of sets (Advances
         //  only), unless a string rule deletes the run following its text.
@@ -4468,6 +4722,7 @@ private:
                 if (in.changes[i]) b.emplace_back("ChangesIn" + std::to_string(i), in.changes[i]);
             }
             for (const auto & k : in.insertions) b.emplace_back("InsertIn" + std::to_string(k.first), k.second);
+            for (const auto & k : in.marks) b.emplace_back("MarkIn" + std::to_string(k.first), k.second);
             if (c.coverage && in.spans) {
                 b.emplace_back("SpansIn", in.spans);
                 b.emplace_back("StartsIn", in.starts);
@@ -4483,6 +4738,7 @@ private:
         }
         for (unsigned i = 0; i < l.changePositions; i++) b.emplace_back("Changes" + std::to_string(i), out.changes[i]);
         for (unsigned k : l.insertCounts) b.emplace_back("Insert" + std::to_string(k), out.insertions.at(k));
+        for (unsigned k : l.marks) b.emplace_back("Mark" + std::to_string(k), out.marks.at(k));
         if (c.coverage) {
             b.emplace_back("Spans", out.spans);
             b.emplace_back("Starts", out.starts);
@@ -4540,8 +4796,10 @@ private:
         s += "/";
         for (const auto & k : in.insertions) s += std::to_string(k.first) + ",";
         if (c.coverage && in.spans) s += "v";
+        for (const auto & k : in.marks) s += "m" + std::to_string(k.first);
         s += "O" + std::to_string(l.changePositions) + "/";
         for (unsigned k : l.insertCounts) s += std::to_string(k) + ",";
+        for (unsigned k : l.marks) s += "M" + std::to_string(k);
         auto source = [&](int match) {
             const FusedMatchSource & src = c.sources[match];
             return "@" + std::to_string(std::find(l.sourceSets.begin(), l.sourceSets.end(), src.streamSet) - l.sourceSets.begin())
@@ -4587,6 +4845,7 @@ private:
                 if (g.afterMatch >= 0) s += "a" + source(g.afterMatch); else appendContext(s, g.after);
             }
             if (g.converted) s += "c";
+            if (g.caseMaps) s += "C";
             for (const ldml::CharMapping & m : g.mappings) {
                 appendSet(s, m.chars);
                 s += ">";
@@ -4603,6 +4862,7 @@ private:
     const std::vector<bool> mChangesIn;
     const std::set<unsigned> mInsertIn;
     const bool mCoverageIn;
+    const std::set<unsigned> mMarksIn;
     const std::string mSignature;
 };
 
@@ -4733,6 +4993,7 @@ void FusedRules::generatePabloMethod() {
         std::map<unsigned, PabloAST *> insert;
         PabloAST * spans;
         PabloAST * firsts;
+        std::map<unsigned, PabloAST *> marks;    // by case mapping (see CaseMapSplit)
     };
     auto stateIn = [&]() {
         Results res;
@@ -4745,6 +5006,7 @@ void FusedRules::generatePabloMethod() {
         }
         res.spans = mCoverageIn ? getInputStreamSet("SpansIn")[0] : zeroes;
         res.firsts = mCoverageIn ? getInputStreamSet("StartsIn")[0] : zeroes;
+        for (unsigned k : mLayout.marks) res.marks[k] = mMarksIn.count(k) ? getInputStreamSet("MarkIn" + std::to_string(k))[0] : zeroes;
         return res;
     };
     //  The results of the rules applied at the positions given (the first
@@ -4830,6 +5092,12 @@ void FusedRules::generatePabloMethod() {
         for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
             const FusedSubgroupPlan plan(mConfig.subgroups[g]);
             PabloAST * const at = atOf[g];
+            if (plan.caseMap >= 0) {
+                //  The positions of the characters of the case mapping, marked.
+                PabloAST *& m = res.marks[static_cast<unsigned>(plan.caseMap)];
+                if (m == nullptr) m = zeroes;
+                m = pb.createOr(m, plan.literalAll.empty() ? at : pb.createAnd(at, pb.createNot(classAt(0, plan.literalAll))));
+            }
             if (plan.multiplexed) {
                 //  The number of the mapping of the character, and the sets of
                 //  numbers compiled over its bits.
@@ -5020,12 +5288,44 @@ void FusedRules::generatePabloMethod() {
                 if (set.empty()) return zeroes;
                 return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
             };
-            PabloAST * const deleted = pb.createAnd(pb.createNot(anyInsert),
-                                                    pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark))));
+            //  (The positions marked for case mappings: their outcomes those of the
+            //  case mappings, see CaseMapSplit.)
+            PabloAST * marked = zeroes;
+            unsigned markedLength = 0;
+            for (const auto & k : res.marks) {
+                if (k.second == nullptr || k.second == zeroes) continue;
+                marked = pb.createOr(marked, k.second);
+                markedLength = std::max(markedLength, caseMapData(k.first).maxLength);
+            }
+            PabloAST * const unmarked = pb.createNot(marked);
+            //  A slot's membership in a set, at the marked positions as their case mappings give it.
+            auto markedSlot = [&](PabloAST * v, unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                if (marked == zeroes) return v;
+                v = pb.createAnd(v, unmarked);
+                for (const auto & k : res.marks) {
+                    if (k.second && k.second != zeroes && i < caseMapData(k.first).maxLength) {
+                        v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapSlotChars(k.first, i, set, true))));
+                    }
+                }
+                return v;
+            };
+            PabloAST * const deleted = pb.createAnd(unmarked, pb.createAnd(pb.createNot(anyInsert),
+                                                    pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark)))));
             PabloAST * const kept = pb.createInFile(pb.createNot(deleted));
-            std::vector<PabloAST *> length(maxInsert + 2, zeroes);     // length[l]: the converted text has l characters
+            std::vector<PabloAST *> length(std::max(maxInsert + 2, markedLength + 1), zeroes);     // length[l]: the converted text has l characters
             length[1] = pb.createAnd(kept, pb.createNot(anyInsert));
             for (const auto & k : res.insert) length[k.first + 1] = pb.createOr(length[k.first + 1], k.second);
+            if (marked != zeroes) {
+                for (unsigned l = 1; l < length.size(); l++) {
+                    PabloAST * v = pb.createAnd(length[l], unmarked);
+                    for (const auto & k : res.marks) {
+                        if (k.second && k.second != zeroes && l <= caseMapData(k.first).maxLength) {
+                            v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapLengthChars(k.first, l))));
+                        }
+                    }
+                    length[l] = v;
+                }
+            }
             PabloAST * const noneKeptBefore = pb.createInFile(pb.createNot(pb.createMatchStar(pb.createAdvance(kept, 1), ones)));
             //  Whether the j-th last character of the converted text up to each
             //  position (j = 1, its last) is in a set (or, before the start of the
@@ -5036,10 +5336,10 @@ void FusedRules::generatePabloMethod() {
                 const UCD::UnicodeSet inReplaced = item.chars & replaced;
                 auto slotIn = [&](unsigned i) -> PabloAST * {
                     if (i == 0) {
-                        return pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, item.chars)),
-                                           pb.createAnd(changed0, slotClass(0, inReplaced)));
+                        return markedSlot(pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, item.chars)),
+                                                      pb.createAnd(changed0, slotClass(0, inReplaced))), 0, item.chars);
                     }
-                    return slotClass(i, inReplaced);
+                    return markedSlot(slotClass(i, inReplaced), i, item.chars);
                 };
                 auto previous = [&](PabloAST * v) {
                     PabloAST * p = pb.createAdvance(v, 1);
@@ -5068,10 +5368,10 @@ void FusedRules::generatePabloMethod() {
             auto memberOf = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
                 const UCD::UnicodeSet inReplaced = set & replaced;
                 if (i == 0) {
-                    return pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)),
-                                       pb.createAnd(changed0, slotClass(0, inReplaced)));
+                    return markedSlot(pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)),
+                                                  pb.createAnd(changed0, slotClass(0, inReplaced))), 0, set);
                 }
-                return slotClass(i, inReplaced);
+                return markedSlot(slotClass(i, inReplaced), i, set);
             };
             //  For a possessive repetition of S at depth j, with T beyond it: whether,
             //  going back from the j-th last character of the converted text up to
@@ -5182,6 +5482,22 @@ void FusedRules::generatePabloMethod() {
                 std::map<unsigned, PabloAST *> baseLength;      // l: the position has l characters
                 baseLength[1] = pb.createAnd(inText, pb.createNot(pb.createOr(baseAnyInsert, baseDeleted)));
                 for (const auto & k : base.insert) baseLength[k.first + 1] = k.second;
+                //  (The marked positions, as their case mappings give them; base and
+                //  res have the same marks.)
+                if (marked != zeroes) {
+                    for (unsigned l = 1; l <= markedLength; l++) {
+                        if (!baseLength.count(l)) baseLength[l] = zeroes;
+                    }
+                    for (auto & bl : baseLength) {
+                        PabloAST * v = pb.createAnd(bl.second, unmarked);
+                        for (const auto & k : res.marks) {
+                            if (k.second && k.second != zeroes && bl.first <= caseMapData(k.first).maxLength) {
+                                v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapLengthChars(k.first, bl.first))));
+                            }
+                        }
+                        bl.second = v;
+                    }
+                }
                 auto ownExcluded = [&](const FusedItem & item, unsigned j) -> PabloAST * {
                     lastIn(item, j);
                     const std::vector<PabloAST *> & V = memo[{setKey(item.chars), item.boundary}];
@@ -5333,11 +5649,32 @@ void FusedRules::generatePabloMethod() {
                 if (set.empty()) return zeroes;
                 return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
             };
-            PabloAST * const baseDeleted = pb.createAnd(inText, pb.createAnd(pb.createNot(anyInsert),
+            //  (The positions marked for case mappings: their outcomes those of the
+            //  case mappings, see CaseMapSplit.)
+            PabloAST * marked = zeroes;
+            unsigned markedLength = 0;
+            for (const auto & k : base.marks) {
+                if (k.second == nullptr || k.second == zeroes) continue;
+                marked = pb.createOr(marked, k.second);
+                markedLength = std::max(markedLength, caseMapData(k.first).maxLength);
+            }
+            PabloAST * const unmarked = pb.createNot(marked);
+            PabloAST * const baseDeleted = pb.createAnd(pb.createAnd(inText, unmarked), pb.createAnd(pb.createNot(anyInsert),
                                                         pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark)))));
-            std::vector<PabloAST *> baseLength(maxInsert + 2, zeroes);     // [l]: l characters (l >= 1)
+            std::vector<PabloAST *> baseLength(std::max(maxInsert + 2, markedLength + 1), zeroes);     // [l]: l characters (l >= 1)
             baseLength[1] = pb.createAnd(pb.createAnd(inText, pb.createNot(baseDeleted)), pb.createNot(anyInsert));
             for (const auto & k : base.insert) baseLength[k.first + 1] = pb.createOr(baseLength[k.first + 1], k.second);
+            if (marked != zeroes) {
+                for (unsigned l = 1; l < baseLength.size(); l++) {
+                    PabloAST * v = pb.createAnd(baseLength[l], unmarked);
+                    for (const auto & k : base.marks) {
+                        if (k.second && k.second != zeroes && l <= caseMapData(k.first).maxLength) {
+                            v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapLengthChars(k.first, l))));
+                        }
+                    }
+                    baseLength[l] = v;
+                }
+            }
             //  Whether slot i of the base outcome is in a set, or not.
             auto baseIn = [&](unsigned i, const UCD::UnicodeSet & set, bool in) -> PabloAST * {
                 const UCD::UnicodeSet inReplaced = set & replaced;
@@ -5346,6 +5683,14 @@ void FusedRules::generatePabloMethod() {
                     m = pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)), pb.createAnd(changed0, slotClass(0, inReplaced)));
                 } else {
                     m = slotClass(i, inReplaced);
+                }
+                if (marked != zeroes) {
+                    m = pb.createAnd(m, unmarked);
+                    for (const auto & k : base.marks) {
+                        if (k.second && k.second != zeroes && i < caseMapData(k.first).maxLength) {
+                            m = pb.createOr(m, pb.createAnd(k.second, classAt(0, caseMapSlotChars(k.first, i, set, true))));
+                        }
+                    }
                 }
                 return in ? m : pb.createAnd(inText, pb.createNot(m));
             };
@@ -5514,7 +5859,7 @@ void FusedRules::generatePabloMethod() {
                 std::map<std::string, size_t> classIndex;
                 for (size_t g = 0; g < numGroups; g++) {
                     if (!cand[g]) continue;
-                    std::string key;
+                    std::string key = mConfig.subgroups[g].caseMaps ? "C" : "";
                     for (const ldml::CharMapping & m : mConfig.subgroups[g].mappings) {
                         key += setKey(m.chars) + ">";
                         for (char32_t c : m.replacement) key += std::to_string(c) + ",";
@@ -5551,10 +5896,30 @@ void FusedRules::generatePabloMethod() {
                     }
                     return wb.createOr(any, all);
                 };
-                auto mappingsOf = [&](size_t c) -> const FusedSubgroup & {return mConfig.subgroups[classes[c].front()];};
+                //  The outcomes of each class, of its literal mappings and of its case
+                //  mapping (outside their characters).
+                std::vector<SubgroupOutcomes> outcomesOf;
+                std::vector<PabloAST *> notLiteral;
+                for (size_t c = 0; c < numClasses; c++) {
+                    outcomesOf.push_back(subgroupOutcomes(mConfig.subgroups[classes[c].front()]));
+                    const SubgroupOutcomes & o = outcomesOf.back();
+                    notLiteral.push_back(o.caseMap < 0 ? nullptr : o.literalAll.empty() ? ones : wb.createNot(classAt(0, o.literalAll)));
+                }
+                auto lengthClass = [&](size_t c, unsigned l) -> PabloAST * {
+                    const SubgroupOutcomes & o = outcomesOf[c];
+                    PabloAST * v = classAt(0, mappingLengthChars(o.literal, l));
+                    if (o.caseMap >= 0) v = wb.createOr(v, wb.createAnd(notLiteral[c], classAt(0, caseMapLengthChars(o.caseMap, l))));
+                    return v;
+                };
+                auto itemClass = [&](size_t c, size_t x, unsigned l, unsigned j, int outcome) -> PabloAST * {
+                    const SubgroupOutcomes & o = outcomesOf[c];
+                    PabloAST * v = classAt(0, mappingItemChars(o.literal, items[x], l, j, outcome));
+                    if (o.caseMap >= 0) v = wb.createOr(v, wb.createAnd(notLiteral[c], classAt(0, caseMapItemChars(o.caseMap, items[x], l, j, outcome))));
+                    return v;
+                };
                 //  The positions known to be deleted.
                 std::vector<PabloAST *> cDel(numClasses);
-                for (size_t c = 0; c < numClasses; c++) cDel[c] = classAt(0, mappingLengthChars(mappingsOf(c), 0));
+                for (size_t c = 0; c < numClasses; c++) cDel[c] = classAt(0, mappingLengthChars(outcomesOf[c].literal, 0));
                 PabloAST * const delChar = settled(cDel, baseDeleted);
                 //  The positions known to be passed over by each run item.
                 std::vector<PabloAST *> thru(items.size(), nullptr);
@@ -5563,8 +5928,8 @@ void FusedRules::generatePabloMethod() {
                     std::vector<PabloAST *> cThru(numClasses);
                     for (size_t c = 0; c < numClasses; c++) {
                         PabloAST * t = zeroes;
-                        for (unsigned l : mappingLengths(mappingsOf(c))) {
-                            if (l >= 1) t = wb.createOr(t, classAt(0, mappingItemChars(mappingsOf(c), items[x], l, 1, 2)));
+                        for (unsigned l : outcomesOf[c].lengths) {
+                            if (l >= 1) t = wb.createOr(t, itemClass(c, x, l, 1, 2));
                         }
                         cThru[c] = t;
                     }
@@ -5573,16 +5938,15 @@ void FusedRules::generatePabloMethod() {
                 //  The outcome of the subgroups of class c for item x at distance j,
                 //  known in (in) or known out (!in).
                 auto outcomeOf = [&](size_t c, size_t x, unsigned j, int in) -> PabloAST * {
-                    const FusedSubgroup & sg = mappingsOf(c);
                     const std::vector<Var *> & K = vars[x].K[in];
                     PabloAST * v = zeroes;
-                    for (unsigned l : mappingLengths(sg)) {
+                    for (unsigned l : outcomesOf[c].lengths) {
                         PabloAST * w;
                         if (l >= j) {
-                            w = classAt(0, mappingItemChars(sg, items[x], l, j, in));
-                            if (items[x].run) w = wb.createOr(w, wb.createAnd(classAt(0, mappingItemChars(sg, items[x], l, j, 2)), K[0]));
+                            w = itemClass(c, x, l, j, in);
+                            if (items[x].run) w = wb.createOr(w, wb.createAnd(itemClass(c, x, l, j, 2), K[0]));
                         } else {
-                            w = wb.createAnd(classAt(0, mappingLengthChars(sg, l)), K[j - l - 1]);
+                            w = wb.createAnd(lengthClass(c, l), K[j - l - 1]);
                         }
                         v = wb.createOr(v, w);
                     }
@@ -5746,6 +6110,10 @@ void FusedRules::generatePabloMethod() {
     addInsertions(res, insAt);
     for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), res.changes[i]);
     for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
+    for (unsigned k : mLayout.marks) {
+        PabloAST * const m = res.marks.count(k) && res.marks[k] ? res.marks[k] : zeroes;
+        writeOutputStreamSet("Mark" + std::to_string(k), std::vector<PabloAST *>{m});
+    }
     if (mConfig.coverage) {
         writeOutputStreamSet("Spans", std::vector<PabloAST *>{res.spans});
         writeOutputStreamSet("Starts", std::vector<PabloAST *>{res.firsts});
@@ -8884,6 +9252,12 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     StreamSet * const inText = P.CreateStreamSet(1);
     P.CreateKernelCall<TextPositions>(U21, inText);
     //  The classes of the sets that a fused kernel uses.
+    //  Whether the group applies its case mappings by marks (see CaseMapSplit):
+    //  not with captures, sequential selection, insertion or deferred rules,
+    //  whose positions or texts the marked case mappings would have to follow.
+    const bool caseMapGroup = CaseMapMarks && U21->getNumElements() == 21 && step.captureReplacements.empty()
+                              && !step.sequentialSelection && step.insertions.empty() && step.deferred.empty()
+                              && step.copyCaptures.empty();
     //  The Unicode properties of the group's rules (see GroupProperty), their
     //  cells, and their streams (each computed once in the pipeline).
     std::vector<GroupProperty> groupProps;
@@ -9080,11 +9454,16 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     };
     std::vector<Move> moves;
     auto applyFused = [&](FusedRulesConfig && config, StreamSet * allowedAt) {
+        if (caseMapGroup) {
+            for (FusedSubgroup & fg : config.subgroups) fg.caseMaps = true;
+        }
         config.resolve = resolvableByWhile(config);
         const FusedLayout layout(config, state);
+        config.marks = layout.marks;
         FusedState out;
         for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
         for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+        for (unsigned k : layout.marks) out.marks[k] = P.CreateStreamSet(1);
         if (config.coverage) {
             out.spans = P.CreateStreamSet(1);
             out.starts = P.CreateStreamSet(1);
@@ -10083,6 +10462,32 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     }
     std::vector<StreamSet *> changesAt = state.changes;
     std::map<unsigned, StreamSet *> inserting = state.insertions;
+    //  The case mappings at the positions marked for them (see CaseMapSplit),
+    //  applied with the group's own changes: the positions their values insert
+    //  after the character, and their changes at each index of the values, from
+    //  classes of the case mapping (shared by every transform), at the marked
+    //  positions.
+    //  (Each a class kernel with the marks as its mask: Zeroing, or with the
+    //  group's streams as the base it modifies in place, PassThru; the group
+    //  writes nothing at the marked positions.)
+    for (const auto & m : state.marks) {
+        const unsigned p = m.first;
+        auto maskedClasses = [&](const std::vector<UCD::UnicodeSet> & sets, StreamSet * base) {
+            std::vector<re::CC *> ccs;
+            for (const UCD::UnicodeSet & set : sets) ccs.push_back(re::makeCC(set, &cc::Unicode));
+            StreamSet * const result = P.CreateStreamSet(ccs.size());
+            const StreamMask mask{m.second, base ? MaskKind::PassThru : MaskKind::Zeroing, base};
+            P.CreateKernelCall<CharClassesKernel>(ccs, U21, mask, result);
+            return result;
+        };
+        const unsigned maxLength = caseMapData(p).maxLength;
+        for (unsigned l = 2; l <= maxLength; l++) {
+            StreamSet * const base = inserting.count(l - 1) ? inserting[l - 1] : nullptr;
+            inserting[l - 1] = maskedClasses({caseMapLengthChars(p, l)}, base);
+        }
+        if (changesAt.size() < maxLength) changesAt.resize(maxLength, nullptr);
+        for (unsigned i = 0; i < maxLength; i++) changesAt[i] = maskedClasses(caseMapChangeSets(p, i), changesAt[i]);
+    }
 
     //  Phase 3.  The positions inserted, and the changes applied.
     StreamSet * result = U21;

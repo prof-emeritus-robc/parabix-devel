@@ -526,6 +526,7 @@ public:
     void updateThreadLocalMemoryLoopExitPhiNodes(KernelBuilder & b);
     void updateThreadLocalMemoryAtInsufficentIOPhiNodes(KernelBuilder & b);
     void updateThreadLocalMemoryAfterTerminationPhiNodes(KernelBuilder & b);
+    void copyThreadLocalOffsetsToInOutReplacements(const size_t streamSet);
     void allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBuilder & b, Value * const maximumNumOfStrides, Value * const nonCountableNumOfStrides);
     void remapThreadLocalBufferMemory(KernelBuilder & b);
     void identifyAllThreadLocalStreamSetsInCurrentPartition();

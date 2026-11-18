@@ -3,7 +3,9 @@
 Status (2026-11-18): plan. The first step, a mask input for the class and
 property kernels, is done (`MaskKind`, `StreamMask` in
 `include/kernel/unicode/charclasses.h`, commit fc7aaa956) and used by tconv's
-case-map marks (c85065bb7).
+case-map marks (c85065bb7). Step 2, the pipeline-level `TransformMask` with
+position maps, is done in tconv (`TransformMask`, `PositionMap`,
+`TransformMasks` in `tools/ldml/tconv.cpp`).
 
 ## Goal
 
@@ -30,8 +32,8 @@ one pipeline run for `--lines`, and more kernels that can run in parallel.
 
 | Mechanism | Where | What it does |
 |---|---|---|
-| Mask stack | `RulePipelineBuilder::pushFilter`, `activeMask`, `popFilter` | the filter's characters, intersected with the outer filters |
-| Masks kept in step | `spreadMasks` (with `InheritMask`), `filterMasks` | after positions are inserted or deleted |
+| Mask stack | `TransformMasks` (`pushFilter`, `activeMask`, `popFilter`) | the filter's characters, intersected with the outer filters |
+| Masks kept in step | stages return a `PositionMap`; `inStep` applies it (`InheritMask` for inherited positions) | after positions are inserted or deleted |
 | Barrier replacement | `barrierNormalization`, `maskedNormalization`, `fcd` | characters outside the mask replaced by `BarrierMark` (a starter), normalized, then restored |
 | Masked case maps | `maskedStringOverrides` | lc, uc or tc at masked positions, with its own spread |
 | Classes outside the mask | `OutsideMask` kernel | a class also holds outside the filter |
@@ -116,10 +118,23 @@ Each step is checked against the per-line or unmasked behaviour on the
 transforms it can affect, and against ICU.
 
 1. **Class and property kernels with masks.** Done.
-2. **Pipeline-level `TransformMask`.** Replace the mask stack's raw streams with
-   `TransformMask` (text scope), keeping the current mechanisms underneath.
-   Return position maps from the insertion and deletion stages, rather than
-   updating the stack from inside them. There should be no change in output.
+2. **Pipeline-level `TransformMask`.** Done. The mask stack (`TransformMasks`)
+   holds `TransformMask`s of text scope, in both the Unicode and the UTF-8
+   pipeline builders. The stages that insert or delete positions return
+   `Staged` (the text and its `PositionMap`: deletions, and insertions whose
+   positions inherit the mask, are within it, or are outside it), and the
+   caller keeps the masks in step (`inStep`). Mapped streams are cached, so a
+   stage that needs its mapped active mask (`localCharacterMapping`'s placement,
+   the DivCode translation, the deferred rules' rounds) shares the kernels of the
+   stack's update. Barrier normalization is a map too: the characters outside
+   the mask deleted, and the normalized characters inserted between the
+   barriers, within the masks. Three stages still carry the masks themselves:
+   the engine's search and replace (shape groups), `kernel::UTF8_CharMapPipeline`
+   (whose inserted bytes inherit by `UTF8_InheritMask`), and the front-letter
+   revisits, which keep their placeholders out by an outermost mask.
+   Output unchanged: the tconv tests, and the CLDR test data of the transforms
+   with filters (single-threaded and `-thread-num=4 -segment-size=1`),
+   compared with the previous build.
 3. **`--lines` as region scope, for the transforms whose components support it.**
    - The plan of a transform says whether every component it uses supports region
      scope. Initially: class kernels, case maps, hex, and fused groups without

@@ -115,6 +115,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <set>
 #include <sstream>
 #include <re/adt/re_name.h>
@@ -1459,6 +1460,144 @@ protected:
         PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, inserted), inserted);
         writeOutputStreamSet("Inherited", std::vector<PabloAST *>{pb.createOr(spread, runs)});
     }
+};
+
+//  Transforms applied to part of a text (see doc/masked-transforms-plan.md).
+//  The context scope of a mask: what the contexts and anchors of a run of its
+//  positions see.  Text: the whole text, as under an ICU filter.  Region: the
+//  run only, as a text of its own (not yet supported).
+enum class ContextScope {Text, Region};
+
+//  The positions where a transform applies (the 1 bits of apply, each run of
+//  them applied as a run), what a kernel with the mask produces outside them
+//  (see MaskKind), and the scope of their contexts.
+struct TransformMask {
+    StreamSet * apply = nullptr;
+    MaskKind kind = MaskKind::PassThru;
+    ContextScope scope = ContextScope::Text;
+};
+
+//  The changes a stage makes to the positions of a text, in order: positions
+//  deleted (keep: 1 at the positions kept), or inserted (spread: 0 at the
+//  positions inserted, as by InsertionSpreadMask).  An inserted position is
+//  within a mask if the position before it is (Inherit: it belongs to the run
+//  of the character it follows), or always (In), or never (Out).  The caller
+//  keeps its other streams in step with the text by the map.
+struct PositionMap {
+    enum class Inserted {Inherit, In, Out};
+    struct Edit {
+        StreamSet * keep = nullptr;
+        StreamSet * spread = nullptr;
+        Inserted inserted = Inserted::Inherit;
+    };
+    std::vector<Edit> edits;
+    void remove(StreamSet * keep) {edits.push_back(Edit{keep, nullptr, Inserted::Inherit});}
+    void insert(StreamSet * spread, Inserted inserted = Inserted::Inherit) {edits.push_back(Edit{nullptr, spread, inserted});}
+    void append(const PositionMap & m) {edits.insert(edits.end(), m.edits.begin(), m.edits.end());}
+    bool empty() const {return edits.empty();}
+};
+
+//  The text produced by a stage, and the changes to its positions.
+struct Staged {
+    StreamSet * text = nullptr;
+    PositionMap positions;
+    Staged(StreamSet * t) : text(t) {}
+    Staged(StreamSet * t, PositionMap p) : text(t), positions(std::move(p)) {}
+};
+
+//  The masks of the filters in effect (the innermost last, each within the ones
+//  before it), all of text scope, kept in step with the text by the position
+//  maps of the stages.  The streams mapped are cached, so that a stage that
+//  needs the mapped active mask itself (e.g. to place its replacements) and
+//  the update of the masks after it share their kernels.
+class TransformMasks {
+public:
+    explicit TransformMasks(PipelineBuilder & P) : mP(P) {}
+    bool empty() const {return mMasks.empty();}
+    size_t size() const {return mMasks.size();}
+    const TransformMask & operator[](size_t i) const {return mMasks[i];}
+    //  The innermost mask's positions, or nullptr without a filter.
+    StreamSet * active() const {return mMasks.empty() ? nullptr : mMasks.back().apply;}
+    void push(StreamSet * apply) {mMasks.push_back(TransformMask{apply});}
+    void pop() {mMasks.pop_back();}
+    //  A mask outside all others (taken out by popOutermost).
+    void pushOutermost(StreamSet * apply) {mMasks.insert(mMasks.begin(), TransformMask{apply});}
+    StreamSet * popOutermost() {
+        StreamSet * const apply = mMasks.front().apply;
+        mMasks.erase(mMasks.begin());
+        return apply;
+    }
+    //  The masks taken out (for a stage on a text without them), and put back.
+    std::vector<TransformMask> release() {
+        std::vector<TransformMask> masks = std::move(mMasks);
+        mMasks.clear();
+        return masks;
+    }
+    void restore(std::vector<TransformMask> && masks) {mMasks = std::move(masks);}
+    //  The positions of every mask replaced (by a stage that carries the masks
+    //  through itself, as the engine's search and replace does).
+    std::vector<StreamSet *> applyStreams() const {
+        std::vector<StreamSet *> streams;
+        for (const TransformMask & m : mMasks) streams.push_back(m.apply);
+        return streams;
+    }
+    void setApplyStreams(const std::vector<StreamSet *> & streams) {
+        for (size_t k = 0; k < mMasks.size(); k++) mMasks[k].apply = streams[k];
+    }
+    //  The positions added to every mask.
+    void include(StreamSet * positions) {
+        for (TransformMask & m : mMasks) {
+            StreamSet * const combined = mP.CreateStreamSet(1);
+            OrCombine(mP, m.apply, positions, combined);
+            m.apply = combined;
+        }
+    }
+    //  The complement of a stream of one bit per position (cached).
+    StreamSet * complement(StreamSet * s) {
+        StreamSet *& c = mCache[{s, nullptr, Complement}];
+        if (c == nullptr) {
+            c = mP.CreateStreamSet(1);
+            Invert(mP, s, c);
+        }
+        return c;
+    }
+    //  A mask (of one bit per position) after the changes of a map.
+    StreamSet * mapped(StreamSet * mask, const PositionMap & map) {
+        for (const PositionMap::Edit & e : map.edits) mask = mapped(mask, e);
+        return mask;
+    }
+    void keepInStep(const PositionMap & map) {
+        for (TransformMask & m : mMasks) m.apply = mapped(m.apply, map);
+    }
+private:
+    enum Op {Complement, Filter, Inherit, In, Out};
+    StreamSet * mapped(StreamSet * mask, const PositionMap::Edit & e) {
+        const Op op = e.keep ? Filter : e.inserted == PositionMap::Inserted::Inherit ? Inherit
+                    : e.inserted == PositionMap::Inserted::In ? In : Out;
+        StreamSet * const by = e.keep ? e.keep : e.spread;
+        auto f = mCache.find({mask, by, op});
+        if (f != mCache.end()) return f->second;
+        StreamSet * result = mP.CreateStreamSet(1);
+        if (op == Filter) {
+            FilterByMask(mP, e.keep, mask, result);
+        } else {
+            SpreadByMask(mP, e.spread, mask, result);
+            if (op == Inherit) {
+                StreamSet * const inherited = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<InheritMask>(e.spread, result, inherited);
+                result = inherited;
+            } else if (op == In) {
+                StreamSet * const combined = mP.CreateStreamSet(1);
+                OrCombine(mP, result, complement(e.spread), combined);
+                result = combined;
+            }
+        }
+        mCache[{mask, by, op}] = result;
+        return result;
+    }
+    PipelineBuilder & mP;
+    std::vector<TransformMask> mMasks;
+    std::map<std::tuple<StreamSet *, StreamSet *, Op>, StreamSet *> mCache;
 };
 
 //  The positions where the single-character rules of a conversion group may
@@ -3882,7 +4021,6 @@ struct FusedState {
 static constexpr size_t CaseMapMinChars = 64;
 static constexpr unsigned CaseMapCount = 3;
 static const UCD::property_t CaseMapProperty[CaseMapCount] = {UCD::lc, UCD::uc, UCD::tc};
-static const char * const CaseMapName[CaseMapCount] = {"lc", "uc", "tc"};
 
 struct CaseMapData {
     UCD::UnicodeSet reflexive;                              // mapped to themselves
@@ -4525,36 +4663,37 @@ static size_t rangeCount(const UCD::UnicodeSet & set) {
 }
 
 static void collectProperties(re::RE * re, std::vector<GroupProperty> & out, std::set<std::string> & seen) {
-    using namespace re;
     if (re == nullptr) return;
-    if (PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
-        if (pe->getKind() != PropertyExpression::Kind::Codepoint) return;
+    if (re::PropertyExpression * pe = dyn_cast<re::PropertyExpression>(re)) {
+        if (pe->getKind() != re::PropertyExpression::Kind::Codepoint) return;
         //  (Resolved on a copy, as linking modifies property expressions; see
         //  ldml::CharSetAnalysis::propertySet.)
-        PropertyExpression * const copy = makePropertyExpression(pe->getKind(), pe->getPropertyIdentifier(),
+        re::PropertyExpression * const copy = re::makePropertyExpression(pe->getKind(), pe->getPropertyIdentifier(),
                                                                  pe->getOperator(), pe->getValueString());
-        if (isa<Any>(UCD::linkProperties(copy)) || copy->getPropertyCode() < 0) return;
+        if (isa<re::Any>(UCD::linkProperties(copy)) || copy->getPropertyCode() < 0) return;
         UCD::resolveProperties(UCD::standardizeProperties(copy));
-        CC * const cc = dyn_cast_or_null<CC>(copy->getResolvedRE());
+        re::CC * const cc = dyn_cast_or_null<re::CC>(copy->getResolvedRE());
         if (cc == nullptr || rangeCount(*cc) <= PropertyMinRanges) return;
-        if (seen.insert(copy->getFullName()).second && out.size() < PropertyMaxCount) out.push_back(GroupProperty{copy, UCD::UnicodeSet(*cc)});
-    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (seen.insert(copy->getFullName()).second && out.size() < PropertyMaxCount) {
+            out.push_back(GroupProperty{copy, UCD::UnicodeSet(*cc)});
+        }
+    } else if (re::Name * n = dyn_cast<re::Name>(re)) {
         collectProperties(n->getDefinition(), out, seen);
-    } else if (Alt * a = dyn_cast<Alt>(re)) {
-        for (RE * x : *a) collectProperties(x, out, seen);
-    } else if (Seq * s = dyn_cast<Seq>(re)) {
-        for (RE * x : *s) collectProperties(x, out, seen);
-    } else if (Rep * r = dyn_cast<Rep>(re)) {
+    } else if (re::Alt * a = dyn_cast<re::Alt>(re)) {
+        for (re::RE * x : *a) collectProperties(x, out, seen);
+    } else if (re::Seq * s = dyn_cast<re::Seq>(re)) {
+        for (re::RE * x : *s) collectProperties(x, out, seen);
+    } else if (re::Rep * r = dyn_cast<re::Rep>(re)) {
         collectProperties(r->getRE(), out, seen);
-    } else if (Diff * d = dyn_cast<Diff>(re)) {
+    } else if (re::Diff * d = dyn_cast<re::Diff>(re)) {
         collectProperties(d->getLH(), out, seen);
         collectProperties(d->getRH(), out, seen);
     } else if (re::Intersect * x = dyn_cast<re::Intersect>(re)) {
         collectProperties(x->getLH(), out, seen);
         collectProperties(x->getRH(), out, seen);
-    } else if (Assertion * as = dyn_cast<Assertion>(re)) {
+    } else if (re::Assertion * as = dyn_cast<re::Assertion>(re)) {
         collectProperties(as->getAsserted(), out, seen);
-    } else if (Capture * c = dyn_cast<Capture>(re)) {
+    } else if (re::Capture * c = dyn_cast<re::Capture>(re)) {
         collectProperties(c->getCapturedRE(), out, seen);
     }
 }
@@ -7096,7 +7235,7 @@ public:
                   }(),
                   {Binding{"Candidates", Candidates}}),
       mSrcIndex(std::move(srcIndex)), mMatchOf(std::move(matchOf)), mTextLengths(std::move(textLengths)),
-      mInterferers(std::move(interferers)), mRuleBits(ruleBits), mMasked(Mask != nullptr) {}
+      mInterferers(std::move(interferers)), mMasked(Mask != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -7123,7 +7262,6 @@ private:
     const std::vector<unsigned> mMatchOf;
     const std::vector<unsigned> mTextLengths;
     const std::vector<std::vector<size_t>> mInterferers;
-    const unsigned mRuleBits;
     const bool mMasked;
 };
 
@@ -7915,7 +8053,7 @@ private:
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
+    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P) {}
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
     StreamSet * applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21);
@@ -7944,19 +8082,25 @@ private:
     //  transform may change, once, when the transform is applied: the steps of
     //  the transform then apply only at the positions of these characters (and of
     //  the characters they are replaced by), while contexts match the whole text.
-    //  The positions are given by masks, one for each filter in effect (the
-    //  innermost last, each within the ones before it), which are kept in step
-    //  with the text as positions are inserted and deleted.
+    //  The positions are given by masks (TransformMask, of text scope), one for
+    //  each filter in effect (the innermost last, each within the ones before
+    //  it), which are kept in step with the text as positions are inserted and
+    //  deleted: each stage that inserts or deletes positions returns its
+    //  position map (Staged), and the masks are kept in step by it (inStep)
+    //  where the stage is applied.
     //  Two differences from ICU remain: ICU 74 ignores the global filter of a
     //  transform consisting of a single set of conversion rules (applied here),
     //  and a context added by DisambiguateOrder for a string rule (e.g., the
     //  [^d] of b } [^d] → Z for bd → Y ; b → Z ;) still sees a character
     //  outside the filter that keeps the string rule from applying.
     void pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21);
-    void popFilter() {mMasks.pop_back();}
-    StreamSet * activeMask() const {return mMasks.empty() ? nullptr : mMasks.back();}
-    void spreadMasks(StreamSet * SpreadMask);
-    void filterMasks(StreamSet * keep);
+    void popFilter() {mMasks.pop();}
+    StreamSet * activeMask() const {return mMasks.active();}
+    //  The text of a stage, with the masks kept in step with its positions.
+    StreamSet * inStep(const Staged & s) {
+        mMasks.keepInStep(s.positions);
+        return s.text;
+    }
     //  A context-free, single-character mapping of U21 (no contexts, and no
     //  characters deleted): without an active mask, simply map(U21).  With a
     //  mask, map is applied only to the masked characters, in a stream
@@ -7968,35 +8112,35 @@ private:
     //  to (e.g. the digit-length ranges of Any-Hex/Unicode, or a conversion
     //  group's characters by the length of their replacement); every other
     //  masked character is assumed to map to exactly one character.
-    StreamSet * localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
-                                      const std::function<StreamSet * (StreamSet *)> & map);
+    Staged localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
+                                 const std::function<StreamSet * (StreamSet *)> & map);
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
     StreamSet * normalization(const std::string & name, StreamSet * U21);
-    StreamSet * maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection = nullptr);
-    StreamSet * barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask, bool updateMasks);
+    Staged maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection = nullptr);
+    Staged barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask);
     StreamSet * fcc(StreamSet * U21);
-    StreamSet * fcd(StreamSet * U21);
-    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
-    StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21);
+    Staged fcd(StreamSet * U21);
+    Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
+    Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged deferredRules(const ldml::TransformStep & step, StreamSet * U21);
+    Staged prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * chainRevisitsGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
-    StreamSet * hexJava(StreamSet * U21);
-    StreamSet * hexUnicode(StreamSet * U21);
-    StreamSet * hexC(StreamSet * U21);
-    StreamSet * hexXML(StreamSet * U21);
-    StreamSet * hexXML10(StreamSet * U21);
-    StreamSet * hexPerl(StreamSet * U21);
-    StreamSet * hexDecode(unsigned forms, StreamSet * U21);
-    StreamSet * remove(StreamSet * U21);
+    Staged hexJava(StreamSet * U21);
+    Staged hexUnicode(StreamSet * U21);
+    Staged hexC(StreamSet * U21);
+    Staged hexXML(StreamSet * U21);
+    Staged hexXML10(StreamSet * U21);
+    Staged hexPerl(StreamSet * U21);
+    Staged hexDecode(unsigned forms, StreamSet * U21);
+    Staged remove(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
-    StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
+    Staged maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                              StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text, StreamSet * U21);
@@ -8010,7 +8154,7 @@ private:
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
     NFD_PipelineBuilder mNFD;
-    std::vector<StreamSet *> mMasks;
+    TransformMasks mMasks;
     //  The positions following a run deleted by the prefix runs of the step
     //  before (if they only delete), for the blocking marks of the rules of
     //  this step (see ldml::DeletedRunBlockMark); and those of this step's
@@ -8033,8 +8177,10 @@ private:
     //  (numbered from 1, as by --divcode-report), for the names of kernels.
     std::string mTransformLabel = "rules";
     std::string mGroupLabel = "rulesG0";
-    //  The letters of the front-letter revisits being applied (see frontLettersBegin).
+    //  The letters of the front-letter revisits being applied (see frontLettersBegin),
+    //  and the mask of the positions other than their placeholders.
     std::pair<char32_t, char32_t> mFrontLetters;
+    StreamSet * mFrontLetterMask = nullptr;
 };
 
 //  The rules of a conversion group, of all kinds.
@@ -8063,31 +8209,10 @@ void RulePipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet *
     StreamSet * mask = classes({filter}, U21);
     if (StreamSet * const outer = activeMask()) mask = combine(mask, outer, false);
     SHOW_STREAM(mask);
-    mMasks.push_back(mask);
+    mMasks.push(mask);
 }
 
-//  The masks after positions are inserted (where the spread mask is 0): each
-//  inserted position has the mask of the character it follows.
-void RulePipelineBuilder::spreadMasks(StreamSet * SpreadMask) {
-    for (StreamSet *& mask : mMasks) {
-        StreamSet * const spread = mP.CreateStreamSet(1);
-        SpreadByMask(mP, SpreadMask, mask, spread);
-        StreamSet * const inherited = mP.CreateStreamSet(1);
-        mP.CreateKernelCall<InheritMask>(SpreadMask, spread, inherited);
-        mask = inherited;
-    }
-}
-
-//  The masks after the positions not in keep are deleted.
-void RulePipelineBuilder::filterMasks(StreamSet * keep) {
-    for (StreamSet *& mask : mMasks) {
-        StreamSet * const filtered = mP.CreateStreamSet(1);
-        FilterByMask(mP, keep, mask, filtered);
-        mask = filtered;
-    }
-}
-
-StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
+Staged RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
                                                        const std::function<StreamSet * (StreamSet *)> & map) {
     StreamSet * const mask = activeMask();
     if (!mask) return map(U21);
@@ -8107,15 +8232,16 @@ StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const st
     //  The placement of the mapped characters among the untouched ones: as
     //  many positions as each masked character's replacement has (lengths),
     //  or one otherwise, inserted after its position (as for a conversion
-    //  group's longer replacements) -- expanding the masks in effect so that
-    //  the (now expanded) active mask spans each full replacement, which is
-    //  exactly the placement needed.
+    //  group's longer replacements) -- the inserted positions inheriting the
+    //  masks, so that the (expanded) active mask spans each full replacement,
+    //  which is exactly the placement needed.
+    PositionMap positions;
     std::vector<unsigned> counts;
-    std::vector<StreamSet *> positions;
+    std::vector<StreamSet *> at;
     for (const auto & l : lengths) {
         if (l.first == 1) continue;
         counts.push_back(l.first - 1);
-        positions.push_back(combine(classes({l.second}, U21), mask, false));
+        at.push_back(combine(classes({l.second}, U21), mask, false));
     }
     StreamSet * placement = mask;
     if (!counts.empty()) {
@@ -8124,76 +8250,77 @@ StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const st
         unsigned bits = 0;
         while ((maxCount >> bits) != 0) bits++;
         StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
-        P.CreateKernelCall<InsertionCounts>(counts, positions, InsertBixNum);
+        P.CreateKernelCall<InsertionCounts>(counts, at, InsertBixNum);
         SHOW_BIXNUM(InsertBixNum);
         StreamSet * const SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
-        spreadMasks(SpreadMask);
-        placement = activeMask();
+        positions.insert(SpreadMask);
+        placement = mMasks.mapped(mask, positions);
     }
     SHOW_STREAM(placement);
     StreamSet * const Merged = P.CreateStreamSet(21);
     MergeByMask(P, placement, Mapped, NonSelected, Merged);
     SHOW_BIXNUM(Merged);
-    return Merged;
+    return Staged(Merged, std::move(positions));
 }
 
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null" || (mOmitICUBuiltIns && isICUBuiltIn(name))) return U21;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
-        return activeMask() ? maskedNormalization(name, U21) : normalization(name, U21);
+        return activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
     }
-    if (name == "Any-FCD") return fcd(U21);
+    if (name == "Any-FCD") return inStep(fcd(U21));
     if (name == "Any-Lower" || name == "Any-Upper") {
         //  Full lowercasing: the Final_Sigma context of Σ, then the lc mapping.
         if (name == "Any-Lower") {
             for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
-                U21 = conversionGroup(step, U21);
+                U21 = inStep(conversionGroup(step, U21));
             }
         }
         const UCD::property_t prop = name == "Any-Lower" ? UCD::lc : UCD::uc;
-        if (StreamSet * const mask = activeMask()) return maskedStringOverrides({{prop, mask}}, U21);
+        if (StreamSet * const mask = activeMask()) return inStep(maskedStringOverrides({{prop, mask}}, U21));
         return U21_StringOverridePipeline(P, prop, U21);
     }
     if (name == "Any-Title") return titlecase(U21);
-    if (name == "Any-Hex") return hexJava(U21);
-    if (name == "Any-Hex/Java") return hexJava(U21);
-    if (name == "Any-Hex/Unicode") return hexUnicode(U21);
-    if (name == "Any-Hex/C") return hexC(U21);
-    if (name == "Any-Hex/XML") return hexXML(U21);
-    if (name == "Any-Hex/XML10") return hexXML10(U21);
-    if (name == "Any-Hex/Perl") return hexPerl(U21);
-    if (const unsigned forms = hexDecodeForms(name)) return hexDecode(forms, U21);
-    if (name == "Any-Remove") return remove(U21);
+    if (name == "Any-Hex") return inStep(hexJava(U21));
+    if (name == "Any-Hex/Java") return inStep(hexJava(U21));
+    if (name == "Any-Hex/Unicode") return inStep(hexUnicode(U21));
+    if (name == "Any-Hex/C") return inStep(hexC(U21));
+    if (name == "Any-Hex/XML") return inStep(hexXML(U21));
+    if (name == "Any-Hex/XML10") return inStep(hexXML10(U21));
+    if (name == "Any-Hex/Perl") return inStep(hexPerl(U21));
+    if (const unsigned forms = hexDecodeForms(name)) return inStep(hexDecode(forms, U21));
+    if (name == "Any-Remove") return inStep(remove(U21));
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
 //  Hex-Any (and its variants): the escapes decoded (within the filter, if any),
-//  with the masks kept in step with the positions deleted.
-StreamSet * RulePipelineBuilder::hexDecode(unsigned forms, StreamSet * U21) {
+//  with the positions deleted.
+Staged RulePipelineBuilder::hexDecode(unsigned forms, StreamSet * U21) {
     PipelineBuilder & P = mP;
     std::vector<StreamSet *> keeps;
     StreamSet * const decoded = P.CreateStreamSet(21, 1);
     HexAnyPipeline(P, forms, U21, activeMask(), decoded, keeps);
-    for (StreamSet * keep : keeps) filterMasks(keep);
+    PositionMap positions;
+    for (StreamSet * keep : keeps) positions.remove(keep);
     SHOW_BIXNUM(decoded);
-    return decoded;
+    return Staged(decoded, std::move(positions));
 }
 
-//  Any-Remove: the characters within the filter deleted, with the masks kept in
-//  step; without a filter, every character (an empty text).
-StreamSet * RulePipelineBuilder::remove(StreamSet * U21) {
+//  Any-Remove: the characters within the filter deleted; without a filter,
+//  every character (an empty text).
+Staged RulePipelineBuilder::remove(StreamSet * U21) {
     PipelineBuilder & P = mP;
     StreamSet * const mask = activeMask();
     if (!mask) return P.CreateEmptyStreamSet(21, 1);
-    StreamSet * const keep = P.CreateStreamSet(1);
-    Invert(P, mask, keep);
+    StreamSet * const keep = mMasks.complement(mask);
     StreamSet * const kept = P.CreateStreamSet(21, 1);
     FilterByMask(P, keep, U21, kept);
-    filterMasks(keep);
+    PositionMap positions;
+    positions.remove(keep);
     SHOW_BIXNUM(kept);
-    return kept;
+    return Staged(kept, std::move(positions));
 }
 
 StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamSet * U21) {
@@ -8217,15 +8344,16 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
 //  it).  The characters of the normalized runs are all within the filter.
 //  With a selection, the characters normalized are those of the selection
 //  (within the active mask, if any) rather than of the active mask.
-StreamSet * RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection) {
+Staged RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection) {
     StreamSet * const selected = selection ? combine(selection, activeMask(), false) : activeMask();
-    return barrierNormalization(name, U21, selected, true);
+    return barrierNormalization(name, U21, selected);
 }
 
 //  The normalization of the characters of mask, the others replaced by barriers
-//  (as is a barrier codepoint in the text), and restored after it; with
-//  updateMasks, the masks of the filters in effect are kept in step.
-StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * selected, bool updateMasks) {
+//  (as is a barrier codepoint in the text), and restored after it.  As a
+//  position map: the characters replaced by barriers deleted, and the
+//  normalized characters inserted between the barriers (where the masks hold).
+Staged RulePipelineBuilder::barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * selected) {
     PipelineBuilder & P = mP;
     StreamSet * const barrierChars = classes({UCD::UnicodeSet(BarrierMark)}, U21);
     StreamSet * const notBarrierChars = P.CreateStreamSet(1);
@@ -8236,10 +8364,8 @@ StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, 
     SHOW_BIXNUM(Work);
     StreamSet * const Normalized = normalization(name, Work);
     StreamSet * const barriers = classes({UCD::UnicodeSet(BarrierMark)}, Normalized);
-    StreamSet * const others = P.CreateStreamSet(1);
-    Invert(P, barriers, others);
-    StreamSet * const unmasked = P.CreateStreamSet(1);
-    Invert(P, mask, unmasked);
+    StreamSet * const others = mMasks.complement(barriers);
+    StreamSet * const unmasked = mMasks.complement(mask);
     //  The characters replaced by barriers, at the positions of the barriers.
     StreamSet * const outside = P.CreateStreamSet(21);
     FilterByMask(P, unmasked, U21, outside);
@@ -8252,16 +8378,10 @@ StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, 
     SHOW_BIXNUM(result);
     //  The masks hold at the normalized characters, and keep their values at
     //  the barriers.
-    if (updateMasks) for (StreamSet *& m : mMasks) {
-        StreamSet * const outer = P.CreateStreamSet(1);
-        FilterByMask(P, unmasked, m, outer);
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, barriers, outer, spread);
-        StreamSet * const combined = P.CreateStreamSet(1);
-        OrCombine(P, spread, others, combined);
-        m = combined;
-    }
-    return result;
+    PositionMap positions;
+    positions.remove(unmasked);
+    positions.insert(barriers, PositionMap::Inserted::In);
+    return Staged(result, std::move(positions));
 }
 
 //  Any-FCD (see FCD_RegionMask): the regions where the text fails the FCD test
@@ -8269,7 +8389,7 @@ StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, 
 //  filter, as in ICU, each run of the filtered characters is taken by itself:
 //  the regions are found with the other characters replaced by the barrier
 //  codepoint (lccc = tccc = 0), and kept within the filter.
-StreamSet * RulePipelineBuilder::fcd(StreamSet * U21) {
+Staged RulePipelineBuilder::fcd(StreamSet * U21) {
     PipelineBuilder & P = mP;
     StreamSet * text = U21;
     if (StreamSet * const mask = activeMask()) {
@@ -8337,7 +8457,7 @@ StreamSet * RulePipelineBuilder::fcc(StreamSet * U21) {
         StreamSet * const starters = classes({starterSet}, text);
         StreamSet * const visible = P.CreateStreamSet(1);
         P.CreateKernelCall<FCC_Window>(starters, visible);
-        text = barrierNormalization("Any-NFC", text, visible, false);
+        text = barrierNormalization("Any-NFC", text, visible).text;
     }
     return text;
 }
@@ -8349,7 +8469,7 @@ StreamSet * RulePipelineBuilder::fcc(StreamSet * U21) {
 StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
     PipelineBuilder & P = mP;
     for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
-        U21 = conversionGroup(step, U21);
+        U21 = inStep(conversionGroup(step, U21));
     }
     StreamSet * const boundaries = wordBoundaries(U21);
     UCD::BinaryPropertyObject * const casedObj = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(UCD::Cased));
@@ -8362,16 +8482,16 @@ StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
     SHOW_STREAM(lower);
     //  Within a filter, the words are those of the whole text.
     if (StreamSet * const mask = activeMask()) {
-        return maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21);
+        return inStep(maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21));
     }
-    return maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21);
+    return inStep(maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21));
 }
 
 //  Any-Hex/Java: each character encoded as UTF-16 code units, then
 //  each unit expressed as \u followed by 4 hexadecimal digits (JavaHexPipeline) --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexJava(StreamSet * U21) {
+Staged RulePipelineBuilder::hexJava(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
         {12, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // a surrogate pair: 2 \uXXXX
@@ -8389,7 +8509,7 @@ StreamSet * RulePipelineBuilder::hexJava(StreamSet * U21) {
 //  hexadecimal, of 4, 5 or 6 digits by its magnitude (UnicodeHexPipeline) --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
+Staged RulePipelineBuilder::hexUnicode(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // U+ and 4 digits
         {7, UCD::UnicodeSet(0x10000, 0xFFFFF)},     // U+ and 5 digits
@@ -8408,7 +8528,7 @@ StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
 //  each supplementary plane character as \Uxxxxxxxx (UnicodeHexPipeline) --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexC(StreamSet * U21) {
+Staged RulePipelineBuilder::hexC(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
         {10, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // \U and 8 digits
@@ -8426,7 +8546,7 @@ StreamSet * RulePipelineBuilder::hexC(StreamSet * U21) {
 //  where leading zeroes are deleted from <hexdigit>s, except for the last --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
+Staged RulePipelineBuilder::hexXML(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {5, UCD::UnicodeSet(0x0, 0xF)},            // &#x and 1 digit and ;
         {6, UCD::UnicodeSet(0x10, 0xFF)},          // &#x and 2 digits and ;
@@ -8448,7 +8568,7 @@ StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
 //  of its codepoint, without leading zeroes (XMLDecimalPipeline) -- a
 //  context-free, single-character mapping, so within a mask only the masked
 //  characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexXML10(StreamSet * U21) {
+Staged RulePipelineBuilder::hexXML10(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {4, UCD::UnicodeSet(0, 9)},                 // &# and 1 digit and ;
         {5, UCD::UnicodeSet(10, 99)},               // &# and 2 digits and ;
@@ -8471,7 +8591,7 @@ StreamSet * RulePipelineBuilder::hexXML10(StreamSet * U21) {
 //  where leading zeroes are deleted from <hexdigit>s, except for the last --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexPerl(StreamSet * U21) {
+Staged RulePipelineBuilder::hexPerl(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {5, UCD::UnicodeSet(0x0, 0xF)},            // \x{ and 1 digit and }
         {6, UCD::UnicodeSet(0x10, 0xFF)},          // \x{ and 2 digits and }
@@ -8504,7 +8624,7 @@ StreamSet * RulePipelineBuilder::wordBoundaries(StreamSet * U21) {
 //  U21_StringOverridePipeline: positions are inserted after the characters
 //  mapped to longer strings, and the bits of each position of the replacements
 //  are changed (the first) or set (the further ones).
-StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides,
+Staged RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides,
                                                        StreamSet * U21) {
     PipelineBuilder & P = mP;
     struct Override {
@@ -8537,6 +8657,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         ZeroByMask(P, mask, streams, result);
         return result;
     };
+    PositionMap positions;
     if (insertionBits > 0) {
         StreamSet * InsertBixNum = nullptr;
         for (const Override & v : all) {
@@ -8550,7 +8671,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         StreamSet * const Expanded = P.CreateStreamSet(21, 1);
         SpreadByMask(P, SpreadMask, U21, Expanded);
         U21 = Expanded;
-        spreadMasks(SpreadMask);
+        positions.insert(SpreadMask);
         for (Override & v : all) {
             StreamSet * const spread = P.CreateStreamSet(1);
             SpreadByMask(P, SpreadMask, v.mask, spread);
@@ -8576,7 +8697,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         }
         result = next;
     }
-    return result;
+    return Staged(result, std::move(positions));
 }
 
 //  The options of tconv's uses of the regular expression engine: without
@@ -9010,7 +9131,7 @@ StreamSet * RulePipelineBuilder::insertionsEligible() {
     const size_t restricting = mMasks.size() - (mInsertAnywhere && !mMasks.empty() ? 1 : 0);
     if (restricting == 0) return nullptr;
     StreamSet * const eligible = mP.CreateStreamSet(1);
-    mP.CreateKernelCall<ShiftBack>(mMasks[restricting - 1], eligible, 1);
+    mP.CreateKernelCall<ShiftBack>(mMasks[restricting - 1].apply, eligible, 1);
     return eligible;
 }
 
@@ -9020,7 +9141,7 @@ StreamSet * RulePipelineBuilder::insertionsEligible() {
 //  and, within a filter, where the next character is in the mask (see below).
 //  The positions are inserted after them (InsertionSpreadMask), and the texts
 //  written there.
-StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     //  Within a filter, ICU applies a compound transform (of several groups) to
     //  each run of the characters of the mask, inserting where the cursor stops
@@ -9058,12 +9179,9 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
     SHOW_STREAM(SpreadMask);
     StreamSet * const Expanded = P.CreateStreamSet(21, 1);
     SpreadByMask(P, SpreadMask, U21, Expanded);
-    spreadMasks(SpreadMask);
-    if (!mMasks.empty()) {
-        StreamSet * const inserted = P.CreateStreamSet(1);
-        Invert(P, SpreadMask, inserted);
-        for (StreamSet *& mask : mMasks) mask = combine(mask, inserted, true);
-    }
+    //  (The text inserted is within the masks.)
+    PositionMap inserted;
+    inserted.insert(SpreadMask, PositionMap::Inserted::In);
     //  The j-th position inserted after a position where rule i applies.
     StreamSet * const At = P.CreateStreamSet(positions.size());
     P.CreateKernelCall<CollectStreams>(positions, At);
@@ -9078,10 +9196,10 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
     StreamSet * const Result = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<InsertedTexts>(texts, shifted, Expanded, Result);
     SHOW_BIXNUM(Result);
-    return Result;
+    return Staged(Result, std::move(inserted));
 }
 
-StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     //  (A group without string rules: eligible only with rules whose before
     //  contexts are matched against the converted text, see planDivCodeGroup.)
     if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter) {
@@ -9112,14 +9230,17 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
         }
         return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
-            std::vector<StreamSet *> outerMasks = std::move(mMasks);
-            mMasks.clear();
-            StreamSet * const Mapped = conversionGroup(step, Selected);
-            mMasks = std::move(outerMasks);
+            //  (On the selected text alone, whose positions are placed by
+            //  localCharacterMapping.)
+            std::vector<TransformMask> outerMasks = mMasks.release();
+            StreamSet * const Mapped = conversionGroup(step, Selected).text;
+            mMasks.restore(std::move(outerMasks));
             return Mapped;
         });
     }
     PipelineBuilder & P = mP;
+    //  The positions inserted and deleted by the group.
+    PositionMap positionMap;
     //  The characters of a set that the group may change: those other than the
     //  deletion mark.
     auto restricted = [&](const UCD::UnicodeSet & chars) {
@@ -10546,7 +10667,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         P.CreateKernelCall<FillInsertedPositions>(SpreadMask, Expanded, Marked);
         SHOW_BIXNUM(Marked);
         result = Marked;
-        spreadMasks(SpreadMask);
+        positionMap.insert(SpreadMask);
         for (Swap & sw : swaps) {
             StreamSet * const spread = P.CreateStreamSet(1);
             SpreadByMask(P, SpreadMask, sw.marks, spread);
@@ -10588,7 +10709,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * const filtered = P.CreateStreamSet(21);
         FilterByMask(P, keep, result, filtered);
         result = filtered;
-        filterMasks(keep);
+        positionMap.remove(keep);
         for (Swap & sw : swaps) {
             StreamSet * const marks = P.CreateStreamSet(1);
             FilterByMask(P, keep, sw.marks, marks);
@@ -10678,8 +10799,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * const merged = P.CreateStreamSet(21);
         MergeByMask(P, inserted, extracted, rest, merged);
         result = merged;
-        filterMasks(keepRest);
-        spreadMasks(SpreadMask);
+        positionMap.remove(keepRest);
+        positionMap.insert(SpreadMask);
         for (size_t later = m + 1; later < moves.size(); later++) {
             for (StreamSet ** mk : {&moves[later].startI, &moves[later].startJ, &moves[later].endJ}) {
                 StreamSet * const filtered = P.CreateStreamSet(1);
@@ -10690,7 +10811,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
         }
     }
-    return result;
+    return Staged(result, std::move(positionMap));
 }
 
 //  The choice of plans for the segments of a transform (see
@@ -10897,9 +11018,9 @@ static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
     options.utf8 = true;
     return ldml::planDivCodeGroup(step, options);
 }
-static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
-                                        StreamSet * Basis, std::vector<StreamSet *> & Masks,
-                                        const std::vector<StreamSet *> & afterStreams = {});
+static Staged DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
+                                   StreamSet * Basis, TransformMasks & Masks,
+                                   const std::vector<StreamSet *> & afterStreams = {});
 
 const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEntry * entry) {
     const std::string name = entry->canonicalName;
@@ -10967,23 +11088,35 @@ class UTF8PipelineBuilder {
 public:
     UTF8PipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                         std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
+    : mMasks(P), mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
     //  The steps of an analysis (of a transform named name, or a rules file).
     StreamSet * applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis);
 private:
     StreamSet * builtIn(const std::string & name, StreamSet * Basis);
     StreamSet * normalization(const std::string & name, StreamSet * Basis);
-    StreamSet * maskedNormalization(const std::string & name, StreamSet * Basis);
+    Staged maskedNormalization(const std::string & name, StreamSet * Basis);
     StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
     //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
     //  masks of the filters in effect (the innermost last, within the ones
     //  before it), over the bytes of the characters each selects, kept in step
     //  with the text as bytes are deleted and inserted.
     void pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis);
-    void popFilter() {mMasks.pop_back();}
-    std::vector<StreamSet *> * masks() {return mMasks.empty() ? nullptr : &mMasks;}
-    std::vector<StreamSet *> mMasks;
+    void popFilter() {mMasks.pop();}
+    StreamSet * inStep(const Staged & s) {
+        mMasks.keepInStep(s.positions);
+        return s.text;
+    }
+    //  kernel::UTF8_CharMapPipeline within the masks, which it keeps in step
+    //  itself (the bytes inserted after a character have its mask).
+    StreamSet * charMap(const kernel::UTF8_CharMap & map, StreamSet * Basis,
+                        const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * applies = nullptr) {
+        std::vector<StreamSet *> masks = mMasks.applyStreams();
+        StreamSet * const result = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextual, applies, masks.empty() ? nullptr : &masks);
+        mMasks.setApplyStreams(masks);
+        return result;
+    }
+    TransformMasks mMasks;
     //  The conversion group being applied, for the names of kernels.
     std::string mGroupLabel;
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count);
@@ -11028,12 +11161,12 @@ StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         //  A group with string rules, by its DivCode plan on the UTF-8 code units.
         const ldml::DivCodePlan plan = utf8DivCodePlan(step);
         if (!DivCodeGroups || !divCodeApplies(plan)) llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
-        Basis = DivCodeGroupPipeline(mP, plan, mGroupLabel, Basis, mMasks);
+        Basis = inStep(DivCodeGroupPipeline(mP, plan, mGroupLabel, Basis, mMasks));
         if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         return Basis;
     }
     StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(mP, contextual, Basis);
-    Basis = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextualChars, applies, masks());
+    Basis = charMap(map, Basis, contextualChars, applies);
     if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
     return Basis;
 }
@@ -11047,7 +11180,7 @@ static bool utf8BuiltIn(const std::string & name) {
 StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
     if (name == "Any-Null") return Basis;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
-        return mMasks.empty() ? normalization(name, Basis) : maskedNormalization(name, Basis);
+        return mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
     }
     if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " not in UTF-8 mode"));
@@ -11150,8 +11283,8 @@ void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet *
     P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(filter, &cc::Unicode)}, Basis, firsts,
                                           pablo::BitMovementMode::LookAhead);
     StreamSet * const spans = P.CreateStreamSet(1);
-    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.empty() ? nullptr : mMasks.back(), spans);
-    mMasks.push_back(spans);
+    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.active(), spans);
+    mMasks.push(spans);
 }
 
 //  A normalization within a filter, as in Unicode mode (see RulePipelineBuilder::
@@ -11159,7 +11292,7 @@ void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet *
 //  itself, the characters outside it (and any barrier in the text) replaced in
 //  place by the barriers of their lengths, and restored after the normalization,
 //  which keeps the barriers in order; the masks are kept in step.
-StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
+Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
     PipelineBuilder & P = mP;
     UCD::UnicodeSet barrierSet;
     for (UCD::codepoint_t c : UTF8_Barriers) barrierSet.insert(c);
@@ -11174,15 +11307,13 @@ StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, S
     StreamSet * const notBarriers = P.CreateStreamSet(1);
     Invert(P, barrierSpans(Basis), notBarriers);
     StreamSet * const selected = P.CreateStreamSet(1);
-    AndCombine(P, mMasks.back(), notBarriers, selected);
-    StreamSet * const unselected = P.CreateStreamSet(1);
-    Invert(P, selected, unselected);
+    AndCombine(P, mMasks.active(), notBarriers, selected);
+    StreamSet * const unselected = mMasks.complement(selected);
     StreamSet * const Work = P.CreateStreamSet(8);
     P.CreateKernelCall<UTF8_ReplaceUnselected>(Basis, selected, Work);
     StreamSet * const Normalized = normalization(name, Work);
     StreamSet * const barriers = barrierSpans(Normalized);
-    StreamSet * const others = P.CreateStreamSet(1);
-    Invert(P, barriers, others);
+    StreamSet * const others = mMasks.complement(barriers);
     //  The bytes of the characters replaced, at the bytes of the barriers.
     StreamSet * const outside = P.CreateStreamSet(8);
     FilterByMask(P, unselected, Basis, outside);
@@ -11193,17 +11324,11 @@ StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, S
     StreamSet * const result = P.CreateStreamSet(8);
     OrCombine(P, kept, restored, result);
     //  The masks hold at the normalized characters, and keep their values at
-    //  the barriers.
-    for (StreamSet *& m : mMasks) {
-        StreamSet * const outer = P.CreateStreamSet(1);
-        FilterByMask(P, unselected, m, outer);
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, barriers, outer, spread);
-        StreamSet * const combined = P.CreateStreamSet(1);
-        OrCombine(P, spread, others, combined);
-        m = combined;
-    }
-    return result;
+    //  the barriers (see RulePipelineBuilder::barrierNormalization).
+    PositionMap positions;
+    positions.remove(unselected);
+    positions.insert(barriers, PositionMap::Inserted::In);
+    return Staged(result, std::move(positions));
 }
 
 //  The full case mapping of a string override property (lc or uc): each
@@ -11240,13 +11365,12 @@ StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet
                 for (const ldml::CharMapping & m : g.mappings) {
                     if (m.replacement != std::u32string(1, U'ς')) continue;
                     StreamSet * const applies = utf8Applies(mP, {&g}, Basis);
-                    Basis = kernel::UTF8_CharMapPipeline(mP, {{m.chars, m.replacement}}, Basis, m.chars, applies, masks());
+                    Basis = charMap({{m.chars, m.replacement}}, Basis, m.chars, applies);
                 }
             }
         }
     }
-    return kernel::UTF8_CharMapPipeline(mP, fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis, UCD::UnicodeSet(),
-                                        nullptr, masks());
+    return charMap(fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis);
 }
 
 //  A transform in UTF-8 mode on the UTF-8 code units of a text, made
@@ -11349,22 +11473,25 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
         if (!mask) {
             engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result);
         } else {
-            //  (Every match lies within each mask.)
-            StreamSet * masks = mMasks.front();
-            if (mMasks.size() > 1) {
-                masks = mP.CreateStreamSet(mMasks.size());
-                mP.CreateKernelCall<CollectStreams>(mMasks, masks);
+            //  (Every match lies within each mask.  The engine carries the masks
+            //  through the replacement.)
+            std::vector<StreamSet *> streams = mMasks.applyStreams();
+            StreamSet * masks = streams.front();
+            if (streams.size() > 1) {
+                masks = mP.CreateStreamSet(streams.size());
+                mP.CreateKernelCall<CollectStreams>(streams, masks);
             }
-            StreamSet * const resultMasks = mP.CreateStreamSet(mMasks.size());
+            StreamSet * const resultMasks = mP.CreateStreamSet(streams.size());
             engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result, masks, resultMasks);
-            for (size_t k = 0; k < mMasks.size(); k++) {
-                if (mMasks.size() == 1) {
-                    mMasks[k] = resultMasks;
+            for (size_t k = 0; k < streams.size(); k++) {
+                if (streams.size() == 1) {
+                    streams[k] = resultMasks;
                     break;
                 }
-                mMasks[k] = mP.CreateStreamSet(1);
-                mP.CreateKernelCall<StreamSelect>(mMasks[k], Select(resultMasks, {static_cast<unsigned>(k)}));
+                streams[k] = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<StreamSelect>(streams[k], Select(resultMasks, {static_cast<unsigned>(k)}));
             }
+            mMasks.setApplyStreams(streams);
         }
         if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
         return result;
@@ -11377,10 +11504,10 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
             U21 = searchReplace(i, U21);
             continue;
         }
-        for (const ldml::TransformStep & s : step.maps[i].steps) U21 = conversionGroup(s, U21);
+        for (const ldml::TransformStep & s : step.maps[i].steps) U21 = inStep(conversionGroup(s, U21));
         if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
     }
-    for (const ldml::TransformStep & s : step.markMap.steps) U21 = conversionGroup(s, U21);
+    for (const ldml::TransformStep & s : step.markMap.steps) U21 = inStep(conversionGroup(s, U21));
     if (outermost && rules > 0) mGroupCounts.push_back({rules, mP.getNumOfKernelCalls() - kernels});
     return U21;
 }
@@ -11420,7 +11547,7 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
 //  each start is counted among the roughs taken (compressed: those of a start
 //  follow one another, from its first), and shifted back to the start (up to
 //  65 letters a start).
-StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     const ldml::FrontLetterRevisits & f = step.frontLetters;
     FrontLetterLayout L;
@@ -11496,16 +11623,14 @@ StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & s
     StreamSet * const Kept = P.CreateStreamSet(21), * const KeptCounts = P.CreateStreamSet(CountBits);
     FilterByMask(P, Keep, Lowered, Kept);
     FilterByMask(P, Keep, Counts, KeptCounts);
-    filterMasks(Keep);
     StreamSet * const SpreadMask = P.CreateStreamSet(1);
     InsertionSpreadMask(P, KeptCounts, SpreadMask, kernel::InsertPosition::Before);
     StreamSet * const Spread = P.CreateStreamSet(21);
     SpreadByMask(P, SpreadMask, Kept, Spread);
-    for (StreamSet *& mask : mMasks) {
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, SpreadMask, mask, spread);
-        mask = spread;
-    }
+    //  (The placeholders outside the masks.)
+    PositionMap positions;
+    positions.remove(Keep);
+    positions.insert(SpreadMask, PositionMap::Inserted::Out);
     StreamSet * const Inserted = P.CreateStreamSet(1);
     Invert(P, SpreadMask, Inserted);
     StreamSet * const SpreadLetters = P.CreateStreamSet(2);
@@ -11513,26 +11638,27 @@ StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & s
     StreamSet * const Filled = P.CreateStreamSet(21);
     P.CreateKernelCall<FrontLetterFill>(SpreadMask, Spread, SpreadLetters, Filled);
     SHOW_BIXNUM(Filled);
-    mMasks.insert(mMasks.begin(), SpreadMask);
+    //  (The placeholders are kept out of the steps until frontLettersEnd by a
+    //  mask outside the others, pushed once the masks are in step.)
+    mFrontLetterMask = SpreadMask;
     mFrontLetters = {f.lowerLetter, f.upperLetter};
-    return Filled;
+    return Staged(Filled, std::move(positions));
 }
 
 //  The placeholders of the front-letter revisits (outside the first mask) as
 //  their letters, within the filters (as the replacements of the roughs).
 StreamSet * RulePipelineBuilder::frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    StreamSet * const front = mMasks.front();
-    mMasks.erase(mMasks.begin());
+    StreamSet * const front = mMasks.popOutermost();
     StreamSet * const Placed = P.CreateStreamSet(1);
     Invert(P, front, Placed);
     StreamSet * const Result = P.CreateStreamSet(21);
     P.CreateKernelCall<FrontLetterPlace>(mFrontLetters.first, mFrontLetters.second, U21, Placed, Result);
-    for (StreamSet *& mask : mMasks) mask = combine(mask, Placed, true);
+    mMasks.include(Placed);
     return Result;
 }
 
-StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     //  The families (by P), each with its texts and the index of their A.
     std::vector<UCD::UnicodeSet> firsts;
@@ -11628,6 +11754,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
     StreamSet * const Counts = countBits ? P.CreateStreamSet(countBits) : nullptr;
     StreamSet * Delete = anyEmpty || interior ? P.CreateStreamSet(1) : nullptr;
     P.CreateKernelCall<PrefixRuns>(runClasses, families, lengths, U21, Classes, activeMask(), Result, Select, Counts, Delete);
+    PositionMap positions;
     if (Counts) {
         StreamSet * const SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, Counts, SpreadMask, kernel::InsertPosition::After);
@@ -11640,7 +11767,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         spread(Select);
         if (Delete) spread(Delete);
         //  The inserted positions are within the filters, as the A positions.
-        spreadMasks(SpreadMask);
+        positions.insert(SpreadMask);
     }
     if (maxLength > 0) {
         std::vector<StreamSet *> selected{Select};
@@ -11658,7 +11785,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         Invert(P, Delete, keep);
         StreamSet * const kept = P.CreateStreamSet(21);
         FilterByMask(P, keep, Result, kept);
-        filterMasks(keep);
+        positions.remove(keep);
         Result = kept;
         if (!Counts) {
             //  The positions following the runs deleted (after each P, at the
@@ -11686,7 +11813,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
             }
         }
     }
-    return Result;
+    return Staged(Result, std::move(positions));
 }
 
 //  The chain revisits of a group (ChainRevisits).
@@ -11705,7 +11832,7 @@ StreamSet * RulePipelineBuilder::chainRevisitsGroup(const ldml::TransformStep & 
 //  The mark run edits of a group (MarkRunEdits), on the starts of the
 //  matches of [P1] R* T of each family from the regular expression engine;
 //  the deleted positions are then removed.
-StreamSet * RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     std::vector<UCD::UnicodeSet> sets;
     auto index = [&](const UCD::UnicodeSet & s) {
@@ -11759,11 +11886,12 @@ StreamSet * RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & s
     Invert(P, Delete, keep);
     StreamSet * const kept = P.CreateStreamSet(21);
     FilterByMask(P, keep, Result, kept);
-    filterMasks(keep);
-    return kept;
+    PositionMap positions;
+    positions.remove(keep);
+    return Staged(kept, std::move(positions));
 }
 
-StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     DeferredConfig config;
     for (const ldml::DeferredRule & d : step.deferred) {
@@ -11821,7 +11949,10 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
     InsertionSpreadMask(P, reserve, SpreadMask, kernel::InsertPosition::After);
     StreamSet * X = P.CreateStreamSet(21);
     SpreadByMask(P, SpreadMask, U21, X);
-    spreadMasks(SpreadMask);
+    PositionMap positions;
+    positions.insert(SpreadMask);
+    //  The active mask over the reserved positions.
+    StreamSet * const reservedMask = activeMask() ? mMasks.mapped(activeMask(), positions) : nullptr;
     StreamSet * live = SpreadMask;
     //  The positions written by the deferred rules in the rounds so far, and the
     //  blocks written by the self-reproducing rules (see DeferredRuns).
@@ -11841,7 +11972,7 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
     };
     for (unsigned round = 0; round < DeferredRounds; round++) {
         StreamSet * const text = compact(X);
-        StreamSet * const mask = compact(activeMask());
+        StreamSet * const mask = compact(reservedMask);
         StreamSet * const textWritten = compact(written);
         config.masked = mask != nullptr;
         config.written = textWritten != nullptr;
@@ -11911,7 +12042,7 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
             std::vector<std::vector<size_t>> interferers;
             for (const ldml::DeferredRule & d : step.deferred) interferers.push_back(d.runInterferers);
             P.CreateKernelCall<DeferredCandidates>(srcIndex, matchOf, config.textLengths, interferers, srcBits, textMatches,
-                                                   compact(written), compact(activeMask()), candidates);
+                                                   compact(written), compact(reservedMask), candidates);
             SHOW_STREAM(candidates);
             //  The text with the positions written and the live positions.
             std::vector<std::pair<unsigned, unsigned>> textOrder;
@@ -11945,9 +12076,9 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
     }
     //  The positions not live deleted, once.
     StreamSet * const result = compact(X);
-    filterMasks(live);
+    positions.remove(live);
     SHOW_BIXNUM(result);
-    return result;
+    return Staged(result, std::move(positions));
 }
 
 StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, StreamSet * U21) {
@@ -11999,14 +12130,17 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
         } else {
             mGroupLabel = mTransformLabel + "G" + std::to_string(++group);
             const size_t kernels = mP.getNumOfKernelCalls();
-            if (step.hasFrontLetters) U21 = frontLettersBegin(step, U21);
-            if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
-            if (!step.markRunEditRules.empty()) U21 = markRunEditsGroup(step, U21);
-            if (!step.prefixRuns.empty()) U21 = prefixRunsGroup(step, U21);
-            if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
-                U21 = conversionGroup(step, U21);
+            if (step.hasFrontLetters) {
+                U21 = inStep(frontLettersBegin(step, U21));
+                mMasks.pushOutermost(mFrontLetterMask);
             }
-            if (!step.deferred.empty()) U21 = deferredRules(step, U21);
+            if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
+            if (!step.markRunEditRules.empty()) U21 = inStep(markRunEditsGroup(step, U21));
+            if (!step.prefixRuns.empty()) U21 = inStep(prefixRunsGroup(step, U21));
+            if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
+                U21 = inStep(conversionGroup(step, U21));
+            }
+            if (!step.deferred.empty()) U21 = inStep(deferredRules(step, U21));
             if (step.frontLettersEnd) U21 = frontLettersEnd(step, U21);
             if (outermost && groupRules(step) > 0) mGroupCounts.push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         }
@@ -14149,12 +14283,12 @@ static StreamSet * DivCodeItemsOf(PipelineBuilder & P, const ldml::DivCodePlan &
     return Items;
 }
 
-//  A conversion group by its DivCode plan (eligible), on the 21-bit basis
-//  (Masks: the filter masks, the innermost last, kept in step with the text) or
-//  on the basis bits of UTF-8 code units.
-static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
-                                        StreamSet * Basis, std::vector<StreamSet *> & Masks,
-                                        const std::vector<StreamSet *> & afterStreams) {
+//  A conversion group by its DivCode plan (eligible), on the 21-bit basis or
+//  on the basis bits of UTF-8 code units, within the active mask of Masks (the
+//  filter masks), with the positions inserted and deleted.
+static Staged DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
+                                   StreamSet * Basis, TransformMasks & Masks,
+                                   const std::vector<StreamSet *> & afterStreams) {
     const bool utf8 = Basis->getNumElements() == 8;
     StreamSet * Code = DivCodeOf(P, plan, Basis);
     SHOW_BIXNUM(Code);
@@ -14173,7 +14307,8 @@ static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCode
     }
     StreamSet * InText = P.CreateStreamSet(1);
     P.CreateKernelCall<TextPositions>(Basis, InText);
-    StreamSet * const Mask = Masks.empty() ? nullptr : Masks.back();
+    StreamSet * const Mask = Masks.active();
+    PositionMap positions;
     //  The after contexts, on the text before it is spread (see DivCodeItems).
     StreamSet * Items = DivCodeItemsOf(P, plan, label, Basis, Code, Externals, InText, Mask);
     //  With expansions: the positions inserted after the matches, counted by the
@@ -14199,11 +14334,7 @@ static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCode
         Code = spread(Code);
         if (Externals) Externals = spread(Externals);
         if (Items) Items = spread(Items);
-        for (StreamSet *& m : Masks) {
-            StreamSet * const inherited = P.CreateStreamSet(1);
-            P.CreateKernelCall<InheritMask>(SpreadMask, spread(m), inherited);
-            m = inherited;
-        }
+        positions.insert(SpreadMask);
         InText = P.CreateStreamSet(1);
         P.CreateKernelCall<TextPositions>(Basis, InText);
     }
@@ -14216,7 +14347,7 @@ static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCode
     //  by item, in the set and not, and the matches of families deleted.)
     StreamSet * const Dep = plan.dependent() ? P.CreateStreamSet(3) : nullptr;
     StreamSet * const Ends = plan.dependent() ? P.CreateStreamSet(2 * convertedItems + 1) : nullptr;
-    StreamSet * const SpreadTextMask = Masks.empty() ? nullptr : Masks.back();
+    StreamSet * const SpreadTextMask = Mask ? Masks.mapped(Mask, positions) : nullptr;
     P.CreateKernelCall<DivCodeTranslate>(plan, label, DivCodeTranslate::Mode::Translate, Basis, Code, Externals, InText,
                                          SpreadTextMask, SpreadMask, Items, Out, Deleted, Dep, Ends);
     SHOW_BIXNUM(Out);
@@ -14233,20 +14364,16 @@ static StreamSet * DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCode
         SHOW_BIXNUM(Out);
         SHOW_STREAM(Deleted);
     }
-    if (!DivCodeTranslate::deletes(plan, utf8)) return Out;
+    if (!DivCodeTranslate::deletes(plan, utf8)) return Staged(Out, std::move(positions));
     StreamSet * const keep = P.CreateStreamSet(1);
     Invert(P, Deleted, keep);
     StreamSet * const filtered = P.CreateStreamSet(Out->getNumElements());
     FilterByMask(P, keep, Out, filtered);
-    for (StreamSet *& m : Masks) {
-        StreamSet * const kept = P.CreateStreamSet(1);
-        FilterByMask(P, keep, m, kept);
-        m = kept;
-    }
-    return filtered;
+    positions.remove(keep);
+    return Staged(filtered, std::move(positions));
 }
 
-StreamSet * RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21) {
+Staged RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21) {
     //  (The after contexts computed by the engine: the anchors, characters of
     //  any kind, after which each matches.)
     std::vector<StreamSet *> afterStreams;

@@ -5237,7 +5237,6 @@ protected:
 //    - DeferredRuns: the runs of the texts of the self-reproducing rules
 //      applied (and of the rules known to write the same block after it),
 //      each written in the positions reserved after its trigger.
-constexpr unsigned DeferredBlockingDepth = 8;
 //  (A copy counts runs of up to 16 characters, which bounds the positions
 //  reserved after each trigger.)
 constexpr unsigned DeferredRunBits = 4;
@@ -5307,7 +5306,7 @@ public:
     DeferredPlan(LLVMTypeSystemInterface & ts, DeferredConfig config, const std::vector<StreamSet *> & Matches, StreamSet * Classes,
                  const std::vector<StreamSet *> & Runs, StreamSet * Mask, StreamSet * Written, StreamSet * Count, StreamSet * Info,
                  StreamSet * Reach, const std::vector<StreamSet *> & Bare = {})
-    : PabloKernel(ts, "DeferredPlan_" + getStringHash(config.signature()),
+    : PabloKernel(ts, "DeferredPlanW_" + getStringHash(config.signature()),
                   [&] {
                       Bindings b;
                       for (size_t i = 0; i < Matches.size(); i++) {
@@ -5375,18 +5374,32 @@ protected:
         //  The triggers whose before contexts may not reach back to a trigger not yet
         //  replaced: the triggers that match a rule, or are not ready themselves
         //  (and may match once ready), block those they may reach.  A trigger
-        //  that is ready and matches no rule stays as it is.  (Through chains of
-        //  up to DeferredBlockingDepth triggers, each blocked by the one before.)
-        auto blockedBy = [&](PabloAST * blocking) {
-            return pb.createMatchStar(pb.createAdvance(deferredTexts(pb, blocking, classes, mConfig.numTails), 1), reach);
+        //  that is ready and matches no rule stays as it is.  Through chains of
+        //  any length, each trigger blocked by the one before: a While loop whose
+        //  frontier is the triggers just blocked, which block in turn.  Its Vars
+        //  only gain bits, and each iteration starts again from all the blocking
+        //  triggers (Sources), so that the loop is exact although its carries from
+        //  the previous block reach its first iteration only (see
+        //  doc/ldml-divcode-plan.md §10).  (The initial values are built on the
+        //  streams, not on the Vars, which an expression in the loop body could
+        //  otherwise be taken for.)
+        auto blockedBy = [&](PabloBuilder & b, PabloAST * blocking) {
+            return b.createMatchStar(b.createAdvance(deferredTexts(b, blocking, classes, mConfig.numTails), 1), reach);
         };
-        PabloAST * blocking = pb.createAnd(triggers, matched);
-        PabloAST * blocked = blockedBy(blocking);
-        for (unsigned j = 0; j < DeferredBlockingDepth; j++) {
-            blocking = pb.createAnd(triggers, pb.createOr(matched, blocked));
-            blocked = blockedBy(blocking);
+        PabloAST * const matchedTriggers = pb.createAnd(triggers, matched);
+        PabloAST * const blocked0 = blockedBy(pb, matchedTriggers);
+        Var * const Blocked = pb.createVar("Blocked", blocked0);
+        Var * const Sources = pb.createVar("Sources", matchedTriggers);
+        Var * const Frontier = pb.createVar("Frontier", pb.createAnd(pb.createAnd(triggers, blocked0), pb.createNot(matched)));
+        {
+            PabloBuilder wb = pb.createScope();
+            PabloAST * const sources = wb.createOr(Sources, Frontier);
+            wb.createAssign(Sources, sources);
+            wb.createAssign(Blocked, wb.createOr(Blocked, blockedBy(wb, sources)));
+            wb.createAssign(Frontier, wb.createAnd(wb.createAnd(triggers, Blocked), wb.createNot(Sources)));
+            pb.createWhile(Frontier, wb);
         }
-        PabloAST * const ready = pb.createAnd(triggers, pb.createNot(blocked));
+        PabloAST * const ready = pb.createAnd(triggers, pb.createNot(Blocked));
         //  The first rule matching at each ready trigger (none, if the length of its
         //  capture is not known).
         PabloAST * taken = pb.createZeroes();

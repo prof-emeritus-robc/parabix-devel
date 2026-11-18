@@ -30,7 +30,14 @@ Default `--converted-context-rounds` is 8 and `--deferred-rule-rounds` is 8. Bot
 | Cold compile | 7.17 s | 2.72 s |
 | Warm run, 1 thread | 0.293 s | 0.163 s |
 
-Kana-Latn, 5 MB of random Katakana with iteration marks, at the default 8 deferred rounds: cold compile 734.6 s, warm run 3.85 s on one thread. The runs at 4 and 1 rounds are pending.
+Kana-Latn, 5 MB of random Katakana with iteration marks (runs of 1 to 3 marks), by `--deferred-rule-rounds`:
+
+| | 8 rounds (default) | 4 rounds | 1 round |
+|---|--:|--:|--:|
+| Cold compile | 734.6 s | 294.1 s | 79.9 s |
+| Warm run, 1 thread | 3.85 s | 2.11 s | 0.64 s |
+
+The outputs at 8 and 4 rounds are identical on this text; 1 round differs. Each deferred round adds about 70 to 110 s of cold compilation and 0.45 s of run time on 5 MB. Rounds 5 to 8 change nothing on this text, so the default spends about 440 s of compilation and 1.7 s of run time on them.
 
 ## 1. Correction kernel with unrolled rounds
 
@@ -56,7 +63,7 @@ The selection is a left-to-right fixpoint of the same kind as the converted cont
 | ps-ps_Latn/BGN | 1 | 58 | 10 | 2 | 50 | 3,357 / 1,313 | string rule overlaps, two-way or self |
 | ru-zh | 1 | 22 | 2 | 1 | 8 | 4,152 / 953 | self-overlapping string rules; string rule overlaps, two-way or self |
 | zu-zu_FONIPA | 1 | 18 | 19 | 9 | 27 | 7,903 / 1,638 | self-overlapping string rules; string rule overlaps, two-way or self |
-| Zawgyi-my | 9 | 18 | 3 | 2 | 103 | not yet measured | rules with captures; string rule overlaps, two-way or self; string rules with runs |
+| Zawgyi-my | 9 | 18 | 3 | 2 | 103 | not measured (the 1-round compile was stopped after 15 minutes) | rules with captures; string rule overlaps, two-way or self; string rules with runs |
 
 ### 1B. Converted-context string rules that DivCode does not apply
 
@@ -107,7 +114,7 @@ Small correction kernels (one to six converted contexts). A While loop would mak
 | my-my_FONIPA | 4 | 1 | 1 | 1 | 38 | 1,235 / 395 | contexts that are not fixed sequences of sets |
 | Latin-NumericPinyin | 1 | 5 | 2 | 6 | 114 | 2,489 / 697 | rules with captures |
 | ThaiLogical-Thai | 1 | 1 | 1 | 2 | 20 | 652 / 169 | rules with captures |
-| Zawgyi-my | 3 | 1 | 4 | 1 (+1 warned) | 301 | not yet measured | rules with captures; string rules with runs |
+| Zawgyi-my | 3 | 1 | 4 | 1 (+1 warned) | 301 | not measured (the 1-round compile was stopped after 15 minutes) | rules with captures; string rules with runs |
 
 Where a transform has several regular-plan groups, the Pablo figure is its largest correction kernel.
 
@@ -160,6 +167,32 @@ repeat DeferredBlockingDepth (8) times:
 
 That is 9 `MatchStar` steps per kernel, in each of the 8 rounds: 72 copies per deferred group, 144 in Jpan-Latn. The closure is monotone and moves rightward, exactly the form DivCode §10 shows a While loop computes exactly (accumulate `blocked`, frontier = triggers newly blocked). A chain of more than 9 triggers is currently under-blocked, so a trigger can be treated as ready while a trigger before it is unreplaced. Possibly a single `MatchStar` through the reach and the trigger texts suffices; that needs checking against the tails' classes. Small change, exact, cheap: recommended first.
 
+**Status (2026-11-17): implemented in the working tree, not yet committed.** `DeferredPlan` now computes the closure with a While loop (`tools/ldml/tconv.cpp`, kernel renamed `DeferredPlanW_…` so that cached kernels are not reused; `DeferredBlockingDepth` removed):
+
+```
+Blocked  = blockedBy(triggers ∧ matched)
+Sources  = triggers ∧ matched
+Frontier = triggers ∧ Blocked ∧ ¬matched
+while (Frontier) {
+    Sources  = Sources ∨ Frontier
+    Blocked  = Blocked ∨ blockedBy(Sources)
+    Frontier = triggers ∧ Blocked ∧ ¬Sources
+}
+ready = triggers ∧ ¬Blocked
+```
+
+Every Var only gains bits and each iteration starts again from all the blocking triggers, the form DivCode §10 shows exact although the loop's carries from the previous block reach its first iteration only. The initial values are built on the streams, not on the Vars.
+
+Checks so far:
+
+| Check | Result |
+|---|---|
+| `tconv_run_moves_test` (deferred rules deleting runs of triggers) | 0 failures |
+| Kana-Latn, 5 MB Katakana, 1 deferred round | identical to the previous build |
+| Kana-Latn, the same text, 8 deferred rounds | running |
+| A chain of more than 9 triggers that the unrolled depth treated as ready too early | test not yet written: most simple copy rules are self-reproducing, whose runs `DeferredRuns` handles |
+| `-CheckWhileProgress` | not yet run; a run carried from the previous block can block a trigger before the current frontier in the first iteration, which the check may report although the result is exact |
+
 ## 5. Any-FCC passes (not recommended)
 
 `fcc()` runs NFC on a barrier-masked text `FCC_Passes()` times (3: the most nonstarters in a primary composite, U+1F82). Each pass is a multi-kernel NFC pipeline (Any-FCC has 422 kernels against 114 for Any-NFC). The count is exact by Unicode data, and an NFC pipeline cannot run inside a Pablo While, so there is nothing to gain from a loop.
@@ -172,7 +205,7 @@ That is 9 `MatchStar` steps per kernel, in each of the 8 rounds: 72 copies per d
 
 ## Recommended order
 
-1. Section 4: the `DeferredPlan` blocking closure as a While loop (or one `MatchStar`). Small, exact, also fixes chains longer than 9.
+1. Section 4: the `DeferredPlan` blocking closure as a While loop (or one `MatchStar`). Small, exact, also fixes chains longer than 9. In progress (see its status).
 2. Section 1, in the regular `FusedRules` correction kernel: a monotone three-valued While loop for single-character subgroups first (classes 1C–1E, 21 groups), reusing the DivCode §10 formulation, then string-match selection (class 1A, then section 2). Lift `--whole-group-rules` once the body is not unrolled.
 3. Class 1B: let DivCode follow prefix runs that delete (brings in ja_Latn-ko #2 and ro_FONIPA-ja #2).
 4. Section 3: only after measuring rounds against real Japanese and Persian text; the redesign is large.

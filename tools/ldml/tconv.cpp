@@ -157,6 +157,11 @@ static cl::opt<bool> ConvertedContextWhile("converted-context-while",
              "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
              "§1; default on, --converted-context-while=0 for the rounds)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> UCDPropertyKernels("ucd-property-kernels",
+    cl::desc("Compute the Unicode properties of a group's rules each by a kernel of its own (UnicodePropertyKernelBuilder, "
+             "shared and cached across transforms), and the classes of the fused kernels made of them from their streams, "
+             "instead of compiling those classes from their characters (default on; Unicode mode)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool, true> CaptureVariants("capture-variants",
     cl::desc("Merge MultipleCaptureMultipleReplacement rules differing only in one character of a text and their results "
              "into one set, matched once (see ldml::MultipleCaptureMultipleReplacementSet::variants)"),
@@ -4223,6 +4228,165 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
     }
     return sets;
 }
+
+//  The Unicode properties of a conversion group's rules, each computed by a
+//  kernel of its own (UnicodePropertyKernelBuilder: named by the property, so
+//  shared, and cached, across transforms), from whose streams the classes of the
+//  fused kernels made of them are computed (PropertyClasses), instead of being
+//  compiled from their characters (see RulePipelineBuilder::conversionGroup,
+//  fusedClasses; --ucd-property-kernels).  Only properties of more than
+//  PropertyMinRanges ranges, at most PropertyMaxCount of them.
+static constexpr size_t PropertyMinRanges = 32;
+static constexpr size_t PropertyMaxCount = 8;
+
+struct GroupProperty {
+    re::PropertyExpression * pe;
+    UCD::UnicodeSet set;
+};
+
+static size_t rangeCount(const UCD::UnicodeSet & set) {
+    return static_cast<size_t>(std::distance(set.begin(), set.end()));
+}
+
+static void collectProperties(re::RE * re, std::vector<GroupProperty> & out, std::set<std::string> & seen) {
+    using namespace re;
+    if (re == nullptr) return;
+    if (PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
+        if (pe->getKind() != PropertyExpression::Kind::Codepoint) return;
+        //  (Resolved on a copy, as linking modifies property expressions; see
+        //  ldml::CharSetAnalysis::propertySet.)
+        PropertyExpression * const copy = makePropertyExpression(pe->getKind(), pe->getPropertyIdentifier(),
+                                                                 pe->getOperator(), pe->getValueString());
+        if (isa<Any>(UCD::linkProperties(copy)) || copy->getPropertyCode() < 0) return;
+        UCD::resolveProperties(UCD::standardizeProperties(copy));
+        CC * const cc = dyn_cast_or_null<CC>(copy->getResolvedRE());
+        if (cc == nullptr || rangeCount(*cc) <= PropertyMinRanges) return;
+        if (seen.insert(copy->getFullName()).second && out.size() < PropertyMaxCount) out.push_back(GroupProperty{copy, UCD::UnicodeSet(*cc)});
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        collectProperties(n->getDefinition(), out, seen);
+    } else if (Alt * a = dyn_cast<Alt>(re)) {
+        for (RE * x : *a) collectProperties(x, out, seen);
+    } else if (Seq * s = dyn_cast<Seq>(re)) {
+        for (RE * x : *s) collectProperties(x, out, seen);
+    } else if (Rep * r = dyn_cast<Rep>(re)) {
+        collectProperties(r->getRE(), out, seen);
+    } else if (Diff * d = dyn_cast<Diff>(re)) {
+        collectProperties(d->getLH(), out, seen);
+        collectProperties(d->getRH(), out, seen);
+    } else if (re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+        collectProperties(x->getLH(), out, seen);
+        collectProperties(x->getRH(), out, seen);
+    } else if (Assertion * as = dyn_cast<Assertion>(re)) {
+        collectProperties(as->getAsserted(), out, seen);
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        collectProperties(c->getCapturedRE(), out, seen);
+    }
+}
+
+//  A class set as the union of cells of the properties (the characters in
+//  exactly the properties of a mask), without the characters of out, with
+//  those of in.
+struct PropertyFormula {
+    std::vector<uint32_t> cells;
+    UCD::UnicodeSet in, out;
+};
+
+//  The cells of the properties: by mask, the non-empty ones.
+static std::vector<std::pair<uint32_t, UCD::UnicodeSet>> propertyCells(const std::vector<GroupProperty> & props) {
+    std::vector<std::pair<uint32_t, UCD::UnicodeSet>> cells{{0, UCD::UnicodeSet(0, 0x10FFFF)}};
+    for (size_t k = 0; k < props.size(); k++) {
+        std::vector<std::pair<uint32_t, UCD::UnicodeSet>> next;
+        for (const auto & c : cells) {
+            const UCD::UnicodeSet inK = c.second & props[k].set, outK = c.second - props[k].set;
+            if (!inK.empty()) next.emplace_back(c.first | (1u << k), inK);
+            if (!outK.empty()) next.emplace_back(c.first, outK);
+        }
+        cells = std::move(next);
+    }
+    return cells;
+}
+
+//  The formula of a set, if the characters it adds and removes have far fewer
+//  ranges than the set: each cell is taken if what it adds beyond the set has
+//  fewer ranges than what it has of the set.
+static bool propertyFormula(const UCD::UnicodeSet & set, const std::vector<std::pair<uint32_t, UCD::UnicodeSet>> & cells,
+                            PropertyFormula & f) {
+    const size_t ranges = rangeCount(set);
+    if (ranges <= PropertyMinRanges) return false;
+    f = PropertyFormula();
+    UCD::UnicodeSet taken;
+    for (const auto & c : cells) {
+        const UCD::UnicodeSet inS = c.second & set;
+        if (inS.empty()) continue;
+        if (rangeCount(c.second - set) < rangeCount(inS)) {
+            f.cells.push_back(c.first);
+            taken = taken + c.second;
+        }
+    }
+    if (f.cells.empty()) return false;
+    f.in = set - taken;
+    f.out = taken - set;
+    return 4 * (rangeCount(f.in) + rangeCount(f.out)) < ranges;
+}
+
+//  The classes given by property formulas: from the streams of the properties
+//  (Props, one stream set of one stream each) and the basis (for the
+//  characters added and removed), within the text.
+class PropertyClasses final : public pablo::PabloKernel {
+public:
+    PropertyClasses(LLVMTypeSystemInterface & ts, std::vector<std::string> names, std::vector<PropertyFormula> formulas,
+                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes)
+    : PropertyClasses(ts, signature(names, formulas), std::move(formulas), U21, props, classes) {}
+    bool hasSignature() const override { return true; }
+    llvm::StringRef getSignature() const override { return mSignature; }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        cc::Parabix_CC_Compiler_Builder ccc(basis);
+        std::vector<PabloAST *> p;
+        for (size_t k = 0; k < mNumProps; k++) p.push_back(getInputStreamSet("P" + std::to_string(k))[0]);
+        std::map<uint32_t, PabloAST *> cellOf;
+        auto cell = [&](uint32_t mask) {
+            PabloAST *& c = cellOf[mask];
+            if (c) return c;
+            c = pb.createOnes();
+            for (size_t k = 0; k < mNumProps; k++) c = pb.createAnd(c, ((mask >> k) & 1) ? p[k] : pb.createNot(p[k]));
+            return c;
+        };
+        std::vector<PabloAST *> out;
+        for (const PropertyFormula & f : mFormulas) {
+            PabloAST * u = pb.createZeroes();
+            for (uint32_t mask : f.cells) u = pb.createOr(u, cell(mask));
+            if (!f.out.empty()) u = pb.createAnd(u, pb.createNot(ccc.compileCC(re::makeCC(f.out, &cc::Unicode), pb)));
+            if (!f.in.empty()) u = pb.createOr(u, ccc.compileCC(re::makeCC(f.in, &cc::Unicode), pb));
+            out.push_back(pb.createInFile(u));
+        }
+        writeOutputStreamSet("Classes", out);
+    }
+private:
+    PropertyClasses(LLVMTypeSystemInterface & ts, std::string && sig, std::vector<PropertyFormula> && formulas,
+                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes)
+    : PabloKernel(ts, "PropertyClasses_" + getStringHash(sig), [&] {
+          Bindings b{Binding{"U21", U21}};
+          for (size_t k = 0; k < props.size(); k++) b.emplace_back("P" + std::to_string(k), props[k]);
+          return b;
+      }(), {Binding{"Classes", classes}}),
+      mFormulas(std::move(formulas)), mNumProps(props.size()), mSignature(std::move(sig)) {}
+    static std::string signature(const std::vector<std::string> & names, const std::vector<PropertyFormula> & formulas) {
+        std::string s = "PropertyClasses";
+        for (const std::string & n : names) s += "|" + n;
+        for (const PropertyFormula & f : formulas) {
+            s += "/";
+            for (uint32_t m : f.cells) s += std::to_string(m) + ",";
+            s += "+" + setKey(f.in) + "-" + setKey(f.out);
+        }
+        return s;
+    }
+    const std::vector<PropertyFormula> mFormulas;
+    const size_t mNumProps;
+    const std::string mSignature;
+};
 
 //  The fused kernel of a chunk of the rules of a conversion group (see above),
 //  given the classes of fusedClassSets in Classes.  Out holds the stream sets
@@ -8720,6 +8884,22 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     StreamSet * const inText = P.CreateStreamSet(1);
     P.CreateKernelCall<TextPositions>(U21, inText);
     //  The classes of the sets that a fused kernel uses.
+    //  The Unicode properties of the group's rules (see GroupProperty), their
+    //  cells, and their streams (each computed once in the pipeline).
+    std::vector<GroupProperty> groupProps;
+    if (UCDPropertyKernels && U21->getNumElements() == 21) {
+        std::set<std::string> seen;
+        for (const ldml::ConversionRule * r : step.rules) {
+            for (const ldml::RuleSide * side : {r->getLeftSide(), r->getRightSide()}) {
+                if (side == nullptr) continue;
+                collectProperties(side->getBeforeContext(), groupProps, seen);
+                collectProperties(side->getText(), groupProps, seen);
+                collectProperties(side->getAfterContext(), groupProps, seen);
+            }
+        }
+    }
+    const std::vector<std::pair<uint32_t, UCD::UnicodeSet>> groupCells = propertyCells(groupProps);
+    std::vector<StreamSet *> propertyStreams;
     auto fusedClasses = [&](const FusedRulesConfig & config) -> StreamSet * {
         const std::vector<UCD::UnicodeSet> sets = fusedClassSets(config);
         if (sets.empty()) return nullptr;
@@ -8732,9 +8912,25 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 for (const UCD::UnicodeSet & set : plan.mux) muxKeys.insert(setKey(set));
             }
         }
-        std::vector<size_t> rest, mux;
+        std::vector<size_t> rest, mux, byProperties;
         for (size_t i = 0; i < sets.size(); i++) (muxKeys.count(setKey(sets[i])) ? mux : rest).push_back(i);
-        auto kernelOf = [&](const std::vector<size_t> & indices) {
+        //  The classes made of the group's properties (see PropertyFormula), from
+        //  their streams.
+        std::vector<PropertyFormula> formulas;
+        if (!groupProps.empty()) {
+            std::vector<size_t> others;
+            for (size_t i : rest) {
+                PropertyFormula f;
+                if (propertyFormula(sets[i], groupCells, f)) {
+                    byProperties.push_back(i);
+                    formulas.push_back(std::move(f));
+                } else {
+                    others.push_back(i);
+                }
+            }
+            rest = std::move(others);
+        }
+        auto kernelOf = [&](const std::vector<size_t> & indices, bool properties) {
             std::vector<re::CC *> ccs;
             std::vector<unsigned> outside;      // the sets with ldml::FilterRunEndMark
             for (size_t i : indices) {
@@ -8742,7 +8938,20 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 ccs.push_back(re::makeCC(sets[i], &cc::Unicode));
             }
             StreamSet * classes = P.CreateStreamSet(ccs.size());
-            P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+            if (properties) {
+                if (propertyStreams.empty()) {
+                    for (const GroupProperty & gp : groupProps) {
+                        StreamSet * const stream = P.CreateStreamSet(1);
+                        P.CreateKernelCall<UnicodePropertyKernelBuilder>(gp.pe, U21, stream);
+                        propertyStreams.push_back(stream);
+                    }
+                }
+                std::vector<std::string> names;
+                for (const GroupProperty & gp : groupProps) names.push_back(gp.pe->getFullName());
+                P.CreateKernelCall<PropertyClasses>(names, formulas, U21, propertyStreams, classes);
+            } else {
+                P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+            }
             if (!outside.empty()) {
                 //  (Their classes also hold the positions outside the filter.)
                 StreamSet * const marked = P.CreateStreamSet(ccs.size());
@@ -8753,19 +8962,29 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             for (size_t i : indices) of.push_back(sets[i]);
             return notAfterDeletedRuns(of, classes);
         };
-        if (mux.empty()) return kernelOf(rest);
+        if (mux.empty() && byProperties.empty()) return kernelOf(rest, false);
+        if (mux.empty() && rest.empty()) return kernelOf(byProperties, true);
         std::vector<std::vector<size_t>> parts;
-        if (!rest.empty()) parts.push_back(rest);
+        std::vector<bool> partByProperties;
+        if (!rest.empty()) {
+            parts.push_back(rest);
+            partByProperties.push_back(false);
+        }
+        if (!byProperties.empty()) {
+            parts.push_back(byProperties);
+            partByProperties.push_back(true);
+        }
         const size_t n = std::min<size_t>(MuxClassKernels, mux.size());
         for (size_t k = 0; k < n; k++) {
             std::vector<size_t> part;
             for (size_t j = k * mux.size() / n; j < (k + 1) * mux.size() / n; j++) part.push_back(mux[j]);
             parts.push_back(part);
+            partByProperties.push_back(false);
         }
         std::vector<StreamSet *> in;
         std::vector<std::pair<unsigned, unsigned>> where(sets.size());
         for (size_t p = 0; p < parts.size(); p++) {
-            in.push_back(kernelOf(parts[p]));
+            in.push_back(kernelOf(parts[p], partByProperties[p]));
             for (size_t j = 0; j < parts[p].size(); j++) where[parts[p][j]] = {static_cast<unsigned>(p), static_cast<unsigned>(j)};
         }
         StreamSet * const classes = P.CreateStreamSet(sets.size());

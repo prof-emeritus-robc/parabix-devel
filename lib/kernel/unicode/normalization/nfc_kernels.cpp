@@ -26,6 +26,15 @@
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/utf/utf_compiler.h>
 #include <toolchain/toolchain.h>
+#include <re/adt/re_cc.h>
+#include <re/cc/cc_compiler_target.h>
+#include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/UCD_property_kernel.h>
+#include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/sorting.h>
+#include <kernel/bitwise/bixlogic.h>
+#include <kernel/bitwise/bixnum_kernel.h>
 
 using namespace kernel;
 using namespace pablo;
@@ -739,6 +748,324 @@ protected:
     }
 };
 
+//  ---- NFC on the 21-bit basis (doc/masked-nfc-plan.md, A U21 mode of NFC) ----
+//
+//  One position per character.  A character stage writes the first character
+//  of a replacement in place and the others in the positions inserted after it;
+//  a composition writes the composite at one position and deletes the other (a
+//  composite never needs room); an overridable primary writes its starter in
+//  place and the marks that remain in the positions inserted after it.  With a
+//  mask, as in UTF-8 mode: the classes within it (the character ahead, within
+//  the mask ahead).
+
+//  The classes of the characters at a position (or one ahead), compiled on the
+//  basis (looked ahead), each once.
+class U21Classes {
+public:
+    U21Classes(std::vector<PabloAST *> basis) : mCompiler(std::move(basis)) {}
+    PabloAST * get(PabloBuilder & pb, const UnicodeSet & set) {
+        for (unsigned i = 0; i < mSets.size(); i++) if (mSets[i] == set) return mClasses[i];
+        mSets.push_back(set);
+        mClasses.push_back(set.empty() ? pb.createZeroes() : mCompiler.compileCC(re::makeCC(set, &cc::Unicode), pb));
+        return mClasses.back();
+    }
+private:
+    cc::Parabix_CC_Compiler_Builder mCompiler;
+    std::vector<UnicodeSet> mSets;
+    std::vector<PabloAST *> mClasses;
+};
+
+std::vector<PabloAST *> aheadBasis(PabloBuilder & pb, const std::vector<PabloAST *> & basis) {
+    std::vector<PabloAST *> a;
+    for (PabloAST * b : basis) a.push_back(pb.createLookahead(b, 1));
+    return a;
+}
+
+//  The XOR into xfrm, at marker, of the bits of v.
+void xorBits(PabloBuilder & pb, std::vector<PabloAST *> & xfrm, codepoint_t v, PabloAST * marker) {
+    for (unsigned j = 0; j < 21; j++) if ((v >> j) & 1) xfrm[j] = pb.createOr(xfrm[j], marker);
+}
+
+//  The changes of the characters of a map to strings, at the positions of their
+//  classes (within the mask) and the positions after them: (position, bit) ->
+//  the characters whose replacement changes that bit there.
+std::map<std::pair<unsigned, unsigned>, UnicodeSet> u21Changes(const std::map<codepoint_t, std::u32string> & map) {
+    std::map<std::pair<unsigned, unsigned>, UnicodeSet> sets;
+    for (const auto & e : map) {
+        for (unsigned i = 0; i < e.second.size(); i++) {
+            const codepoint_t v = i == 0 ? (e.first ^ e.second[0]) : e.second[i];
+            for (unsigned j = 0; j < 21; j++) if ((v >> j) & 1) sets[{i, j}].insert(e.first);
+        }
+    }
+    return sets;
+}
+
+void writeU21(PabloBuilder & pb, Var * out, const std::vector<PabloAST *> & basis, const std::vector<PabloAST *> & xfrm, PabloAST * del) {
+    PabloAST * const select = del ? pb.createNot(del) : nullptr;
+    for (unsigned i = 0; i < 21; i++) {
+        PabloAST * v = pb.createXor(basis[i], xfrm[i]);
+        if (select) v = pb.createAnd(select, v);
+        pb.createAssign(pb.createExtract(out, pb.getInteger(i)), v);
+    }
+}
+
+Bindings u21Inputs(StreamSet * Basis, StreamSet * Mask, unsigned lookahead) {
+    Bindings b;
+    if (lookahead) b.emplace_back("Basis", Basis, FixedRate(), LookAhead(lookahead)); else b.emplace_back("Basis", Basis);
+    MaskInput::bind(b, Mask, lookahead);
+    return b;
+}
+
+//  A character-to-string stage (the excluded composites, the singletons).
+class CharacterStage21 final : public PabloKernel {
+public:
+    CharacterStage21(LLVMTypeSystemInterface & ts, std::string name, std::map<codepoint_t, std::u32string> map,
+                     StreamSet * Basis, StreamSet * Out, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, name + MaskInput::suffix(Mask) + nameSuffix(), u21Inputs(Basis, Mask, 0), {Binding{"Out", Out}}),
+      mMap(std::move(map)), mHasMask(Mask != nullptr) {
+        addAttribute(kernel::LocalCarries());
+    }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+        U21Classes classes(basis);
+        std::vector<PabloAST *> xfrm(21, pb.createZeroes());
+        for (const auto & c : u21Changes(mMap)) {
+            PabloAST * at = classes.get(pb, c.second);
+            if (mask) at = pb.createAnd(at, mask);
+            if (c.first.first) at = pb.createAdvance(at, c.first.first);
+            xfrm[c.first.second] = pb.createOr(xfrm[c.first.second], at);
+        }
+        writeU21(pb, getOutputStreamVar("Out"), basis, xfrm, nullptr);
+    }
+private:
+    const std::map<codepoint_t, std::u32string> mMap;
+    const bool mHasMask;
+};
+
+//  A pass of the short composables: the composite written at the second
+//  character, the first deleted (or both replaced, by a recomposition).
+class ShortComposableStage21 final : public PabloKernel {
+public:
+    ShortComposableStage21(LLVMTypeSystemInterface & ts, unsigned pass, StreamSet * Basis, StreamSet * Out, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "NFC21_ShortComposable" + std::to_string(pass) + MaskInput::suffix(Mask) + nameSuffix(),
+                  u21Inputs(Basis, Mask, 1), {Binding{"Out", Out}}), mPass(pass), mHasMask(Mask != nullptr) {
+        addAttribute(kernel::LocalCarries());
+    }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const zeroes = pb.createZeroes();
+        const std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+        PabloAST * const maskAhead = maskAt(pb, mask, 1);
+        U21Classes here(basis), ahead(aheadBasis(pb, basis));
+        const auto & rules = tables().short_pass_map.at(mPass);
+        std::vector<codepoint_t> cp1_list;
+        for (const auto & r : rules) cp1_list.push_back(r.first);
+        std::map<codepoint_t, Var *> generated;
+        for (codepoint_t cp1 : cp1_list) {
+            PabloAST * c = here.get(pb, UnicodeSet(cp1));
+            if (mask) c = pb.createAnd(c, mask);
+            generated[cp1] = pb.createVar("first", c);
+        }
+        auto second = [&](codepoint_t cp2) {
+            PabloAST * c = ahead.get(pb, UnicodeSet(cp2));
+            return maskAhead ? pb.createAnd(c, maskAhead) : c;
+        };
+        std::vector<PabloAST *> xfrm(21, zeroes);
+        PabloAST * del = zeroes;
+        std::map<codepoint_t, PabloAST *> precomposedGenerated;
+        auto emitCases = [&](codepoint_t cp1) {
+            for (const auto & y : rules.at(cp1)) {
+                const codepoint_t cp2 = y.first;
+                if (cp1 == cp2) continue;
+                PabloAST * const before = pb.createAnd(generated[cp1], second(cp2));
+                PabloAST * const found = pb.createAdvance(before, 1);
+                if (y.second.size() == 1) {
+                    del = pb.createOr(del, before);
+                    xorBits(pb, xfrm, cp2 ^ y.second[0], found);
+                    precomposedGenerated[y.second[0]] = found;
+                } else {
+                    xorBits(pb, xfrm, cp1 ^ y.second[0], before);
+                    xorBits(pb, xfrm, cp2 ^ y.second[1], found);
+                }
+            }
+        };
+        //  (A composite that is itself a first character composes again: its
+        //  cases follow those generating it, as in UTF-8 mode.)
+        std::vector<codepoint_t> deferred;
+        for (codepoint_t cp1 : cp1_list) {
+            for (const auto & y : rules.at(cp1)) {
+                if (y.first == cp1 || y.second.size() != 1) continue;
+                const codepoint_t p = y.second[0];
+                if (rules.count(p) && std::find(deferred.begin(), deferred.end(), p) == deferred.end()) deferred.push_back(p);
+            }
+        }
+        for (codepoint_t cp1 : cp1_list) {
+            if (std::find(deferred.begin(), deferred.end(), cp1) == deferred.end()) emitCases(cp1);
+        }
+        while (!deferred.empty()) {
+            std::vector<codepoint_t> next;
+            for (codepoint_t cp1 : deferred) {
+                const auto g = precomposedGenerated.find(cp1);
+                if (g != precomposedGenerated.end()) {
+                    pb.createAssign(generated[cp1], pb.createOr(generated[cp1], g->second));
+                    emitCases(cp1);
+                } else {
+                    next.push_back(cp1);
+                }
+            }
+            if (next.size() == deferred.size()) report_fatal_error("ShortComposableStage21: deferred composites never generated");
+            deferred = next;
+        }
+        writeU21(pb, getOutputStreamVar("Out"), basis, xfrm, del);
+    }
+private:
+    const unsigned mPass;
+    const bool mHasMask;
+};
+
+//  The self-composables (A A -> AA), by SelfComposableLogic, with characters of
+//  one position (no UTF-8 suffixes).
+class SelfComposableStage21 final : public PabloKernel {
+public:
+    SelfComposableStage21(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Out, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "NFC21_SelfComposable" + MaskInput::suffix(Mask) + nameSuffix(), u21Inputs(Basis, Mask, 1), {Binding{"Out", Out}}),
+      mHasMask(Mask != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const zeroes = pb.createZeroes();
+        const std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+        PabloAST * const maskAhead = maskAt(pb, mask, 1);
+        U21Classes here(basis), ahead(aheadBasis(pb, basis));
+        auto within = [&](PabloAST * c, PabloAST * m) {return m ? pb.createAnd(c, m) : c;};
+        const std::vector<PabloAST *> noSuffix(8, zeroes);
+        std::vector<PabloAST *> xfrm(21, zeroes);
+        PabloAST * del = zeroes;
+        for (const auto & sc : tables().self_composables) {
+            const codepoint_t A = sc.first, AA = sc.second;
+            const SCResults r = SelfComposableLogic(pb, noSuffix, 1, 1, within(here.get(pb, UnicodeSet(A)), mask),
+                                                    within(here.get(pb, UnicodeSet(AA)), mask),
+                                                    within(ahead.get(pb, UnicodeSet(A)), maskAhead),
+                                                    within(ahead.get(pb, UnicodeSet(AA)), maskAhead));
+            del = pb.createOr(del, r.A_or_AA_to_delete);
+            xorBits(pb, xfrm, A ^ AA, pb.createOr(r.A_to_convert_to_AA, r.AA_to_convert_to_A));
+        }
+        writeU21(pb, getOutputStreamVar("Out"), basis, xfrm, del);
+    }
+private:
+    const bool mHasMask;
+};
+
+//  The marks of a long-composition pass that compose with the starter they follow.
+class FindComposablesStage21 final : public PabloKernel {
+public:
+    FindComposablesStage21(LLVMTypeSystemInterface & ts, unsigned pass, StreamSet * Basis, StreamSet * ccc_NR,
+                           StreamSet * MarkCode, StreamSet * Index, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "NFC21_FindComposables" + std::to_string(pass) + MaskInput::suffix(Mask) + nameSuffix(),
+                  [&] {
+                      Bindings b = u21Inputs(Basis, Mask, 0);
+                      b.emplace_back("ccc_NR", ccc_NR);
+                      return b;
+                  }(),
+                  {Binding{"MarkCode", MarkCode}, Binding{"Index_ccc_NR_or_MarksFound", Index}}), mPass(pass), mHasMask(Mask != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        auto * cccObj = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const zeroes = pb.createZeroes();
+        const std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        PabloAST * const ccc_NR = getInputStreamSet("ccc_NR")[0];
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+        U21Classes classes(basis);
+        const unsigned bits = tables().max_conditional_code_bits.at(mPass);
+        std::vector<PabloAST *> codeBits(bits, zeroes);
+        std::map<unsigned, PabloAST *> cccOrNR;
+        for (const auto & d : passData(mPass)) {
+            for (const auto & m : d.second) {
+                UnicodeSet starters;
+                for (codepoint_t s : m.second) starters.insert(s);
+                PabloAST * st = classes.get(pb, starters);
+                PabloAST * mk = classes.get(pb, UnicodeSet(m.first));
+                if (mask) {
+                    st = pb.createAnd(st, mask);
+                    mk = pb.createAnd(mk, mask);
+                }
+                const unsigned cccEnum = cccObj->GetEnumerationValue(m.first);
+                if (!cccOrNR.count(cccEnum)) cccOrNR[cccEnum] = pb.createOr(classes.get(pb, cccObj->GetCodepointSet(cccEnum)), ccc_NR);
+                PabloAST * const found = pb.createAnd(pb.createAdvanceThenScanTo(st, cccOrNR[cccEnum]), mk);
+                const unsigned code = markCode(mPass, d.first, m.first);
+                for (unsigned i = 0; i < bits; i++) if ((code >> i) & 1) codeBits[i] = pb.createOr(codeBits[i], found);
+            }
+        }
+        PabloAST * any = zeroes;
+        for (PabloAST * c : codeBits) any = pb.createOr(any, c);
+        writeOutputStreamSet("MarkCode", codeBits);
+        writeOutputStreamSet("Index_ccc_NR_or_MarksFound", std::vector<PabloAST *>{pb.createOr(ccc_NR, any)});
+    }
+private:
+    const unsigned mPass;
+    const bool mHasMask;
+};
+
+//  The compositions of a long-composition pass at the starters, and the marks deleted.
+class ApplyLongCompositionStage21 final : public PabloKernel {
+public:
+    ApplyLongCompositionStage21(LLVMTypeSystemInterface & ts, unsigned pass, StreamSet * Basis, StreamSet * MarkCodeAtStarter,
+                                StreamSet * MarkCode, StreamSet * Out)
+    : PabloKernel(ts, "NFC21_ApplyLongComposition" + std::to_string(pass) + nameSuffix(),
+                  {Binding{"Basis", Basis}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
+                  {Binding{"Out", Out}}), mPass(pass) {
+        addAttribute(kernel::LocalCarries());
+    }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+        PabloAST * const zeroes = pb.createZeroes();
+        const std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        const std::vector<PabloAST *> atStarter = getInputStreamSet("MarkCodeAtStarter");
+        const std::vector<PabloAST *> codes = getInputStreamSet("MarkCode");
+        U21Classes classes(basis);
+        std::vector<PabloAST *> xfrm(21, zeroes);
+        for (const auto & d : passData(mPass)) {
+            for (const auto & m : d.second) {
+                PabloAST * const foundMark = bnc.EQ(atStarter, markCode(mPass, d.first, m.first));
+                std::map<codepoint_t, std::u32string> xlate;
+                for (codepoint_t s : m.second) xlate[s] = tables().long_composable_map.at(m.first).at(s);
+                for (const auto & c : u21Changes(xlate)) {
+                    PabloAST * at = pb.createAnd(classes.get(pb, c.second), foundMark);
+                    if (c.first.first) at = pb.createAdvance(at, c.first.first);
+                    xfrm[c.first.second] = pb.createOr(xfrm[c.first.second], at);
+                }
+            }
+        }
+        PabloAST * any = zeroes;
+        for (PabloAST * c : codes) any = pb.createOr(any, c);
+        writeU21(pb, getOutputStreamVar("Out"), basis, xfrm, any);
+    }
+private:
+    const unsigned mPass;
+};
+
+//  The positions to insert after each character for NFC on the 21-bit basis:
+//  for the decomposition of an excluded composite, or the marks an overridable
+//  primary leaves after its starter.
+std::map<codepoint_t, unsigned> u21Insertions() {
+    std::map<codepoint_t, unsigned> ins;
+    auto need = [&](codepoint_t cp, size_t n) {if (n > 1) ins[cp] = std::max<unsigned>(ins[cp], static_cast<unsigned>(n - 1));};
+    for (const auto & e : tables().excluded_composite_map) need(e.first, e.second.size());
+    for (const auto & o : tables().overridable_primaries) {
+        for (const auto & m : o.second) need(o.first, m.second.size());
+    }
+    return ins;
+}
+
 }
 
 bool NFC_CxxKernels() {
@@ -836,4 +1163,124 @@ void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Ca
     } else {
         P.CreateKernelCall<NFC_CandidateClass>(Basis, Candidates);
     }
+}
+
+StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask) {
+    const NFC_Tables & T = tables();
+    //  The working space: room for the decompositions and the marks of overrides
+    //  (within the mask).
+    const std::map<codepoint_t, unsigned> ins = u21Insertions();
+    unsigned maxIns = 0;
+    for (const auto & e : ins) maxIns = std::max(maxIns, e.second);
+    unsigned bits = 0;
+    while ((maxIns >> bits) != 0) bits++;
+    StreamSet * Working = U21;
+    StreamSet * SpreadMask = nullptr;
+    StreamSet * WorkingMask = Mask;
+    if (bits > 0) {
+        std::vector<re::CC *> ccs;
+        for (unsigned b = 0; b < bits; b++) {
+            UnicodeSet set;
+            for (const auto & e : ins) if ((e.second >> b) & 1) set.insert(e.first);
+            ccs.push_back(re::makeCC(set, &cc::Unicode));
+        }
+        StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
+        if (Mask) {
+            P.CreateKernelCall<CharClassesKernel>(ccs, U21, StreamMask{Mask, MaskKind::Zeroing}, InsertBixNum);
+        } else {
+            P.CreateKernelCall<CharClassesKernel>(ccs, U21, InsertBixNum);
+        }
+        SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+        Working = P.CreateStreamSet(21, 1);
+        SpreadByMask(P, SpreadMask, U21, Working);
+        if (Mask) {
+            StreamSet * const spread = P.CreateStreamSet(1);
+            SpreadByMask(P, SpreadMask, Mask, spread);
+            StreamSet * const inserted = P.CreateStreamSet(1);
+            P.CreateKernelCall<bixnum::EQ_immediate>(SpreadMask, 0, inserted);
+            WorkingMask = P.CreateStreamSet(1);
+            OrCombine(P, spread, inserted, WorkingMask);
+        }
+    }
+    StreamSet * const EC = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<CharacterStage21>("NFC21_ExcludedComposites", T.excluded_composite_map, Working, EC, WorkingMask);
+    //  The starters (not the positions inserted), and with a mask the positions
+    //  outside it, which block the long compositions.
+    auto * cccObj = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
+    StreamSet * ccc_NR = P.CreateStreamSet(1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(cccObj->GetCodepointSet(UCD::CCC_ns::NR), &cc::Unicode)}, EC, ccc_NR);
+    if (SpreadMask) {
+        StreamSet * const original = P.CreateStreamSet(1);
+        AndCombine(P, ccc_NR, SpreadMask, original);
+        ccc_NR = original;
+    }
+    StreamSet * blocking = ccc_NR;
+    if (WorkingMask) {
+        StreamSet * const outside = P.CreateStreamSet(1);
+        P.CreateKernelCall<bixnum::EQ_immediate>(WorkingMask, 0, outside);
+        blocking = P.CreateStreamSet(1);
+        OrCombine(P, ccc_NR, outside, blocking);
+    }
+    StreamSet * input = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<CharacterStage21>("NFC21_Singletons", singletonStrings(), EC, input, WorkingMask);
+    for (unsigned pass = 0; pass < T.short_pass_count; pass++) {
+        StreamSet * const output = P.CreateStreamSet(21, 1);
+        if (static_cast<int>(pass) == T.self_composable_pass_no) {
+            P.CreateKernelCall<SelfComposableStage21>(input, output, WorkingMask);
+        } else {
+            P.CreateKernelCall<ShortComposableStage21>(pass, input, output, WorkingMask);
+        }
+        input = output;
+    }
+    for (unsigned pass = 0; pass < T.pass_count; pass++) {
+        const unsigned codeBits = T.max_conditional_code_bits.at(pass);
+        for (unsigned a = 0; a < T.pass_applications[pass]; a++) {
+            StreamSet * const MarkCode = P.CreateStreamSet(codeBits);
+            StreamSet * const Index = P.CreateStreamSet(1);
+            P.CreateKernelCall<FindComposablesStage21>(pass, input, blocking, MarkCode, Index, WorkingMask);
+            StreamSet * const AtStarter = P.CreateStreamSet(codeBits);
+            P.CreateKernelCall<IndexedShiftBack>(Index, MarkCode, AtStarter);
+            StreamSet * const output = P.CreateStreamSet(21, 1);
+            P.CreateKernelCall<ApplyLongCompositionStage21>(pass, input, AtStarter, MarkCode, output);
+            input = output;
+        }
+    }
+    StreamSet * L_V_T = P.CreateStreamSet(Hangul_Composables::HC_Kind::Count);
+    P.CreateKernelCall<Hangul_Composables>(input, L_V_T, pablo::BitMovementMode::LookAhead);
+    if (WorkingMask) L_V_T = NFC_MaskStreams(P, L_V_T, WorkingMask);
+    StreamSet * const Translated = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<Hangul_Composition>(input, L_V_T, Translated);
+    //  The positions that remain: the characters, and the nulls of the source.
+    StreamSet * const NonZero = P.CreateStreamSet(1);
+    P.CreateKernelCall<bixnum::NEQ_immediate>(Translated, 0, NonZero);
+    StreamSet * const SourceZero = P.CreateStreamSet(1);
+    P.CreateKernelCall<bixnum::EQ_immediate>(Working, 0, SourceZero);
+    StreamSet * SourceNull = SourceZero;
+    if (SpreadMask) {
+        SourceNull = P.CreateStreamSet(1);
+        AndCombine(P, SourceZero, SpreadMask, SourceNull);
+    }
+    StreamSet * const Valid = P.CreateStreamSet(1);
+    OrCombine(P, NonZero, SourceNull, Valid);
+    StreamSet * const Compressed = P.CreateStreamSet(21, 1);
+    FilterByMask(P, Valid, Translated, Compressed);
+    StreamSet * CompressedMask = nullptr;
+    if (WorkingMask) {
+        CompressedMask = OutputMask ? OutputMask : P.CreateStreamSet(1);
+        FilterByMask(P, Valid, WorkingMask, CompressedMask);
+    }
+    //  The canonical ordering (within the mask).
+    StreamSet * const CCC_Basis = P.CreateStreamSet(cccObj->GetEnumerationBasisSets().size(), 1);
+    P.CreateKernelCall<UnicodePropertyBasis>(cccObj, Compressed, CCC_Basis);
+    StreamSet * NonZeroCCC = P.CreateStreamSet(1);
+    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, NonZeroCCC);
+    if (CompressedMask) {
+        StreamSet * const within = P.CreateStreamSet(1);
+        AndCombine(P, NonZeroCCC, CompressedMask, within);
+        NonZeroCCC = within;
+    }
+    StreamSet * const Sorted = P.CreateStreamSet(21, 1);
+    SortRuns(P, NonZeroCCC, CCC_Basis, Compressed, Sorted);
+    return Sorted;
 }

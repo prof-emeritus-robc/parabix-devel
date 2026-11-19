@@ -21,6 +21,8 @@
 #include <kernel/unicode/normalization/nfc_tables.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/utf8_support.h>
+#include <kernel/unicode/utf8_decoder.h>
+#include <kernel/unicode/utf8gen.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/bitwise/bixnum_kernel.h>
 #include <re/adt/re_cc.h>
@@ -48,6 +50,11 @@ static cl::opt<bool> DumpNFC_Tables("dump-nfc-tables", cl::desc("Print the NFC a
 static cl::opt<std::string> NFC_MaskSet("nfc-mask", cl::desc("Normalize only within the characters of a set (hexadecimal "
                                        "ranges, e.g. 41-5a,300-36f): each run of them by itself, the others unchanged "
                                        "(NFC_Masked, focused or with -NoFocus in place; for testing)"), cl::init(""), cl::cat(NFC_Options), cl::Hidden);
+static cl::opt<bool> NFC_U21Mode("nfc-u21", cl::desc("Normalize on the 21-bit basis (NFC_U21): the input decoded, and the "
+                                 "result encoded to UTF-8 (for testing)"), cl::init(false), cl::cat(NFC_Options), cl::Hidden);
+static cl::opt<bool> NFC_U21ViaUTF8("nfc-u21-via-utf8", cl::desc("With -nfc-u21, normalize the 21-bit basis by encoding it to "
+                                    "UTF-8, the focused NFC of the bytes, and decoding the result (for measurement)"),
+                                    cl::init(false), cl::cat(NFC_Options), cl::Hidden);
 enum class MaskSelect {All, Inside, Outside};
 static cl::opt<MaskSelect> NFC_MaskSelect("nfc-mask-select", cl::desc("With -nfc-mask, print only the output bytes inside or "
                                           "outside the output mask (for testing it)"),
@@ -165,6 +172,8 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
     source_logic(P, ByteStream, BasisBits);
 
     StreamSet * OutputBytes = nullptr;
+    //  (-nfc-mask: the bytes of the characters of the set.)
+    StreamSet * Mask = nullptr;
     if (!NFC_MaskSet.empty()) {
         //  (-nfc-mask: the bytes of the characters of the set.)
         UCD::UnicodeSet set;
@@ -184,8 +193,56 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
                                               pablo::BitMovementMode::LookAhead);
         StreamSet * const u8index = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-        StreamSet * const Mask = P.CreateStreamSet(1, 1);
+        Mask = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<U8Spans>(firsts, u8index, Mask, pablo::BitMovementMode::Advance);
+    }
+    if (NFC_U21Mode) {
+        //  (-nfc-u21: the characters decoded, normalized on the 21-bit basis, and encoded.)
+        StreamSet * const U21_u8indexed = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
+        StreamSet * const u8index = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+        StreamSet * const U21 = P.CreateStreamSet(21, 1);
+        FilterByMask(P, u8index, U21_u8indexed, U21);
+        StreamSet * Mask21 = nullptr;
+        if (Mask) {
+            Mask21 = P.CreateStreamSet(1, 1);
+            FilterByMask(P, u8index, Mask, Mask21);
+        }
+        StreamSet * const OutputMask = Mask && NFC_MaskSelect != MaskSelect::All ? P.CreateStreamSet(1, 1) : nullptr;
+        StreamSet * Result = nullptr;
+        if (NFC_U21ViaUTF8) {
+            StreamSet * const Basis8 = P.CreateStreamSet(8, 1);
+            U21_to_UTF8(P, U21, Basis8);
+            StreamSet * const Bytes8 = P.CreateStreamSet(1, 8);
+            P.CreateKernelCall<P2SKernel>(Basis8, Bytes8);
+            StreamSet * const Normalized = NFC.build(P, Bytes8, Basis8);
+            StreamSet * const NormalizedBasis = P.CreateStreamSet(8, 1);
+            Selected_S2P(P, Normalized, NormalizedBasis);
+            StreamSet * const Decoded = P.CreateStreamSet(21, 1);
+            P.CreateKernelCall<UTF8_Decoder>(NormalizedBasis, Decoded);
+            StreamSet * const index = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<UTF8_index>(NormalizedBasis, index);
+            Result = P.CreateStreamSet(21, 1);
+            FilterByMask(P, index, Decoded, Result);
+        } else {
+            Result = NFC_U21(P, U21, Mask21, OutputMask);
+        }
+        if (OutputMask) {
+            StreamSet * selected = OutputMask;
+            if (NFC_MaskSelect == MaskSelect::Outside) {
+                selected = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<bixnum::EQ_immediate>(OutputMask, 0, selected);
+            }
+            StreamSet * const Selected = P.CreateStreamSet(21, 1);
+            FilterByMask(P, selected, Result, Selected);
+            Result = Selected;
+        }
+        StreamSet * const OutputBasis = P.CreateStreamSet(8, 1);
+        U21_to_UTF8(P, Result, OutputBasis);
+        OutputBytes = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(OutputBasis, OutputBytes);
+    } else if (Mask) {
         StreamSet * const OutputMask = NFC_MaskSelect == MaskSelect::All ? nullptr : P.CreateStreamSet(1, 1);
         OutputBytes = NFC_Masked(P, NFC.getOptions(), ByteStream, BasisBits, Mask, OutputMask);
         if (OutputMask) {

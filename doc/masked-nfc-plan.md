@@ -542,6 +542,47 @@ on the CLDR transforms that use NFC.
 5. **U21 mode.** Kernel classes on the 21-bit basis (see A U21 mode of NFC),
    unmasked then masked, checked against the UTF-8 kernels by the same tests,
    and measured against the conversion to UTF-8 and back.
+
+   Done (2026-11-19), in place. `NFC_U21(P, U21, Mask, OutputMask)`
+   (`nfc_kernels.cpp`) runs on the 21-bit basis, one position per character.
+   - **Room:** the positions inserted are for an excluded composite's
+     decomposition and the marks an override leaves. A composite never needs
+     room, so there is no `maxReach` here.
+   - **Character stages** (`CharacterStage21`): a replacement's first
+     character XORed in place, the others written into the inserted positions.
+   - **Short and self composables** (`ShortComposableStage21`,
+     `SelfComposableStage21`): the second character is a class compiled with
+     `Parabix_CC_Compiler_Builder` on the basis looked ahead by 1, and
+     `SelfComposableLogic` is given no UTF-8 suffixes.
+   - **Long compositions** (`FindComposablesStage21`,
+     `ApplyLongCompositionStage21`): as in UTF-8 mode, by the same pass data
+     and mark codes. An override writes its starter in place and its marks
+     after it.
+   - **Hangul:** the existing kernels, on the 21-bit basis.
+   - **Sort:** `SortRuns` on the compressed result, with no decoding.
+   - **Mask:** as in step 3.
+
+   `nfc -nfc-u21` decodes, normalizes and encodes, and `-nfc-u21-via-utf8`
+   instead takes the conversion route (encode, focused NFC of the bytes,
+   decode) for comparison. Every input (the pairs, random text, every code
+   point, NormalizationTest.txt) gives the reference NFC. With the five masks
+   and the output mask's selections, also with `-thread-num=4
+   -segment-size=1`, every input gives the masked reference.
+   `normalization_test` has three U21 cases.
+
+   Warm run times, U21 in place / via UTF-8 (focused) / UTF-8 focused alone:
+
+   | Text | U21 in place | via UTF-8 (focused) | UTF-8 focused alone |
+   |---|---|---|---|
+   | sparse (10 MB) | 0.14 s | 0.08 s | 0.06 s |
+   | dense Vietnamese (10 MB) | 0.12 s | 0.12 s | 0.10 s |
+   | random sequences of composing characters (2.7 MB) | 0.06 s | 0.10 s | 0.09 s |
+
+   Where the work is dense, U21 in place wins, by avoiding the conversions.
+   Where it is sparse, the focused route through UTF-8 wins despite them. A
+   focused U21 NFC (the work regions filtered by character, with the
+   placement replayed as `NFC_WorkPlacement` does) is needed before U21 can
+   replace the conversion in general (step 6).
 6. **tconv.**
    - Unicode mode: masked NFC in U21 mode, with the position map from the
      output mask, replacing `barrierNormalization` for NFC and NFKC (masked

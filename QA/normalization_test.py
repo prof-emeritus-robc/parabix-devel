@@ -13,8 +13,8 @@
 #  - regression: the small cases in nfd/TestFiles and nfc/TestFiles, concatenated
 #    into one input per tool (each ends in a newline, so nothing composes across
 #    them), checked against the concatenated ExpectedOutput files;
-#  - masked: nfc with -nfc-mask (NFC_Masked, in place and focused, with the
-#    output mask's selections), each run of the characters of a set normalized
+#  - masked: nfc with -nfc-mask (NFC_Masked, in place and focused, and NFC_U21
+#    with -nfc-u21, with the output mask's selections), each run of the characters of a set normalized
 #    by itself and the others unchanged, on the focus text, checked against
 #    unicodedata.normalize of each run;
 #  - focus: a generated text mixing sparse and dense work, run with a small
@@ -98,6 +98,8 @@ MASK_MODES = [
     ([], 'all'),
     (['-thread-num=3', '-segment-size=1'], 'inside'),
     (['-focus-filter=byte', '-reintegrate=byte-replace'], 'outside'),
+    (['-nfc-u21'], 'all'),
+    (['-nfc-u21', '-thread-num=3', '-segment-size=1'], 'inside'),
 ]
 
 
@@ -129,6 +131,8 @@ def main():
         for tool, flags in FOCUS_CASES:
             expected = unicodedata.normalize(FORM[tool], text).encode('utf-8')
             cases.append((tool, FOCUS_COMMON + flags, focus_path, expected, 'focus text'))
+        # NFC on the 21-bit basis (nfc -nfc-u21), unmasked.
+        cases.append(('nfc', ['-nfc-u21'], focus_path, unicodedata.normalize('NFC', text).encode('utf-8'), 'focus text, U21'))
         for spec, within in MASK_CASES:
             for flags, select in MASK_MODES:
                 expected = masked_nfc(text, within, select).encode('utf-8')

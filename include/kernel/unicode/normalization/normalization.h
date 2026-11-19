@@ -234,6 +234,11 @@ void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * Fi
 void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc_NR, StreamSet * FinalBasis, StreamSet * Mask = nullptr);
 //  The streams of In within the mask.
 StreamSet * NFC_MaskStreams(PipelineBuilder & P, StreamSet * In, StreamSet * Mask);
+//  NFC of a 21-bit basis (one position per character), with the kernels built
+//  from NFC_Tables for that basis: no conversion to UTF-8.  With a Mask (a
+//  stream of the positions of U21), each run of it normalized by itself, the
+//  others unchanged; OutputMask, if given, receives the mask over the result.
+StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr);
 void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates);
 //
 //  Compute a mask for final work placement, given

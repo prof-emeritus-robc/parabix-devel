@@ -202,7 +202,13 @@ void Hangul_Composition::generatePabloMethod() {
             nested.createAssign(outputVar[i], updated);
         }
     } else {
-        Composed = bnc.ZeroExtend(Composed, Basis.size());
+        //  Merged_LV is as wide as the basis, so Composed has a carry bit
+        //  beyond it (always 0: a syllable is at most U+D7A3).
+        if (Composed.size() > Basis.size()) {
+            Composed = bnc.Truncate(Composed, Basis.size());
+        } else {
+            Composed = bnc.ZeroExtend(Composed, Basis.size());
+        }
         for (unsigned i = 0; i < Basis.size(); i++) {
             PabloAST * selected = nested.createAnd(Basis[i], maskVar);
             nested.createAssign(outputVar[i], nested.createSel(LV_sequence, Composed[i], selected));

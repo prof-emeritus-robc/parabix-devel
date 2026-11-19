@@ -285,7 +285,8 @@ transforms it can affect, and against ICU.
    Barrier substitution (`barrierNormalization`, `BarrierMark`,
    `ReplaceUnmasked`, `UTF8_ReplaceUnselected`) is left only behind
    `--masked-normalization=0` (and `--u21-nfc=0`) for comparison, and can be
-   removed with the generated NFC kernels (masked NFC plan, step 7).
+   removed with the NFC generator (masked NFC plan, step 7; the generated
+   kernels are removed).
 
    Checks: the CLDR test data of the transforms with NFC, NFKC, NFD, NFKD or
    FCC under a filter give the previous route's output, also multithreaded and

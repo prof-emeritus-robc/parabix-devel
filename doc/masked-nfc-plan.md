@@ -1,6 +1,7 @@
 # Plan: masked NFC, with the NFC generator rewritten in C++
 
-Status (2026-11-19): steps 1 to 6 done; step 7 (retiring the generator) open.
+Status (2026-11-19): steps 1 to 6 done; step 7 in part (the generated
+kernels and `-nfc-kernels` removed, the generator kept).
 Part of step 6 of `doc/masked-transforms-plan.md` (normalization with a mask).
 tconv normalizes within a filter by the masked kernels in both modes (NFD,
 NFKD, NFC, NFKC, FCC and FCD); barrier substitution
@@ -684,6 +685,15 @@ on the CLDR transforms that use NFC.
    `normalization-generated.cpp`, together with the transitional option
    (`-nfc-kernels`), and the barrier substitution in tconv with
    `--masked-normalization` and `--u21-nfc`.
+
+   In part (2026-11-19): `normalization-generated.cpp` and `-nfc-kernels` are
+   removed, with the declarations of the generated kernel classes
+   (`NFC_Initial_Insertion`, `SingletonCanonicalization`,
+   `ExcludedCompositeStage`, `SelfComposableTranslation`, `NFC_CandidateClass`,
+   `ShortComposablePipeline`, `LongComposablePipeline`) in `normalization.h`.
+   `nfc_generator.py` is kept, for its `--dump-tables` comparison with
+   `NFC_Tables`; the C++ it emits no longer compiles against the header.
+   Remaining: the generator itself, and tconv's barrier substitution.
 
 Step 1 can be checked on its own and is the cheapest test of whether the port
 is sound. Steps 3 and 4 could instead be done in the Python templates

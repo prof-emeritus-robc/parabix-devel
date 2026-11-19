@@ -19,7 +19,6 @@ SRC
     nfc_kernels.cpp
     nfc_tables.cpp
     nfd.cpp
-    normalization-generated.cpp
     normalization.cpp
 DEPS
     kernel.unicode

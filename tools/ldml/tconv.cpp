@@ -226,6 +226,10 @@ static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied b
                                    cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> BoundRegions("bound-regions",
+    cl::desc("With --lines (and --lines-regions), also apply in one run a transform whose conversion groups have contexts that "
+             "are not line-bound, bounded by the lines in the fused kernels and the engine (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> LinesRegions("lines-regions",
     cl::desc("With --lines, apply a transform whose components all support region scope (see --plan --lines) in one run "
              "over the whole input, each line a region of a mask (default on; --lines-regions=0 for one run per line)"),
@@ -1468,6 +1472,24 @@ protected:
         PabloAST * const follow = pb.createAnd(pb.createAdvance(spread, 1), inserted);
         PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, inserted), inserted);
         writeOutputStreamSet("Inherited", std::vector<PabloAST *>{pb.createOr(spread, runs)});
+    }
+};
+
+//  The starts and follows of the regions of a mask (its runs of 1 bits): the
+//  first positions of the runs, and the positions after them (outside the
+//  mask), as the regular expression engine takes regions (RE_context::
+//  matchStarts and matchFollows).
+class RegionEdges : public pablo::PabloKernel {
+public:
+    RegionEdges(LLVMTypeSystemInterface & ts, StreamSet * Regions, StreamSet * Starts, StreamSet * Follows)
+    : PabloKernel(ts, "RegionEdges", {Binding{"Regions", Regions}}, {Binding{"Starts", Starts}, Binding{"Follows", Follows}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const r = getInputStreamSet("Regions")[0];
+        PabloAST * const before = pb.createAdvance(r, 1);
+        writeOutputStreamSet("Starts", std::vector<PabloAST *>{pb.createAnd(r, pb.createNot(before))});
+        writeOutputStreamSet("Follows", std::vector<PabloAST *>{pb.createInFile(pb.createAnd(before, pb.createNot(r)))});
     }
 };
 
@@ -3097,6 +3119,101 @@ static bool hasConvertedSubgroup(const ldml::TransformStep & step, const std::ve
 }
 
 
+//  Whether the contexts of the rules of a conversion group are line-bound (see
+//  regionScope): they match a line within the text as they match the
+//  line taken as a text, without bounds at the line's ends.
+static bool groupLineBound(const ldml::TransformStep & step) {
+    //  A context is line-bound if it matches a line within the text as it
+    //  matches the line taken as a text: in the text, the position beyond the
+    //  line (after its end, or before its start) holds a line feed, or is
+    //  beyond the text.  An item of one position (a class, or an alternation or
+    //  difference of classes, see single) matches the line feed if its set has
+    //  it, and beyond the line if it has U+FFFF (as in ICU, see
+    //  UnicodeSet::matches) or the anchor of that end (Start in a before
+    //  context, End in an after one).  The outermost item of a context (the
+    //  last of an after context, the first of a before context) may reach the
+    //  position beyond the line, and must match both or neither; an inner item
+    //  must match neither, so that the outermost cannot reach past it.  A
+    //  lookaround (toward the outside of the context) of an item holds or fails
+    //  on the line feed as beyond the end if the item matches both or neither.
+    //  No item may match a mark of tconv's (which can stand for a position
+    //  outside a filter, e.g. FilterRunEndMark) or the deletion mark.  Other
+    //  constructs (e.g. anchors elsewhere) are not line-bound.
+    static const UCD::UnicodeSet marks = UCD::UnicodeSet(0xD800, 0xDFFF) + UCD::UnicodeSet(0xFDD0, 0xFDEF);
+    struct Single {
+        UCD::UnicodeSet set;
+        bool beyond = false;
+    };
+    std::function<std::optional<Single> (const re::RE *, bool)> single = [&](const re::RE * re, bool after) -> std::optional<Single> {
+        if (const re::CC * cc = llvm::dyn_cast<re::CC>(re)) return Single{*cc, cc->contains(0xFFFF)};
+        if (llvm::isa<re::Any>(re)) return Single{UCD::UnicodeSet(0, 0x10FFFF), false};
+        if ((after && llvm::isa<re::End>(re)) || (!after && llvm::isa<re::Start>(re))) return Single{UCD::UnicodeSet(), true};
+        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
+            if (n->getDefinition() == nullptr) return std::nullopt;
+            return single(n->getDefinition(), after);
+        }
+        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+            Single u;
+            for (const re::RE * r : *alt) {
+                const std::optional<Single> s = single(r, after);
+                if (!s) return std::nullopt;
+                u.set = u.set + s->set;
+                u.beyond |= s->beyond;
+            }
+            return u;
+        }
+        if (const re::Diff * d = llvm::dyn_cast<re::Diff>(re)) {
+            const std::optional<Single> l = single(d->getLH(), after), r = single(d->getRH(), after);
+            if (!l || !r) return std::nullopt;
+            return Single{l->set - r->set, l->beyond && !r->beyond};
+        }
+        return std::nullopt;
+    };
+    std::function<bool (const re::RE *, bool, bool)> lineBound = [&](const re::RE * re, bool after, bool outermost) -> bool {
+        if (re == nullptr) return true;
+        if (const std::optional<Single> s = single(re, after)) {
+            if (s->set.intersects(marks)) return false;
+            const bool lf = s->set.contains(0x0A);
+            return lf == s->beyond && (!lf || outermost);
+        }
+        if (const re::Seq * seq = llvm::dyn_cast<re::Seq>(re)) {
+            const size_t n = seq->size();
+            for (size_t i = 0; i < n; i++) {
+                const size_t outer = after ? n - 1 : 0;
+                if (!lineBound((*seq)[i], after, outermost && i == outer)) return false;
+            }
+            return true;
+        }
+        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+            for (const re::RE * r : *alt) if (!lineBound(r, after, outermost)) return false;
+            return true;
+        }
+        if (const re::Rep * rep = llvm::dyn_cast<re::Rep>(re)) return lineBound(rep->getRE(), after, false);
+        if (const re::Assertion * a = llvm::dyn_cast<re::Assertion>(re)) {
+            const auto toward = after ? re::Assertion::Kind::LookAhead : re::Assertion::Kind::LookBehind;
+            const std::optional<Single> s = single(a->getAsserted(), after);
+            return s && a->getKind() == toward && !s->set.intersects(marks) && s->set.contains(0x0A) == s->beyond;
+        }
+        if (const re::Capture * c = llvm::dyn_cast<re::Capture>(re)) return lineBound(c->getCapturedRE(), after, outermost);
+        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
+            return n->getDefinition() && lineBound(n->getDefinition(), after, outermost);
+        }
+        return false;
+    };
+    //  (The contexts as the engine matches them, with their variables expanded,
+    //  where the plan has them.)
+    auto contextsBound = [&](const re::RE * before, const re::RE * after, const re::RE * engineBefore, const re::RE * engineAfter) {
+        return lineBound(engineBefore ? engineBefore : before, false, true) && lineBound(engineAfter ? engineAfter : after, true, true);
+    };
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        if (!contextsBound(s.before, s.after, s.engineBefore, s.engineAfter)) return false;
+    }
+    for (const ldml::StringRule & r : step.stringRules) {
+        if (!contextsBound(r.before, r.after, r.engineBefore, r.engineAfter)) return false;
+    }
+    return true;
+}
+
 //  The MultipleCaptureMultipleReplacement rules whose before contexts the
 //  conversions of their group may make match differently in the converted text
 //  (or of which this is not known): their contexts are matched against the
@@ -4020,6 +4137,15 @@ struct FusedRulesConfig {
     //  The case mappings marked in the state given or by the subgroups (see
     //  CaseMapSplit), whose outcomes a correction kernel takes into account.
     std::set<unsigned> marks;
+    //  Region scope (see RulePipelineBuilder::boundRegions): InText gives the
+    //  positions of the regions (runs of 1 bits, not adjacent), and the
+    //  contexts are bounded by them.  An item of a context at a distance d from
+    //  the position matches as at that distance from the end (or start) of a text
+    //  when a position between them (or the item's own) is outside the region:
+    //  only if it is a boundary item.  In a correction kernel, the converted text
+    //  is walked back within the region (see stepBack), its first position
+    //  as the start of a text.
+    bool region = false;
 };
 
 //  The results of the rules of a conversion group, accumulated by its fused
@@ -5020,6 +5146,7 @@ private:
             }
         }
         if (c.coverage) s += "V";
+        if (c.region) s += "Rg";
         if (Mask) s += "K" + std::to_string(l.maskLookahead);
         if (Allowed) s += "A";
         s += "L" + std::to_string(l.lookahead) + "S";
@@ -5117,13 +5244,45 @@ void FusedRules::generatePabloMethod() {
         PabloAST * const c = getInputStreamSet("Classes")[f->second];
         return offset ? pb.createLookahead(c, offset) : c;
     };
-    //  The positions past the end of the text at an offset after them, and
-    //  those before the start of the text at an offset before them.
+    //  With regions (see FusedRulesConfig::region): the positions whose region
+    //  extends to the positions at each offset after (or before) them.
+    std::vector<PabloAST *> regionAhead{ones}, regionBehind{ones};
+    auto withinAhead = [&](unsigned offset) {
+        while (regionAhead.size() <= offset) {
+            const unsigned o = regionAhead.size();
+            regionAhead.push_back(pb.createAnd(regionAhead.back(), pb.createLookahead(inText, o)));
+        }
+        return regionAhead[offset];
+    };
+    auto withinBehind = [&](unsigned offset) {
+        while (regionBehind.size() <= offset) {
+            const unsigned d = regionBehind.size();
+            regionBehind.push_back(pb.createAnd(regionBehind.back(), pb.createAdvance(inText, d)));
+        }
+        return regionBehind[offset];
+    };
+    //  The positions past the end of the text (or region) at an offset after
+    //  them, and those before the start of the text (or region) at an offset
+    //  before them.
     auto pastEnd = [&](unsigned offset) {
+        if (mConfig.region) return pb.createInFile(pb.createNot(withinAhead(offset)));
         return pb.createInFile(pb.createNot(pb.createLookahead(inText, offset)));
     };
     auto beforeStart = [&](unsigned offset) {
+        if (mConfig.region) return pb.createInFile(pb.createNot(withinBehind(offset)));
         return pb.createInFile(pb.createNot(pb.createAdvance(ones, offset)));
+    };
+    //  A step back to the previous position, within the region (in a correction
+    //  kernel, where the converted text is walked back: a position outside the
+    //  region is as beyond the start of the text, firstPosition below).
+    auto stepBack = [&](PabloAST * v) {
+        PabloAST * const p = pb.createAdvance(v, 1);
+        return mConfig.region ? pb.createAnd(p, pb.createAdvance(inText, 1)) : p;
+    };
+    //  The positions within the region of the positions of C after those of M
+    //  (as MatchStar(M, C), not past the region).
+    auto regionStar = [&](PabloAST * M, PabloAST * C) {
+        return pb.createMatchStar(M, mConfig.region ? pb.createAnd(C, inText) : C);
     };
     //  The positions at which a before context matches the B items of one of
     //  its alternatives before them, and an after context those of one of its
@@ -5136,6 +5295,7 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k = 0; k < B; k++) {
                 const unsigned d = B - k;
                 PabloAST * item = pb.createAdvance(classAt(0, alt[k].chars), d);
+                if (mConfig.region) item = pb.createAnd(item, withinBehind(d));
                 if (alt[k].boundary) item = pb.createOr(item, beforeStart(d));
                 m = pb.createAnd(m, item);
             }
@@ -5147,6 +5307,7 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k = 0; k < alt.size(); k++) {
                 const unsigned o = afterOffset + k;
                 PabloAST * item = classAt(o, alt[k].chars);
+                if (mConfig.region) item = pb.createAnd(item, withinAhead(o));
                 if (alt[k].boundary) item = pb.createOr(item, pastEnd(o));
                 m = pb.createAnd(m, item);
             }
@@ -5581,7 +5742,8 @@ void FusedRules::generatePabloMethod() {
                     length[l] = v;
                 }
             }
-            PabloAST * const noneKeptBefore = pb.createInFile(pb.createNot(pb.createMatchStar(pb.createAdvance(kept, 1), ones)));
+            PabloAST * const noneKeptBefore = mConfig.region ? pb.createInFile(pb.createNot(regionStar(stepBack(kept), ones)))
+                                              : pb.createInFile(pb.createNot(pb.createMatchStar(pb.createAdvance(kept, 1), ones)));
             //  Whether the j-th last character of the converted text up to each
             //  position (j = 1, its last) is in a set (or, before the start of the
             //  text, whether the item holds there), for j = 1 .. depth.
@@ -5597,7 +5759,7 @@ void FusedRules::generatePabloMethod() {
                     return markedSlot(slotClass(i, inReplaced), i, item.chars);
                 };
                 auto previous = [&](PabloAST * v) {
-                    PabloAST * p = pb.createAdvance(v, 1);
+                    PabloAST * p = stepBack(v);
                     return item.boundary ? pb.createOr(p, firstPosition) : p;
                 };
                 while (V.size() < depth) {
@@ -5609,7 +5771,7 @@ void FusedRules::generatePabloMethod() {
                         x = pb.createOr(x, pb.createAnd(length[l], v));
                     }
                     //  A deleted position: as the position before it.
-                    PabloAST * carried = pb.createMatchStar(pb.createAnd(pb.createAdvance(x, 1), deleted), deleted);
+                    PabloAST * carried = pb.createMatchStar(pb.createAnd(stepBack(x), deleted), deleted);
                     if (item.boundary) carried = pb.createOr(carried, noneKeptBefore);
                     V.push_back(pb.createOr(x, pb.createAnd(deleted, carried)));
                 }
@@ -5652,7 +5814,7 @@ void FusedRules::generatePabloMethod() {
                     return std::make_pair(found, allS);
                 };
                 auto previous = [&](PabloAST * v) {
-                    PabloAST * p = pb.createAdvance(v, 1);
+                    PabloAST * p = stepBack(v);
                     return T.boundary ? pb.createOr(p, firstPosition) : p;
                 };
                 if (U.empty()) {
@@ -5664,10 +5826,11 @@ void FusedRules::generatePabloMethod() {
                         x = pb.createOr(x, pb.createAnd(length[l], w.first));
                         through = pb.createOr(through, pb.createAnd(length[l], w.second));
                     }
-                    PabloAST * carried = pb.createMatchStar(pb.createAdvance(x, 1), through);
+                    if (mConfig.region) through = pb.createAnd(through, inText);
+                    PabloAST * carried = pb.createMatchStar(stepBack(x), through);
                     if (T.boundary) {
                         PabloAST * const noneBefore = pb.createInFile(pb.createNot(
-                            pb.createMatchStar(pb.createAdvance(pb.createInFile(pb.createNot(through)), 1), ones)));
+                            regionStar(stepBack(pb.createInFile(pb.createNot(through))), ones)));
                         carried = pb.createOr(carried, noneBefore);
                     }
                     U.push_back(pb.createOr(x, pb.createAnd(through, carried)));
@@ -5686,7 +5849,7 @@ void FusedRules::generatePabloMethod() {
                         }
                         y = pb.createOr(y, pb.createAnd(length[l], v));
                     }
-                    PabloAST * carried = pb.createMatchStar(pb.createAnd(pb.createAdvance(y, 1), deleted), deleted);
+                    PabloAST * carried = pb.createMatchStar(pb.createAnd(stepBack(y), deleted), deleted);
                     if (T.boundary) carried = pb.createOr(carried, noneKeptBefore);
                     U.push_back(pb.createOr(y, pb.createAnd(deleted, carried)));
                 }
@@ -5706,10 +5869,10 @@ void FusedRules::generatePabloMethod() {
                         PabloAST * item;
                         bool boundary = alt[k].boundary;
                         if (alt[k].star) {
-                            item = pb.createAdvance(runIn(alt[k].chars, alt[k - 1], d), 1);
+                            item = stepBack(runIn(alt[k].chars, alt[k - 1], d));
                             boundary = alt[k - 1].boundary;
                         } else {
-                            item = pb.createAdvance(lastIn(alt[k], d), 1);
+                            item = stepBack(lastIn(alt[k], d));
                         }
                         if (boundary) item = pb.createOr(item, firstPosition);
                         m = pb.createAnd(m, item);
@@ -6052,7 +6215,7 @@ void FusedRules::generatePabloMethod() {
                     std::vector<PabloAST *> k;
                     for (unsigned j = 1; j <= item.depth; j++) {
                         PabloAST * const y = pb.createAnd(baseValue(pb, x, j, in, k), independent);
-                        k.push_back(pb.createMatchStar(pb.createOr(pb.createAdvance(y, 1), startOf(item, in)), j == 1 ? over1 : del0));
+                        k.push_back(pb.createMatchStar(pb.createOr(stepBack(y), startOf(item, in)), j == 1 ? over1 : del0));
                         const std::string suffix = std::to_string(varCount++);
                         vars[x].Y[in].push_back(pb.createVar("Y" + suffix, y));
                         vars[x].C[in].push_back(numIns ? pb.createVar("C" + suffix, y) : vars[x].Y[in].back());
@@ -6061,6 +6224,9 @@ void FusedRules::generatePabloMethod() {
                 }
             }
             Var * const KDel = pb.createVar("KDel", del0);
+            //  (With regions, the positions whose previous position is in the region:
+            //  the loop steps back only within the region, see stepBack.)
+            PabloAST * const previousInRegion = mConfig.region ? pb.createAdvance(inText, 1) : nullptr;
             Var * const Progress = pb.createVar("Progress", dep);
 
             //  Whether a converted subgroup's before context is known to hold at
@@ -6320,7 +6486,9 @@ void FusedRules::generatePabloMethod() {
                             Var * const K = vars[x].K[in][j - 1];
                             PabloAST * const y = newY[a++].second;
                             PabloAST * const over = (items[x].run && j == 1) ? wb.createOr(del, thru[x]) : del;
-                            PabloAST * const src = wb.createOr(wb.createOr(wb.createAdvance(y, 1), startOf(items[x], in)), K);
+                            PabloAST * back = wb.createAdvance(y, 1);
+                            if (previousInRegion) back = wb.createAnd(back, previousInRegion);
+                            PabloAST * const src = wb.createOr(wb.createOr(back, startOf(items[x], in)), K);
                             PabloAST * const kk = wb.createOr(K, wb.createMatchStar(src, over));
                             progress = wb.createOr(progress, wb.createAnd(kk, wb.createNot(K)));
                             wb.createAssign(K, kk);
@@ -8162,10 +8330,15 @@ public:
     //  stages of no kernels (for --kernel-counts: a transform that invokes them
     //  runs them as ICU stages, outside its pipelines).
     void omitICUBuiltIns() {mOmitICUBuiltIns = true;}
-    //  The lines of U21 as regions (see --lines and regionScopeProblem): a mask
+    //  The lines of U21 as regions (see --lines and regionScope): a mask
     //  of region scope, outside every filter, of the characters other than the
     //  line feeds, which pass through unchanged.
     void pushRegions(StreamSet * U21);
+    //  The contexts of the conversion groups that are not line-bound bounded by
+    //  the regions (see RegionScope::bounded): in the fused kernels, and by the
+    //  engine, with the starts and follows of the regions; such a group is not
+    //  applied by DivCode, nor the transforms by their shape groups.
+    void boundRegions() {mBoundRegions = true;}
 private:
     //  Filters.  As in ICU, a filter selects the characters of the text that a
     //  transform may change, once, when the transform is applied: the steps of
@@ -8185,6 +8358,12 @@ private:
     void pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21);
     void popFilter() {mMasks.pop();}
     StreamSet * activeMask() const {return mMasks.active();}
+    //  The positions of the regions (the mask of region scope, kept in step), if
+    //  their contexts are bounded (see boundRegions), or nullptr.
+    StreamSet * boundedRegions() const {
+        if (!mBoundRegions || mMasks.empty() || mMasks[0].scope != ContextScope::Region) return nullptr;
+        return mMasks[0].apply;
+    }
     //  The text of a stage, with the masks kept in step with its positions.
     StreamSet * inStep(const Staged & s) {
         mMasks.keepInStep(s.positions);
@@ -8270,6 +8449,9 @@ private:
     //  and the mask of the positions other than their placeholders.
     std::pair<char32_t, char32_t> mFrontLetters;
     StreamSet * mFrontLetterMask = nullptr;
+    bool mBoundRegions = false;
+    //  The starts and follows of the regions (see RegionEdges), by the regions' stream.
+    std::map<StreamSet *, std::pair<StreamSet *, StreamSet *>> mRegionEdges;
 };
 
 //  The rules of a conversion group, of all kinds.
@@ -8936,6 +9118,17 @@ StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * 
 //  filter (the active mask) as FilterRunEndName, if the pattern refers to them.
 RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pattern) {
     RE_context context{&cc::Unicode, U21};
+    //  (Matches, contexts and anchors within the regions, with bounded regions.)
+    if (StreamSet * const regions = boundedRegions()) {
+        auto & edges = mRegionEdges[regions];
+        if (edges.first == nullptr) {
+            edges.first = mP.CreateStreamSet(1);
+            edges.second = mP.CreateStreamSet(1);
+            mP.CreateKernelCall<RegionEdges>(regions, edges.first, edges.second);
+        }
+        context.matchStarts = edges.first;
+        context.matchFollows = edges.second;
+    }
     if (StreamSet * const mask = activeMask(); mask && usesExternal(pattern, FilterRunEndName)) {
         StreamSet * const outside = mP.CreateStreamSet(1);
         Invert(mP, mask, outside);
@@ -9295,9 +9488,13 @@ Staged RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step, Str
 }
 
 Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    //  With bounded regions (see boundRegions), the regions of a group whose
+    //  contexts are not line-bound: its fused kernels bound its contexts by them
+    //  (FusedRulesConfig::region), and it is not applied by DivCode.
+    StreamSet * const regions = groupLineBound(step) ? nullptr : boundedRegions();
     //  (A group without string rules: eligible only with rules whose before
     //  contexts are matched against the converted text, see planDivCodeGroup.)
-    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter) {
+    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter && !regions) {
         ldml::DivCodeOptions options;
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
@@ -9527,8 +9724,12 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         if (fusedMatch[r]) fr.yields = stringYields[r];
         return fr;
     };
-    StreamSet * const inText = P.CreateStreamSet(1);
-    P.CreateKernelCall<TextPositions>(U21, inText);
+    //  (With regions, the positions of the regions instead; see FusedRulesConfig::region.)
+    StreamSet * inText = regions;
+    if (inText == nullptr) {
+        inText = P.CreateStreamSet(1);
+        P.CreateKernelCall<TextPositions>(U21, inText);
+    }
     //  The classes of the sets that a fused kernel uses.
     //  Whether the group applies its case mappings by marks (see CaseMapSplit):
     //  not with captures, sequential selection, insertion or deferred rules,
@@ -9750,6 +9951,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             out.starts = state.starts;
         }
         StreamSet * const classes = fusedClasses(config);
+        config.region = regions != nullptr;
         P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowedAt, state, out, nullptr);
         state = out;
     };
@@ -10381,6 +10583,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 matching.startsByLength = byLengthOf;
                 StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
                 const FusedState none;
+                matching.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(matching), U21, classes, inText, mask, nullptr, previous, none, starts);
                 StreamSet * const selected = P.CreateStreamSet(1);
                 P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
@@ -10391,6 +10594,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 FusedState out;
                 for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
                 for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+                applying.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(applying), U21, classes, inText, mask, nullptr, previous, out, nullptr);
                 previous = out;
             }
@@ -10455,6 +10659,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 StreamSet * const matches = P.CreateStreamSet(chunkLengths.size());
                 const FusedState none;
                 StreamSet * const classes = fusedClasses(config);
+                config.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, nullptr, none, none, matches);
                 for (size_t k = 0; k < chunkLengths.size(); k++) {
                     byLength[lengthIndex(chunkLengths[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
@@ -10558,6 +10763,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 StreamSet * const matches = P.CreateStreamSet(chunk.size());
                 const FusedState none;
                 StreamSet * const classes = fusedClasses(config);
+                config.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, nullptr, none, none, matches);
                 for (size_t k = 0; k < chunk.size(); k++) firsts[index[chunk[k]]] = SelectStringMatches::Source{matches, static_cast<unsigned>(k)};
             }
@@ -11552,7 +11758,7 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
         //  (Within a filter, where the engine supports its passes within it, see
         //  RulePipelineBuilder::applyShapeStep.)
         const TransformAnalyzer::ShapeChoice & choice = shapeChoice(mRegistry, mAnalyzer, entry);
-        if (choice.any() && (!activeMask() || choice.appliesInFilter())) {
+        if (choice.any() && (!activeMask() || choice.appliesInFilter()) && !boundedRegions()) {
             const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
             mShapeChoice = &choice;
             U21 = applyAnalysis(a, U21);
@@ -12297,7 +12503,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
 
 static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                   TransformAnalyzer & analyzer, const ldml::TransformEntry * entry,
-                                                  bool regions = false) {
+                                                  bool regions = false, bool bounded = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
@@ -12305,6 +12511,7 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
     if (regions) builder.pushRegions(U21);
+    if (bounded) builder.boundRegions();
     StreamSet * const Result = builder.transform(entry, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
@@ -12574,7 +12781,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
 //  given its already-computed analysis (see TransformAnalyzer::analyzeRulesFile).
 static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                                TransformAnalyzer & analyzer, const TransformAnalysis & a,
-                                                               bool regions = false) {
+                                                               bool regions = false, bool bounded = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
@@ -12582,6 +12789,7 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
     if (regions) builder.pushRegions(U21);
+    if (bounded) builder.boundRegions();
     StreamSet * const Result = builder.applyAnalysis(a, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
@@ -12605,94 +12813,30 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 //  transform (within the mask) and the transforms it invokes are as well.  Each
 //  line is then a region; the line feeds, outside the mask, pass through
 //  unchanged.
-static std::string regionScopeProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                      const ldml::TransformEntry * entry);
+//  A conversion group whose contexts are not line-bound is supported too (step
+//  4): its contexts are then bounded by the regions (bounded, see
+//  RulePipelineBuilder::boundRegions), in the fused kernels (see
+//  FusedRulesConfig::region; also the before contexts matched against the
+//  converted text, in rounds or by the While loop) and by the engine (region
+//  starts and follows), and it is not applied by DivCode, shape groups or in
+//  UTF-8 mode.
+struct RegionScope {
+    std::string problem;
+    bool bounded = false;
+    bool supported() const {return problem.empty();}
+};
 
-static std::string regionScopeProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                      const TransformAnalysis & a) {
-    if (!a.implementable) return "not implementable by the regular plan";
-    //  A context is line-bound if it matches a line within the text as it
-    //  matches the line taken as a text: in the text, the position beyond the
-    //  line (after its end, or before its start) holds a line feed, or is
-    //  beyond the text.  An item of one position (a class, or an alternation or
-    //  difference of classes, see single) matches the line feed if its set has
-    //  it, and beyond the line if it has U+FFFF (as in ICU, see
-    //  UnicodeSet::matches) or the anchor of that end (Start in a before
-    //  context, End in an after one).  The outermost item of a context (the
-    //  last of an after context, the first of a before context) may reach the
-    //  position beyond the line, and must match both or neither; an inner item
-    //  must match neither, so that the outermost cannot reach past it.  A
-    //  lookaround (toward the outside of the context) of an item holds or fails
-    //  on the line feed as beyond the end if the item matches both or neither.
-    //  No item may match a mark of tconv's (which can stand for a position
-    //  outside a filter, e.g. FilterRunEndMark) or the deletion mark.  Other
-    //  constructs (e.g. anchors elsewhere) are not line-bound.
-    static const UCD::UnicodeSet marks = UCD::UnicodeSet(0xD800, 0xDFFF) + UCD::UnicodeSet(0xFDD0, 0xFDEF);
-    struct Single {
-        UCD::UnicodeSet set;
-        bool beyond = false;
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                               const ldml::TransformEntry * entry);
+
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                               const TransformAnalysis & a) {
+    RegionScope scope;
+    auto fail = [&](const std::string & p) {
+        scope.problem = p;
+        return scope;
     };
-    std::function<std::optional<Single> (const re::RE *, bool)> single = [&](const re::RE * re, bool after) -> std::optional<Single> {
-        if (const re::CC * cc = llvm::dyn_cast<re::CC>(re)) return Single{*cc, cc->contains(0xFFFF)};
-        if (llvm::isa<re::Any>(re)) return Single{UCD::UnicodeSet(0, 0x10FFFF), false};
-        if ((after && llvm::isa<re::End>(re)) || (!after && llvm::isa<re::Start>(re))) return Single{UCD::UnicodeSet(), true};
-        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
-            if (n->getDefinition() == nullptr) return std::nullopt;
-            return single(n->getDefinition(), after);
-        }
-        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
-            Single u;
-            for (const re::RE * r : *alt) {
-                const std::optional<Single> s = single(r, after);
-                if (!s) return std::nullopt;
-                u.set = u.set + s->set;
-                u.beyond |= s->beyond;
-            }
-            return u;
-        }
-        if (const re::Diff * d = llvm::dyn_cast<re::Diff>(re)) {
-            const std::optional<Single> l = single(d->getLH(), after), r = single(d->getRH(), after);
-            if (!l || !r) return std::nullopt;
-            return Single{l->set - r->set, l->beyond && !r->beyond};
-        }
-        return std::nullopt;
-    };
-    std::function<bool (const re::RE *, bool, bool)> lineBound = [&](const re::RE * re, bool after, bool outermost) -> bool {
-        if (re == nullptr) return true;
-        if (const std::optional<Single> s = single(re, after)) {
-            if (s->set.intersects(marks)) return false;
-            const bool lf = s->set.contains(0x0A);
-            return lf == s->beyond && (!lf || outermost);
-        }
-        if (const re::Seq * seq = llvm::dyn_cast<re::Seq>(re)) {
-            const size_t n = seq->size();
-            for (size_t i = 0; i < n; i++) {
-                const size_t outer = after ? n - 1 : 0;
-                if (!lineBound((*seq)[i], after, outermost && i == outer)) return false;
-            }
-            return true;
-        }
-        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
-            for (const re::RE * r : *alt) if (!lineBound(r, after, outermost)) return false;
-            return true;
-        }
-        if (const re::Rep * rep = llvm::dyn_cast<re::Rep>(re)) return lineBound(rep->getRE(), after, false);
-        if (const re::Assertion * a = llvm::dyn_cast<re::Assertion>(re)) {
-            const auto toward = after ? re::Assertion::Kind::LookAhead : re::Assertion::Kind::LookBehind;
-            const std::optional<Single> s = single(a->getAsserted(), after);
-            return s && a->getKind() == toward && !s->set.intersects(marks) && s->set.contains(0x0A) == s->beyond;
-        }
-        if (const re::Capture * c = llvm::dyn_cast<re::Capture>(re)) return lineBound(c->getCapturedRE(), after, outermost);
-        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
-            return n->getDefinition() && lineBound(n->getDefinition(), after, outermost);
-        }
-        return false;
-    };
-    //  (The contexts as the engine matches them, with their variables expanded,
-    //  where the plan has them.)
-    auto contextsBound = [&](const re::RE * before, const re::RE * after, const re::RE * engineBefore, const re::RE * engineAfter) {
-        return lineBound(engineBefore ? engineBefore : before, false, true) && lineBound(engineAfter ? engineAfter : after, true, true);
-    };
+    if (!a.implementable) return fail("not implementable by the regular plan");
     auto revisits = [](const ldml::RuleSide * result) {
         if (result == nullptr || !result->hasCursor()) return false;
         if (result->getCursorOffset() != 0) return true;
@@ -12702,53 +12846,56 @@ static std::string regionScopeProblem(const ldml::TransformRegistry & registry, 
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
-            if (used == nullptr) return "unknown transform " + step.transform.getText();
-            const std::string p = regionScopeProblem(registry, analyzer, used);
-            if (!p.empty()) return used->canonicalName + ": " + p;
+            if (used == nullptr) return fail("unknown transform " + step.transform.getText());
+            const RegionScope inner = regionScope(registry, analyzer, used);
+            if (!inner.supported()) return fail(used->canonicalName + ": " + inner.problem);
+            scope.bounded |= inner.bounded;
             continue;
         }
-        if (!step.insertions.empty()) return "insertion rules";
-        if (!step.deferred.empty() || !step.copyCaptures.empty()) return "deferred rules";
-        if (!step.prefixRuns.empty()) return "prefix runs";
-        if (!step.chainRevisitRules.empty()) return "chain revisits";
-        if (!step.markRunEditRules.empty()) return "mark run edits";
-        if (!step.captureReplacements.empty()) return "capture replacements";
-        if (step.hasFrontLetters || step.frontLettersEnd) return "front-letter revisits";
-        for (const ldml::CharMapSubgroup & s : step.subgroups) {
-            if (!contextsBound(s.before, s.after, s.engineBefore, s.engineAfter)) return "a context not bound to the line";
-        }
-        for (const ldml::StringRule & r : step.stringRules) {
-            if (!contextsBound(r.before, r.after, r.engineBefore, r.engineAfter)) return "a context not bound to the line";
-        }
+        if (!step.insertions.empty()) return fail("insertion rules");
+        if (!step.deferred.empty() || !step.copyCaptures.empty()) return fail("deferred rules");
+        if (!step.prefixRuns.empty()) return fail("prefix runs");
+        if (!step.chainRevisitRules.empty()) return fail("chain revisits");
+        if (!step.markRunEditRules.empty()) return fail("mark run edits");
+        if (!step.captureReplacements.empty()) return fail("capture replacements");
+        if (step.hasFrontLetters || step.frontLettersEnd) return fail("front-letter revisits");
         for (const ldml::ConversionRule * r : step.rules) {
-            if (revisits(r->getRightSide())) return "a rule with a revisit";
+            if (revisits(r->getRightSide())) return fail("a rule with a revisit");
+        }
+        if (!groupLineBound(step)) {
+            if (!BoundRegions) return fail("a context not bound to the line");
+            scope.bounded = true;
         }
     }
-    return "";
+    return scope;
 }
 
-static std::string regionScopeProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                      const ldml::TransformEntry * entry) {
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                               const ldml::TransformEntry * entry) {
     if (entry->isBuiltIn()) {
         static const std::vector<std::string> supported = {
             "Any-Null", "Any-Upper", "Any-Lower", "Any-Title", "Any-NFD", "Any-NFKD", "Any-NFC", "Any-NFKC",
             "Any-Remove", "Any-Hex", "Any-Hex/Java", "Any-Hex/Unicode", "Any-Hex/C", "Any-Hex/XML", "Any-Hex/XML10",
             "Any-Hex/Perl"};
-        if (std::find(supported.begin(), supported.end(), entry->canonicalName) != supported.end()) return "";
-        return "the built-in " + entry->canonicalName;
+        if (std::find(supported.begin(), supported.end(), entry->canonicalName) != supported.end()) return RegionScope();
+        RegionScope s;
+        s.problem = "the built-in " + entry->canonicalName;
+        return s;
     }
-    return regionScopeProblem(registry, analyzer, analyzer.analyze(entry));
+    return regionScope(registry, analyzer, analyzer.analyze(entry));
 }
 
 //  The line printed by --plan --lines.
-static void printRegionScope(const std::string & problem) {
-    toolio::out() << "  region scope (--lines): " << (problem.empty() ? "supported, one run" : "per-line runs: " + problem) << "\n";
+static void printRegionScope(const RegionScope & scope) {
+    toolio::out() << "  region scope (--lines): "
+                  << (!scope.supported() ? "per-line runs: " + scope.problem
+                      : scope.bounded ? "supported, one run, contexts bounded by the lines" : "supported, one run") << "\n";
 }
 
 //  Applies a transform function to the input: the whole text, or with --lines,
 //  each line as a text of its own (given through a pipe), followed by its line
 //  break; with regions, the function applies to each line as a region of the
-//  whole text (see regionScopeProblem), in one run.
+//  whole text (see regionScope), in one run.
 static void applyToInput(const std::function<void (int)> & fn, int fd, bool regions = false) {
     if (!Lines || regions) {
         fn(fd);
@@ -14859,7 +15006,7 @@ static int run(int argc, char *argv[]) {
         if (DivCodeReport) return printDivCodeReportOf(RulesFile, a);
         if (ShowPlan) {
             printPlan("rules file " + RulesFile, a);
-            if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, a));
+            if (Lines) printRegionScope(regionScope(registry, analyzer, a));
             return a.implementable ? 0 : 2;
         }
         //  Not implementable: applied by ICU (unless --use-ICU=0).
@@ -14910,10 +15057,13 @@ static int run(int argc, char *argv[]) {
             applyToInput(runner, MainInput.fd);
             return finishOutput();
         }
-        //  (With --lines, the lines as regions where every component supports it.)
-        const bool regions = Lines && LinesRegions && regionScopeProblem(registry, analyzer, a).empty();
+        //  (With --lines, the lines as regions where every component supports it;
+        //  with contexts bounded by them, in Unicode mode.)
+        const RegionScope scope = regionScope(registry, analyzer, a);
+        const bool regions = Lines && LinesRegions && scope.supported();
+        const bool bounded = regions && scope.bounded;
         //  (In UTF-8 mode, where its steps can be: see TransformAnalyzer::mode.)
-        if (UTF8Mode && analyzer.modeOf(a).utf8) {
+        if (UTF8Mode && analyzer.modeOf(a).utf8 && !bounded) {
             auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
             StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
             P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
@@ -14925,7 +15075,7 @@ static int run(int argc, char *argv[]) {
             applyToInput(pipelineRunner(P.compile()), MainInput.fd, regions);
             return finishOutput();
         }
-        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a, regions);
+        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a, regions, bounded);
         applyToInput(pipelineRunner(fn), MainInput.fd, regions);
         return finishOutput();
     }
@@ -14993,7 +15143,7 @@ static int run(int argc, char *argv[]) {
                         printShapeStep(step);
                     }
                 }
-                if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
+                if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
                 return 0;
             }
             //  (The transforms invoked by their shape groups, within filters
@@ -15015,17 +15165,17 @@ static int run(int argc, char *argv[]) {
                 printPlan(label, a, &shapeChoice(registry, analyzer, entry), note);
                 if (!groups.applicable) toolio::out() << "  (not entirely by shape groups: " << groups.reason << ")\n";
                 printMode(analyzer, entry);
-                if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
+                if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
                 return 0;
             }
             printPlan(label, a);
             toolio::out() << "  not by shape groups: " << groups.reason << "\n";
-            if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
+            if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
             return 2;
         }
         printPlan(label, a);
         if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry);
-        if (Lines) printRegionScope(regionScopeProblem(registry, analyzer, entry));
+        if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
@@ -15111,10 +15261,12 @@ static int run(int argc, char *argv[]) {
                         && impl->second != Transform::Remove;
     //  (With --lines, the lines as regions where every component supports it,
     //  by the rule pipeline.)
-    const bool regions = Lines && LinesRegions && regionScopeProblem(registry, analyzer, entry).empty();
+    const RegionScope scope = regionScope(registry, analyzer, entry);
+    const bool regions = Lines && LinesRegions && scope.supported();
+    const bool bounded = regions && scope.bounded;
     TransformFunctionType fn = direct && !regions ? generatePipeline(driver, impl->second)
-                               : (UTF8Mode && analyzer.mode(entry).utf8) ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
-                               : generateRulePipeline(driver, registry, analyzer, entry, regions);
+                               : (UTF8Mode && analyzer.mode(entry).utf8 && !bounded) ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
+                               : generateRulePipeline(driver, registry, analyzer, entry, regions, bounded);
     applyToInput(pipelineRunner(fn), MainInput.fd, regions);
     return finishOutput();
 }

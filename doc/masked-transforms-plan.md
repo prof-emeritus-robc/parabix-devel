@@ -7,7 +7,9 @@ case-map marks (c85065bb7). Step 2, the pipeline-level `TransformMask` with
 position maps, is done in tconv (`TransformMask`, `PositionMap`,
 `TransformMasks` in `tools/ldml/tconv.cpp`). Step 3, `--lines` in one run for
 the transforms whose components support region scope, is done
-(`regionScopeProblem`, `pushRegions`, `--lines-regions`).
+(`regionScope`, `pushRegions`, `--lines-regions`). Step 4, contexts bounded by
+the regions in the fused kernels (correction kernels included) and the engine,
+is done (`boundRegions`, `FusedRulesConfig::region`, `--bound-regions`).
 
 ## Goal
 
@@ -181,6 +183,36 @@ transforms it can affect, and against ICU.
 4. **Fused kernels and DivCode with region scope.** Bounded before and after
    contexts, the While loop's start and run items, and the correction kernel's
    rounds. Test with rules files whose contexts reach across line boundaries.
+
+   Done for the fused kernels and the engine; DivCode is not used for a bounded
+   group. A conversion group whose contexts are not line-bound (step 3) is
+   applied with its contexts bounded by the regions (`RegionScope::bounded`,
+   `--plan --lines`: "contexts bounded by the lines"); `--bound-regions=0`
+   keeps step 3's per-line runs for them.
+   - **Fused kernels** (`FusedRulesConfig::region`): InText gives the region
+     positions. An item at distance d holds only if every position between it
+     and the match is in the region; otherwise it holds as beyond the end (or
+     start) of a text, only if it is a boundary item.
+   - **Correction kernels**: the converted text is walked back within the
+     region (`stepBack`; deletion carries and possessive runs stop at its
+     start), and the first position of a region is the start of a text
+     (`firstPosition`), in the rounds and in the While loop (whose initial and
+     loop steps back are bounded alike; the values outside the regions stay 0).
+   - **Engine**: the region starts and follows (`RegionEdges`) as
+     `RE_context::matchStarts` and `matchFollows` (step 5).
+   - A bounded group is not applied by DivCode, the transform not by its shape
+     groups, and not in UTF-8 mode (the fused path gives the same output).
+
+   Of the 252 CLDR transforms with test data, 228 are now applied in one run
+   (112 after step 3), 116 of them with bounded contexts; the others have
+   capture replacements, prefix runs, insertion or deferred rules. On the test
+   data of the 116, one run gives the output of the per-line runs, also with
+   `-thread-num=4 -segment-size=1`. `tconv_lines_regions_test` has rules files
+   whose contexts reach across lines (after and before, the engine's, and
+   before contexts matched against the converted text, which differ without
+   the bounds). Warm run times, per-line runs to one run: zh-t-es 2.86 s to
+   0.17 s, zh-t-es-419 2.46 s to 0.18 s, ja-t-es-419 2.42 s to 0.08 s,
+   zh-t-es-fonipa 0.83 s to 0.16 s (3514 lines each).
 5. **Engine regions.** Done, for regions that are not adjacent. The engine
    confines matches, lookaheads and lookbehinds to the regions given by start and
    follow streams (see Engine regions above). icgrep's lines were checked on

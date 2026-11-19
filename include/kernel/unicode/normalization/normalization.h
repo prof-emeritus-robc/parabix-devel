@@ -238,7 +238,10 @@ StreamSet * NFC_MaskStreams(PipelineBuilder & P, StreamSet * In, StreamSet * Mas
 //  from NFC_Tables for that basis: no conversion to UTF-8.  With a Mask (a
 //  stream of the positions of U21), each run of it normalized by itself, the
 //  others unchanged; OutputMask, if given, receives the mask over the result.
-StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr);
+//  Focused (the work regions filtered by character, transformed and placed back)
+//  or in place.
+StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr,
+                    bool focus = true);
 void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates);
 //
 //  Compute a mask for final work placement, given

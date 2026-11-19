@@ -1066,6 +1066,45 @@ std::map<codepoint_t, unsigned> u21Insertions() {
     return ins;
 }
 
+//  The work of a focused NFC on the 21-bit basis (as NFC_Focus by character):
+//  the candidates, the characters before them, and those to expand.
+class U21Focus final : public PabloKernel {
+public:
+    U21Focus(LLVMTypeSystemInterface & ts, StreamSet * Candidates, StreamSet * Work)
+    : PabloKernel(ts, "NFC21_Focus", {Binding{"Candidates", Candidates, FixedRate(), LookAhead(1)}}, {Binding{"Work", Work}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> c = getInputStreamSet("Candidates");
+        PabloAST * const work = pb.createOr3(c[0], pb.createLookahead(c[0], 1), c[1]);
+        writeOutputStreamSet("Work", std::vector<PabloAST *>{pb.createInFile(work)});
+    }
+};
+
+//  The insertion amounts of the working space (see u21Insertions), at the
+//  characters of restriction (if any), or nullptr if none are needed.
+StreamSet * u21InsertionBixNum(PipelineBuilder & P, StreamSet * U21, StreamSet * restriction) {
+    const std::map<codepoint_t, unsigned> ins = u21Insertions();
+    unsigned maxIns = 0;
+    for (const auto & e : ins) maxIns = std::max(maxIns, e.second);
+    unsigned bits = 0;
+    while ((maxIns >> bits) != 0) bits++;
+    if (bits == 0) return nullptr;
+    std::vector<re::CC *> ccs;
+    for (unsigned b = 0; b < bits; b++) {
+        UnicodeSet set;
+        for (const auto & e : ins) if ((e.second >> b) & 1) set.insert(e.first);
+        ccs.push_back(re::makeCC(set, &cc::Unicode));
+    }
+    StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
+    if (restriction) {
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, StreamMask{restriction, MaskKind::Zeroing}, InsertBixNum);
+    } else {
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, InsertBixNum);
+    }
+    return InsertBixNum;
+}
+
 }
 
 bool NFC_CxxKernels() {
@@ -1165,31 +1204,16 @@ void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Ca
     }
 }
 
-StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask) {
+//  NFC of a 21-bit basis in its working space: the result (compressed and
+//  sorted), and Valid, the positions of the working space that remain.
+static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask, StreamSet *& Valid) {
     const NFC_Tables & T = tables();
     //  The working space: room for the decompositions and the marks of overrides
     //  (within the mask).
-    const std::map<codepoint_t, unsigned> ins = u21Insertions();
-    unsigned maxIns = 0;
-    for (const auto & e : ins) maxIns = std::max(maxIns, e.second);
-    unsigned bits = 0;
-    while ((maxIns >> bits) != 0) bits++;
     StreamSet * Working = U21;
     StreamSet * SpreadMask = nullptr;
     StreamSet * WorkingMask = Mask;
-    if (bits > 0) {
-        std::vector<re::CC *> ccs;
-        for (unsigned b = 0; b < bits; b++) {
-            UnicodeSet set;
-            for (const auto & e : ins) if ((e.second >> b) & 1) set.insert(e.first);
-            ccs.push_back(re::makeCC(set, &cc::Unicode));
-        }
-        StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
-        if (Mask) {
-            P.CreateKernelCall<CharClassesKernel>(ccs, U21, StreamMask{Mask, MaskKind::Zeroing}, InsertBixNum);
-        } else {
-            P.CreateKernelCall<CharClassesKernel>(ccs, U21, InsertBixNum);
-        }
+    if (StreamSet * const InsertBixNum = u21InsertionBixNum(P, U21, Mask)) {
         SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
         Working = P.CreateStreamSet(21, 1);
@@ -1261,7 +1285,7 @@ StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, Stre
         SourceNull = P.CreateStreamSet(1);
         AndCombine(P, SourceZero, SpreadMask, SourceNull);
     }
-    StreamSet * const Valid = P.CreateStreamSet(1);
+    Valid = P.CreateStreamSet(1);
     OrCombine(P, NonZero, SourceNull, Valid);
     StreamSet * const Compressed = P.CreateStreamSet(21, 1);
     FilterByMask(P, Valid, Translated, Compressed);
@@ -1283,4 +1307,65 @@ StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, Stre
     StreamSet * const Sorted = P.CreateStreamSet(21, 1);
     SortRuns(P, NonZeroCCC, CCC_Basis, Compressed, Sorted);
     return Sorted;
+}
+
+//  NFC of a 21-bit basis: in place, U21_Transform of the whole text; focused, of
+//  its work regions (U21Focus, within the mask: the characters before the
+//  candidates are kept even outside it, inert, so that the regions do not
+//  compose across their seams), placed in the output as NFC_WorkPlacement
+//  places the UTF-8 work: the source expanded by the same insertions at the
+//  work, with the valid positions of the working space at the work.
+StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask, bool focus) {
+    StreamSet * Valid = nullptr;
+    if (!focus) return U21_Transform(P, U21, Mask, OutputMask, Valid);
+    StreamSet * const Candidates = P.CreateStreamSet(2);
+    std::vector<re::CC *> ccs{re::makeCC(tables().candidate_class, &cc::Unicode), re::makeCC(tables().expansion_required_class, &cc::Unicode)};
+    if (Mask) {
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, StreamMask{Mask, MaskKind::Zeroing}, Candidates);
+    } else {
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, Candidates);
+    }
+    StreamSet * const Work = P.CreateStreamSet(1);
+    P.CreateKernelCall<U21Focus>(Candidates, Work);
+    SHOW_STREAM(Work);
+    StreamSet * const Focused = P.CreateStreamSet(21, 1);
+    FilterByMask(P, Work, U21, Focused);
+    StreamSet * FocusedMask = nullptr;
+    if (Mask) {
+        FocusedMask = P.CreateStreamSet(1);
+        FilterByMask(P, Work, Mask, FocusedMask);
+    }
+    StreamSet * const TransformedMask = OutputMask ? P.CreateStreamSet(1) : nullptr;
+    StreamSet * const Transformed = U21_Transform(P, Focused, FocusedMask, TransformedMask, Valid);
+    //  The placement of the transformed characters in the output.
+    StreamSet * restriction = Work;
+    if (Mask) {
+        restriction = P.CreateStreamSet(1);
+        AndCombine(P, Work, Mask, restriction);
+    }
+    StreamSet * ExpandedWork = Work;
+    if (StreamSet * const InsertBixNum = u21InsertionBixNum(P, U21, restriction)) {
+        StreamSet * const SourceExpansion = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertBixNum, SourceExpansion, kernel::InsertPosition::After);
+        ExpandedWork = P.CreateStreamSet(1);
+        ExpandFilter(P, SourceExpansion, Work, ExpandedWork);
+    }
+    StreamSet * const Final = P.CreateStreamSet(1);
+    ExpandFilter(P, ExpandedWork, Valid, Final);
+    StreamSet * const Placement = P.CreateStreamSet(1);
+    FilterByMask(P, Final, ExpandedWork, Placement);
+    SHOW_STREAM(Placement);
+    //  The unmodified characters, and the output.
+    StreamSet * const NotWork = P.CreateStreamSet(1);
+    P.CreateKernelCall<bixnum::EQ_immediate>(Work, 0, NotWork);
+    StreamSet * const Unmodified = P.CreateStreamSet(21, 1);
+    FilterByMask(P, NotWork, U21, Unmodified);
+    StreamSet * const Output = P.CreateStreamSet(21, 1);
+    MergeByMask(P, Placement, Transformed, Unmodified, Output);
+    if (OutputMask) {
+        StreamSet * const UnmodifiedMask = P.CreateStreamSet(1);
+        FilterByMask(P, NotWork, Mask, UnmodifiedMask);
+        MergeByMask(P, Placement, TransformedMask, UnmodifiedMask, OutputMask);
+    }
+    return Output;
 }

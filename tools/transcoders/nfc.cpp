@@ -226,7 +226,7 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
             Result = P.CreateStreamSet(21, 1);
             FilterByMask(P, index, Decoded, Result);
         } else {
-            Result = NFC_U21(P, U21, Mask21, OutputMask);
+            Result = NFC_U21(P, U21, Mask21, OutputMask, NFC.getOptions().Focus);
         }
         if (OutputMask) {
             StreamSet * selected = OutputMask;

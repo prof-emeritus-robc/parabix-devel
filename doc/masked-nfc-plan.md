@@ -583,6 +583,39 @@ on the CLDR transforms that use NFC.
    focused U21 NFC (the work regions filtered by character, with the
    placement replayed as `NFC_WorkPlacement` does) is needed before U21 can
    replace the conversion in general (step 6).
+
+   Focused U21 (2026-11-19): `NFC_U21(…, focus)`, focused by default, `nfc
+   -nfc-u21 [-NoFocus]`.
+   - **Work:** the candidates (within the mask), the characters before them
+     (kept even outside the mask, inert), and those to expand (`U21Focus`, by
+     character).
+   - **Transform:** the work is filtered by character (the mask with it), and
+     `U21_Transform` (the in-place transform, which also gives the valid
+     positions of its working space) runs on it.
+   - **Placement:** as `NFC_WorkPlacement`: the source expanded by the same
+     insertions at the work (∧ the mask), the working space's valid positions
+     put at the work (`ExpandFilter`), and the result filtered to the output
+     positions.
+   - **Output:** `MergeByMask` of the transformed and the unmodified
+     characters, and likewise the output mask.
+
+   It gives the reference NFC on every input, and with the five masks the
+   masked reference: focused, in place, and focused with `-thread-num=4
+   -segment-size=1`, with the output mask's selections. Without the seam rule
+   it differs on 363 to 21,821 lines per mask and input.
+
+   Warm run times, U21 focused / U21 in place / via UTF-8 (focused) / UTF-8
+   focused alone (the U21 runs include the decoding and encoding of the
+   input):
+
+   | Text | U21 focused | U21 in place | via UTF-8 (focused) | UTF-8 focused alone |
+   |---|---|---|---|---|
+   | sparse (10 MB) | 0.08 s | 0.14 s | 0.08 s | 0.06 s |
+   | dense Vietnamese (10 MB) | 0.10 s | 0.12 s | 0.12 s | 0.10 s |
+   | random (2.7 MB) | 0.06 s | 0.06 s | 0.10 s | 0.09 s |
+
+   Focused U21 matches or beats the route through UTF-8 on every text, so it
+   can replace the conversion in tconv's Unicode mode (step 6).
 6. **tconv.**
    - Unicode mode: masked NFC in U21 mode, with the position map from the
      output mask, replacing `barrierNormalization` for NFC and NFKC (masked

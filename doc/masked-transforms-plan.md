@@ -229,6 +229,27 @@ transforms it can affect, and against ICU.
 6. **Normalization with a mask**, replacing the barrier substitution in
    `barrierNormalization`. One masked NFD/NFC kernel set, shared by every
    filter.
+
+   Done for NFD and NFKD in Unicode mode (`--masked-normalization`, default
+   on): `NFD_U21_Pipeline` and `NFKD_U21_Pipeline` take a mask. Only the
+   characters of the mask are decomposed (masked class kernels in
+   `U21_CharToShortStringPipeline`, and `LVT2NFD` for the Hangul syllables),
+   and only the runs of nonzero combining classes within it are sorted, so a
+   character outside it is unchanged and nothing moves across it. The positions
+   inserted for a decomposition belong to the run of the character it
+   decomposes (the spread mask is returned for the position map). FCD uses it
+   too. On the CLDR test data of the 112 transforms with NFD, NFKD or FCD under a
+   filter, the output equals the barrier substitution's (also multithreaded and
+   with `--lines`); el-Latn-t-el-m0-bgn: 83 to 75 kernels.
+   Remaining:
+   - **UTF-8 mode** (95 of those 112 transforms) still substitutes barriers
+     (`UTF8PipelineBuilder::maskedNormalization`). A mask on the byte-level
+     focused NFD needs work regions within the runs of the mask, with no
+     reordering across the seams of the focused stream.
+   - **NFC, NFKC and FCC** still substitute barriers. Their composition kernels
+     are generated (`scripts/UCD/nfc_generator.py`); a mask needs the pairs
+     composed only within a run (the pair finding, long composition and Hangul
+     composition).
 7. **Filters through the interface.** Fold `OutsideMask`, `FilterRunEndMark` and
    the insertion eligibility into text scope, and retire the special cases one at
    a time.

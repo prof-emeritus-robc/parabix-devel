@@ -327,9 +327,16 @@ public:
     // Mark the last byte (Advance) or the first byte (LookAhead) of each UTF-8 sequence.
     void setBitMovement(pablo::BitMovementMode m) { mBitMovement = m; }
 
-    StreamSet * NFD_U21_Pipeline(StreamSet * U21_Basis);
+    //  NFD (NFKD) of a 21-bit basis.  With a mask (a stream of the positions of
+    //  U21_Basis), each run of the mask is normalized by itself: only its
+    //  characters are decomposed and reordered, and the characters outside it
+    //  are unchanged and act as barriers (no character moves across them).
+    //  SpreadMask, if given, receives the spread mask of the positions inserted
+    //  for the decompositions (0 at them; nullptr if none can be), each after
+    //  the character it decomposes.
+    StreamSet * NFD_U21_Pipeline(StreamSet * U21_Basis, StreamSet * Mask = nullptr, StreamSet ** SpreadMask = nullptr);
 
-    StreamSet * NFKD_U21_Pipeline(StreamSet * U21_Basis);
+    StreamSet * NFKD_U21_Pipeline(StreamSet * U21_Basis, StreamSet * Mask = nullptr, StreamSet ** SpreadMask = nullptr);
 
     void DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * workItems);
 

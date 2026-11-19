@@ -159,6 +159,10 @@ static cl::opt<bool> ConvertedContextWhile("converted-context-while",
              "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
              "§1; default on, --converted-context-while=0 for the rounds)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> MaskedNormalization("masked-normalization",
+    cl::desc("Normalize to NFD or NFKD within a filter by the masked NFD pipeline (NFD_PipelineBuilder::NFD_U21_Pipeline "
+             "with a mask), rather than with the characters outside the filter replaced by barriers (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> FusedPriority("fused-priority",
     cl::desc("Match the earlier rules that a rule yields to at the same position (see TransformStep::stringPriority) "
              "in the fused kernels, where their contexts are fused contexts (default on; 0: by the regular expression "
@@ -8623,6 +8627,19 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
 //  (within the active mask, if any) rather than of the active mask.
 Staged RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection) {
     StreamSet * const selected = selection ? combine(selection, activeMask(), false) : activeMask();
+    //  NFD and NFKD by the masked pipeline (--masked-normalization): each run of
+    //  the selected characters decomposed and ordered by itself, the others
+    //  unchanged (as barriers); the positions inserted for the decompositions
+    //  belong to the runs of the characters they follow.
+    if (MaskedNormalization && (name == "Any-NFD" || name == "Any-NFKD")) {
+        StreamSet * SpreadMask = nullptr;
+        StreamSet * const Result = name == "Any-NFD" ? mNFD.NFD_U21_Pipeline(U21, selected, &SpreadMask)
+                                                     : mNFD.NFKD_U21_Pipeline(U21, selected, &SpreadMask);
+        if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
+        PositionMap positions;
+        if (SpreadMask) positions.insert(SpreadMask);
+        return Staged(Result, std::move(positions));
+    }
     return barrierNormalization(name, U21, selected);
 }
 

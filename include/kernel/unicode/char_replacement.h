@@ -52,9 +52,16 @@ kernel::StreamSet * U21_CharMapPipeline(
 //  (b) CCs that represent the bit value of the second or subsequent
 //      character of the replacement string.
 
+//  With a mask (a stream of the positions of U21_basis), only the characters
+//  at its positions are transformed; the others are unchanged.  SpreadMask, if
+//  given, receives the spread mask of the insertions (nullptr if none can be
+//  made: 0 at the positions inserted, see InsertionSpreadMask).
+
 kernel::StreamSet *  U21_CharToShortStringPipeline(
     kernel::PipelineBuilder & P,
     unicode::BitTranslationSets & insert_length_bixnum,
     std::vector<unicode::BitTranslationSets> & char_xlat_bitsets_by_position,
-    kernel::StreamSet * U21_basis);
+    kernel::StreamSet * U21_basis,
+    kernel::StreamSet * Mask = nullptr,
+    kernel::StreamSet ** SpreadMask = nullptr);
 

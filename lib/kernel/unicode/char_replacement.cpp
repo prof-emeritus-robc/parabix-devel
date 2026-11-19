@@ -86,11 +86,21 @@ StreamSet * U21_CharMapPipeline(PipelineBuilder & P,
 StreamSet * U21_CharToShortStringPipeline(PipelineBuilder & P,
     unicode::BitTranslationSets & insert_length_bixnum,
     std::vector<unicode::BitTranslationSets> & char_xlat_bitsets_by_position,
-    StreamSet * U21_basis) {
+    StreamSet * U21_basis,
+    StreamSet * Mask,
+    StreamSet ** SpreadMaskOut) {
 
     unsigned bix_bits = insert_length_bixnum.size();
 
     StreamSet * SpreadMask = nullptr;
+    //  (With a mask: the classes of the characters within it.)
+    auto classes = [&](std::vector<re::CC *> ccs, StreamSet * basis, StreamSet * mask, StreamSet * out) {
+        if (mask) {
+            P.CreateKernelCall<CharClassesKernel>(std::move(ccs), basis, StreamMask{mask, MaskKind::Zeroing}, out);
+        } else {
+            P.CreateKernelCall<CharClassesKernel>(std::move(ccs), basis, out);
+        }
+    };
 
     StreamSet * U21 = U21_basis;
     if (bix_bits > 0) {
@@ -99,7 +109,7 @@ StreamSet * U21_CharToShortStringPipeline(PipelineBuilder & P,
             insertion_ccs.push_back(re::makeCC(b, &cc::Unicode));
         }
         StreamSet * InsertBixNum = P.CreateStreamSet(bix_bits);
-        P.CreateKernelCall<CharClassesKernel>(insertion_ccs, U21, InsertBixNum);
+        classes(insertion_ccs, U21, Mask, InsertBixNum);
         SHOW_BIXNUM(InsertBixNum);
 
         SpreadMask = P.CreateStreamSet(1);
@@ -110,7 +120,13 @@ StreamSet * U21_CharToShortStringPipeline(PipelineBuilder & P,
         SpreadByMask(P, SpreadMask, U21, ExpandedBasis);
         SHOW_BIXNUM(ExpandedBasis);
         U21 = ExpandedBasis;
+        if (Mask) {
+            StreamSet * const ExpandedMask = P.CreateStreamSet(1);
+            SpreadByMask(P, SpreadMask, Mask, ExpandedMask);
+            Mask = ExpandedMask;
+        }
     }
+    if (SpreadMaskOut) *SpreadMaskOut = SpreadMask;
 
     StreamSet * ResultBasis = U21;
 
@@ -120,7 +136,7 @@ StreamSet * U21_CharToShortStringPipeline(PipelineBuilder & P,
             xfrm_ccs.push_back(re::makeCC(b, &cc::Unicode));
         }
         StreamSet * BitXfmrs = P.CreateStreamSet(xfrm_ccs.size());
-        P.CreateKernelCall<CharClassesKernel>(xfrm_ccs, U21, BitXfmrs);
+        classes(xfrm_ccs, U21, Mask, BitXfmrs);
         SHOW_BIXNUM(BitXfmrs);
 
         StreamSet * XfrmdBasis = P.CreateStreamSet(21, 1);

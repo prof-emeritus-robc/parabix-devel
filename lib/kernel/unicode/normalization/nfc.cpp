@@ -83,7 +83,7 @@ void NFC_WorkingSpaceTransform(PipelineBuilder & P, StreamSet * ExpansionMask, S
     SHOW_STREAM(SourceNull);
 
     StreamSet * EC_Basis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<ExcludedCompositeStage>(U8_Basis, EC_Basis);
+    NFC_ExcludedComposites(P, U8_Basis, EC_Basis);
     SHOW_BIXNUM(EC_Basis);
 
     re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
@@ -98,15 +98,15 @@ void NFC_WorkingSpaceTransform(PipelineBuilder & P, StreamSet * ExpansionMask, S
     SHOW_STREAM(ccc_NR);
 
     StreamSet * CanonBasis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<SingletonCanonicalization>(EC_Basis, CanonBasis);
+    NFC_Singletons(P, EC_Basis, CanonBasis);
     SHOW_BIXNUM(CanonBasis);
 
     StreamSet * ShortBasis = P.CreateStreamSet(8, 1);
-    ShortComposablePipeline(P, CanonBasis, ShortBasis);
+    NFC_ShortComposables(P, CanonBasis, ShortBasis);
     SHOW_BIXNUM(ShortBasis);
 
     StreamSet * FinalBasis = P.CreateStreamSet(8, 1);
-    LongComposablePipeline(P, ShortBasis, ccc_NR, FinalBasis);
+    NFC_LongComposables(P, ShortBasis, ccc_NR, FinalBasis);
     SHOW_BIXNUM(FinalBasis);
 
     StreamSet * L_V_T =  P.CreateStreamSet(Hangul_Composables::HC_Kind::Count);
@@ -162,7 +162,7 @@ void NFC_WorkingSpaceTransform(PipelineBuilder & P, StreamSet * ExpansionMask, S
 
 void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask) {
     StreamSet * NFC_Candidates = P.CreateStreamSet(2, 1);
-    P.CreateKernelCall<NFC_CandidateClass>(U8_Basis, NFC_Candidates);
+    NFC_CandidateClasses(P, U8_Basis, NFC_Candidates);
     SHOW_BIXNUM(NFC_Candidates);
 
     StreamSet * NFC_WorkItems = P.CreateStreamSet(1, 1);
@@ -180,7 +180,7 @@ void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, Strea
 void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * TransformedBasis, StreamSet * ValidWorkMask,
                    StreamSet * WorkMask) {
     StreamSet * const InsertionBixNum = P.CreateStreamSet(4, 1);
-    P.CreateKernelCall<NFC_Initial_Insertion>(U8_Basis, InsertionBixNum, WorkMask);
+    NFC_InitialInsertion(P, U8_Basis, InsertionBixNum, WorkMask);
     SHOW_BIXNUM(InsertionBixNum);
 
     StreamSet * const ExpansionMask = P.CreateStreamSet(1, 1);
@@ -198,7 +198,7 @@ void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * Wo
     // The working space of the work regions, in the source expanded as for the
     // transform of the work regions.
     StreamSet * const InsertionBixNum = P.CreateStreamSet(4, 1);
-    P.CreateKernelCall<NFC_Initial_Insertion>(U8_Basis, InsertionBixNum, WorkSelectionMask);
+    NFC_InitialInsertion(P, U8_Basis, InsertionBixNum, WorkSelectionMask);
     SHOW_BIXNUM(InsertionBixNum);
 
     StreamSet * const SourceExpansionMask = P.CreateStreamSet(1, 1);

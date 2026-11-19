@@ -513,7 +513,7 @@ static StreamSet * applyNFC(PipelineBuilder & P, StreamSet * U21_focus) {
     // NFC_Initial_Insertion outputs a BixNum (multi-bit count) saying
     // "insert N extra slots after position X".
     StreamSet * InsertBixNum = P.CreateStreamSet(4, 1);
-    P.CreateKernelCall<NFC_Initial_Insertion>(BasisBits, InsertBixNum);
+    NFC_InitialInsertion(P, BasisBits, InsertBixNum);
 
     // Build the expansion mask from those insertion counts.
     // InsertionSpreadMask turns the BixNum into a 1-bit mask where:
@@ -539,7 +539,7 @@ static StreamSet * applyNFC(PipelineBuilder & P, StreamSet * U21_focus) {
     // Some precomposed characters are "excluded composites"
     // they must always be left in decomposed form.
     StreamSet * EC_Basis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<ExcludedCompositeStage>(ExpandedBasis, EC_Basis);
+    NFC_ExcludedComposites(P, ExpandedBasis, EC_Basis);
 
     // Find non-reorderable (CCC = NR) positions.
     // CCC = "Canonical Combining Class".  NR means the class is 0 —
@@ -559,19 +559,19 @@ static StreamSet * applyNFC(PipelineBuilder & P, StreamSet * U21_focus) {
     // Some codepoints have a "singleton decomposition" — they map to
     // a single different codepoint. 
     StreamSet * CanonBasis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<SingletonCanonicalization>(EC_Basis, CanonBasis);
+    NFC_Singletons(P, EC_Basis, CanonBasis);
 
     // Short-range composition.
     // Composes pairs of adjacent composable characters — a base letter
     // immediately followed by a combining mark that can merge with it.
     StreamSet * ShortBasis = P.CreateStreamSet(8, 1);
-    ShortComposablePipeline(P, CanonBasis, ShortBasis);
+    NFC_ShortComposables(P, CanonBasis, ShortBasis);
 
     // Long-range composition.
     // Composes sequences where combining marks may appear between the
     // two characters being composed.
     StreamSet * FinalBasis = P.CreateStreamSet(8, 1);
-    LongComposablePipeline(P, ShortBasis, ccc_NR, FinalBasis);
+    NFC_LongComposables(P, ShortBasis, ccc_NR, FinalBasis);
 
     // Hangul syllable composition.
     // Korean L + V + T sequences (or LV + T) are composed into

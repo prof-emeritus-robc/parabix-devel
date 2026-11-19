@@ -92,6 +92,27 @@ struct TransformMask {
 - **Zeroing** applies to kernels producing classes, properties and changes. For
   character transforms it is useful only before a merge.
 
+### Execution: focused or in place
+
+A transform under a mask can run in two ways, and both are kept for every
+masked transform:
+
+- **Focused:** the masked positions (or the work they need) are filtered into a
+  short stream, transformed there, and spread back. `localCharacterMapping` and
+  the focused normalization transforms work this way.
+- **In place:** the kernels run over the whole text under the mask, with no
+  filter or spread. `maskedStringOverrides`, the masked class kernels and
+  masked NFD work this way.
+
+The cheaper choice depends on the work per position in the transform, against
+the cost of filtering and spreading, and on the density of the mask. Filter and
+spread are an area for improvement in the pipeline, which will move the
+balance, so neither path is retired: the same masked kernels serve both, with
+the choice made by an option (and possibly estimated later). Focusing
+concatenates regions, so a focused transform must also keep its regions from
+interacting at the seams; working in place has no seams (see
+doc/masked-nfc-plan.md, The focus seam).
+
 ### Kernel-level conventions
 
 - **Unicode mode:** one mask bit per code point.

@@ -18,6 +18,7 @@
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/unicode/normalization/normalization.h>
+#include <kernel/unicode/normalization/nfc_tables.h>
 #include <toolchain/fileutil.h>
 #include <toolchain/toolchain.h>
 #include <toolchain/toolio.h>
@@ -36,6 +37,8 @@ static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> MultiStage("MultiStage", cl::desc("Use separate pipelines for the focus, transform and reintegration stages"), cl::init(false), cl::cat(NFC_Options));
 static cl::opt<bool> ByteFiltering("ByteFiltering", cl::desc("Use byte filtering for focused work (alias of -focus-filter=byte)"), cl::init(false), cl::cat(NFC_Options));
 
+static cl::opt<bool> DumpNFC_Tables("dump-nfc-tables", cl::desc("Print the NFC analysis (NFC_Tables) in the text form of "
+                                    "scripts/UCD/nfc_generator.py --dump-tables, and exit"), cl::init(false), cl::cat(NFC_Options), cl::Hidden);
 static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers (alias of -focus-layers=filter)"), cl::init(false), cl::cat(NFC_Options));
 
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -170,6 +173,10 @@ int main(int argc, char *argv[]) {
     //  ParseCommandLineOptions uses the LLVM CommandLine processor, but we also add
     //  standard Parabix command line options such as -help, -ShowPablo and many others.
     codegen::ParseCommandLineOptions(argc, argv, {&NFC_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    if (DumpNFC_Tables) {
+        NFC_Tables::get().dump(llvm::outs());
+        return 0;
+    }
     if (MultiStage && !NFC_FocusOptions().Focus) {
         llvm::report_fatal_error("-MultiStage requires focus (not -NoFocus)");
     }

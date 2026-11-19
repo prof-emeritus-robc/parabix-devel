@@ -51,7 +51,7 @@ REGRESSION_CASES = [
              ('nfd/TestFiles', 'singletons'), ('nfd/TestFiles', 'x212b_323'),
              (NORMALIZATION_DIR, 'lv_t')], 'nfd/ExpectedOutput'),
     ('nfc', [('nfc/TestFiles', 'self_composable_test'), ('nfc/TestFiles', 'x212b_323'),
-             (NORMALIZATION_DIR, 'lv_t')], 'nfc/ExpectedOutput'),
+             (NORMALIZATION_DIR, 'lv_t'), ('nfc/TestFiles', 'composition_regressions')], 'nfc/ExpectedOutput'),
 ]
 
 FOCUS_COMMON = ['--thread-num=3', '--segment-size=1024']

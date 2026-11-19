@@ -6,7 +6,7 @@
 #
 # Licensed under Open Software License 3.0.
 #
-import re, string, os.path, cformat, codecs
+import re, string, os.path, cformat, codecs, sys
 import UCD_config
 from unicode_set import *
 from UCD_parser import *
@@ -1926,6 +1926,69 @@ class NFC_generator:
         expansion_required_uset = self.builder.install_uset(expansion_required_class)
         return t.substitute(candidate_uset = candidate_uset, expansion_required_uset = expansion_required_uset)
 
+    #  The tables of the analysis in a text form, sorted, as the C++ port of the
+    #  analysis prints them (NFC_Tables::dump, nfc -dump-nfc-tables): for checking
+    #  the port (doc/masked-nfc-plan.md, step 1).
+    def dump_tables(self, out):
+        def seq(s): return " ".join(["%x" % ord(c) for c in s])
+        def ranges(u): return " ".join(["%x-%x" % (lo, hi) for (lo, hi) in uset_to_range_list(u)])
+        for cp in sorted(self.singleton_map.keys()):
+            out.write("singleton %x %x\n" % (cp, self.singleton_map[cp]))
+        for cp in sorted(self.excluded_composite_map.keys()):
+            out.write("excluded %x : %s\n" % (cp, seq(self.excluded_composite_map[cp])))
+        for cp1 in sorted(self.short_composable_map.keys()):
+            for cp2 in sorted(self.short_composable_map[cp1].keys()):
+                out.write("short %x %x %x\n" % (cp1, cp2, self.short_composable_map[cp1][cp2]))
+        for A in sorted(self.self_composables.keys()):
+            out.write("self %x %x\n" % (A, self.self_composables[A]))
+        for mark in sorted(self.long_composable_map.keys()):
+            for starter in sorted(self.long_composable_map[mark].keys()):
+                out.write("long %x %x : %s\n" % (mark, starter, seq(self.long_composable_map[mark][starter])))
+        out.write("nonstarter %s\n" % ranges(self.non_starter_uset))
+        out.write("seconds %s\n" % ranges(self.composable_seconds))
+        for A in sorted(self.short_overridable_map.keys()):
+            for X in sorted(self.short_overridable_map[A].keys()):
+                out.write("shortoverride %x %x : %s\n" % (A, X, seq(self.short_overridable_map[A][X])))
+        for p in sorted(self.overridable_primaries.keys()):
+            for mark in sorted(self.overridable_primaries[p].keys()):
+                out.write("override %x %x : %s\n" % (p, mark, seq(self.overridable_primaries[p][mark])))
+        for cp in sorted(self.max_insert_map.keys()):
+            out.write("maxinsert %x %i\n" % (cp, self.max_insert_map[cp]))
+        for ccc in sorted(self.ccc_pass_allocation.keys()):
+            out.write("cccpass %i %i\n" % (ccc, self.ccc_pass_allocation[ccc]))
+        out.write("passcount %i\n" % self.pass_count)
+        for p in sorted(self.short_pass_map.keys()):
+            for X in sorted(self.short_pass_map[p].keys()):
+                for Y in sorted(self.short_pass_map[p][X].keys()):
+                    out.write("shortpass %i %x %x : %s\n" % (p, X, Y, seq(self.short_pass_map[p][X][Y])))
+        out.write("selfpass %i\n" % self.self_composable_pass_no)
+        out.write("shortpasscount %i\n" % self.short_pass_count)
+        for p in sorted(self.conditional_mark_codes.keys()):
+            for pfx in sorted(self.conditional_mark_codes[p].keys()):
+                for mark in sorted(self.conditional_mark_codes[p][pfx].keys()):
+                    out.write("markcode %i %x %x %i\n" % (p, pfx, mark, self.conditional_mark_codes[p][pfx][mark]))
+        for p in sorted(self.max_conditional_code_bits.keys()):
+            out.write("markbits %i %i\n" % (p, self.max_conditional_code_bits[p]))
+        # (As generate_candidate_classes.)
+        candidate_class = uset_union(self.non_starter_uset, self.composable_seconds)
+        for ccc_enum in self.ucd.ccc_map.keys():
+            if ccc_enum != 'NR':
+                candidate_class = uset_union(candidate_class, self.ucd.ccc_map[ccc_enum])
+        for cp in self.self_composables.keys():
+            candidate_class = uset_union(candidate_class, singleton_uset(self.self_composables[cp]))
+        candidate_class = uset_union(candidate_class, range_uset(0x1161, 0x1161 + 21 - 1))
+        candidate_class = uset_union(candidate_class, range_uset(0x11A7, 0x11A7 + 28 - 1))
+        out.write("candidate %s\n" % ranges(candidate_class))
+        expansion = empty_uset()
+        for cp in self.singleton_map.keys():
+            expansion = uset_union(expansion, singleton_uset(cp))
+        for cp in self.excluded_composite_map.keys():
+            expansion = uset_union(expansion, singleton_uset(cp))
+        out.write("expansion %s\n" % ranges(expansion))
+        # (generate_long_composable_pipeline applies pass 3 twice.)
+        for p in range(self.pass_count):
+            out.write("applications %i %i\n" % (p, 2 if p == 3 else 1))
+
     def emit_normalization_cpp(self):
         basename = 'normalization-generated'
         f = cformat.open_cpp_file_for_write(basename)
@@ -1963,6 +2026,9 @@ if __name__ == "__main__":
     generator.allocate_chained_short_passes()
     generator.implement_overridable_primaries_as_long_composables()
     generator.create_conditional_mark_codes()
+    if len(sys.argv) > 1 and sys.argv[1] == "--dump-tables":
+        generator.dump_tables(sys.stdout)
+        sys.exit(0)
     #generator.show_overridable_primaries()
     #generator.show_ccc_pass_allocation()
     #generator.show_conditional_codes()

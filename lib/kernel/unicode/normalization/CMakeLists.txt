@@ -16,6 +16,8 @@ NAME
 SRC
     fcd.cpp
     nfc.cpp
+    nfc_kernels.cpp
+    nfc_tables.cpp
     nfd.cpp
     normalization-generated.cpp
     normalization.cpp

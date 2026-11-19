@@ -90,12 +90,18 @@ StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, 
                                     bool byteDomain = false, bool utf8Classes = false,
                                     const std::vector<re::CC *> & extraCCs = {}, StreamSet ** classesOut = nullptr);
 
-// Stage 2b: spread codepoints, insert LF separators, filter whitespace.
+// The bytelevel PreTokenizerResult with the GPT-2 boundaries of buildGPT2ByteBoundaries (the
+// BPE front end) instead of buildPreTokenizerBoundaries; the same pre-tokens.
+PreTokenizerResult buildGPT2ByteLevelResult(PipelineBuilder & P, StreamSet * BasisBits, bool classCode,
+                                            bool byteDomain, bool utf8Classes);
+
+// Stage 2b: spread codepoints, insert separators (default LF), filter whitespace.
 // Takes the PreTokenizerResult and returns the final U21 codepoint stream
 // ready for UTF-8 re-encoding.
 StreamSet * applyTokenSeparatorInsertion(
     PipelineBuilder & P,
-    const PreTokenizerResult & result);
+    const PreTokenizerResult & result,
+    uint32_t separator = 0x0A);
 
 // ByteLevel encoding: maps every input byte to a unique printable Unicode codepoint
 // using the GPT-2 byte alphabet. Returns a 21-bit U21 stream with one codepoint

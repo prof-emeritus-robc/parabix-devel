@@ -15,6 +15,7 @@ venv.
 | `compare_pretokenizers.py` | correctness | Pre-tokenizers and `--behavior`, against HF `tokenizers.pre_tokenizers` |
 | `compare_bpe.py` | correctness + timing | BPE token ids against HF `tokenizers` 0.23 and tiktoken |
 | `compare_bpe_hf1.py` | correctness + timing | The same against HF `tokenizers` 1.0.0rc4 |
+| `bench_pretokenizers.py` | correctness + performance | Pre-tokenizers on their own (no BPE) against HF 0.23: whole-file pre-token lists, then time |
 | `bench_bpe.py` | performance | Throughput (MB/s) against HF 0.23 and tiktoken |
 | `bench_bpe_hf1.py` | performance | The same against HF 1.0.0rc4 |
 | `bench_configs.py` | performance (Parabix only) | Several Parabix option sets timed against each other, with an output-identity check |
@@ -67,7 +68,7 @@ from any directory. Defaults and overrides:
 | `--merges PATH` | `<repo>/tools/lex/tokenizer_files/merges.txt` | `compare_bpe*`, `bench_bpe*`, `bench_configs`, `selfmerge_test` |
 | `--vocab PATH` | `<repo>/tools/lex/tokenizer_files/vocab.json` | `compare_bpe*` |
 | `--tokenizer-json PATH` | `<repo>/tools/lex/tokenizer_files/tokenizer.json` | `compare_bpe*`, `bench_bpe*` |
-| `--input PATH` | none (required) | `compare_bpe*`; `bench_bpe*` take `--input FILE …`, `--sweep --sweep-source FILE` or `--openwebtext` |
+| `--input PATH` | none (required) | `compare_bpe*`; `bench_bpe*` take `--input FILE …`, `--sweep --sweep-source FILE` or `--openwebtext`; `bench_pretokenizers` takes `--input FILE …` |
 | `--input PATH` | `<repo>/build19/test.txt` (not in the repo) | `compare_normalizers`, `compare_pretokenizers` |
 | `--input PATH` | `tokenizer_files/val_2MB.txt` (no longer in the repo) | `bench_configs` |
 
@@ -98,6 +99,7 @@ Two notes on line ends:
   the file's own bytes.
 - `compare_pretokenizers.py` and `compare_normalizers.py` split on `\n` only. Give
   them LF text (`tr -d '\r'`), or a leftover `\r` shows up as a mismatch.
+  `bench_pretokenizers.py` reads the file's own bytes, CRLF included.
 
 ---
 
@@ -284,6 +286,43 @@ python bench_bpe.py --input FILE --parabix-only | --hf-only | --tiktoken-only | 
 
 ---
 
+## `bench_pretokenizers.py`
+
+Each pre-tokenizer on its own (no normalizer, no BPE), Parabix against HF, one
+thread on both sides. The 9 modes of `compare_pretokenizers.py`, plus
+`bytelevel_frontend`: `--pretokenizer=bytelevel` with the BPE front end's
+boundary builder (`--pretok-compress-classes --pretok-class-code
+--pretok-byte-domain --pretok-utf8-classes`), as the recommended BPE options run it.
+
+1. **Check.** One tokenizer run with `--pretok-separator=0x10FFFF` on the whole
+   file, compared with HF's `pre_tokenize_str`: the complete pre-token list,
+   strings and order (not offsets). U+10FFFF must not be in the input, so, unlike
+   `\n`, it cannot be mistaken for a line break inside a pre-token. A case that
+   does not match is reported and not timed.
+2. **Time.** `--rounds` rounds (default 5) of `--iters` timed calls (default 10)
+   per side, the side that goes first alternating by round:
+   - **Parabix**: `--bench-loop=N --thread-num=1 --segment-size=16384`. Built,
+     compiled and loaded once; one untimed run, then N timed runs, each writing
+     its pre-tokens to `/dev/null`. The script reads `BENCH_SAMPLES_MS`.
+   - **HF**: per call, a fresh `PreTokenizedString(text)` and an in-place
+     `pre_tokenize` (strings and offsets stay native, no Python lists). One
+     untimed call, then N timed.
+
+It reports the median of the round medians, their range, and HF median / Parabix
+median. The two sides are complete pipelines with different outputs (serialized
+text vs native strings with offsets), not boundary finding alone. Each case runs
+in a fresh process, so HF allocations do not pile up from case to case.
+
+```bash
+python bench_pretokenizers.py --input ../tokenizer_files/val_4MB.txt \
+    ../tokenizer_files/code_4MB.txt ../tokenizer_files/multi_4MB.txt
+python bench_pretokenizers.py --input FILE --modes whitespace bytelevel_frontend
+python bench_pretokenizers.py --input FILE --rounds 1 --iters 1     # quick check
+python bench_pretokenizers.py --input FILE --json results.json      # every sample too
+```
+
+---
+
 ## `bench_configs.py`
 
 Parabix option sets timed against each other; no HF. One run times N sets:
@@ -387,6 +426,7 @@ Run on 2026-11-15, commit `a02100f9e`, Apple M3 (macOS), `tokenizers` 0.23.3,
 | `selfmerge_test.py` | its own input | 8/8 sets MATCH |
 | `compare_pretokenizers.py` and `--behaviors` | first 200 lines of each 4 MB file, LF | 9/9 modes and 10/10 behavior cases PASS on each |
 | `compare_normalizers.py` | the same lines | 19/19 PASS on each |
+| `bench_pretokenizers.py`| 10/10 modes MATCH on each |
 
 **Speed** (`bench_bpe.py --iters 10 --no-adaptive-iters`, cold caches:
 `--bench-cold-cache`, HF word cache cleared before every run). Time per
@@ -407,3 +447,24 @@ boundaries (`--baseline-threads 4`). These times exclude start-up: a one-shot ru
 of the tokenizer also loads the rules, builds the tables and the pipeline (about
 60 ms, `[BPE] pipeline graph build` on stderr), compiles or loads the kernels,
 and formats the output.
+
+**Pre-tokenizers alone** (`bench_pretokenizers.py`, defaults: 5 rounds of 10
+calls, 1 thread; 2026-11-19, uncommitted change on top of `a2d03a697`, same
+machine). HF median / Parabix median, both from the median of the 5 round
+medians:
+
+| Mode | `val_4MB.txt` | `code_4MB.txt` | `multi_4MB.txt` |
+|---|---|---|---|
+| `whitespace` | 5.36× | 5.16× | 5.43× |
+| `whitespacesplit` | 4.63× | 3.99× | 4.43× |
+| `digits` | 1.90× | 1.87× | 1.84× |
+| `punctuation` | 6.90× | 9.47× | 6.22× |
+| `simplewordboundaries` | 10.22× | 7.42× | 9.64× |
+| `chardelimiter` | 1.14× | 1.18× | 1.29× |
+| `bert` | 11.61× | 11.67× | 11.02× |
+| `sequence_whitespace_punctuation` | 11.95× | 11.78× | 10.96× |
+| `bytelevel` | 15.14× | 16.30× | 13.87× |
+| `bytelevel_frontend` | 23.42× | 24.68× | 20.25× |
+
+Parabix takes 17–33 ms per file in every mode; HF from 25 ms (`chardelimiter`)
+to 529 ms (`bytelevel`).

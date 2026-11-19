@@ -390,10 +390,13 @@ static cl::opt<bool> SkipIdentityNormalize(
 // decoder leaves each codepoint (its last byte) and compress the 9 class bits to one slot
 // per codepoint, instead of compressing all 21 codepoint bits first (FilterByMask's two
 // kernels were 8.5% of a 1-thread run). Same boundaries (buildGPT2ByteBoundaries).
+// In pre-tokenizer mode (bytelevel, no normalizer) it selects the same boundary builder, so
+// the BPE front end can be checked and timed on its own.
 static cl::opt<bool> PretokCompressClasses(
     "pretok-compress-classes",
     cl::desc("BPE mode, bytelevel pretokenizer, no normalizer, --skip-identity-normalize: "
-             "compress the pretokenizer's character classes instead of the codepoints."),
+             "compress the pretokenizer's character classes instead of the codepoints. "
+             "Pre-tokenizer mode, bytelevel, no normalizer: use the BPE front end's boundaries."),
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
@@ -429,10 +432,20 @@ static cl::opt<bool> PretokUTF8Classes(
 
 static cl::opt<unsigned> BenchLoop(
     "bench-loop",
-    cl::desc("BPE mode: tokenize the input N times inside one process (excludes OS "
-             "process spawn + merges load + pipeline build/JIT), suppress token "
-             "output, and print machine-readable timing to stderr. 0 = off (normal run)."),
+    cl::desc("Run the pipeline on the input N times inside one process (excludes OS "
+             "process spawn + merges load + pipeline build/JIT) and print machine-readable "
+             "timing to stderr. BPE mode suppresses the token output; pre-tokenizer mode "
+             "writes each run's output to /dev/null. 0 = off (normal run)."),
     cl::init(0),
+    cl::cat(wordBreakerFlags));
+
+// --pretok-separator: pre-tokenizer mode writes this codepoint between pre-tokens. The default
+// LF is ambiguous when a pre-token holds a line break; a codepoint that is not in the input
+// (bench_pretokenizers.py uses U+10FFFF) lets the output be split back into the pre-tokens.
+static cl::opt<unsigned> PretokSeparator(
+    "pretok-separator",
+    cl::desc("Pre-tokenizer mode: the codepoint written between pre-tokens (default 0x0A)."),
+    cl::init(0x0A),
     cl::cat(wordBreakerFlags));
 
 // --bench-cold-cache: empty the --bpe-tail segment caches before every --bench-loop run, so
@@ -734,50 +747,150 @@ static BPEPipelineFunctionType buildBPEPipeline(
         P, driver, bpe, P.getInputScalar("buffer"), P.getInputScalar("length"), nullptr, __tBuild0));
 }
 
-WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
-    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fileDescriptor"}, Input<uint32_t>{"outputFD"});
-
-    Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
-
-    //  Stage 0: I/O — read file, convert to parallel bit streams 
-    StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
-
+// The pre-tokenizer mode's pipeline after its source: normalization, pre-tokenization and
+// separators, written to the "outputFD" input.
+static void buildWordBreakerBody(PipelineBuilder & P, StreamSet * ByteStream) {
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
-    // Normalization
-    // Using applyNormalizationU21 to get U21 codepoints directly
     std::vector<NormalizationMode> normModes(Normalization.begin(), Normalization.end());
-    StreamSet * U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
-
-    // Re-encode to BasisBits once — needed by the pretokenizer's bytelevel mode
-    // and by the normalization-only output path below.
-    StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
-    U21_to_UTF8(P, U21codepoints, normalizedBasis);
-
-    // If any active normalization was requested but no --pretokenizer was given,
-    // output the raw normalized text and stop
     bool hasActiveNorm = false;
     for (auto m : normModes) if (m != NormNone) { hasActiveNorm = true; break; }
-    if (hasActiveNorm && PreTokenizer.getNumOccurrences() == 0) {
-        writeToStdout(P, normalizedBasis);
-        return reinterpret_cast<WordBreakerFunctionType>(P.compile());
+
+    PreTokenizerResult ptResult;
+    if (PretokCompressClasses && !hasActiveNorm
+            && PreTokenizer.getNumOccurrences() != 0 && PreTokenizer == bytelevel) {
+        // --pretok-compress-classes: the boundaries of the BPE front end, from the bytes
+        ptResult = buildGPT2ByteLevelResult(P, BasisBits, PretokClassCode, PretokByteDomain,
+                                            PretokUTF8Classes);
+    } else {
+        // Normalization
+        // Using applyNormalizationU21 to get U21 codepoints directly
+        StreamSet * U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
+
+        // Re-encode to BasisBits once — needed by the pretokenizer's bytelevel mode
+        // and by the normalization-only output path below.
+        StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
+        U21_to_UTF8(P, U21codepoints, normalizedBasis);
+
+        // If any active normalization was requested but no --pretokenizer was given,
+        // output the raw normalized text and stop
+        if (hasActiveNorm && PreTokenizer.getNumOccurrences() == 0) {
+            writeToStdout(P, normalizedBasis);
+            return;
+        }
+
+        //Pre-tokenization
+        // U21codepoints is already decoded above — no re-decode needed here.
+        ptResult = buildPreTokenizerBoundaries(
+            P, normalizedBasis, U21codepoints, PreTokenizer, SplitBehavior, DelimiterString);
     }
 
-    //Pre-tokenization
-    // U21codepoints is already decoded above — no re-decode needed here.
-    PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
-        P, normalizedBasis, U21codepoints, PreTokenizer, SplitBehavior, DelimiterString);
-
-    StreamSet * finalU21 = applyTokenSeparatorInsertion(P, ptResult);
+    StreamSet * finalU21 = applyTokenSeparatorInsertion(P, ptResult, PretokSeparator);
 
     // Output — U21 → UTF-8 → serial bytes → stdout
     StreamSet * output_basis = P.CreateStreamSet(8);
     U21_to_UTF8(P, finalU21, output_basis);
     writeToStdout(P, output_basis);
+}
 
+WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
+    auto P = CreatePipeline(driver, Input<uint32_t>{"useMMap"}, Input<uint32_t>{"fileDescriptor"}, Input<uint32_t>{"outputFD"});
+
+    //  Stage 0: I/O — read file, convert to parallel bit streams
+    StreamSet * ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("fileDescriptor"), ByteStream);
+    buildWordBreakerBody(P, ByteStream);
     return reinterpret_cast<WordBreakerFunctionType>(P.compile());
+}
+
+// --bench-loop in pre-tokenizer mode: the same pipeline, reading a resident buffer in place.
+using WordBreakerMemoryFunctionType = void (*)(const char * buffer, size_t length, size_t inPlace,
+                                               uint32_t outputFD);
+
+static WordBreakerMemoryFunctionType wordBreakerMemoryPipeline(CPUDriver & driver) {
+    auto P = CreatePipeline(driver, Input<const char *>{"buffer"}, Input<size_t>{"length"},
+                            Input<size_t>{"inPlace"}, Input<uint32_t>{"outputFD"});
+    StreamSet * ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<MemorySourceKernel>(P.getInputScalar("buffer"), P.getInputScalar("length"),
+                                           P.getInputScalar("inPlace"), ByteStream);
+    buildWordBreakerBody(P, ByteStream);
+    return reinterpret_cast<WordBreakerMemoryFunctionType>(P.compile());
+}
+
+// --bench-loop's report on stderr: a summary, the BENCH_RESULT line that bench_bpe.py and
+// bench_pretokenizers.py parse, and every run's time in run order.
+static void reportBenchLoop(size_t nbytes, std::vector<double> ms) {
+    const unsigned N = ms.size();
+    std::fprintf(stderr, "BENCH_SAMPLES_MS ");
+    for (unsigned i = 0; i < N; ++i) std::fprintf(stderr, "%s%.6f", i ? "," : "", ms[i]);
+    std::fprintf(stderr, "\n");
+
+    std::sort(ms.begin(), ms.end());
+    const double minv    = ms.front();
+    const double median  = ms[N / 2];
+    double sum = 0.0; for (double v : ms) sum += v;
+    const double mean    = sum / N;
+    // Throughput on the best (min) run — the steady-state peak, like criterion.
+    const double mbps    = (minv > 0.0) ? (nbytes / (minv / 1e3)) / 1e6 : 0.0;
+
+    std::cerr << "[BENCH] iters=" << N << " bytes=" << nbytes
+              << " min=" << minv << "ms median=" << median << "ms mean=" << mean
+              << "ms  peak=" << mbps << " MB/s\n";
+    // Single machine-readable line for bench_bpe.py to parse (grep BENCH_RESULT).
+    std::fprintf(stderr,
+                 "BENCH_RESULT bytes=%zu iters=%u min_ms=%.6f median_ms=%.6f "
+                 "mean_ms=%.6f mbps=%.4f\n",
+                 nbytes, N, minv, median, mean, mbps);
+}
+
+// --bench-loop=N in pre-tokenizer mode: load the input once into a padded, page-aligned
+// buffer, build and compile, run once untimed, then N timed runs, each writing its
+// pre-tokens to /dev/null.
+static int benchPretokenizer() {
+    toolio::Input in;
+    if (!toolio::openInput(inputFile, in)) return 1;
+    AlignedFileBuffer input;
+    if (!input.load(in.fd, in.mappable)) {
+        llvm::errs() << toolio::programName() << ": " << in.name << ": " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    const size_t nbytes = input.getBufSize();
+    const size_t page = size_t(getpagesize());
+    const size_t size = (nbytes + page - 1) / page * page + page;
+    void * p = nullptr;
+    if (posix_memalign(&p, page, size) != 0) {
+        llvm::errs() << "Error: cannot allocate the input buffer.\n";
+        return 1;
+    }
+    std::unique_ptr<char, void (*)(void *)> buf(static_cast<char *>(p), std::free);
+    if (nbytes > 0) std::memcpy(p, input.getBuf(), nbytes);
+    std::memset(buf.get() + nbytes, 0, size - nbytes);
+    input.release();
+    toolio::closeInput(in);
+
+    // Without it, a last segment under one block is read from block 0 (--memsource-block-capacity).
+    kernel::MemorySourceBlockCapacity = true;
+    CPUDriver driver("unicode_word_tokenizer");
+    WordBreakerMemoryFunctionType fn = wordBreakerMemoryPipeline(driver);
+
+    const int sink = open("/dev/null", O_WRONLY);
+    if (sink < 0) {
+        llvm::errs() << "Error: cannot open /dev/null: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    fn(buf.get(), nbytes, 1, uint32_t(sink));   // discarded warm-up
+    std::vector<double> ms;
+    ms.reserve(BenchLoop);
+    for (unsigned i = 0; i < BenchLoop; ++i) {
+        auto t0 = std::chrono::steady_clock::now();
+        fn(buf.get(), nbytes, 1, uint32_t(sink));
+        auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    close(sink);
+    reportBenchLoop(nbytes, std::move(ms));
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -904,23 +1017,7 @@ int main(int argc, char *argv[]) {
             }
             input.release();
             toolio::closeInput(in);
-
-            std::sort(ms.begin(), ms.end());
-            const double minv    = ms.front();
-            const double median  = ms[N / 2];
-            double sum = 0.0; for (double v : ms) sum += v;
-            const double mean    = sum / N;
-            // Throughput on the best (min) run — the steady-state peak, like criterion.
-            const double mbps    = (minv > 0.0) ? (nbytes / (minv / 1e3)) / 1e6 : 0.0;
-
-            std::cerr << "[BENCH] iters=" << N << " bytes=" << nbytes
-                      << " min=" << minv << "ms median=" << median << "ms mean=" << mean
-                      << "ms  peak=" << mbps << " MB/s\n";
-            // Single machine-readable line for bench_bpe.py to parse (grep BENCH_RESULT).
-            std::fprintf(stderr,
-                         "BENCH_RESULT bytes=%zu iters=%u min_ms=%.6f median_ms=%.6f "
-                         "mean_ms=%.6f mbps=%.4f\n",
-                         nbytes, N, minv, median, mean, mbps);
+            reportBenchLoop(nbytes, std::move(ms));
             return toolio::finishOutput() ? 0 : 1;
         }
 
@@ -937,7 +1034,12 @@ int main(int argc, char *argv[]) {
         return toolio::finishOutput() ? 0 : 1;
     }
 
-    // Pre-tokenizer pipeline mode (existing behaviour) 
+    // Pre-tokenizer pipeline mode (existing behaviour)
+    if (PretokSeparator > 0x10FFFF || (PretokSeparator >= 0xD800 && PretokSeparator <= 0xDFFF)) {
+        llvm::errs() << "Error: --pretok-separator must be a Unicode scalar value.\n";
+        return 1;
+    }
+    if (BenchLoop > 0) return benchPretokenizer();
     toolio::Input in;
     if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
         return 1;

@@ -157,13 +157,14 @@ and [merge-kernel options](#merge-kernel-options).
 | `--emit-id-table` | With `--fast-emit` and the tail emitter: format ids from a precomputed table (same output). |
 | `--strip-newlines` | BPE without `--pretokenizer`: drop `\n` bytes as separators. By default `\n` is content (id 198, `Ċ`), as in HuggingFace. |
 | `--skip-identity-normalize` | BPE without `--normalize`: feed BPE the input bytes, not decoded and re-encoded codepoints (the same bytes for valid UTF-8). |
-| `--pretok-compress-classes` | Bytelevel pre-tokenizer, no normalizer, with `--skip-identity-normalize`: compress only the pre-tokenizer's character classes to one slot per codepoint, not all 21 codepoint bits. |
+| `--pretok-compress-classes` | Bytelevel pre-tokenizer, no normalizer, with `--skip-identity-normalize`: compress only the pre-tokenizer's character classes to one slot per codepoint, not all 21 codepoint bits. In pre-tokenizer mode (bytelevel, no normalizer) it selects the BPE front end's boundary builder, with the three options below, so the front end can be checked and timed on its own. |
 | `--pretok-class-code` | With the above: compress a 4-bit code of the classes instead of 9 class streams. |
 | `--pretok-byte-domain` | With `--pretok-class-code`: find the pre-token starts on the bytes, with no compression at all ([GPT-2 boundaries](#the-bytelevel-pre-tokenizer)). |
 | `--pretok-utf8-classes` | With `--pretok-byte-domain`: compile the classes on the UTF-8 bytes, with no UTF-8 decoder. |
 | `--memsource-in-place` | Load the input once into a padded buffer that the source kernel reads in place, instead of copying it on every pipeline call. |
 | `--auto-segment-size` | Pick `--segment-size` from the input size and `--thread-num` (16K to 256K, at least 64 segments per thread) unless `--segment-size` is given. |
-| `--bench-loop=N` | Tokenize the input N times in one process with output off, after one warm-up run, and print a `BENCH_RESULT` line to stderr. Excludes process start, rule loading, compiling and file reading. |
+| `--bench-loop=N` | Run the input N times in one process, after one warm-up run, and print a `BENCH_RESULT` line and every run's time (`BENCH_SAMPLES_MS`) to stderr. Excludes process start, rule loading, compiling and file reading. BPE mode turns the output off; pre-tokenizer mode writes each run's pre-tokens to `/dev/null`. |
+| `--pretok-separator=C` | Pre-tokenizer mode: the codepoint written between pre-tokens (default `0x0A`). A codepoint that is not in the input, such as `0x10FFFF`, keeps a pre-token that holds a line break apart from the separator. |
 | `--bench-cold-cache` | With `--bench-loop`: empty the tail's caches before every run, so each run starts cold like a one-shot run. |
 
 ## Normalizer
@@ -573,6 +574,9 @@ Run on 2026-11-15, commit `a02100f9e`, macOS (Apple M3), scripts in
   behaviors for `simplewordboundaries` and `punctuation`, match on 200 lines of
   each test file.
 - **Normalizers**: all 19 modes and sequences match on the same lines.
+- **Pre-tokenizers, whole files** (`bench_pretokenizers.py`, 2026-11-19): the 9
+  modes and the BPE front end's boundaries give the same complete pre-token lists
+  as HuggingFace 0.23.3 on all three 4 MB files.
 
 **Speed**, same machine, `bench_bpe.py` with cold caches, median of 10 runs per
 engine on each 4 MB file: 12.7–17.5 ms at 1 thread (10.8–15.4× faster than

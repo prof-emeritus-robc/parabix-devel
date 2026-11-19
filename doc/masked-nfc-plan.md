@@ -685,6 +685,81 @@ is sound. Steps 3 and 4 could instead be done in the Python templates
 (classes ∧ mask in `generate_scope_compilations`, `ccc_NR ∨ outside`), if the
 rewrite turns out too costly. The mask design does not depend on the rewrite.
 
+## NFD and NFKD, aligned (2026-11-19)
+
+NFD and NFKD now have the same modes as NFC: UTF-8 and 21-bit, each focused or
+in place, with a mask and an output mask (`NFD_PipelineBuilder`, in `nfd.cpp`).
+
+- **`NFD_Masked(form, options, Bytes, Basis, Mask, OutputMask)`** (UTF-8)
+  - Focused, as `NFD_FocusedTransform`.
+    - The candidates are the decomposables within the mask and the
+      characters of nonzero ccc within it. A character outside the mask
+      counts as a starter, so it ends a reorderable run.
+    - The work is each candidate and the character after it. That character
+      separates the work regions, even outside the mask, where it is inert.
+    - The placement's insertion and deletion classes are zeroed outside the
+      mask (`ComputeWorkPlacement` takes the mask).
+    - The focused mask goes through the decomposition, and is merged with the
+      unmodified part of the mask into the output mask, as in `NFC_Masked`.
+  - In place (`-NoFocus`): the whole text decomposed under the mask.
+  - The UTF-8 decomposition (`NFD_U8_Pipeline` and `NFKD_U8_Pipeline` share
+    `U8_Decomposition`) decodes, applies the masked 21-bit decomposition, and
+    re-encodes. The output byte mask is the 21-bit output mask spread over
+    each character's UTF-8 bytes (`U21_MaskToU8`).
+- **`NFD_U21(form, U21, Mask, OutputMask, focus, SpreadMask)`** (21-bit)
+  - In place: `U21_Decomposition` under the mask, as before.
+  - Focused: the work is the candidates within the mask, each with the
+    character after it. The work is filtered, decomposed under the filtered
+    mask, and merged back.
+    - The placement is the work expanded by the insertions of the source's
+      decomposables within the mask.
+    - `SpreadMask` is that insertion spread mask over the source, the same
+      position map as the in-place version's, which tconv uses.
+
+**Tools.** `nfd` and `nfkd` take `-nfd-u21`, plus `-nfd-mask` and
+`-nfd-mask-select` (hidden, for testing), as nfc does
+(`tools/transcoders/decomposition_modes.cpp`).
+
+**tconv.**
+- Unicode mode decomposes with `NFD_U21`: unmasked, within a filter, and in
+  FCC's first step. It is focused unless `-NoFocus`.
+- UTF-8 mode normalizes NFD, NFKD and NFKC within a filter with `NFD_Masked`.
+  NFKC follows with `NFC_Masked` of the NFKD output mask. Both give the
+  position map from the output masks, as NFC does. There is no barrier
+  substitution left for these forms; `--masked-normalization=0` restores it.
+
+**Checks.**
+- Reference: `refnfd.py` (NFD and NFKD from the UCD 18 files) agrees with
+  all 20,171 lines of NormalizationTest.txt.
+- Unmasked: `nfd` and `nfkd`, UTF-8 and 21-bit, focused, in place and
+  multithreaded, on the conformance text, the composition chains, the
+  singletons and the pairs, match the reference.
+- Masked: five masks × six routes (UTF-8 and 21-bit; focused, in place,
+  multithreaded) × three output selections × three inputs, for both tools:
+  540 runs, no failures.
+- tconv:
+  - Ten rules files (NFD, NFKD, NFKC, NFC and FCC, under global and step
+    filters that cut through decompositions) on 4,000 random lines, in both
+    modes, in one run and with `--lines`: the output equals ICU's, the
+    previous route's and the `-NoFocus` one's.
+  - CLDR test data: 117 transforms with test data apply NFD, NFKD or NFKC
+    under a global filter. All 18 non-Indic ones, and one per Indic source
+    script (27 in all), give the previous route's output, also with
+    `-thread-num=4 -segment-size=1` and with `-NoFocus`. The 24 one-run
+    transforms also give the same output with `--lines`.
+- `normalization_test` adds 21-bit and masked cases for nfd and nfkd (1.9 s).
+  `nfd_test` and `nfc_test` pass.
+
+**Timing.** 10 MB, 4 threads, warm; `nfd` / `nfkd`:
+
+| Input  | UTF-8 focused | UTF-8 in place | 21-bit focused | 21-bit in place |
+|--------|---------------|----------------|----------------|-----------------|
+| Dense  | 0.051 / 0.063 | 0.048 / 0.060  | 0.055 / 0.069  | 0.048 / 0.059   |
+| Sparse | 0.043 / 0.054 | 0.049 / 0.060  | 0.060 / 0.071  | 0.049 / 0.061   |
+
+The 21-bit routes include the tool's decoding and re-encoding. Masking adds
+nothing measurable.
+
 ## Open questions
 
 - **The byte sort's cost.** Runs are longer in bytes than in characters (2 to

@@ -386,13 +386,21 @@ void ComputeWorkPlacement(PipelineBuilder & P,
                           std::vector<re::CC *> deletionBixNumCCs,
                           StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
                           StreamSet * WorkPlacementMask,
-                          pablo::BitMovementMode m) {
+                          pablo::BitMovementMode m, StreamSet * Mask) {
+    //  (With a mask, only the characters within it change.)
+    auto classes = [&](std::vector<re::CC *> ccs, StreamSet * out) {
+        if (Mask) {
+            P.CreateKernelCall<CharClassesKernel>(std::move(ccs), U8_Basis, StreamMask{Mask, MaskKind::Zeroing}, out, m);
+        } else {
+            P.CreateKernelCall<CharClassesKernel>(std::move(ccs), U8_Basis, out, m);
+        }
+    };
     StreamSet * const U8_Insertion_BixNum = P.CreateStreamSet(insertionBixNumCCs.size());
-    P.CreateKernelCall<CharClassesKernel>(insertionBixNumCCs, U8_Basis, U8_Insertion_BixNum, m);
+    classes(insertionBixNumCCs, U8_Insertion_BixNum);
     SHOW_BIXNUM(U8_Insertion_BixNum);
 
     StreamSet * const U8_Deletion_BixNum = P.CreateStreamSet(deletionBixNumCCs.size());
-    P.CreateKernelCall<CharClassesKernel>(deletionBixNumCCs, U8_Basis, U8_Deletion_BixNum, m);
+    classes(deletionBixNumCCs, U8_Deletion_BixNum);
     SHOW_BIXNUM(U8_Deletion_BixNum);
 
     // The insertions follow the marked position: within the UTF-8 sequence in the

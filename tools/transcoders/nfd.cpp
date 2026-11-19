@@ -32,6 +32,7 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization/normalization.h>
+#include "decomposition_modes.h"
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
@@ -259,14 +260,15 @@ XfrmFunctionType generate_unitary_pipeline(CPUDriver & driver) {
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
-    StreamSet * const OutputBytes = NFD.build(P, ByteStream, BasisBits);
+    StreamSet * OutputBytes = DecompositionModes(P, NFD_builder, UCD::DecompositionOptions::NFD, NFD.getOptions(), ByteStream, BasisBits);
+    if (OutputBytes == nullptr) OutputBytes = NFD.build(P, ByteStream, BasisBits);
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&NFD_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&NFD_Options, &DecompositionModeOptions(), &toolio::InputOutputOptions, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     toolio::Input in;
     if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
         return 1;

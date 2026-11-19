@@ -100,6 +100,7 @@ NAME
     nfd
 SRC
     nfd.cpp
+    decomposition_modes.cpp
 DEPS
     pablo.bixnum
     kernel.basis
@@ -117,6 +118,7 @@ NAME
     nfkd
 SRC
     nfkd.cpp
+    decomposition_modes.cpp
 DEPS
     pablo.compiler
     pablo.bixnum

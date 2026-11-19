@@ -261,7 +261,8 @@ void ComputeWorkPlacement(PipelineBuilder & P,
                           std::vector<re::CC *> deletionBixNumCCs,
                           StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
                           StreamSet * WorkPlacementMask,
-                          pablo::BitMovementMode m = pablo::BitMovementMode::Advance);
+                          pablo::BitMovementMode m = pablo::BitMovementMode::Advance,
+                          StreamSet * Mask = nullptr);
 
 struct BitXfrmSpec {
     unsigned BitXfrmIndex;
@@ -382,10 +383,12 @@ public:
 
     StreamSet * NFKD_U21_Pipeline(StreamSet * U21_Basis, StreamSet * Mask = nullptr, StreamSet ** SpreadMask = nullptr);
 
-    void DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * workItems);
+    void DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * workItems, StreamSet * Mask = nullptr);
 
     // The focus of NFD: the UTF-8 sequences that may change.
-    void DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask);
+    //  (With a mask, as NFD_Masked: the candidates within it, with the character
+    //  after them even outside it.)
+    void DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * Mask = nullptr);
 
     // DetermineNFD_WorkSelection, with gap filling, then FilterByMask of the basis bits.
     void NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis);
@@ -393,20 +396,45 @@ public:
     // Fill gaps of at most this many unchanged bytes between work regions (0: none).
     void setFillRunGaps(unsigned maxGap) { mFillRunGaps = maxGap; }
 
-    void ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask);
+    void ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask,
+                                  StreamSet * Mask = nullptr);
 
-    void NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
+    //  (With a mask over WorkingBasis, only its characters decompose, each run of it
+    //  ordered by itself; OutputMask receives the mask over TransformedBasis.)
+    void NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr);
 
-    void NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
+    void NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr);
+
+    //  NFD (or NFKD) within a mask of UTF-8 text (a stream over Basis set on every
+    //  byte of each character within it), as NFC_Masked: each run of the mask
+    //  decomposed and ordered by itself, the characters outside it unchanged and
+    //  acting as barriers.  Focused (as NFD_FocusedTransform, with the options'
+    //  modes: the candidates within the mask, with the character after them even
+    //  outside it, which separates the work regions) or, with options.Focus false,
+    //  in place.  Returns the output bytes; OutputMask, if given, receives the
+    //  mask over them.
+    StreamSet * NFD_Masked(UCD::DecompositionOptions form, const kernel::FocusOptions & options, StreamSet * Bytes, StreamSet * Basis,
+                           StreamSet * Mask, StreamSet * OutputMask = nullptr);
+
+    //  NFD (or NFKD) of a 21-bit basis, focused (the candidates and the
+    //  characters after them filtered, decomposed, and placed back) or in place,
+    //  within a mask if given.  OutputMask, if given, receives the mask over the
+    //  result; SpreadMask, the spread mask of the positions inserted (0 at them),
+    //  each after the character decomposed.
+    StreamSet * NFD_U21(UCD::DecompositionOptions form, StreamSet * U21, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr,
+                        bool focus = true, StreamSet ** SpreadMask = nullptr);
 
     // The focus of NFKD: the characters with a decomposition (canonical or
     // compatibility) or a nonzero combining class, and the character after each.
-    void DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask);
+    void DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * Mask = nullptr);
 
-    void ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask);
+    void ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask,
+                                       StreamSet * Mask = nullptr);
 
 private:
     NFD_BixData & NFKD_Data();
+    void U8_Decomposition(UCD::DecompositionOptions form, StreamSet * WorkingBasis, StreamSet * TransformedBasis,
+                          StreamSet * Mask, StreamSet * OutputMask);
 
     unsigned mFillRunGaps = 0;
     pablo::BitMovementMode mBitMovement;

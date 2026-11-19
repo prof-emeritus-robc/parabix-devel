@@ -14,9 +14,11 @@
 #    into one input per tool (each ends in a newline, so nothing composes across
 #    them), checked against the concatenated ExpectedOutput files;
 #  - masked: nfc with -nfc-mask (NFC_Masked, in place and focused, and NFC_U21
-#    with -nfc-u21, focused and in place, with the output mask's selections), each run of the characters of a set normalized
-#    by itself and the others unchanged, on the focus text, checked against
-#    unicodedata.normalize of each run;
+#    with -nfc-u21, focused and in place, with the output mask's selections), and
+#    likewise nfd and nfkd with -nfd-mask (NFD_Masked, and NFD_U21 with
+#    -nfd-u21), each run of the characters of a set normalized by itself and the
+#    others unchanged, on the focus text, checked against unicodedata.normalize
+#    of each run;
 #  - focus: a generated text mixing sparse and dense work, run with a small
 #    --segment-size so that segment boundaries fall inside work regions, checked
 #    against Python's unicodedata.normalize.  The default focus mode runs for nfd
@@ -79,7 +81,7 @@ MASK_CASES = [
 ]
 
 
-def masked_nfc(text, within, select='all'):
+def masked(form, text, within, select='all'):
     out = []
     i = 0
     while i < len(text):
@@ -88,7 +90,7 @@ def masked_nfc(text, within, select='all'):
         while j < len(text) and within(text[j]) == inside:
             j += 1
         if select == 'all' or (select == 'inside') == inside:
-            out.append(unicodedata.normalize('NFC', text[i:j]) if inside else text[i:j])
+            out.append(unicodedata.normalize(form, text[i:j]) if inside else text[i:j])
         i = j
     return ''.join(out)
 
@@ -101,6 +103,16 @@ MASK_MODES = [
     (['-nfc-u21'], 'all'),
     (['-nfc-u21', '-NoFocus'], 'outside'),
     (['-nfc-u21', '-thread-num=3', '-segment-size=1'], 'inside'),
+]
+
+# (tool, flags, -nfd-mask-select, mask case) of the masked decompositions.
+DECOMPOSITION_MASK_MODES = [
+    ('nfd', [], 'all', 0),
+    ('nfd', ['-NoFocus'], 'inside', 1),
+    ('nfd', ['-nfd-u21'], 'outside', 0),
+    ('nfd', ['-nfd-u21', '-NoFocus', '-thread-num=3', '-segment-size=1'], 'all', 1),
+    ('nfkd', ['-thread-num=3', '-segment-size=1'], 'all', 1),
+    ('nfkd', ['-nfd-u21'], 'inside', 0),
 ]
 
 
@@ -128,6 +140,8 @@ def main():
             cases.append((tool, [], path, expected, 'regression files'))
             if tool == 'nfc':
                 cases.append((tool, ['-nfc-u21'], path, expected, 'regression files, U21'))
+            if tool == 'nfd':
+                cases.append((tool, ['-nfd-u21'], path, expected, 'regression files, U21'))
         text = focus_text()
         focus_path = os.path.join(tmp, 'focus_text')
         write(focus_path, text.encode('utf-8'))
@@ -137,11 +151,19 @@ def main():
         # NFC on the 21-bit basis (nfc -nfc-u21), unmasked.
         for flags in (['-nfc-u21'], ['-nfc-u21', '-NoFocus']):
             cases.append(('nfc', flags, focus_path, unicodedata.normalize('NFC', text).encode('utf-8'), 'focus text, U21'))
+        # NFD and NFKD on the 21-bit basis (-nfd-u21), unmasked.
+        for tool, flags in (('nfd', ['-nfd-u21']), ('nfkd', ['-nfd-u21', '-NoFocus'])):
+            cases.append((tool, flags, focus_path, unicodedata.normalize(FORM[tool], text).encode('utf-8'), 'focus text, U21'))
         for spec, within in MASK_CASES:
             for flags, select in MASK_MODES:
-                expected = masked_nfc(text, within, select).encode('utf-8')
+                expected = masked('NFC', text, within, select).encode('utf-8')
                 cases.append(('nfc', flags + ['-nfc-mask=' + spec, '-nfc-mask-select=' + select], focus_path, expected,
                               'focus text, masked'))
+        for tool, flags, select, m in DECOMPOSITION_MASK_MODES:
+            spec, within = MASK_CASES[m]
+            expected = masked(FORM[tool], text, within, select).encode('utf-8')
+            cases.append((tool, flags + ['-nfd-mask=' + spec, '-nfd-mask-select=' + select], focus_path, expected,
+                          'focus text, masked'))
         failures = []
         for tool, flags, path, expected, label in cases:
             result = subprocess.run([os.path.join(bin_dir, tool)] + flags + [path], stdout=subprocess.PIPE)

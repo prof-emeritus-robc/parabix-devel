@@ -82,16 +82,28 @@ protected:
     }
 };
 
-// Unicode line separator insertion kernel: writes LF (0x0A) at token boundaries
+// The kernel's name: the default LF keeps the old name; any other separator is in the name,
+// since the object cache tells kernels apart by name.
+static std::string separatorKernelName(uint32_t separator) {
+    if (separator == 0x0A) return "addUnicodeLineSeparators";
+    char name[48];
+    std::snprintf(name, sizeof(name), "addUnicodeSeparators_%X", unsigned(separator));
+    return name;
+}
+
+// Unicode separator insertion kernel: writes the separator codepoint (default LF, 0x0A) at
+// token boundaries
 class AddUnicodeLineSeparators : public PabloKernel {
 public:
     AddUnicodeLineSeparators(LLVMTypeSystemInterface & ts,
                              StreamSet * insertMask,
                              StreamSet * spreadBasis,
-                             StreamSet * finalBasis)
-    : PabloKernel(ts, "addUnicodeLineSeparators",
+                             StreamSet * finalBasis,
+                             uint32_t separator)
+    : PabloKernel(ts, separatorKernelName(separator),
                   {Binding{"insertMask", insertMask}, Binding{"spreadBasis", spreadBasis}},
-                  {Binding{"finalBasis", finalBasis}}) {}
+                  {Binding{"finalBasis", finalBasis}})
+    , mSeparator(separator) {}
 
 protected:
     void generatePabloMethod() override {
@@ -102,13 +114,15 @@ protected:
         std::vector<PabloAST *> out(basis.size());
         for (unsigned i = 0; i < basis.size(); ++i) out[i] = basis[i];
 
+        // The inserted positions hold zero, so setting the separator's one bits writes it.
         PabloAST * insertMark = pb.createNot(insert);
-        if (out.size() >= 4) {
-            out[1] = pb.createOr(out[1], insertMark);
-            out[3] = pb.createOr(out[3], insertMark);
+        for (unsigned i = 0; i < out.size(); ++i) {
+            if ((mSeparator >> i) & 1) out[i] = pb.createOr(out[i], insertMark);
         }
         writeOutputStreamSet("finalBasis", out);
     }
+private:
+    const uint32_t mSeparator;
 };
 
 // AND kernel
@@ -1399,11 +1413,39 @@ StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, 
     return byteBoundary;
 }
 
-//  Stage 2b: spread + insert LF + filter
+// The masks buildGPT2ByteLevelResult needs: the starts without the one at position 0 (no
+// separator before the first pre-token), and a zero stream (no whitespace is removed).
+class GPT2ByteLevelMasks final : public PabloKernel {
+public:
+    GPT2ByteLevelMasks(LLVMTypeSystemInterface & ts, StreamSet * starts, StreamSet * clean, StreamSet * zero)
+    : PabloKernel(ts, "gpt2ByteLevelMasks", {Binding{"starts", starts}},
+                  {Binding{"clean", clean}, Binding{"zero", zero}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * notAtFirst = pb.createAdvance(pb.createOnes(), 1);
+        writeOutputStreamSet("clean", std::vector<PabloAST *>{
+            pb.createAnd(getInputStreamSet("starts")[0], notAtFirst)});
+        writeOutputStreamSet("zero", std::vector<PabloAST *>{pb.createZeroes()});
+    }
+};
+
+PreTokenizerResult buildGPT2ByteLevelResult(PipelineBuilder & P, StreamSet * BasisBits, bool classCode,
+                                            bool byteDomain, bool utf8Classes) {
+    StreamSet * starts = buildGPT2ByteBoundaries(P, BasisBits, classCode, byteDomain, utf8Classes);
+    StreamSet * clean = P.CreateStreamSet(1, 1);
+    StreamSet * zero = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2ByteLevelMasks>(starts, clean, zero);
+    StreamSet * mapped = applyByteLevelEncoding(P, BasisBits);
+    return PreTokenizerResult{clean, starts, zero, mapped, zero, zero, isolated, nullptr};
+}
+
+//  Stage 2b: spread + insert separators + filter
 
 StreamSet * applyTokenSeparatorInsertion(
     PipelineBuilder & P,
-    const PreTokenizerResult & result)
+    const PreTokenizerResult & result,
+    uint32_t separator)
 {
     StreamSet * lineInsertMask = P.CreateStreamSet(1);
     UnitInsertionSpreadMask(P, result.insertionBoundaries, lineInsertMask,
@@ -1415,7 +1457,7 @@ StreamSet * applyTokenSeparatorInsertion(
     SHOW_BIXNUM(spreadBasis);
 
     StreamSet * tokenBasis = P.CreateStreamSet(21);
-    P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
+    P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis, separator);
     SHOW_BIXNUM(tokenBasis);
 
     StreamSet * spreadTokenBoundaries = P.CreateStreamSet(1);

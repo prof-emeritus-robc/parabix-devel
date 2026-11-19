@@ -260,14 +260,14 @@ ready = triggers ∧ ¬Blocked
 
 Every Var only gains bits and each iteration starts again from all the blocking triggers, the form DivCode §10 shows exact although the loop's carries from the previous block reach its first iteration only. The initial values are built on the streams, not on the Vars.
 
-Checks so far:
+Checks (all closed on 2026-11-19):
 
 | Check | Result |
 |---|---|
 | `tconv_run_moves_test` (deferred rules deleting runs of triggers) | 0 failures |
 | Kana-Latn, 5 MB Katakana, 1 deferred round | identical to the previous build |
-| Kana-Latn, the same text, 8 deferred rounds | still open: the comparison with the unrolled build's output was not completed (cold compile about 12 min at 8 rounds) |
-| A chain of more than 9 triggers that the unrolled depth treated as ready too early | test not yet written: most simple copy rules are self-reproducing, whose runs `DeferredRuns` handles |
+| Kana-Latn, 8 deferred rounds (2026-11-19) | identical to the unrolled build (5a372fd94 reverted on the current source), on 650 KB of random Katakana with 23,953 iteration marks, and identical to ICU's Katakana-Latin. Rounds 2–8 change this text (the output at 1 round is 9 KB longer). Cold compile, `-compile-threads=12`: 597 s While, 609 s unrolled; 1.1 GB peak each |
+| A chain of more than 9 triggers that the unrolled depth treated as ready too early (2026-11-19) | `QA/tconv_deferred_chains_test.py`: `([bc]) { s → d $1 ; s { s } y → z ;` on `b s…s y` (the copy rule writes `d` first, so it is not self-reproducing), and a second set whose triggers are apart, through the capture's `a*`. With `--deferred-rule-rounds=16`, the While build matches ICU in all 20 cases. The unrolled build (5a372fd94 reverted on the current source) applies `z` at the last trigger of every chain of 11 or more, 8 cases. 9.6 s with a cold cache |
 | `-CheckWhileProgress` (2026-11-19) | passes: Kana-Latn, 650 KB of random Katakana with iteration marks, 1 deferred round, `--u21-nfc=0`; output identical to the run without the check |
 
 ## 5. Any-FCC passes (not recommended)
@@ -293,7 +293,7 @@ Done: section 4 (5a372fd94); section 1 for subgroups and insertion rules with fi
 Next steps (2026-11-19):
 
 1. **Fixed (2026-11-19):** the cold-compile crash under `--u21-nfc`, an out-of-bounds write in `Hangul_Composition` (section 5).
-2. **Close the section 4 checks.** Kana-Latn at 8 deferred rounds against the unrolled build's output, and a `--rules-file` test with a chain of more than 9 triggers that are not self-reproducing, so that `DeferredRuns` does not handle the chain. Both are cheap. The second is the only test that shows the fix.
+2. **Done (2026-11-19):** the section 4 checks. Kana-Latn at 8 deferred rounds is identical to the unrolled build and to ICU, and `QA/tconv_deferred_chains_test.py` covers chains of more than 9 triggers that are not self-reproducing; the unrolled build fails it.
 3. **Converted string rules in the correction kernel's While loop.** They are now the only reason a correction kernel uses rounds: 12 groups, 34 transforms. Work in two parts:
    - (a) Converted string rules whose matches need no selection among themselves. A rule's match positions do not depend on the converted text, only its before context does, so its context is decided as a subgroup's is. Its outcome is its replacement over the match, and the positions inside the match are deleted. Start with the groups that have one converted string rule: ThaiLogical-Thai, ru-zh, ia-ia_FONIPA, ja_Latn-ru. Then the groups with two: Latn-Kana, Latn-Cyrl, zu-zu_FONIPA, es-es_FONIPA. Then the groups where all string rules are converted: hy-hy_Latn/BGN (36), blt-blt_FONIPA (48).
    - (b) Selection among overlapping matches (class 1A: el-el_Latn/BGN; ja_Latn-ko unless DivCode takes it, step 5). Add three-valued state for "match known applied / known rejected", decided left to right as in 1A.

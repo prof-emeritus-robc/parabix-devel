@@ -1051,6 +1051,11 @@ add_test(
   COMMAND python3 tconv_run_moves_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_deferred_chains_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_deferred_chains_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_capture_variants_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_capture_variants_test.py ${BIN_DIR}/tconv)

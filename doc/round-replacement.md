@@ -1,6 +1,42 @@
 # Rounds in tconv: candidates for Pablo While loops
 
-Survey of branch LDML at `d3d0aadc1` (2026-11-17). DivCode now resolves before contexts matched against the converted text with a monotone Pablo `While` loop (doc/ldml-divcode-plan.md §10–§12). This document lists every other place in `tools/ldml/tconv.cpp` that iterates by a fixed number of rounds, classifies them, gives the transforms whose own rules use each one, and counts the unrolled Pablo copies or duplicated kernel calls.
+Survey of branch LDML at `d3d0aadc1` (2026-11-17); status re-surveyed at `d7854835d` (2026-11-19), see the next section. DivCode now resolves before contexts matched against the converted text with a monotone Pablo `While` loop (doc/ldml-divcode-plan.md §10–§12). This document lists every other place in `tools/ldml/tconv.cpp` that iterates by a fixed number of rounds, classifies them, gives the transforms whose own rules use each one, and counts the unrolled Pablo copies or duplicated kernel calls.
+
+## Status at `d7854835d` (2026-11-19)
+
+Since the survey: the correction kernel's While loop (section 1, three increments: bbf6441b9, f54649389, be71bdebb), Unicode properties as kernels of their own (ad6249224), DeferredPlan's closure as a While loop (section 4, 5a372fd94), and, from the masked-transforms work (doc/masked-transforms-plan.md), case-map marks (c85065bb7), fused priority (42afb550b), contexts bounded by regions (cf7678185) and masked NFC (a0fbb5024).
+
+**Method of the re-survey.** A build of `d7854835d` with a temporary trace (not committed): for each `FusedRules` correction kernel, whether `resolvableByWhile` holds (`W`) or the rounds remain (`R`), with its string rules and subgroups and how many of each are matched against the converted text; and a line for each staged selection and each deferred-rule group. `tconv --kernel-counts` for all 453 transform names (the pipelines are built, not compiled). A transform is counted if it or a transform it invokes has the kernel.
+
+| Mechanism | At the survey | Now | Remaining |
+|---|---|---|---|
+| 1. Correction kernel | 34 groups, all on rounds | 21 of those groups on the While loop, 12 on rounds; Latin-NumericPinyin #1 no longer has a correction kernel. 63 transforms have a While correction kernel, 34 one on rounds | converted string rules (all 12 groups) |
+| 2. Staged sequential selection | 13 groups | unchanged: 13 groups, 59 transforms; still 21 kernels more at 8 rounds than at 1 | all |
+| 3. Deferred-rule rounds | Kana-Latn, fa-fa_FONIPA | unchanged; Kana-Latn #1 946 kernels at 8 rounds, 162 at 1 (Jpan-Latn 3,084 in all) | all |
+| 4. DeferredPlan blocking depth | 9 unrolled steps | While loop, committed (5a372fd94) | checks, see section 4 |
+| 5. Any-FCC passes | 422 kernels | 318 kernels (Any-NFC 75): each pass is now a masked NFC on the 21-bit basis | not a candidate |
+| 6. Stale text | | still stale (`include/ldml/divcode_plan.h` 63–66, 155–156; doc/ldml-tconv-coverage.md §3.1, §3.2) | edit |
+
+**The correction kernels still on rounds.** Every one has string rules whose before contexts are matched against the converted text; none is held back by its contexts' form (no repetition that `ContextExpansion` cannot give as `X T*`). Converted string rules are therefore the one remaining blocker of section 1.
+
+| Transform (and those invoking it) | Class | String rules (converted) | Subgroups (converted) |
+|---|---|--:|--:|
+| ThaiLogical-Thai (Latn-Thai) | 1E | 1 (1) | 1 (1) |
+| ru-zh | 1A | 22 (1) | 2 (0) |
+| ia-ia_FONIPA (ia-am, ia-ar, ia-chr, ia-fa) | 1A | 29 (1) | 7 (0) |
+| ja_Latn-ru | 1B | 31 (1) | 26 (7) |
+| Latn-Kana (Latn-Hira) | 1C | 240 (2) | 60 (5) |
+| Latn-Cyrl | 1D | 70 (2) | 24 (4) |
+| zu-zu_FONIPA (zu-am, zu-ar, zu-chr, zu-fa) | 1A | 18 (2) | 12 (4) |
+| es-es_FONIPA (es-am, es-ar, es-chr, es-fa, es-ja, es-zh and the es_419-* forms: 13) | 1A | 12 (2) | 35 (22) |
+| el-el_Latn/BGN | 1A | 73 (18) | 36 (4) |
+| hy-hy_Latn/BGN | 1C | 36 (36) | 4 (4) |
+| blt-blt_FONIPA | 1C | 48 (48) | 22 (22) |
+| ja_Latn-ko | 1B | 80 (60) | 81 (46) |
+
+**The groups of the survey now on the While loop:** 1A Hans-Hant, Latin-InterIndic (and the ten Latn-* Indic transforms), Latn-Ethi/SERA, und_FONIPA-ar (and 21 *-ar transforms), ps-ps_Latn/BGN, Zawgyi-my #9; 1C ConjoiningJamo-Latin (with its 54 insertion rules), uz_Cyrl-uz_Latn, ky-ky_FONIPA, es-ar, es-fa, es_419-ar, es_419-fa; 1D az-, tr-, el-, lt-Title and Grek-Latn #2; 1E Spacedhan-Han, my-my_FONIPA #4, Zawgyi-my #3. Also, not in the survey's tables, the Han-Latin insertion group (Han-Latin/Names, Hani-Latn, Hant-Latn, Jpan-Latn, Han-Spacedhan), Bopo-Latn and NumericPinyin-Latin. For the four 1A groups over `--whole-group-rules` (Hans-Hant, Latin-InterIndic, Latn-Ethi/SERA, und_FONIPA-ar) only the subgroups are in the kernel: their string rules' before contexts are still matched against the text itself (the `--plan` warnings), so these are exact only once converted string rules are resolved too.
+
+**Interactions with the masked-transforms work.** The While loop and the rounds both walk the converted text back within a region when contexts are bounded by `--lines` regions (`FusedRulesConfig::region`, cf7678185). With case-map marks, a marked position's outcome in the loop comes from static classes of the case mapping (`caseMapLengthChars`, `caseMapSlotChars`, `caseMapItemChars`); the Title transforms' class kernels shrink (lt-Title 2,069 Pablo lines against 23,282), but their execution cycles on 10 MB of Wikibooks text rose 1–8% (c85065bb7, to be optimized).
 
 ## Method
 
@@ -118,7 +154,9 @@ The loop's body is factored: the subgroups with the same mappings (differing in 
 - Newly resolved by default: ConjoiningJamo-Latin (and Hang-Latn, Jamo-Latn through it), the Han-Latin groups (Han-Latin/Names, Hani-Latn, Hant-Latn, Jpan-Latn) and Han-Spacedhan. Identical to the rounds and to ICU on random text of their scripts, except Han-Spacedhan, which differs from ICU with the rounds as well (an ICU issue: the filter of its first `::` transform also applies to the next one, doc/ICU-uconv-issues.md).
 - ConjoiningJamo-Latin on 5 MB of jamo (NFD of random Hangul syllables), 1 thread: cold compilation 3.38 s against 12.87 s at 8 rounds, warm run 0.19 s against 0.35 s (−46%); its correction kernel 25,208 Pablo lines against 62,329.
 
-Next increment for this class: converted string rules (hy-hy_Latn/BGN #1, blt-blt_FONIPA #2, Latn-Kana; with class 1A).
+Next increment for this class: converted string rules (hy-hy_Latn/BGN #1, blt-blt_FONIPA #2, Latn-Kana; with class 1A). At `d7854835d` these are the only reason any correction kernel stays on rounds (see the status section at the top).
+
+**`-CheckWhileProgress` (2026-11-19, `--u21-nfc=0`, see section 5):** it fails on every correction kernel tried (uz_Cyrl-uz_Latn: "lowest bit at 7, then at 0"; ConjoiningJamo-Latin and el-Title: "at 0, then at 0"). This is expected from the loop's form, not a sign of a wrong result: `Progress` starts as `dep` (all dependent positions), and the first iteration adds the `K` bits that the carries from the previous block give at the block's start, so the first comparison is between unrelated streams. The check is useful here only if it skips the first iteration or `Progress` starts as the first iteration's new bits.
 
 ### 1D. A repeated set in a before context whose membership the conversions change (S T*)
 
@@ -154,6 +192,8 @@ Small correction kernels (one to six converted contexts). A While loop would mak
 | Zawgyi-my | 3 | 1 | 4 | 1 (+1 warned) | 301 | not measured (the 1-round compile was stopped after 15 minutes) | rules with captures; string rules with runs |
 
 Where a transform has several regular-plan groups, the Pablo figure is its largest correction kernel.
+
+**Status (2026-11-19).** Spacedhan-Han, my-my_FONIPA #4 and Zawgyi-my #3 (and #9 of class 1A) are on the While loop; Zawgyi-my's output against the rounds' and its Pablo sizes are still unmeasured (its compilation is long). Latin-NumericPinyin #1 has no correction kernel now (its before contexts, `e {`, are matched against the text). ThaiLogical-Thai stays on rounds: its one string rule's before context is matched against the converted text.
 
 ## 2. Staged sequential selection between rounds
 
@@ -204,7 +244,7 @@ repeat DeferredBlockingDepth (8) times:
 
 That is 9 `MatchStar` steps per kernel, in each of the 8 rounds: 72 copies per deferred group, 144 in Jpan-Latn. The closure is monotone and moves rightward, exactly the form DivCode §10 shows a While loop computes exactly (accumulate `blocked`, frontier = triggers newly blocked). A chain of more than 9 triggers is currently under-blocked, so a trigger can be treated as ready while a trigger before it is unreplaced. Possibly a single `MatchStar` through the reach and the trigger texts suffices; that needs checking against the tails' classes. Small change, exact, cheap: recommended first.
 
-**Status (2026-11-17): implemented in the working tree, not yet committed.** `DeferredPlan` now computes the closure with a While loop (`tools/ldml/tconv.cpp`, kernel renamed `DeferredPlanW_…` so that cached kernels are not reused; `DeferredBlockingDepth` removed):
+**Status: committed in 5a372fd94 (2026-11-17).** `DeferredPlan` now computes the closure with a While loop (`tools/ldml/tconv.cpp`, kernel renamed `DeferredPlanW_…` so that cached kernels are not reused; `DeferredBlockingDepth` removed):
 
 ```
 Blocked  = blockedBy(triggers ∧ matched)
@@ -226,15 +266,21 @@ Checks so far:
 |---|---|
 | `tconv_run_moves_test` (deferred rules deleting runs of triggers) | 0 failures |
 | Kana-Latn, 5 MB Katakana, 1 deferred round | identical to the previous build |
-| Kana-Latn, the same text, 8 deferred rounds | running |
+| Kana-Latn, the same text, 8 deferred rounds | still open: the comparison with the unrolled build's output was not completed (cold compile about 12 min at 8 rounds) |
 | A chain of more than 9 triggers that the unrolled depth treated as ready too early | test not yet written: most simple copy rules are self-reproducing, whose runs `DeferredRuns` handles |
-| `-CheckWhileProgress` | not yet run; a run carried from the previous block can block a trigger before the current frontier in the first iteration, which the check may report although the result is exact |
+| `-CheckWhileProgress` (2026-11-19) | passes: Kana-Latn, 650 KB of random Katakana with iteration marks, 1 deferred round, `--u21-nfc=0`; output identical to the run without the check |
 
 ## 5. Any-FCC passes (not recommended)
 
 `fcc()` runs NFC on a barrier-masked text `FCC_Passes()` times (3: the most nonstarters in a primary composite, U+1F82). Each pass is a multi-kernel NFC pipeline (Any-FCC has 422 kernels against 114 for Any-NFC). The count is exact by Unicode data, and an NFC pipeline cannot run inside a Pablo While, so there is nothing to gain from a loop.
 
+**Status (2026-11-19).** Each pass is now a masked NFC on the 21-bit basis (`NFC_U21`, `--u21-nfc`, a0fbb5024): Any-FCC has 318 kernels and Any-NFC 75. Still not a candidate.
+
+**A crash found in this check, fixed.** With `--u21-nfc` (the default), the first compile of Any-FCC or Latin-Cyrillic into an empty object cache aborted with "double free or corruption" while freeing the kernel's module (`CPUDriverCompiler::materializeObject` → `llvm::Module::~Module`). It happened every time, also with `-compile-threads=1`, and so also with `-enable-object-cache=0` and `-CheckWhileProgress`. The cause was `Hangul_Composition` on a basis wider than 8 bits (`lib/kernel/unicode/normalization/normalization.cpp`). `Merged_LV` is as wide as the basis, so `Composed = AddFull(Merged_LV, TIndex)` is one bit wider. `ZeroExtend(Composed, Basis.size())` then wrote one element past the end of its vector (its assertion is compiled out in release builds), which corrupted the heap. The bug is as old as the kernel, but nothing used the kernel with a 21-bit basis before `NFC_U21`. Now the carry bit, which is always 0 because a syllable is at most U+D7A3, is truncated. Cold compiles, uncached runs and `-CheckWhileProgress` work at the defaults, and Any-NFC, Any-NFKC and Any-FCC compose random Hangul (NFD and mixed) as Python's NFC does.
+
 ## 6. Already replaced, and stale text
+
+(Rechecked at `d7854835d`: all three items below are still as described.)
 
 - DivCode applies 55 groups (by kernel counts with `--divcode-groups=0`), including all 42 eligible converted-context groups except ja_Latn-ko #2 and ro_FONIPA-ja #2.
 - `include/ldml/divcode_plan.h`: `convertedRounds = 8` is now only an on/off switch for converted contexts, and its comments (lines 63–66, 155–156) and `lib/ldml/divcode_plan.cpp:328` still describe rounds.
@@ -242,7 +288,23 @@ Checks so far:
 
 ## Recommended order
 
-1. Section 4: the `DeferredPlan` blocking closure as a While loop (or one `MatchStar`). Small, exact, also fixes chains longer than 9. In progress (see its status).
-2. Section 1, in the regular `FusedRules` correction kernel: a monotone three-valued While loop for single-character subgroups first (classes 1C–1E, 21 groups), reusing the DivCode §10 formulation, then string-match selection (class 1A, then section 2). Lift `--whole-group-rules` once the body is not unrolled. In progress: subgroups and insertion rules with fixed items or a repeated set done (see the status in 1C; this also covers the Title groups of 1D); converted string rules remain.
-3. Class 1B: let DivCode follow prefix runs that delete (brings in ja_Latn-ko #2 and ro_FONIPA-ja #2).
-4. Section 3: only after measuring rounds against real Japanese and Persian text; the redesign is large.
+Done: section 4 (5a372fd94); section 1 for subgroups and insertion rules with fixed items or a repeated set (21 of the survey's 34 groups, plus the Han-Latin group, Bopo-Latn and NumericPinyin-Latin).
+
+Next steps (2026-11-19):
+
+1. **Fixed (2026-11-19):** the cold-compile crash under `--u21-nfc`, an out-of-bounds write in `Hangul_Composition` (section 5).
+2. **Close the section 4 checks.** Kana-Latn at 8 deferred rounds against the unrolled build's output, and a `--rules-file` test with a chain of more than 9 triggers that are not self-reproducing, so that `DeferredRuns` does not handle the chain. Both are cheap. The second is the only test that shows the fix.
+3. **Converted string rules in the correction kernel's While loop.** They are now the only reason a correction kernel uses rounds: 12 groups, 34 transforms. Work in two parts:
+   - (a) Converted string rules whose matches need no selection among themselves. A rule's match positions do not depend on the converted text, only its before context does, so its context is decided as a subgroup's is. Its outcome is its replacement over the match, and the positions inside the match are deleted. Start with the groups that have one converted string rule: ThaiLogical-Thai, ru-zh, ia-ia_FONIPA, ja_Latn-ru. Then the groups with two: Latn-Kana, Latn-Cyrl, zu-zu_FONIPA, es-es_FONIPA. Then the groups where all string rules are converted: hy-hy_Latn/BGN (36), blt-blt_FONIPA (48).
+   - (b) Selection among overlapping matches (class 1A: el-el_Latn/BGN; ja_Latn-ko unless DivCode takes it, step 5). Add three-valued state for "match known applied / known rejected", decided left to right as in 1A.
+   Use `QA/tconv_converted_while_test.py` as the test pattern, and compare against ICU and the rounds on random text of each script.
+4. **Raise `--whole-group-rules` once 3(b) works.** Hans-Hant, Latin-InterIndic, Latn-Ethi/SERA and und_FONIPA-ar have their subgroups on the While loop already, but their string rules' before contexts are still matched against the unconverted text. For Latin-InterIndic that is the known mismatch with ICU, 41 of 988 random words. With one copy of the loop body, the guard against nine copies is no longer needed.
+5. **Class 1B:** let DivCode follow prefix runs that delete. This brings in ja_Latn-ko #2 and ro_FONIPA-ja #2, and removes the largest group from 3(b).
+6. **Section 2, staged selection** (13 groups, 59 transforms, 21 more kernels each at 8 rounds than at 1): fold the matching, `LeftmostMatches` and applying kernels into one While kernel. This reuses the selection state of 3(b).
+7. **After 3 to 6:** `--converted-context-rounds` is left only as a switch, like DivCode's `convertedRounds`. Remove the round bodies of `FusedRules` (round 0 is still needed) and the staged loop, then update the stale text of section 6.
+8. **Section 3, deferred rounds:** still only after measuring against real Japanese and Persian text. As a cheap interim step, measure whether `--deferred-rule-rounds=4` loses anything on real text. On random Katakana it is identical to 8, and it saves about 440 s of Kana-Latn's cold compile.
+9. **Small items:**
+   - Make `-CheckWhileProgress` usable on the correction kernels: skip the first iteration, or start `Progress` from the first iteration's new bits (see 1C).
+   - Measure Zawgyi-my (While against rounds, and its Pablo size).
+   - Recover the 1–8% execution-cycle regression of the Title transforms under case-map marks (1D).
+   - Edit the stale comments and doc text listed in section 6.

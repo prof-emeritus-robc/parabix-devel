@@ -293,7 +293,8 @@ void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions);
 
 // The focus of NFC: the UTF-8 sequences that may change (composable sequences
 // and excluded composites).
-void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask);
+void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
+                                StreamSet * Mask = nullptr);
 
 // NFC of the UTF-8 basis bits U8_Basis.  The transform works in a working space,
 // U8_Basis with room inserted for decompositions; ValidWorkMask marks the positions
@@ -311,7 +312,17 @@ void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * Transf
 // The placement of the transformed work regions in the output, given the
 // ValidWorkMask from NFC_Transform of the work regions.
 void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask);
+                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask, StreamSet * Mask = nullptr);
+
+// NFC within a mask (a stream over Basis set on every byte of each character
+// within it; the C++ kernels only): each run of the mask normalized by itself,
+// the characters outside it unchanged and acting as barriers.  Focused (as
+// NFC_FocusedTransform, with the options' filter and reintegration modes) or,
+// with options.Focus false, in place.  Returns the output bytes; OutputMask, if
+// given, receives the mask over them (the normalized characters, and those
+// outside the mask where they were).
+StreamSet * NFC_Masked(PipelineBuilder & P, const kernel::FocusOptions & options, StreamSet * Bytes, StreamSet * Basis,
+                       StreamSet * Mask, StreamSet * OutputMask = nullptr);
 
 // NFD Support
 

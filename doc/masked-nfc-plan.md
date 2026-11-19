@@ -498,6 +498,47 @@ on the CLDR transforms that use NFC.
    the in-place path (see Focused or in place). Test focused against in place
    with masks, at every seam case above, and measure both at several densities
    of work.
+
+   Done (2026-11-19). `NFC_Masked(P, options, Bytes, Basis, Mask, OutputMask)`
+   applies NFC within a mask, focused or in place (`options.Focus`).
+   - **Focused:**
+     - the candidates are masked before `NFC_Focus`, so the character before
+       each candidate stays in its work region, even outside the mask;
+     - the mask is filtered with the work regions, and the transform runs
+       under it;
+     - the placement's insertion room is the transform's (the work regions
+       ∧ the mask);
+     - the output mask merges the transformed mask, where placed, with the
+       mask of the unmodified bytes (`MergeByMask` by the placement mask).
+   - **In place:** `NFC_Transform` on the whole text, with the masked work
+     selection for the insertion room.
+
+   The mask travels beside the basis in `NFC_Masked`, not through a generic
+   auxiliary-stream facility of `FocusedTransform`. That facility can follow
+   when masked focused NFD (UTF-8 mode) needs the same.
+
+   `nfc -nfc-mask=<hex ranges> [-nfc-mask-select=inside|outside]` exposes
+   both paths. Checked against the reference NFC of each run with five masks
+   over the pairs, random, every-code-point and NormalizationTest inputs:
+   - in place;
+   - focused with the default modes, the byte and bit filters and
+     reintegrations, `-fill-run-gaps=3`, and `-thread-num=4
+     -segment-size=1`;
+   - the output mask's inside and outside selections.
+
+   All match. Without the seam rule (the predecessors outside the mask
+   dropped from the focus), the focused output differs on 196 to 21,821 lines
+   per mask and input. `normalization_test` has eight masked cases.
+
+   Warm run times on 10 MB (sparse: English with occasional decomposed
+   accents; dense: decomposed Vietnamese), focused / in place:
+
+   | Text | No mask | Mask: all | Mask: Latin and marks | Mask: lowercase and marks |
+   |---|---|---|---|---|
+   | sparse | 0.07 / 0.11 s | 0.06 / 0.10 s | 0.07 / 0.11 s | 0.07 / 0.11 s |
+   | dense | 0.13 / 0.15 s | 0.14 / 0.16 s | 0.14 / 0.16 s | 0.13 / 0.16 s |
+
+   The mask costs nothing measurable, and focus is faster at both densities.
 5. **U21 mode.** Kernel classes on the 21-bit basis (see A U21 mode of NFC),
    unmasked then masked, checked against the UTF-8 kernels by the same tests,
    and measured against the conversion to UTF-8 and back.

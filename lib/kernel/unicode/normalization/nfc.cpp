@@ -11,6 +11,7 @@
 #include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/core/kernel_builder.h>
+#include <kernel/basis/p2s_kernel.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
@@ -189,9 +190,12 @@ void NFC_WorkingSpaceTransform(PipelineBuilder & P, StreamSet * ExpansionMask, S
 
 }
 
-void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask) {
+void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask, StreamSet * Mask) {
     StreamSet * NFC_Candidates = P.CreateStreamSet(2, 1);
     NFC_CandidateClasses(P, U8_Basis, NFC_Candidates);
+    //  (Within a mask: its candidates, with the characters before them, even
+    //  outside it, which separate the work regions; see NFC_Masked.)
+    if (Mask) NFC_Candidates = NFC_MaskStreams(P, NFC_Candidates, Mask);
     SHOW_BIXNUM(NFC_Candidates);
 
     StreamSet * NFC_WorkItems = P.CreateStreamSet(1, 1);
@@ -245,11 +249,16 @@ void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * Transf
 }
 
 void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask) {
+                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask, StreamSet * Mask) {
     // The working space of the work regions, in the source expanded as for the
-    // transform of the work regions.
+    // transform of the work regions (within the mask, if any, as the transform).
+    StreamSet * insertionMask = WorkSelectionMask;
+    if (Mask) {
+        insertionMask = P.CreateStreamSet(1, 1);
+        AndCombine(P, WorkSelectionMask, Mask, insertionMask);
+    }
     StreamSet * const InsertionBixNum = P.CreateStreamSet(4, 1);
-    NFC_InitialInsertion(P, U8_Basis, InsertionBixNum, WorkSelectionMask);
+    NFC_InitialInsertion(P, U8_Basis, InsertionBixNum, insertionMask);
     SHOW_BIXNUM(InsertionBixNum);
 
     StreamSet * const SourceExpansionMask = P.CreateStreamSet(1, 1);
@@ -281,4 +290,52 @@ FocusedTransform NFC_FocusedTransform(const FocusOptions & options) {
         [](PipelineBuilder & P, StreamSet * basis, StreamSet * transformedBasis, StreamSet * validMask) {
             NFC_Transform(P, basis, transformedBasis, validMask);
         });
+}
+
+//  NFC within a mask (see the declaration): focused, the work regions within
+//  the mask (each with the character before its candidates, even outside the
+//  mask: inert in the transform, as its mask bits are 0, it keeps the regions
+//  from composing across their seams) and the mask carried with them; or in
+//  place, the whole text under the mask.
+StreamSet * NFC_Masked(PipelineBuilder & P, const FocusOptions & options, StreamSet * Bytes, StreamSet * Basis,
+                       StreamSet * Mask, StreamSet * OutputMask) {
+    if (!options.Focus) {
+        StreamSet * const WorkSelectionMask = P.CreateStreamSet(1, 1);
+        DetermineNFC_WorkSelection(P, Basis, WorkSelectionMask, Mask);
+        StreamSet * const TransformedBasis = P.CreateStreamSet(8, 1);
+        StreamSet * const ValidWorkMask = P.CreateStreamSet(1, 1);
+        NFC_Transform(P, Basis, TransformedBasis, ValidWorkMask, WorkSelectionMask, Mask, OutputMask);
+        StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(TransformedBasis, OutputBytes);
+        return OutputBytes;
+    }
+    const FocusedTransform NFC(options,
+        [Mask](PipelineBuilder & P, StreamSet * basis, StreamSet * workMask) {
+            DetermineNFC_WorkSelection(P, basis, workMask, Mask);
+        },
+        [Mask](PipelineBuilder & P, StreamSet * basis, StreamSet * workMask, StreamSet * validMask, StreamSet * placementMask) {
+            NFC_WorkPlacement(P, basis, workMask, validMask, placementMask, Mask);
+        },
+        [](PipelineBuilder &, StreamSet *, StreamSet *, StreamSet *) {
+            llvm::report_fatal_error("NFC_Masked: the transform is applied with the focused mask");
+        });
+    StreamSet * const workMask = NFC.focus(P, Basis);
+    StreamSet * const focusedBasis = NFC.filter(P, Bytes, Basis, workMask);
+    StreamSet * const focusedMask = P.CreateStreamSet(1, 1);
+    FilterByMask(P, workMask, Mask, focusedMask);
+    StreamSet * const transformedBasis = P.CreateStreamSet(8, 1);
+    StreamSet * const validMask = P.CreateStreamSet(1, 1);
+    StreamSet * const transformedMask = OutputMask ? P.CreateStreamSet(1, 1) : nullptr;
+    NFC_Transform(P, focusedBasis, transformedBasis, validMask, nullptr, focusedMask, transformedMask);
+    StreamSet * const placementMask = NFC.validatedPlacement(P, Basis, workMask, validMask);
+    StreamSet * const outputBytes = NFC.reintegrate(P, workMask, placementMask, Bytes, Basis, transformedBasis);
+    if (OutputMask) {
+        //  The mask of the unmodified bytes, and that of the transformed ones where placed.
+        StreamSet * const notWork = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<bixnum::EQ_immediate>(workMask, 0, notWork);
+        StreamSet * const unmodified = P.CreateStreamSet(1, 1);
+        FilterByMask(P, notWork, Mask, unmodified);
+        MergeByMask(P, placementMask, transformedMask, unmodified, OutputMask);
+    }
+    return outputBytes;
 }

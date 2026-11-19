@@ -13,9 +13,10 @@
 #  - regression: the small cases in nfd/TestFiles and nfc/TestFiles, concatenated
 #    into one input per tool (each ends in a newline, so nothing composes across
 #    them), checked against the concatenated ExpectedOutput files;
-#  - masked: nfc with -nfc-mask (unfocused), each run of the characters of a set
-#    normalized by itself and the others unchanged, on the focus text, checked
-#    against unicodedata.normalize of each run;
+#  - masked: nfc with -nfc-mask (NFC_Masked, in place and focused, with the
+#    output mask's selections), each run of the characters of a set normalized
+#    by itself and the others unchanged, on the focus text, checked against
+#    unicodedata.normalize of each run;
 #  - focus: a generated text mixing sparse and dense work, run with a small
 #    --segment-size so that segment boundaries fall inside work regions, checked
 #    against Python's unicodedata.normalize.  The default focus mode runs for nfd
@@ -78,7 +79,7 @@ MASK_CASES = [
 ]
 
 
-def masked_nfc(text, within):
+def masked_nfc(text, within, select='all'):
     out = []
     i = 0
     while i < len(text):
@@ -86,9 +87,18 @@ def masked_nfc(text, within):
         inside = within(text[i])
         while j < len(text) and within(text[j]) == inside:
             j += 1
-        out.append(unicodedata.normalize('NFC', text[i:j]) if inside else text[i:j])
+        if select == 'all' or (select == 'inside') == inside:
+            out.append(unicodedata.normalize('NFC', text[i:j]) if inside else text[i:j])
         i = j
     return ''.join(out)
+
+# (flags, -nfc-mask-select) of the masked cases: in place, and focused.
+MASK_MODES = [
+    (['-NoFocus'], 'all'),
+    ([], 'all'),
+    (['-thread-num=3', '-segment-size=1'], 'inside'),
+    (['-focus-filter=byte', '-reintegrate=byte-replace'], 'outside'),
+]
 
 
 def read(path):
@@ -120,8 +130,10 @@ def main():
             expected = unicodedata.normalize(FORM[tool], text).encode('utf-8')
             cases.append((tool, FOCUS_COMMON + flags, focus_path, expected, 'focus text'))
         for spec, within in MASK_CASES:
-            expected = masked_nfc(text, within).encode('utf-8')
-            cases.append(('nfc', ['-NoFocus', '-nfc-mask=' + spec], focus_path, expected, 'focus text, masked'))
+            for flags, select in MASK_MODES:
+                expected = masked_nfc(text, within, select).encode('utf-8')
+                cases.append(('nfc', flags + ['-nfc-mask=' + spec, '-nfc-mask-select=' + select], focus_path, expected,
+                              'focus text, masked'))
         failures = []
         for tool, flags, path, expected, label in cases:
             result = subprocess.run([os.path.join(bin_dir, tool)] + flags + [path], stdout=subprocess.PIPE)

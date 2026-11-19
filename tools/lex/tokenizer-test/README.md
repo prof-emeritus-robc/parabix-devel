@@ -1,4 +1,131 @@
-# Tokenizer Test Suite
+<div align="center">
+
+# ⚡ Parabix Tokenizer: results
+
+**A GPT-2 byte-level BPE tokenizer that processes text as bit streams.**<br>
+Output identical to HuggingFace `tokenizers` and OpenAI `tiktoken`, 11–15× faster than tiktoken
+and 61–90× faster than HuggingFace 0.23.3 on 4 MB inputs.
+
+[![Output](https://img.shields.io/badge/output-identical%20to%20HF%20%26%20tiktoken-3D6F89?style=for-the-badge)](#-correctness)
+[![Model](https://img.shields.io/badge/model-GPT--2%20BPE-2F5B78?style=for-the-badge)](../README.md#limitations)
+[![Speed](https://img.shields.io/badge/vs%20tiktoken-up%20to%2015.2%C3%97-7C8D99?style=for-the-badge)](#-results)
+[![Speed](https://img.shields.io/badge/vs%20HuggingFace-up%20to%2090.0%C3%97-8FA9BC?style=for-the-badge)](#-results)
+
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)
+![LLVM](https://img.shields.io/badge/LLVM-17%2B-262D3A?logo=llvm&logoColor=white)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20BSD-555)
+![License](https://img.shields.io/badge/license-OSL%203.0-blue)
+
+[Results](#-results) · [Correctness](#-correctness) · [Reproduce](#-reproduce) · [Implementation](../README.md) · [Scripts](#test-and-benchmark-scripts)
+
+</div>
+
+---
+
+## 🚀 Results
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/speedup-dark.png">
+    <img alt="Speed-up of Parabix over tiktoken and HuggingFace tokenizers, 1 and 4 threads, three 4 MB inputs" src="assets/speedup-light.png" width="100%">
+  </picture>
+</p>
+
+Time to tokenize a whole 4 MB file, cold caches: median of three rounds of five runs (minimum over all 15 runs in brackets). Speed-up: the reference's median over Parabix's.
+
+| Threads | Input | **Parabix** | tiktoken 0.14.0 | HF `tokenizers` 0.23.3 | vs tiktoken | vs HF |
+|:-:|---|--:|--:|--:|:-:|:-:|
+| 1 | `val_4MB` (web text) | **12.9 ms** (12.7) | 137 ms (135) | 1,098 ms (1,080) | **10.7×** | **85.4×** |
+| 1 | `code_4MB` (C/C++ source) | **16.2 ms** (15.7) | 238 ms (237) | 1,162 ms (1,146) | **14.8×** | **71.9×** |
+| 1 | `multi_4MB` (15 languages) | **17.9 ms** (17.4) | 217 ms (214) | 1,339 ms (1,319) | **12.1×** | **74.9×** |
+| 4 | `val_4MB` | **3.86 ms** (3.77) | 48.7 ms (48.3) | 347 ms (341) | **12.6×** | **90.0×** |
+| 4 | `code_4MB` | **5.89 ms** (5.70) | 85.5 ms (84.7) | 360 ms (348) | **14.5×** | **61.2×** |
+| 4 | `multi_4MB` | **5.89 ms** (5.68) | 89.8 ms (88.9) | 392 ms (381) | **15.2×** | **66.5×** |
+
+<details>
+<summary><b>Absolute times (log scale)</b></summary>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/speed-time-dark.png">
+    <img alt="Milliseconds per 4 MB file for Parabix, tiktoken and HuggingFace, log scale" src="assets/speed-time-light.png" width="100%">
+  </picture>
+</p>
+
+</details>
+
+> [!NOTE]
+> **Measurement conditions.** Apple M3, macOS, measured on 2026-11-19 (commit `4225b1fab`, with `master` merged), with the recommended options
+> (see [Reproduce](#-reproduce)). Parabix and HF caches are emptied before every run. Every engine uses
+> the same number of threads: at 4 threads, HF and tiktoken run `encode_batch` over the text split at
+> pre-token boundaries. The inputs are the original file bytes (`val_4MB` keeps its CRLF line ends and NUL runs).
+> These are **tokenization times only**: a one-shot run of the command-line tool also loads the rules,
+> builds the tables and the pipeline (about 60 ms) and formats the output. The numbers are from one
+> machine; the Intel x86-64 run is not in this table. The previous run (2026-11-16, five rounds of ten
+> runs) gave Parabix times within 5% of these.
+> Per-script options: [Scripts](#test-and-benchmark-scripts).
+
+### Pre-tokenizers on their own
+
+Each pre-tokenizer timed alone against HuggingFace 0.23.3, 1 thread, whole 4 MB files, median of three rounds of five calls (2026-11-19, commit `4225b1fab`). Ratio: HF median over Parabix median. In every case the pre-token strings and their order match HuggingFace's.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/pretokenizers-dark.png">
+    <img alt="Pre-tokenizer speed-up over HuggingFace 0.23.3 for ten modes on three inputs" src="assets/pretokenizers-light.png" width="80%">
+  </picture>
+</p>
+
+The byte path is the GPT-2 boundary builder that the BPE pipeline uses; the codepoint path (`--pretokenizer=bytelevel`) decodes to codepoints first. Gains range from 1.4× (`chardelimiter`) to 27.8× (byte path, `code_4MB`). The two sides do not do the same work (HF also records offsets; Parabix writes the strings to `/dev/null`), so the ratios compare two complete standalone pre-tokenizers, not boundary finding alone.
+
+## ✅ Correctness
+
+Speed is only reported where the output is the same. On the tested inputs, the outputs are identical:
+
+| Check | Inputs | Result |
+|---|---|---|
+| BPE ids vs HF 0.23.3 and tiktoken 0.14.0, original file bytes | 3 corpora + 7 single-language files, 1 and 4 threads | ✅ all 20 runs identical |
+| Same, small segments (128, 1,024, 4,096 bytes) | 3 corpora, 4 threads | ✅ all 9 runs identical |
+| Same, 1,024-byte segments | 3 corpora, 8 threads | ✅ all 3 runs identical |
+| Character offsets (`--offsets=char`) vs HF `Encoding.offsets` | all 10 inputs | ✅ identical |
+| Byte offsets (`--offsets=byte`) | all 10 inputs | ✅ ids match; spans tile the input |
+| Pre-tokenizers vs HF | GPT-2 on all 10 complete inputs; the 8 other timed modes on the 3 corpora (24 cases) | ✅ same strings and order |
+| Normalizers vs HF, 13 modes and 6 compositions | first 200 lines of each 4 MB file | ✅ all 19 match |
+| Normalizers vs HF, codepoint sweep (292,531 assigned codepoints), 2026-11-16, before `master` was merged | 10 modes | 5 modes match on every codepoint; the 5 built on Unicode normalization (`nfc`, `nfd`, `nfkc`, `nfkd`, `stripaccents`) differ on 3–191 characters, all added in Unicode 12.0 or later |
+
+This is testing, not proof: the tests cover these inputs, not every possible input. What each check covers: [Validation](../README.md#validation).
+
+## 🔁 Reproduce
+
+Inputs are committed in [`../tokenizer_files/`](../tokenizer_files/): three 4 MB files, `val_4MB.txt` (web text, CRLF line ends, some NUL runs; 1,334,004 GPT-2 tokens, or 1,302,487 after `compare_bpe.py` turns CRLF into LF), `code_4MB.txt` (C/C++ source, 1,729,186) and `multi_4MB.txt` (15 languages, 2,230,628).
+Setup (Python venv with `tokenizers` 0.23.3 and `tiktoken` 0.14.0) and the full option list: [Requirements](#requirements).
+`BEST` is the recommended option string from [../README.md](../README.md#quick-start).
+
+```bash
+cd tools/lex/tokenizer-test
+
+# correctness
+python compare_bpe.py --no-timing --input ../tokenizer_files/code_4MB.txt --parabix-args="$BEST --thread-num=4"
+
+# speed, 1 thread, cold caches, 5 runs per engine (one round; the table above is three rounds)
+python bench_bpe.py --input ../tokenizer_files/val_4MB.txt ../tokenizer_files/code_4MB.txt \
+    ../tokenizer_files/multi_4MB.txt --iters 5 --no-adaptive-iters \
+    --parabix-args="$BEST --thread-num=1 --bench-cold-cache"
+
+# speed, 4 threads
+python bench_bpe.py --input FILE --iters 5 --no-adaptive-iters --baseline-threads 4 \
+    --parabix-args="$BEST --thread-num=4 --bench-cold-cache"
+
+# pre-tokenizers alone
+python bench_pretokenizers.py --input ../tokenizer_files/val_4MB.txt \
+    ../tokenizer_files/code_4MB.txt ../tokenizer_files/multi_4MB.txt
+```
+
+Benchmark on an idle machine: other work changes the timings, most of all at 4 threads.
+
+---
+
+# Test and benchmark scripts
 
 Test and benchmark scripts for the Parabix tokenizer (`tools/lex`). Most of them
 compare Parabix with **HuggingFace `tokenizers`** and **OpenAI `tiktoken`**
@@ -20,6 +147,7 @@ venv.
 | `bench_bpe_hf1.py` | performance | The same against HF 1.0.0rc4 |
 | `bench_configs.py` | performance (Parabix only) | Several Parabix option sets timed against each other, with an output-identity check |
 | `selfmerge_test.py` | correctness (no HF) | Runs of repeated tokens (X+X→XX merges), against a built-in reference BPE |
+| `assets/make_figures.py` | charts | Draws the charts of [README.md](README.md) (PNG, light and dark) from the numbers of its tables; needs `matplotlib`. Not a test. |
 
 Each script copies its report to `<script>_output.txt` in this directory. Those
 files are not committed, and they hold whatever the last local run wrote: re-run
@@ -263,7 +391,7 @@ different sizes, so ignore it when the inputs are all the same size.
 
 ```bash
 python bench_bpe.py --input ../tokenizer_files/val_4MB.txt ../tokenizer_files/code_4MB.txt \
-    ../tokenizer_files/multi_4MB.txt --iters 10 --no-adaptive-iters \
+    ../tokenizer_files/multi_4MB.txt --iters 5 --no-adaptive-iters \
     --parabix-args="$BEST --thread-num=1 --bench-cold-cache"
 python bench_bpe.py --input FILE --baseline-threads 4 --parabix-args="$BEST --thread-num=4"
 python bench_bpe.py --sweep --sweep-source FILE --parabix-args="$BEST"
@@ -299,7 +427,7 @@ boundary builder (`--pretok-compress-classes --pretok-class-code
    strings and order (not offsets). U+10FFFF must not be in the input, so, unlike
    `\n`, it cannot be mistaken for a line break inside a pre-token. A case that
    does not match is reported and not timed.
-2. **Time.** `--rounds` rounds (default 5) of `--iters` timed calls (default 10)
+2. **Time.** `--rounds` rounds (default 3) of `--iters` timed calls (default 5)
    per side, the side that goes first alternating by round:
    - **Parabix**: `--bench-loop=N --thread-num=1 --segment-size=16384`. Built,
      compiled and loaded once; one untimed run, then N timed runs, each writing
@@ -406,65 +534,3 @@ The tokenizer's options are documented once, in the parent
   `--baseline-threads N`, and `--bench-cold-cache` with `--hf-cache=match`.
 - **`dyld: Library not loaded: @rpath/libparabix_*.dylib`** means the framework
   libraries are stale: run `make -C build19 -j8 tokenizer`.
-
----
-
-## Reference results
-
-Run on 2026-11-15, commit `a02100f9e`, Apple M3 (macOS), `tokenizers` 0.23.3,
-`tiktoken` 0.14.0, with the recommended options (`$BEST` above).
-
-**Correctness**
-
-| Script | Input | Result |
-|---|---|---|
-| `compare_bpe.py`, `$BEST`, 1 and 4 threads | `val_4MB.txt` | MATCH, 1,302,487 tokens (Parabix, HF, tiktoken) |
-| | `code_4MB.txt` | MATCH, 1,729,186 tokens |
-| | `multi_4MB.txt` | MATCH, 2,230,628 tokens |
-| `compare_bpe_hf1.py`, `$BEST` | `val_4MB.txt` | MATCH with HF 1.0.0rc4 and tiktoken |
-| `compare_bpe.py`, no options (merge kernels) | `val_4MB.txt` | MATCH |
-| `selfmerge_test.py` | its own input | 8/8 sets MATCH |
-| `compare_pretokenizers.py` and `--behaviors` | first 200 lines of each 4 MB file, LF | 9/9 modes and 10/10 behavior cases PASS on each |
-| `compare_normalizers.py` | the same lines | 19/19 PASS on each |
-| `bench_pretokenizers.py`| 10/10 modes MATCH on each |
-
-**Speed** (`bench_bpe.py --iters 10 --no-adaptive-iters`, cold caches:
-`--bench-cold-cache`, HF word cache cleared before every run). Time per
-tokenization of the whole 4 MB file, median of 10 runs (min in brackets);
-speed-ups from the medians:
-
-| Threads | Input | Parabix ms | tiktoken ms | HF 0.23.3 ms | vs tiktoken | vs HF |
-|---|---|---|---|---|---|---|
-| 1 | `val_4MB.txt` | 12.69 (12.63) | 137.0 (136.4) | 1,123 (1,095) | 10.8× | 88× |
-| 1 | `code_4MB.txt` | 15.71 (15.67) | 241.3 (239.6) | 1,218 (1,203) | 15.4× | 78× |
-| 1 | `multi_4MB.txt` | 17.53 (17.47) | 221.3 (216.9) | 1,396 (1,364) | 12.6× | 80× |
-| 4 | `val_4MB.txt` | 3.95 (3.73) | 51.8 (50.5) | 338.5 (336.5) | 13.1× | 86× |
-| 4 | `code_4MB.txt` | 5.84 (5.70) | 91.8 (86.9) | 340.4 (337.8) | 15.7× | 58× |
-| 4 | `multi_4MB.txt` | 5.85 (5.71) | 92.3 (88.9) | 390.9 (385.2) | 15.8× | 67× |
-
-At 4 threads HF and tiktoken run `encode_batch` over the text split at pre-token
-boundaries (`--baseline-threads 4`). These times exclude start-up: a one-shot run
-of the tokenizer also loads the rules, builds the tables and the pipeline (about
-60 ms, `[BPE] pipeline graph build` on stderr), compiles or loads the kernels,
-and formats the output.
-
-**Pre-tokenizers alone** (`bench_pretokenizers.py`, defaults: 5 rounds of 10
-calls, 1 thread; 2026-11-19, uncommitted change on top of `a2d03a697`, same
-machine). HF median / Parabix median, both from the median of the 5 round
-medians:
-
-| Mode | `val_4MB.txt` | `code_4MB.txt` | `multi_4MB.txt` |
-|---|---|---|---|
-| `whitespace` | 5.36× | 5.16× | 5.43× |
-| `whitespacesplit` | 4.63× | 3.99× | 4.43× |
-| `digits` | 1.90× | 1.87× | 1.84× |
-| `punctuation` | 6.90× | 9.47× | 6.22× |
-| `simplewordboundaries` | 10.22× | 7.42× | 9.64× |
-| `chardelimiter` | 1.14× | 1.18× | 1.29× |
-| `bert` | 11.61× | 11.67× | 11.02× |
-| `sequence_whitespace_punctuation` | 11.95× | 11.78× | 10.96× |
-| `bytelevel` | 15.14× | 16.30× | 13.87× |
-| `bytelevel_frontend` | 23.42× | 24.68× | 20.25× |
-
-Parabix takes 17–33 ms per file in every mode; HF from 25 ms (`chardelimiter`)
-to 529 ms (`bytelevel`).

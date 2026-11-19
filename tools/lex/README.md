@@ -6,7 +6,9 @@ text as parallel bit streams (one bit per input byte in each stream, a whole SIM
 register of positions per operation) and compiles its kernels at run time.
 
 For GPT-2, the BPE output is the same token ids as HuggingFace `tokenizers` and
-OpenAI `tiktoken` (see [Validation](#validation)). Only GPT-2-style vocabularies
+OpenAI `tiktoken` (see [Validation](#validation)). Speed results and charts are in
+[tokenizer-test/README.md](tokenizer-test/README.md); this file describes how the
+tokenizer is built. Only GPT-2-style vocabularies
 are supported (see [Limitations](#limitations)).
 
 | File | Contents |
@@ -19,7 +21,7 @@ are supported (see [Limitations](#limitations)).
 | `merge_analysis.py` | Python reference for the merge-kernel clean-range partition |
 | `bpe_pipeline.drawio` | An early design sketch (depth-stratified merge passes); not the current pipeline |
 | `tokenizer_files/` | GPT-2 model files and test inputs ([Data files](#data-files)) |
-| `tokenizer-test/` | Correctness and benchmark scripts ([README](tokenizer-test/README.md)) |
+| `tokenizer-test/` | Correctness and benchmark scripts, and the [results](tokenizer-test/README.md) |
 | `third_party/nlohmann/json.hpp` | JSON parser for `vocab.json` (committed) |
 
 ## Requirements
@@ -560,34 +562,60 @@ give the same output, compare their id streams (`cmp`) on the same input, or use
 
 ## Validation
 
-Run on 2026-11-15, commit `a02100f9e`, macOS (Apple M3), scripts in
-`tokenizer-test/`:
+Run on 2026-11-19, commit `4225b1fab` (with `master` merged up to `d7854835d`),
+macOS (Apple M3), scripts in `tokenizer-test/`. Every result is the same as in
+the previous run (2026-11-15, commit `a02100f9e`):
 
-- **BPE**, recommended options: same ids as HuggingFace `tokenizers` 0.23.3 and
-  `tiktoken` 0.14.0 on `val_4MB.txt` (1,302,487 tokens), `code_4MB.txt`
-  (1,729,186) and `multi_4MB.txt` (2,230,628), at 1 and 4 threads; also the same
-  as HuggingFace `tokenizers` 1.0.0rc4 on `val_4MB.txt`.
+- **BPE**, recommended options (`compare_bpe.py`): same ids as HuggingFace
+  `tokenizers` 0.23.3 and `tiktoken` 0.14.0 on `val_4MB.txt` (1,302,487 tokens,
+  after CRLF becomes LF), `code_4MB.txt` (1,729,186) and `multi_4MB.txt`
+  (2,230,628), at 1 and 4 threads; also the same as HuggingFace `tokenizers`
+  1.0.0rc4 on `val_4MB.txt` (`compare_bpe_hf1.py`).
+- **BPE**, recommended options, original file bytes (CRLF and NUL kept): same ids
+  as HuggingFace 0.23.3 and `tiktoken` 0.14.0 on the three 4 MB files and seven
+  4 MB single-language files (Amharic, Hindi, Bengali, Arabic, Korean, Japanese,
+  Chinese), at 1 and 4 threads (20 runs); on the three files also with 128-,
+  1,024- and 4,096-byte segments at 4 threads and 1,024-byte segments at 8
+  threads (12 runs). On all ten files at 4 threads, `--offsets=char` equals HF's
+  `Encoding.offsets` and the `--offsets=byte` spans tile the input.
+- **Pre-tokenizers** (`compare_pretokenizers.py`): all 9 modes with a HuggingFace
+  counterpart, and all 5 behaviors for `simplewordboundaries` and `punctuation`,
+  match on the first 200 lines of each test file (LF line ends).
+- **Pre-tokenizers, whole files** (`bench_pretokenizers.py`): the 9 modes and the
+  BPE front end's boundaries give the same complete pre-token lists as
+  HuggingFace 0.23.3 on all three 4 MB files, CRLF kept (30 of 30 cases).
+- **Normalizers** (`compare_normalizers.py`): all 19 modes and sequences match on
+  the same 200 lines.
+
+Not re-run on 2026-11-19; last run 2026-11-15, commit `a02100f9e`:
+
 - **BPE**, merge kernels (no options, 1,123 kernels): same ids on `val_4MB.txt`.
 - **Self-merges** (`selfmerge_test.py`, merge kernels, no pre-tokenizer): all 8
   built-in option sets match the reference BPE.
-- **Pre-tokenizers**: all 9 modes with a HuggingFace counterpart, and all 5
-  behaviors for `simplewordboundaries` and `punctuation`, match on 200 lines of
-  each test file.
-- **Normalizers**: all 19 modes and sequences match on the same lines.
-- **Pre-tokenizers, whole files** (`bench_pretokenizers.py`, 2026-11-19): the 9
-  modes and the BPE front end's boundaries give the same complete pre-token lists
-  as HuggingFace 0.23.3 on all three 4 MB files.
 
-**Speed**, same machine, `bench_bpe.py` with cold caches, median of 10 runs per
-engine on each 4 MB file: 12.7–17.5 ms at 1 thread (10.8–15.4× faster than
-tiktoken, 78–88× faster than HuggingFace 0.23.3), 3.9–5.9 ms at 4 threads
-(13.1–15.8× and 58–86×). Tokenization only: start-up and output are not timed.
-Full table and commands: [tokenizer-test/README.md](tokenizer-test/README.md#reference-results).
+Timings, speed-ups and the measurement conditions are in [tokenizer-test/README.md](tokenizer-test/README.md).
 
 ## Testing
 
 `tokenizer-test/` holds the scripts that compare against HuggingFace and tiktoken
-and the benchmarks. See [tokenizer-test/README.md](tokenizer-test/README.md).
+and the benchmarks. None of them run under `make check`. Each takes `--tokenizer PATH`
+(default `build19/bin/tokenizer`); pass the recommended options to the BPE scripts
+(`--parabix-args="$BEST"`), or they test the slow merge-kernel design.
+
+| Script | Kind | What it covers |
+|---|---|---|
+| `compare_normalizers.py` | correctness | Normalizers, against HF `tokenizers.normalizers` |
+| `compare_pretokenizers.py` | correctness | Pre-tokenizers and `--behavior`, against HF `tokenizers.pre_tokenizers` |
+| `compare_bpe.py` | correctness + timing | BPE token ids against HF `tokenizers` 0.23 and tiktoken |
+| `compare_bpe_hf1.py` | correctness + timing | The same against HF `tokenizers` 1.0.0rc4 |
+| `bench_pretokenizers.py` | correctness + performance | Pre-tokenizers on their own (no BPE) against HF 0.23 |
+| `bench_bpe.py` | performance | Throughput (MB/s) against HF 0.23 and tiktoken |
+| `bench_bpe_hf1.py` | performance | The same against HF 1.0.0rc4 |
+| `bench_configs.py` | performance (Parabix only) | Several Parabix option sets timed against each other, with an output-identity check |
+| `selfmerge_test.py` | correctness (no HF) | Runs of repeated tokens (X+X→XX merges), against a built-in reference BPE |
+
+Setup, options and examples for each script: [tokenizer-test/README.md](tokenizer-test/README.md#test-and-benchmark-scripts).
+Results: [tokenizer-test/README.md](tokenizer-test/README.md).
 
 ## License
 

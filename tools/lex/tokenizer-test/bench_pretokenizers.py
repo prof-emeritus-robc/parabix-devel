@@ -29,7 +29,7 @@ a pre-token. A case that does not match is reported and not timed.
 
 Rounds
 ------
---rounds R (default 5) rounds of --iters N (default 10) timed calls per side; the
+--rounds R (default 3) rounds of --iters N (default 5) timed calls per side; the
 side that goes first alternates between rounds. Reported: the median of the
 round medians, the range of the round medians, and HF median / Parabix median
 (above 1: Parabix faster). Each case runs in a fresh process, so HuggingFace
@@ -266,8 +266,8 @@ def main():
     ap.add_argument("--input", nargs="+", metavar="FILE", help="UTF-8 input files (required)")
     ap.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES), metavar="MODE",
                     help="pre-tokenizers to run (default: all): " + ", ".join(MODES))
-    ap.add_argument("--rounds", type=int, default=5, help="rounds per case (default 5)")
-    ap.add_argument("--iters", type=int, default=10, help="timed calls per side per round (default 10)")
+    ap.add_argument("--rounds", type=int, default=3, help="rounds per case (default 3)")
+    ap.add_argument("--iters", type=int, default=5, help="timed calls per side per round (default 5)")
     ap.add_argument("--segment-size", type=int, default=16384,
                     help="Parabix --segment-size (default 16384)")
     ap.add_argument("--tokenizer", default=TOKENIZER, help=f"tokenizer binary (default {TOKENIZER})")

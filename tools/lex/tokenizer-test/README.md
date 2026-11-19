@@ -91,7 +91,8 @@ Speed is only reported where the output is the same. On the tested inputs, the o
 | Byte offsets (`--offsets=byte`) | all 10 inputs | ✅ ids match; spans tile the input |
 | Pre-tokenizers vs HF | GPT-2 on all 10 complete inputs; the 8 other timed modes on the 3 corpora (24 cases) | ✅ same strings and order |
 | Normalizers vs HF, 13 modes and 6 compositions | first 200 lines of each 4 MB file | ✅ all 19 match |
-| Normalizers vs HF, codepoint sweep (292,531 assigned codepoints), 2026-11-16, before `master` was merged | 10 modes | 5 modes match on every codepoint; the 5 built on Unicode normalization (`nfc`, `nfd`, `nfkc`, `nfkd`, `stripaccents`) differ on 3–191 characters, all added in Unicode 12.0 or later |
+| Normalizers vs HF, codepoint sweep: 292,531 assigned codepoints, each alone, twice, after `a`, before U+0301 and between two `a`s | 10 modes | 5 modes match on every codepoint; the 5 built on Unicode normalization differ on 6–194 characters (`nfc` 6, `nfd` 24, `stripaccents` 21, `nfkc` 176, `nfkd` 194), all added in Unicode 10.0 or later. In every differing case of `nfc`, `nfd`, `nfkc` and `nfkd`, Parabix gives the Unicode 16.0 result (Python's `unicodedata`) and HF does not |
+| Pre-tokenizers vs HF, codepoint sweep: the same 292,531 codepoints in the same contexts and after a space | 9 modes, the BPE front end, 10 behavior cases | ✅ all 20 match on every codepoint |
 
 This is testing, not proof: the tests cover these inputs, not every possible input. What each check covers: [Validation](../README.md#validation).
 
@@ -115,6 +116,10 @@ python bench_bpe.py --input ../tokenizer_files/val_4MB.txt ../tokenizer_files/co
 # speed, 4 threads
 python bench_bpe.py --input FILE --iters 5 --no-adaptive-iters --baseline-threads 4 \
     --parabix-args="$BEST --thread-num=4 --bench-cold-cache"
+
+# normalizers and pre-tokenizers, codepoint sweeps
+python compare_normalizers.py --sweep
+python compare_pretokenizers.py --sweep
 
 # pre-tokenizers alone
 python bench_pretokenizers.py --input ../tokenizer_files/val_4MB.txt \
@@ -225,9 +230,12 @@ Two notes on line ends:
 - `compare_bpe*.py` read the input in text mode, so `\r\n` becomes `\n`, and all
   engines tokenize that text. `bench_bpe*.py` keep `\r\n`, so every engine reads
   the file's own bytes.
-- `compare_pretokenizers.py` and `compare_normalizers.py` split on `\n` only. Give
-  them LF text (`tr -d '\r'`), or a leftover `\r` shows up as a mismatch.
-  `bench_pretokenizers.py` reads the file's own bytes, CRLF included.
+- `compare_pretokenizers.py` and `compare_normalizers.py` also read in text mode:
+  `\r\n` and a lone `\r` become `\n`, so no `\r` is ever compared.
+  `compare_pretokenizers.py` then compares line by line; `compare_normalizers.py`
+  normalizes the whole text. `bench_pretokenizers.py` reads the file's own bytes,
+  CRLF included. Both `--sweep` runs write their generated text as bytes, so the
+  `\r` cases reach both tools as `\r`.
 
 ---
 
@@ -246,15 +254,33 @@ python compare_normalizers.py --input FILE                 # all modes
 python compare_normalizers.py --input FILE lowercase nfd   # some modes
 python compare_normalizers.py --input FILE --hf-only       # HF side only
 python compare_normalizers.py --input FILE --parabix-only  # Parabix side only
+python compare_normalizers.py --sweep                      # codepoint sweep, 10 modes
+python compare_normalizers.py --sweep nfc nfkc             # sweep some modes
 ```
+
+`--sweep` replaces `--input` with every assigned codepoint of Python's
+`unicodedata` (292,531 in Unicode 16.0; not `Cn`, not `Cs`), each in five
+contexts: alone, twice, after `a`, before U+0301 and between two `a`s. Each tool
+normalizes the whole text once, and the outputs are compared context by context.
+For each mode the script lists the differing codepoints with their Unicode age
+(from [`lib/ucd/data/DerivedAge.cpp`](../../../lib/ucd/data/DerivedAge.cpp)) and
+the contexts that differ; for `nfc`, `nfd`, `nfkc` and `nfkd` it also counts the
+differing contexts where each side equals `unicodedata.normalize`. Default modes:
+the 10 single modes other than `strip`, `stripleft` and `stripright`, which change
+only the ends of the text. Output: `compare_normalizers_sweep_output.txt`, about
+12 s.
 
 ---
 
 ## `compare_pretokenizers.py`
 
-Compares each `--pretokenizer=X` with the matching HF pre-tokenizer, line by line
-(Parabix always ends a pre-token at `\n`). At most `--max-lines` lines (default
-200; 0 = all).
+Compares each `--pretokenizer=X` with the matching HF pre-tokenizer, line by
+line. By default the tokenizer writes a line feed between pre-tokens, so a line
+feed inside a pre-token cannot be told from a boundary: with `punctuation`,
+`a\nb` is one pre-token in both tools but prints as two lines. Running each line
+on its own avoids that (`--sweep` instead compares whole texts, with
+`--pretok-separator=0x10FFFF`). At most `--max-lines` lines (default 200; 0 =
+all).
 
 | Parabix mode | HF pre-tokenizer |
 |---|---|
@@ -280,7 +306,20 @@ python compare_pretokenizers.py --input FILE whitespace bytelevel  # some modes
 python compare_pretokenizers.py --input FILE --behaviors           # the 10 behavior cases
 python compare_pretokenizers.py --input FILE --parabix-only        # + tokenizertest.xml
 python compare_pretokenizers.py --input FILE --hf-only
+python compare_pretokenizers.py --sweep                            # codepoint sweep, 20 cases
+python compare_pretokenizers.py --sweep bytelevel bytelevel_frontend
 ```
+
+`--sweep` replaces `--input` with every assigned codepoint of Python's
+`unicodedata` (292,531 in Unicode 16.0), each in six contexts: alone, twice,
+after `a`, before U+0301, between two `a`s and after a space. Each context sits
+on its own line, with a separator line `,0!a` between contexts; every mode splits
+inside it, so no pre-token covers two contexts. Both sides pre-tokenize the whole
+text (Parabix with `--pretok-separator=0x10FFFF`, so a line feed inside a
+pre-token stays visible), and every differing pre-token is charged to the context
+it overlaps. 20 cases: the 9 modes, `bytelevel_frontend` (the BPE front end's
+boundaries, as in `bench_pretokenizers.py`) and the 10 `--behaviors` cases.
+Output: `compare_pretokenizers_sweep_output.txt`, about 4 minutes.
 
 ---
 

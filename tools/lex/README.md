@@ -218,8 +218,10 @@ repeated).
 `bert`, `sequence_whitespace_punctuation`, `whitespace`, `whitespacesplit` and
 `chardelimiter` always use `excludewhitespace`. For `simplewordboundaries` and
 `punctuation` the behaviors follow HuggingFace exactly; for the other modes they
-act on whitespace. The output has one pre-token per line, so a `\n` in the input
-always ends a pre-token.
+act on whitespace. By default the output has one pre-token per line, so a `\n`
+inside a pre-token looks like a boundary: with `punctuation`, `a\nb` is one
+pre-token, as in HuggingFace, but prints as two lines.
+`--pretok-separator=0x10FFFF` writes U+10FFFF between pre-tokens instead.
 
 ### The bytelevel pre-tokenizer
 
@@ -586,6 +588,17 @@ the previous run (2026-11-15, commit `a02100f9e`):
   HuggingFace 0.23.3 on all three 4 MB files, CRLF kept (30 of 30 cases).
 - **Normalizers** (`compare_normalizers.py`): all 19 modes and sequences match on
   the same 200 lines.
+- **Normalizers, codepoint sweep** (`compare_normalizers.py --sweep`): all
+  292,531 assigned codepoints of Unicode 16.0, each in five contexts, in 10
+  modes. 5 modes match on every codepoint. `nfc`, `nfd`, `stripaccents`, `nfkc`
+  and `nfkd` differ on 6, 24, 21, 176 and 194 codepoints, all added in Unicode
+  10.0 or later; in all 1,928 differing contexts of `nfc`, `nfd`, `nfkc` and
+  `nfkd`, Parabix equals Python's `unicodedata` (Unicode 16.0) and HuggingFace
+  does not.
+- **Pre-tokenizers, codepoint sweep** (`compare_pretokenizers.py --sweep`): the
+  same codepoints in six contexts (the five above and after a space), whole text
+  on both sides: the 9 modes, the BPE front end's boundaries and the 10 behavior
+  cases match HuggingFace on every codepoint (20 of 20).
 
 Not re-run on 2026-11-19; last run 2026-11-15, commit `a02100f9e`:
 

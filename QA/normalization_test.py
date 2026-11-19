@@ -126,6 +126,8 @@ def main():
             write(path, b''.join(read(os.path.join(d, f)) for d, f in files))
             expected = b''.join(read(os.path.join(expected_dir, f + '.' + tool)) for _, f in files)
             cases.append((tool, [], path, expected, 'regression files'))
+            if tool == 'nfc':
+                cases.append((tool, ['-nfc-u21'], path, expected, 'regression files, U21'))
         text = focus_text()
         focus_path = os.path.join(tmp, 'focus_text')
         write(focus_path, text.encode('utf-8'))

@@ -334,6 +334,19 @@ private:
             const int ldiff = static_cast<int>(u8_length(e.second)) - static_cast<int>(u8_encoded_length(e.first));
             if (ldiff > 0) update_max_insert_map(e.first, ldiff);
         }
+        //  A starter of long compositions: room for the longest composite it may
+        //  become, written in place of it (in UTF-8 mode).  The generator gave it
+        //  room for one composition, the following compositions growing into the
+        //  bytes of the marks deleted; but a mark not yet composed (of a higher
+        //  combining class, before the one composed) may lie between, as in
+        //  c U+0301 U+0327, whose ç then grows into U+0301 as U+1E09.
+        std::map<codepoint_t, unsigned> reach;
+        for (const auto & m : T.long_composable_map) {
+            for (const auto & st : m.second) {
+                const int ldiff = static_cast<int>(maxReach(st.first, reach)) - static_cast<int>(u8_encoded_length(st.first));
+                if (ldiff > 0) update_max_insert_map(st.first, ldiff);
+            }
+        }
         //  An override writes its starter, then (right-aligned in the region of
         //  P and its insertion) the marks that remain: room for the composites
         //  its starter may become in the passes that follow (see maxReach and

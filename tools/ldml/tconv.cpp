@@ -163,6 +163,10 @@ static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize to NFD or NFKD within a filter by the masked NFD pipeline (NFD_PipelineBuilder::NFD_U21_Pipeline "
              "with a mask), rather than with the characters outside the filter replaced by barriers (default on)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> U21NFC("u21-nfc",
+    cl::desc("In Unicode mode, compose (NFC, NFKC, FCC) on the 21-bit basis (NFC_U21; within a filter with its mask), "
+             "rather than by the conversion to UTF-8 and back (and barrier substitution within a filter) (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> FusedPriority("fused-priority",
     cl::desc("Match the earlier rules that a rule yields to at the same position (see TransformStep::stringPriority) "
              "in the fused kernels, where their contexts are fused contexts (default on; 0: by the regular expression "
@@ -8390,8 +8394,9 @@ private:
     StreamSet * normalization(const std::string & name, StreamSet * U21);
     Staged maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection = nullptr);
     Staged barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask);
-    StreamSet * fcc(StreamSet * U21);
+    Staged fcc(StreamSet * U21, StreamSet * mask = nullptr);
     Staged fcd(StreamSet * U21);
+    Staged maskedNFC(StreamSet * U21, StreamSet * selected);
     Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -8608,8 +8613,9 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
     PipelineBuilder & P = mP;
     if (name == "Any-NFD") return mNFD.NFD_U21_Pipeline(U21);
     if (name == "Any-NFKD") return mNFD.NFKD_U21_Pipeline(U21);
-    if (name == "Any-FCC") return fcc(U21);
+    if (name == "Any-FCC") return fcc(U21).text;
     if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
+    if (U21NFC) return NFC_U21(P, U21);
     StreamSet * const basis = UTF8_Of(P, U21);
     StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
     return U21_Of(P, BasisOf(P, composed));
@@ -8631,16 +8637,40 @@ Staged RulePipelineBuilder::maskedNormalization(const std::string & name, Stream
     //  the selected characters decomposed and ordered by itself, the others
     //  unchanged (as barriers); the positions inserted for the decompositions
     //  belong to the runs of the characters they follow.
-    if (MaskedNormalization && (name == "Any-NFD" || name == "Any-NFKD")) {
+    if (MaskedNormalization && (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFKC")) {
         StreamSet * SpreadMask = nullptr;
         StreamSet * const Result = name == "Any-NFD" ? mNFD.NFD_U21_Pipeline(U21, selected, &SpreadMask)
                                                      : mNFD.NFKD_U21_Pipeline(U21, selected, &SpreadMask);
         if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
         PositionMap positions;
         if (SpreadMask) positions.insert(SpreadMask);
-        return Staged(Result, std::move(positions));
+        if (name != "Any-NFKC") return Staged(Result, std::move(positions));
+        //  NFKC: the masked NFC of the masked NFKD, with the selection in step.
+        if (U21NFC) {
+            Staged composed = maskedNFC(Result, mMasks.mapped(selected, positions));
+            positions.append(composed.positions);
+            return Staged(composed.text, std::move(positions));
+        }
+    }
+    //  (NFC and FCC on the 21-bit basis within the selection.)
+    if (MaskedNormalization && U21NFC) {
+        if (name == "Any-NFC") return maskedNFC(U21, selected);
+        if (name == "Any-FCC") return fcc(U21, selected);
     }
     return barrierNormalization(name, U21, selected);
+}
+
+//  NFC within the selected characters (each run by itself, see NFC_U21): as a
+//  position map, the selected characters deleted and the composed ones
+//  (OutMask) inserted between the others, within the masks (as barrierNormalization).
+Staged RulePipelineBuilder::maskedNFC(StreamSet * U21, StreamSet * selected) {
+    StreamSet * const OutMask = mP.CreateStreamSet(1);
+    StreamSet * const Result = NFC_U21(mP, U21, selected, OutMask);
+    if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
+    PositionMap positions;
+    positions.remove(mMasks.complement(selected));
+    positions.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);
+    return Staged(Result, std::move(positions));
 }
 
 //  The normalization of the characters of mask, the others replaced by barriers
@@ -8741,19 +8771,44 @@ static unsigned FCC_Passes() {
 //  adjacent to the composite, and is tried in the next pass; where it does not,
 //  it stays next to the starter, and so does nothing after it compose.  As many
 //  passes as nonstarters in a primary composite.
-StreamSet * RulePipelineBuilder::fcc(StreamSet * U21) {
+//  Within a mask (selected characters), each run of it by itself, with the
+//  position map: the decomposition's insertions, then each pass's.
+Staged RulePipelineBuilder::fcc(StreamSet * U21, StreamSet * mask) {
     PipelineBuilder & P = mP;
     auto * cccObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
     const UCD::UnicodeSet starterSet = cccObj->GetCodepointSet(UCD::CCC_ns::NR);
-    StreamSet * text = mNFD.NFD_U21_Pipeline(U21);
+    PositionMap positions;
+    StreamSet * text = nullptr;
+    if (mask) {
+        StreamSet * SpreadMask = nullptr;
+        text = mNFD.NFD_U21_Pipeline(U21, mask, &SpreadMask);
+        if (SpreadMask) {
+            positions.insert(SpreadMask);
+            mask = mMasks.mapped(mask, positions);
+        }
+    } else {
+        text = mNFD.NFD_U21_Pipeline(U21);
+    }
     static const unsigned passes = FCC_Passes();
     for (unsigned i = 0; i < passes; i++) {
         StreamSet * const starters = classes({starterSet}, text);
-        StreamSet * const visible = P.CreateStreamSet(1);
+        StreamSet * visible = P.CreateStreamSet(1);
         P.CreateKernelCall<FCC_Window>(starters, visible);
-        text = barrierNormalization("Any-NFC", text, visible).text;
+        if (mask) visible = combine(visible, mask, false);
+        if (!U21NFC) {
+            text = barrierNormalization("Any-NFC", text, visible).text;
+            continue;
+        }
+        if (mask) {
+            Staged pass = maskedNFC(text, visible);
+            mask = mMasks.mapped(mask, pass.positions);
+            positions.append(pass.positions);
+            text = pass.text;
+        } else {
+            text = NFC_U21(P, text, visible);
+        }
     }
-    return text;
+    return Staged(text, std::move(positions));
 }
 
 //  Unicode titlecasing (see TitlecasePositions), with the word boundaries of
@@ -11653,6 +11708,17 @@ void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet *
 //  which keeps the barriers in order; the masks are kept in step.
 Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
     PipelineBuilder & P = mP;
+    //  NFC by the masked NFC of the bytes (NFC_Masked, focused): as a position
+    //  map, the bytes of the filter deleted and those composed inserted.
+    if (MaskedNormalization && name == "Any-NFC") {
+        StreamSet * const mask = mMasks.active();
+        StreamSet * const OutMask = P.CreateStreamSet(1);
+        StreamSet * const bytes = NFC_Masked(P, NormalizationFocusOptions(), BytesOf(P, Basis), Basis, mask, OutMask);
+        PositionMap positions;
+        positions.remove(mMasks.complement(mask));
+        positions.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);
+        return Staged(BasisOf(P, bytes), std::move(positions));
+    }
     UCD::UnicodeSet barrierSet;
     for (UCD::codepoint_t c : UTF8_Barriers) barrierSet.insert(c);
     auto barrierSpans = [&](StreamSet * basis) {

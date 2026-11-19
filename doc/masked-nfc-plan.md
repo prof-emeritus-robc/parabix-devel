@@ -625,7 +625,59 @@ on the CLDR transforms that use NFC.
    - Check against `--masked-normalization=0` on the CLDR test data of every
      transform with NFC, NFKC or FCC under a filter, also with `--lines` and
      with multiple threads, then measure.
-7. **Retire the generator.** Delete `nfc_generator.py` and
+
+   Done (2026-11-19), `--u21-nfc` (default on).
+   - **Unicode mode**:
+     - NFC, NFKC and FCC compose with `NFC_U21`, unmasked as well, with no
+       conversion through UTF-8.
+     - Within a filter (`maskedNormalization`), NFC is `maskedNFC`: the
+       position map deletes the selected characters and inserts the composed
+       ones (the output mask) within the masks, as barrier normalization did.
+     - NFKC is the masked NFKD, then the masked NFC of the selection mapped
+       through it.
+     - FCC (`fcc(U21, mask)`) is the masked NFD, then each pass's masked NFC
+       of the window within the mask, the mask mapped through each pass.
+   - **UTF-8 mode**: NFC within a filter is `NFC_Masked` of the bytes
+     (focused), with the output byte mask for the position map. NFKC and NFD
+     keep barrier substitution in UTF-8 mode (there is no masked UTF-8 NFKD).
+
+   `--masked-normalization=0 --u21-nfc=0` gives the previous route.
+
+   Two more errors were found and fixed:
+   - **Room for chains of compositions (UTF-8 kernels, also the generated
+     ones).** A starter had room for one composition; the next ones grew into
+     the bytes of the marks deleted, but a mark of a higher class not yet
+     composed may lie between. In `c U+0301 U+0327`, ç (from U+0327) grew into
+     U+0301 as U+1E09. Every long-composition starter now has room for
+     `maxReach`.
+   - **A singleton's room in U21 mode.** U+212B (to U+00C5, an overridable
+     primary) had none for the marks an override of U+00C5 leaves; it now has
+     its canonical character's room (as in UTF-8 mode).
+
+   Test corpora for both: every long starter with 2 or 3 composing marks in
+   shuffled orders (chains), and every singleton with the marks of its
+   canonical character (singletons). Both match the reference in all four
+   routes (UTF-8 and U21, focused and in place) and with the five masks; the
+   cases are in `composition_regressions`, which `normalization_test` now also
+   runs with `-nfc-u21`.
+
+   Five rules files, each NFC, NFKC or FCC under a global or step filter that
+   cuts compositions, on 4,000 random lines: in UTF-8 mode and in Unicode mode
+   (`--utf8-mode=0`), with one run and per-line runs, the output equals ICU's
+   and the previous route's.
+
+   CLDR test data: of the 141 transforms with test data that use NFC, NFKC or
+   FCC, 110 apply them under a filter. All the non-Indic ones and one Indic
+   transform per source script (23) give the previous route's output, also
+   with `-thread-num=4 -segment-size=1`. The 24 that `--lines` applies in one
+   run (where every normalization is masked by the lines) give the same
+   output with `--lines`.
+
+   Warm run times on 5 MB of their test data, previous / new route: am-t-it
+   0.23 / 0.22 s, ja-t-it 0.27 / 0.26 s, ko-t-ja-Latn 0.47 / 0.47 s (Unicode
+   mode); be-Latn-t-be-m0-bgn 0.08 / 0.08 s, ja-Latn-t-ja-hrkt-m0-bgn 0.13 /
+   0.13 s (UTF-8 mode). The normalizations are a small part of these
+   transforms.7. **Retire the generator.** Delete `nfc_generator.py` and
    `normalization-generated.cpp`, together with the transitional option.
 
 Step 1 can be checked on its own and is the cheapest test of whether the port

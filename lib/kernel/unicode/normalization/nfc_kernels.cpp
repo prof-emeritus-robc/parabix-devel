@@ -1063,6 +1063,12 @@ std::map<codepoint_t, unsigned> u21Insertions() {
     for (const auto & o : tables().overridable_primaries) {
         for (const auto & m : o.second) need(o.first, m.second.size());
     }
+    //  A singleton has the room of its canonical character (e.g. U+212B, whose
+    //  U+00C5 is an overridable primary).
+    for (const auto & sg : tables().singleton_map) {
+        const auto f = ins.find(sg.second);
+        if (f != ins.end()) ins[sg.first] = std::max(ins[sg.first], f->second);
+    }
     return ins;
 }
 

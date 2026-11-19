@@ -11,7 +11,9 @@
 #  match (TransformStep::stringPriority, subgroupPriority).  Prefix runs of P of
 #  several characters (tsu~ → | ts) are applied after the others.  A revisit
 #  that is a prefix run after one step of composition is split with a marker
-#  (Composer::prefixRunStep).  The expected
+#  (Composer::prefixRunStep).  The earlier rules yielded to are matched in the
+#  fused kernels (FusedYield) and, with --fused-priority=0, by the engine; both
+#  are checked.  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
 #  tconv_blocking_marks_test.py <tconv binary> [--extended-testing]
@@ -57,16 +59,22 @@ def main():
             input = os.path.join(tmp, "input.txt")
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
-            run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
-            if run.returncode != 0:
-                failures += 1
-                print("FAIL %r: exit status %d\n%s" % (rules_text, run.returncode, run.stderr.decode("utf-8", "replace")))
-                continue
-            got = run.stdout.decode("utf-8", "replace").split("\n")
-            for i, (line, want) in enumerate(cases):
-                if i >= len(got) or got[i] != want:
+            # (The earlier rules yielded to matched in the fused kernels, and by
+            # the engine; see --fused-priority.)
+            for priority in ("1", "0"):
+                run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--fused-priority=" + priority, "--rules-file=" + rules, input],
+                                     capture_output=True)
+                if run.returncode != 0:
                     failures += 1
-                    print("FAIL %r with %r:\n  want %r\n  got  %r" % (line, rules_text, want, got[i] if i < len(got) else None))
+                    print("FAIL %r (--fused-priority=%s): exit status %d\n%s"
+                          % (rules_text, priority, run.returncode, run.stderr.decode("utf-8", "replace")))
+                    continue
+                got = run.stdout.decode("utf-8", "replace").split("\n")
+                for i, (line, want) in enumerate(cases):
+                    if i >= len(got) or got[i] != want:
+                        failures += 1
+                        print("FAIL %r with %r (--fused-priority=%s):\n  want %r\n  got  %r"
+                              % (line, rules_text, priority, want, got[i] if i < len(got) else None))
     print("%d failures" % failures)
     return 1 if failures else 0
 

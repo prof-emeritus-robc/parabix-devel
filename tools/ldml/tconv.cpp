@@ -159,6 +159,11 @@ static cl::opt<bool> ConvertedContextWhile("converted-context-while",
              "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
              "§1; default on, --converted-context-while=0 for the rounds)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> FusedPriority("fused-priority",
+    cl::desc("Match the earlier rules that a rule yields to at the same position (see TransformStep::stringPriority) "
+             "in the fused kernels, where their contexts are fused contexts (default on; 0: by the regular expression "
+             "engine, a pipeline for each)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> CaseMapMarks("case-map-marks",
     cl::desc("Apply the case mappings that the function calls of a group's rules expand to (&Any-Lower($1), ...) at the "
              "positions marked where they apply, after the group, instead of as the changes of their characters "
@@ -3801,15 +3806,30 @@ struct FusedMatchSource {
     unsigned index = 0;
 };
 
+//  An earlier rule of the group that a rule of a fused kernel yields to at the
+//  same position (see ldml::TransformStep::stringPriority and subgroupPriority):
+//  the rule applies only where this does not match there.  Its text (from the
+//  position) and contexts are matched in the kernel, against the text itself
+//  (as ICU tries the earlier rule first), with the characters of its text within
+//  the mask if masked (an earlier string rule, as RulePipelineBuilder::
+//  conversionGroup's matchFirsts has them).
+struct FusedYield {
+    std::vector<UCD::UnicodeSet> text;
+    FusedContexts before{FusedContext()}, after{FusedContext()};
+    bool masked = false;
+};
+
 //  A string rule of a fused kernel.  Matched in the kernel, with its contexts
 //  and within the mask, or (match >= 0, an index in FusedRulesConfig::sources)
 //  given by an input stream of its matches at their first positions, already
-//  restricted to the mask (and selected, where string rules overlap).
+//  restricted to the mask (and selected, where string rules overlap).  When
+//  matched in the kernel, it yields to the rules of yields.
 struct FusedStringRule {
     std::vector<UCD::UnicodeSet> text;
     std::u32string replacement;
     FusedContexts before{FusedContext()}, after{FusedContext()};
     int match = -1;
+    std::vector<FusedYield> yields;
     bool converted = false;     // in a correction kernel: its before context is matched against the converted text
     UCD::UnicodeSet run;        // the set of the run following the text, deleted (see ldml::StringRule::run)
     //  The run of a set with strings (see ldml::StringRule::runStrings).
@@ -3829,11 +3849,13 @@ struct FusedStringRule {
 //  A subgroup whose before context is matched against the converted text, but
 //  whose after context is not a fused context (an unbounded repetition), may
 //  have the positions of its characters where its after context matches given
-//  instead (afterMatch, with no after context).
+//  instead (afterMatch, with no after context).  When matched in the kernel, its
+//  rules yield to the rules of yields.
 struct FusedSubgroup {
     FusedContexts before{FusedContext()}, after{FusedContext()};
     std::vector<ldml::CharMapping> mappings;
     int match = -1;
+    std::vector<FusedYield> yields;
     int afterMatch = -1;
     bool converted = false;     // as for FusedStringRule
     bool caseMaps = false;      // its case mappings may be applied by marks (see CaseMapSplit)
@@ -4153,12 +4175,21 @@ struct FusedLayout {
     std::vector<StreamSet *> sourceSets;
     std::set<unsigned> marks;               // the case mappings marked (given, or by its subgroups)
     FusedLayout(const FusedRulesConfig & c, const FusedState & in) {
+        //  (The lookaheads of the earlier rules yielded to.)
+        auto addYields = [&](const std::vector<FusedYield> & yields) {
+            for (const FusedYield & y : yields) {
+                const unsigned n = y.text.size();
+                for (const FusedContext & a : y.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
+                if (y.masked) maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
+            }
+        };
         for (const FusedStringRule & r : c.strings) {
             const unsigned n = r.text.size(), m = r.resultLength();
             lookahead = std::max(lookahead, runLookahead(r.runStrings));
             if (r.match < 0) {
                 for (const FusedContext & a : r.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
                 maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
+                addYields(r.yields);
             }
             if (!c.matchOnly || c.staged) {
                 changePositions = std::max<unsigned>(changePositions, m > n ? m - n + 1 : 1);
@@ -4169,6 +4200,7 @@ struct FusedLayout {
             if (g.match < 0 && g.afterMatch < 0) {
                 for (const FusedContext & a : g.after) lookahead = std::max<unsigned>(lookahead, a.size());
             }
+            if (g.match < 0) addYields(g.yields);
             const CaseMapSplit split = caseMapSplit(g);
             if (split.caseMap >= 0 && !c.matchOnly) marks.insert(static_cast<unsigned>(split.caseMap));
             for (const ldml::CharMapping & m : split.literal) {
@@ -4579,6 +4611,13 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
             for (const FusedItem & item : items) add(item.chars);
         }
     };
+    auto addYields = [&](const std::vector<FusedYield> & yields) {
+        for (const FusedYield & y : yields) {
+            for (const UCD::UnicodeSet & t : y.text) add(t);
+            addContext(y.before);
+            addContext(y.after);
+        }
+    };
     for (const FusedStringRule & r : c.strings) {
         add(r.run);
         if (!r.runStrings.empty()) {
@@ -4591,6 +4630,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         for (const UCD::UnicodeSet & t : r.text) add(t);
         addContext(r.before);
         addContext(r.after);
+        addYields(r.yields);
     }
     if (c.matchOnly) return sets;
     for (const FusedInsertion & ins : c.insertions) {
@@ -4603,6 +4643,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
             add(plan.all);
             addContext(g.before);
             if (g.afterMatch < 0) addContext(g.after);
+            addYields(g.yields);
         }
         for (const UCD::UnicodeSet & set : plan.mux) add(set);
         for (const auto & position : plan.bitSets) {
@@ -4869,11 +4910,18 @@ private:
             return B;
         };
         unsigned extent = 0;
+        auto yieldExtent = [&](const std::vector<FusedYield> & yields) {
+            for (const FusedYield & y : yields) extent = std::max(extent, beforeLength(y.before) + static_cast<unsigned>(y.text.size()) - 1);
+        };
         for (const FusedStringRule & r : mConfig.strings) {
             if (!r.run.empty()) return;
             extent = std::max(extent, beforeLength(r.before) + static_cast<unsigned>(r.text.size()) - 1);
+            yieldExtent(r.yields);
         }
-        for (const FusedSubgroup & g : mConfig.subgroups) extent = std::max(extent, beforeLength(g.before));
+        for (const FusedSubgroup & g : mConfig.subgroups) {
+            extent = std::max(extent, beforeLength(g.before));
+            yieldExtent(g.yields);
+        }
         if (extent > 0) addAttribute(kernel::LocalCarries(extent));
     }
     static Bindings inputs(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * U21, StreamSet * Classes,
@@ -4936,6 +4984,15 @@ private:
             }
         }
         s += ")";
+    }
+    static void appendYields(std::string & s, const std::vector<FusedYield> & yields) {
+        for (const FusedYield & y : yields) {
+            s += "y";
+            for (const UCD::UnicodeSet & t : y.text) appendSet(s, t);
+            appendContext(s, y.before);
+            appendContext(s, y.after);
+            if (y.masked) s += "m";
+        }
     }
     //  Everything that shapes the generated code (hashed for the kernel name).
     static std::string signature(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * Mask, StreamSet * Allowed,
@@ -5001,6 +5058,7 @@ private:
             } else {
                 appendContext(s, r.before);
                 appendContext(s, r.after);
+                appendYields(s, r.yields);
             }
             if (r.converted) s += "c";
         }
@@ -5019,6 +5077,7 @@ private:
             } else {
                 appendContext(s, g.before);
                 if (g.afterMatch >= 0) s += "a" + source(g.afterMatch); else appendContext(s, g.after);
+                appendYields(s, g.yields);
             }
             if (g.converted) s += "c";
             if (g.caseMaps) s += "C";
@@ -5102,6 +5161,22 @@ void FusedRules::generatePabloMethod() {
     };
     PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
     PabloAST * const allowed = mHasAllowed ? getInputStreamSet("Allowed")[0] : mask;
+    //  The positions where none of the earlier rules yielded to matches (with
+    //  its text from the position), or nullptr if there are none.
+    auto notYielded = [&](const std::vector<FusedYield> & yields) -> PabloAST * {
+        if (yields.empty()) return nullptr;
+        PabloAST * earlier = zeroes;
+        for (const FusedYield & y : yields) {
+            const unsigned n = y.text.size();
+            PabloAST * m = contexts(y.before, y.after, n);
+            for (unsigned j = 0; j < n; j++) {
+                m = pb.createAnd(m, classAt(j, y.text[j]));
+                if (mask && y.masked) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
+            }
+            earlier = pb.createOr(earlier, m);
+        }
+        return pb.createNot(earlier);
+    };
 
     //  The matches of the string rules, at their first positions, and the
     //  positions where the rules of the subgroups apply.  In a correction kernel,
@@ -5119,6 +5194,7 @@ void FusedRules::generatePabloMethod() {
             m = pb.createAnd(m, classAt(j, r.text[j]));
             if (mask) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
         }
+        if (PabloAST * const free = notYielded(r.yields)) m = pb.createAnd(m, free);
         starts.push_back(m);
     }
     if (mConfig.selected >= 0) {
@@ -5148,6 +5224,9 @@ void FusedRules::generatePabloMethod() {
         PabloAST * at = g.match >= 0 ? source(g.match)
                         : g.afterMatch >= 0 ? pb.createAnd(source(g.afterMatch), contexts(before, FusedContexts{FusedContext()}, 1))
                         : pb.createAnd(classAt(0, plan.all), contexts(before, g.after, 1));
+        if (g.match < 0) {
+            if (PabloAST * const free = notYielded(g.yields)) at = pb.createAnd(at, free);
+        }
         if (allowed && !mConfig.groupCoverage) at = pb.createAnd(at, allowed);
         ats.push_back(at);
     }
@@ -9346,14 +9425,44 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                          && convertedContextMatters(convertedBefores[r], outcomes);
     }
     //  The string rules applied only where earlier ones do not match at their
-    //  first positions (see ldml::TransformStep::stringPriority): their matches
-    //  are given to the kernels (see engineFirsts), with their before contexts
-    //  matched against the text as it is.
+    //  first positions (see ldml::TransformStep::stringPriority), with their
+    //  before contexts matched against the text as it is: matched by the fused
+    //  kernels, with the earlier rules (see FusedYield), where the contexts of
+    //  these are fused contexts (--fused-priority); otherwise their matches are
+    //  given to the kernels (see engineFirsts).  Likewise the subgroups.
     auto prioritized = [&](size_t r) {return r < step.stringPriority.size() && !step.stringPriority[r].empty();};
     auto yields = [&](size_t g) {return g < step.subgroupPriority.size() && !step.subgroupPriority[g].empty();};
+    //  An earlier rule as a FusedYield, if its contexts are fused contexts.
+    auto fusedYield = [&](const ldml::ConversionRule * e, FusedYield & y) -> bool {
+        for (size_t r = 0; r < numStringRules; r++) {
+            if (step.stringRules[r].rule != e) continue;
+            const ldml::StringRule & rule = step.stringRules[r];
+            y.text = texts[r];
+            y.masked = true;
+            return !texts[r].empty() && fusedContexts(rule.engineBefore, true, y.before) && fusedContexts(rule.engineAfter, false, y.after);
+        }
+        for (const ldml::CharMapSubgroup & g : step.subgroups) {
+            if (std::find(g.sourceRules.begin(), g.sourceRules.end(), e) == g.sourceRules.end()) continue;
+            const std::vector<ldml::PatternItem> text = ldml::patternItems(e->getSourceSide(ldml::Direction::Forward)->getText());
+            if (text.empty()) return false;
+            y.text = {text.front().chars};
+            return fusedContexts(g.engineBefore, true, y.before) && fusedContexts(g.engineAfter, false, y.after);
+        }
+        return false;
+    };
+    auto fusedYields = [&](const std::vector<const ldml::ConversionRule *> & earlier, std::vector<FusedYield> & ys) -> bool {
+        if (!FusedPriority) return false;
+        ys.clear();
+        for (const ldml::ConversionRule * e : earlier) {
+            ys.emplace_back();
+            if (!fusedYield(e, ys.back())) return false;
+        }
+        return true;
+    };
+    std::vector<std::vector<FusedYield>> stringYields(numStringRules);
     for (size_t r = 0; r < numStringRules; r++) {
         if (prioritized(r)) {
-            fusedMatch[r] = false;
+            fusedMatch[r] = fusedMatch[r] && fusedYields(step.stringPriority[r], stringYields[r]);
             convertible[r] = false;
         }
     }
@@ -9415,6 +9524,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         fr.replacement = step.stringRules[r].replacement;
         fr.before = befores[r];
         fr.after = afters[r];
+        if (fusedMatch[r]) fr.yields = stringYields[r];
         return fr;
     };
     StreamSet * const inText = P.CreateStreamSet(1);
@@ -10563,7 +10673,9 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                         continue;
                     }
                 }
-                if (yields(g) || !fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
+                const bool fusedYielding = !yields(g) || fusedYields(step.subgroupPriority[g], fg.yields);
+                if (!fusedYielding || !fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
+                    fg.yields.clear();
                     fg.before = {FusedContext()};
                     fg.after = {FusedContext()};
                     UCD::UnicodeSet all;

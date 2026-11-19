@@ -4,18 +4,24 @@
 #
 #  tconv: string rules whose before contexts are matched against the converted
 #  text, resolved in the regular plan's correction kernel by the While loop
-#  (doc/round-replacement.md step 3(a), --converted-string-while) instead of
-#  rounds, where no selection among the string matches depends on them.  The
-#  loop decides such a rule at the first position of each match, as it does a
-#  subgroup; the positions of its text then have the outcomes of its result, or
-#  their own where it does not apply.  Cases: a rule whose result is its own
-#  before context, two alternating; a deletion seen through and an expansion
+#  (doc/round-replacement.md step 3, --converted-string-while) instead of
+#  rounds, with the rules whose selection depends on them.  The loop decides
+#  such a rule at the first position of each match, from its before context and
+#  the matches that may cover that position; the positions of its text then
+#  have the outcomes of its result, or their own where it does not apply.
+#  Cases: a rule whose result is its own before context, two alternating; a
+#  deletion seen through and an expansion
 #  seen at distance 2; a negated set at the start of the text; a repeated set
 #  (X T*) in the before context; single-character rules within the text of the
 #  string rule (coverage), and subgroup chains feeding it and fed by it; a
 #  converted rule within the text of a string rule that precedes it; two of
-#  different lengths; results shorter and longer than the text.  Most chains
-#  are longer than the default 8 rounds, which miss them
+#  different lengths; results shorter and longer than the text.  Then rules
+#  whose selection depends on the rules decided in the loop (step 3(b)): a
+#  converted rule containing another, one overlapping itself, a chain of three;
+#  rules shaped as es-es_FONIPA's, zu-zu_FONIPA's and ja_Latn-ru's; characters
+#  kept and deleted, as blt-blt_FONIPA's rules have them; and a match beginning
+#  at the last position of an applied match, which the overlap order does not
+#  have.  Most chains are longer than the default 8 rounds, which miss them
 #  (--converted-string-while=0).  Then chains over 1,000 characters, across
 #  blocks, also with one thread and with four threads and segments of one
 #  stride (all with --extended-testing; otherwise the first only).  The
@@ -94,6 +100,70 @@ CASES = [
         ('klmnolmnolmnolmnolmnolmnolmno', 'kkkkkkkkkkkkkkkkkkkkkk'),
         ('olmn', 'olmn'),
         ('kolmn', 'kkkk'),
+    ]),
+    # Selection depending on the rules decided in the loop (step 3(b)).
+    ('x { ab → x ;\nbc → z ;', [
+        ('xabcabcabcabcabcabcabcabcabcabc', 'xxcazazazazazazazazaz'),
+        ('abc', 'az'),
+        ('xababababababababababababc', 'xxxxxxxxxxxxxc'),
+        ('xabxbc', 'xxxz'),
+    ]),
+    ('x { ab → x ;\nbb → c ;', [
+        ('xabbbbb', 'xxcc'),
+        ('abbbb', 'acc'),
+        ('xabababababababababababbb', 'xxxxxxxxxxxxc'),
+        ('xabbabbbabbbb', 'xxbacbacc'),
+        ('bbbbbbb', 'cccb'),
+    ]),
+    ('x { abc → x ;\ncd → y ;\nde → z ;', [
+        ('xabcdeabcde', 'xxzabye'),
+        ('abcde', 'abye'),
+        ('xabcabcabcabcabcabcabcabcabcabcde', 'xxxxxxxxxxxz'),
+        ('xcde', 'xye'),
+    ]),
+    ('[^s] { xs → s ;\nss → q ;', [
+        ('axsxsxsxsxsxsxsxsxsxss', 'asxsxsxsxsxsxsxsxsxq'),
+        ('xss', 'ss'),
+        ('sxss', 'sxq'),
+        ('axssss', 'asqs'),
+        ('ssss', 'qq'),
+    ]),
+    ('n { sh → t ;\n[^n] { sh → n ;\nhh → H ;\nhl → L ;', [
+        ('nshh', 'nth'),
+        ('ashl', 'anl'),
+        ('shhh', 'nH'),
+        ('ashshshshshshshshshshshshhl', 'antntntntntntL'),
+        ('nshl', 'ntl'),
+        ('hhhh', 'HH'),
+    ]),
+    ('q { uve → q ;\nex → E ;', [
+        ('quvequvequvequvequvequvequvequvequvequvex', 'qqqqqqqqqqqqqqqqqqqqx'),
+        ('uvex', 'uvE'),
+        ('quvex', 'qqx'),
+        ('quvuvex', 'quvuvE'),
+    ]),
+    ('x { (ab) → $1 x ;', [
+        ('xababababababababababababab', 'xabxabxabxabxabxabxabxabxabxabxabxabxabx'),
+        ('abab', 'abab'),
+        ('xabcab', 'xabxcab'),
+    ]),
+    ('[xb] { (aa) → $1 b ;', [
+        ('xaaaaaaaaaaaaaaaaaaaaaaaa', 'xaabaabaabaabaabaabaabaabaabaabaabaab'),
+        ('aaaa', 'aaaa'),
+        ('xaaxaaa', 'xaabxaaba'),
+        ('baaa', 'baaba'),
+    ]),
+    ('q { (ab) → $1 q ;\n[bq] { (bb) → $1 r ;', [
+        ('qabbbbbbbbbbbbbbbbbbbbb', 'qabqbbrbbbrbbbrbbbrbbbrbbbrbbbr'),
+        ('abbb', 'abbbr'),
+        ('qababababababababababababbb', 'qabqabqabqabqabqabqabqabqabqabqabqabqbbr'),
+        ('bbbb', 'bbbrb'),
+    ]),
+    ('q { z (ab) → $1 q ;\n[bq] { (bb) → $1 r ;', [
+        ('qzabzabzabzabzabzabzabzabzabzabzab', 'qabqabqabqabqabqabqabqabqabqabqabq'),
+        ('zab', 'zab'),
+        ('qzabbbb', 'qabqbbrb'),
+        ('qzazab', 'qzazab'),
     ]),
 ]
 

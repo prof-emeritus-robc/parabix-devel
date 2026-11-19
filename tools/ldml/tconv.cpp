@@ -161,8 +161,8 @@ static cl::opt<bool> ConvertedContextWhile("converted-context-while",
     cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> ConvertedStringWhile("converted-string-while",
     cl::desc("With --converted-context-while, also resolve by the While loop the string rules whose before contexts are matched "
-             "against the converted text, where no selection among the string matches depends on them (doc/round-replacement.md "
-             "step 3(a); default on, --converted-string-while=0 for the rounds)"),
+             "against the converted text, with the string rules whose selection depends on them (doc/round-replacement.md "
+             "step 3; default on, --converted-string-while=0 for the rounds)"),
     cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
@@ -4159,14 +4159,14 @@ struct FusedRulesConfig {
     //  round, of the rules applied where selected, are given (without the state
     //  in).
     bool staged = false;
-    //  A correction kernel whose rules matched against the converted text are
-    //  single-character rules (subgroups) and string rules that no selection
-    //  depends on, with before contexts of fixed items, possibly with a repeated
-    //  set, as are those of its insertion rules (see resolvableByWhile): their
-    //  before contexts are resolved by a While loop, exactly, instead of in
-    //  rounds (see FusedRules::generatePabloMethod).  The rounds remain for the
-    //  selection of the string matches, which does not depend on the converted
-    //  text.
+    //  A correction kernel whose rules matched against the converted text have
+    //  before contexts of fixed items, possibly with a repeated set, as do its
+    //  insertion rules (see resolvableByWhile): their before contexts are
+    //  resolved by a While loop, exactly, instead of in rounds, with the
+    //  selection of the string matches that depends on them (see
+    //  loopStringRules and FusedRules::generatePabloMethod).  The rounds remain
+    //  for the selection of the other string matches, which does not depend on
+    //  the converted text.
     bool resolve = false;
     //  The case mappings marked in the state given or by the subgroups (see
     //  CaseMapSplit), whose outcomes a correction kernel takes into account.
@@ -4567,29 +4567,64 @@ struct FusedSubgroupPlan {
 //  (FusedRulesConfig::resolve): possible if the rules matched against the
 //  converted text have before contexts of fixed sequences of items, possibly
 //  with a repeated set (S T*, see ContextExpansion), as do the insertion rules:
-//  subgroups, and string rules whose matches no selection depends on (see
-//  convertedStringResolvable).
+//  subgroups, and string rules (see loopStringRules).
 //
-//  A converted string rule: its matches (their positions, and their selection
-//  where string rules overlap) do not depend on the converted text, only its
-//  before context does, which the loop decides at the first position of each
-//  match as it does a subgroup's.  So no other string rule may be selected by
-//  it (it precedes none; nor does it match within its own text), its result is
-//  a fixed string at each position of the text (no run, no character kept), and
-//  there are no insertion rules.  (--converted-string-while.)
-static bool convertedStringResolvable(const FusedRulesConfig & c, size_t r) {
-    const FusedStringRule & s = c.strings[r];
-    if (!ConvertedStringWhile || !c.insertions.empty() || !s.run.empty() || !s.runStrings.empty() || s.keep >= 0 || s.match >= 0) {
-        return false;
-    }
-    for (char32_t ch : s.replacement) {
-        if (ch == ldml::StringRuleKept || ch == ldml::StringRuleDeleted) return false;
-    }
+//  The string rules decided in the loop: those whose before contexts are
+//  matched against the converted text, and those whose selection depends on
+//  them, transitively: a rule preceding them in the overlap order (see
+//  Selection) is decided in the loop, or their first character may be at a
+//  later position of the text of one (where ICU, having applied it, applies no
+//  rule; the overlap order has only the rules matching within the text, and
+//  the rounds drop such matches, see appliedWithin).  The positions of their
+//  matches do not depend on the converted text; which apply does, and the
+//  loop decides each match at its first position: from its before context, if
+//  converted, as it decides a subgroup's, and from the matches decided in the
+//  loop that may cover that position (see loopCoverers).  Each must have
+//  a fixed string as its result at each position of its text (no run; a
+//  character kept is the position's own, one deleted has none), and there are
+//  no insertion rules.
+//  (--converted-string-while.)
+//  Whether a match of rule r may begin at offset o of a match of rule p.
+static bool mayBeginWithin(const FusedRulesConfig & c, size_t r, size_t p, unsigned o) {
+    if (o == 0 || o >= c.strings[p].text.size()) return false;
     if (!c.selection.empty()) {
-        if (c.selection[r].selfOverlapping) return false;
-        for (const FusedRulesConfig::Selection & sel : c.selection) {
-            if (std::find(sel.predecessors.begin(), sel.predecessors.end(), r) != sel.predecessors.end()) return false;
+        const std::vector<size_t> & pre = c.selection[r].predecessors;
+        if (std::find(pre.begin(), pre.end(), p) != pre.end()) return true;
+        if (p == r && c.selection[r].selfOverlapping && o == 1) return true;
+    }
+    return c.strings[r].text.front().intersects(c.strings[p].text[o]);
+}
+
+static std::vector<bool> loopStringRules(const FusedRulesConfig & c) {
+    std::vector<bool> d(c.strings.size(), false);
+    for (size_t r = 0; r < c.strings.size(); r++) d[r] = c.strings[r].converted;
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t r = 0; r < c.strings.size(); r++) {
+            if (d[r]) continue;
+            for (size_t p = 0; p < c.strings.size() && !d[r]; p++) {
+                if (!d[p]) continue;
+                for (unsigned o = 1; o < c.strings[p].text.size(); o++) {
+                    if (mayBeginWithin(c, r, p, o)) {
+                        d[r] = changed = true;
+                        break;
+                    }
+                }
+            }
         }
+    }
+    return d;
+}
+
+static bool loopStringResolvable(const FusedRulesConfig & c, size_t r) {
+    const FusedStringRule & s = c.strings[r];
+    if (!ConvertedStringWhile || !c.insertions.empty() || !s.run.empty() || !s.runStrings.empty() || s.keep >= 0) return false;
+    if (s.converted && s.match >= 0) return false;
+    //  (A character kept, or deleted: at a position of the text, the first of its
+    //  result.)
+    for (size_t j = 0; j < s.replacement.size(); j++) {
+        const char32_t ch = s.replacement[j];
+        if ((ch == ldml::StringRuleDeleted || ch == ldml::StringRuleKept) && j >= s.text.size()) return false;
     }
     return true;
 }
@@ -4609,9 +4644,10 @@ static bool resolvableByWhile(const FusedRulesConfig & c) {
         if (!starsOk(ins.before)) return false;
     }
     bool any = false;
+    const std::vector<bool> loop = loopStringRules(c);
     for (size_t r = 0; r < c.strings.size(); r++) {
-        if (!c.strings[r].converted) continue;
-        if (!convertedStringResolvable(c, r) || !starsOk(c.strings[r].before)) return false;
+        if (!loop[r]) continue;
+        if (!loopStringResolvable(c, r) || (c.strings[r].converted && !starsOk(c.strings[r].before))) return false;
         any = true;
     }
     for (const FusedSubgroup & g : c.subgroups) {
@@ -5697,9 +5733,11 @@ void FusedRules::generatePabloMethod() {
         }
         return w;
     };
-    //  (While the While loop's candidates are settled: the converted string rules,
-    //  decided in the loop, neither cover positions nor drop matches here.)
+    //  (While the While loop's candidates are settled: the string rules decided in
+    //  the loop are not selected by each other, and neither cover positions nor
+    //  drop matches here.)
     bool resolvingStrings = false;
+    const std::vector<bool> loopRule = mConfig.resolve ? loopStringRules(mConfig) : std::vector<bool>(mConfig.strings.size(), false);
     auto settle = [&]() {
         if (appliedWithin) {
             for (size_t r = 0; r < mConfig.strings.size(); r++) firstOf[r] = pb.createAnd(firstOf[r], pb.createNot(appliedWithin));
@@ -5709,8 +5747,10 @@ void FusedRules::generatePabloMethod() {
             for (size_t i = 0; i < mConfig.selection.size(); i++) {
                 const FusedRulesConfig::Selection & sel = mConfig.selection[i];
                 PabloAST * matches = firstOf[i];
-                for (size_t p : sel.predecessors) matches = pb.createAnd(matches, pb.createNot(within[p]));
-                if (sel.selfOverlapping) {
+                for (size_t p : sel.predecessors) {
+                    if (!(resolvingStrings && loopRule[p])) matches = pb.createAnd(matches, pb.createNot(within[p]));
+                }
+                if (sel.selfOverlapping && !(resolvingStrings && loopRule[i])) {
                     PabloAST * const runFirst = pb.createAnd(matches, pb.createNot(pb.createAdvance(matches, 1)));
                     PabloAST * const firstOdd = pb.createAnd(runFirst, odd);
                     PabloAST * const firstEven = pb.createXor(runFirst, firstOdd);
@@ -5730,7 +5770,7 @@ void FusedRules::generatePabloMethod() {
             PabloAST * inside = zeroes;
             PabloAST * first = zeroes;
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
-                if (resolvingStrings && mConfig.strings[r].converted) continue;
+                if (resolvingStrings && loopRule[r]) continue;
                 inside = pb.createOr(inside, withinMatches(r, firstOf[r]));
                 first = pb.createOr(first, firstOf[r]);
             }
@@ -5741,7 +5781,7 @@ void FusedRules::generatePabloMethod() {
         if (correction) {
             PabloAST * inside = zeroes;
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
-                if (resolvingStrings && mConfig.strings[r].converted) continue;
+                if (resolvingStrings && loopRule[r]) continue;
                 inside = pb.createOr(inside, withinMatches(r, firstOf[r]));
             }
             appliedWithin = inside;
@@ -6089,12 +6129,13 @@ void FusedRules::generatePabloMethod() {
             //
             //  The string matches that apply, and the positions of the subgroups not
             //  covered by them, as after the rounds: they do not depend on the
-            //  converted text, except for the converted string rules (see
-            //  convertedStringResolvable), whose matches no selection depends on, and
-            //  which neither cover positions nor drop matches here.  The candidates of
-            //  a converted subgroup are its positions without its before context, and
-            //  those of a converted string rule the first positions of its matches
-            //  without it.
+            //  converted text, except for the string rules decided in the loop (see
+            //  loopStringRules), which are not selected by each other, and neither
+            //  cover positions nor drop matches here.  The candidates of a converted
+            //  subgroup are its positions without its before context, and those of a
+            //  string rule decided in the loop the first positions of its matches
+            //  without its before context (if converted) and its selection by the
+            //  rules decided in the loop.
             const size_t numGroups = mConfig.subgroups.size();
             resolvingStrings = true;
             for (unsigned round = 0; round <= mConfig.rounds; round++) {
@@ -6112,14 +6153,17 @@ void FusedRules::generatePabloMethod() {
                 dep = pb.createOr(dep, cand[g]);
                 atBase[g] = zeroes;
             }
-            //  The converted string rules: the candidates of each, and each position
-            //  of their texts, which a match covers.  At offset o of a match applied,
-            //  the result is a fixed string: the character of the replacement at o
-            //  (none beyond it: deleted), and at the last position the rest of the
-            //  replacement.  Where it does not apply, the position has its own
-            //  outcome (no other string match may cover it).
+            //  The string rules decided in the loop: the candidates of each, its
+            //  decisions (DT, DF: the candidates known to apply, and known not to),
+            //  and each position of their texts, which a match covers.  At offset o
+            //  of a match applied, the result is a fixed string: the character of the
+            //  replacement at o (none beyond it: deleted), and at the last position
+            //  the rest of the replacement.  Where none applies, the position has its
+            //  own outcome.
             std::vector<size_t> convStrings;
             std::vector<PabloAST *> candS(mConfig.strings.size(), nullptr);
+            std::vector<Var *> DT(mConfig.strings.size(), nullptr), DF(mConfig.strings.size(), nullptr);
+            std::vector<std::vector<size_t>> coversOf(mConfig.strings.size());
             struct StringCover {
                 size_t rule;
                 unsigned offset;
@@ -6132,16 +6176,21 @@ void FusedRules::generatePabloMethod() {
             std::vector<StringCover> covers;
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
                 const FusedStringRule & rule = mConfig.strings[r];
-                if (!rule.converted) continue;
+                if (!loopRule[r]) continue;
                 convStrings.push_back(r);
                 candS[r] = firstOf[r];
                 firstOf[r] = zeroes;
+                DT[r] = pb.createVar("DT" + std::to_string(r), zeroes);
+                DF[r] = pb.createVar("DF" + std::to_string(r), zeroes);
                 const unsigned n = static_cast<unsigned>(rule.text.size()), m = static_cast<unsigned>(rule.replacement.size());
                 for (unsigned o = 0; o < n; o++) {
                     StringCover sc;
                     sc.rule = r;
                     sc.offset = o;
                     if (o < m) sc.result = o + 1 < n ? rule.replacement.substr(o, 1) : rule.replacement.substr(o);
+                    //  (A character of the text deleted, see ldml::StringRule::kept: with
+                    //  the rest of the replacement after it at the last position.)
+                    if (!sc.result.empty() && sc.result[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) sc.result.erase(0, 1);
                     sc.cand = o ? pb.createAdvance(candS[r], o) : candS[r];
                     sc.notCand = pb.createNot(sc.cand);
                     if (o) {
@@ -6150,6 +6199,7 @@ void FusedRules::generatePabloMethod() {
                         sc.F = pb.createVar("SF" + suffix, zeroes);
                     }
                     dep = pb.createOr(dep, sc.cand);
+                    coversOf[r].push_back(covers.size());
                     covers.push_back(std::move(sc));
                 }
             }
@@ -6428,32 +6478,68 @@ void FusedRules::generatePabloMethod() {
                         RC[c] = wb.createAnd(RC[c], wb.createOr(notCand[g], known(wb, g, false)));
                     }
                 }
-                //  The converted string rules decided at the candidates whose before
-                //  contexts are known, and at each offset of their texts, where a match
-                //  is known to apply (covT) or none is (covF).  (The decisions shifted
-                //  to the offsets are accumulated: the carries of the previous block
-                //  reach the first iteration only.)
+                //  The string rules decided in the loop, in the order of their
+                //  selection (each after the rules preceding it): a candidate is known
+                //  to apply where its before context (if converted) is known to hold
+                //  and every match decided in the loop that may cover it (see
+                //  mayBeginWithin) is known not to apply, and known not to apply where
+                //  its before context is known not to hold or such a match is known to
+                //  apply.  (A match of a rule after it, or of itself, as decided in the
+                //  previous iteration: a run of a rule overlapping itself takes an
+                //  iteration for each of its candidates.)  Then at each offset of their texts, where a
+                //  match is known to apply (covT) or none is (covF).  (The decisions
+                //  and those shifted to the offsets are accumulated: the carries of
+                //  the previous block reach the first iteration only.)
                 std::vector<PabloAST *> covT(covers.size()), covF(covers.size());
-                {
-                    std::map<size_t, std::pair<PabloAST *, PabloAST *>> decided;
-                    for (size_t r : convStrings) {
+                PabloAST * decisionProgress = zeroes;
+                for (size_t r : convStrings) {
+                    PabloAST * applies = candS[r];
+                    PabloAST * rejected = zeroes;
+                    if (mConfig.strings[r].converted) {
                         const FusedContexts & before = mConfig.strings[r].before;
-                        decided[r] = {knownBefore(wb, before, candS[r], true), knownBefore(wb, before, candS[r], false)};
+                        applies = knownBefore(wb, before, candS[r], true);
+                        rejected = knownBefore(wb, before, candS[r], false);
                     }
-                    for (size_t k = 0; k < covers.size(); k++) {
+                    //  The matches that may cover its first position: of the rules
+                    //  decided before it in this iteration, as just decided; of the
+                    //  others (itself among them), as in the previous iteration.
+                    PabloAST * within = zeroes;
+                    PabloAST * notWithin = ones;
+                    for (size_t p : convStrings) {
+                        for (size_t k : coversOf[p]) {
+                            const StringCover & sc = covers[k];
+                            if (!mayBeginWithin(mConfig, r, p, sc.offset)) continue;
+                            if (p < r) {
+                                within = wb.createOr(within, covT[k]);
+                                notWithin = wb.createAnd(notWithin, covF[k]);
+                            } else {
+                                within = wb.createOr(within, sc.T);
+                                notWithin = wb.createAnd(notWithin, wb.createOr(sc.notCand, sc.F));
+                            }
+                        }
+                    }
+                    applies = wb.createAnd(applies, notWithin);
+                    rejected = wb.createOr(rejected, within);
+                    rejected = wb.createAnd(candS[r], rejected);
+                    PabloAST * const t = wb.createOr(DT[r], applies);
+                    PabloAST * const f = wb.createOr(DF[r], rejected);
+                    decisionProgress = wb.createOr(decisionProgress, wb.createOr(wb.createAnd(t, wb.createNot(DT[r])),
+                                                                                 wb.createAnd(f, wb.createNot(DF[r]))));
+                    wb.createAssign(DT[r], t);
+                    wb.createAssign(DF[r], f);
+                    for (size_t k : coversOf[r]) {
                         const StringCover & sc = covers[k];
-                        const auto & d = decided[sc.rule];
                         if (sc.offset == 0) {
-                            covT[k] = d.first;
-                            covF[k] = wb.createOr(sc.notCand, d.second);
+                            covT[k] = t;
+                            covF[k] = wb.createOr(sc.notCand, f);
                             continue;
                         }
-                        PabloAST * const t = wb.createOr(sc.T, wb.createAdvance(d.first, sc.offset));
-                        PabloAST * const f = wb.createOr(sc.F, wb.createAdvance(d.second, sc.offset));
-                        wb.createAssign(sc.T, t);
-                        wb.createAssign(sc.F, f);
-                        covT[k] = t;
-                        covF[k] = wb.createOr(sc.notCand, f);
+                        PabloAST * const st = wb.createOr(sc.T, wb.createAdvance(t, sc.offset));
+                        PabloAST * const sf = wb.createOr(sc.F, wb.createAdvance(f, sc.offset));
+                        wb.createAssign(sc.T, st);
+                        wb.createAssign(sc.F, sf);
+                        covT[k] = st;
+                        covF[k] = wb.createOr(sc.notCand, sf);
                     }
                 }
                 //  The positions known to have a value: where a string match covering
@@ -6471,6 +6557,50 @@ void FusedRules::generatePabloMethod() {
                     return wb.createOr(any, all);
                 };
                 auto constant = [&](bool v) -> PabloAST * {return v ? ones : zeroes;};
+                //  The value of item x at distance j for the result w of a string match
+                //  at the position: its characters, the first possibly the position's
+                //  own (StringRuleKept); shorter than j, the item before it; passed
+                //  over by a run item, as before it.  (A deleted position: as the
+                //  position before it.)
+                auto resultValue = [&](const std::u32string & w, size_t x, unsigned j, int in) -> PabloAST * {
+                    const std::vector<Var *> & K = vars[x].K[in];
+                    const unsigned l = static_cast<unsigned>(w.size());
+                    if (l < j) return K[j - l - 1];
+                    const ResolvedItem & item = items[x];
+                    const int top = static_cast<int>(l - j);
+                    auto ownIn = [&](const UCD::UnicodeSet & set, bool want) -> PabloAST * {
+                        PabloAST * const c = classAt(0, set);
+                        return want ? c : wb.createAnd(inText, wb.createNot(c));
+                    };
+                    if (!item.run) {
+                        if (w[top] == ldml::StringRuleKept) return ownIn(item.chars, in == 1);
+                        return constant(item.chars.contains(static_cast<UCD::codepoint_t>(w[top])) == (in == 1));
+                    }
+                    for (int i = top; i >= 0; i--) {
+                        if (w[i] == ldml::StringRuleKept) {
+                            //  (Only the first: the position's own character.)
+                            PabloAST * const inT = classAt(0, item.chars);
+                            PabloAST * const stop = wb.createAnd(wb.createNot(inT), ownIn(item.beyond, in == 1));
+                            return wb.createOr(wb.createAnd(inText, stop), wb.createAnd(inT, K[0]));
+                        }
+                        const UCD::codepoint_t c = static_cast<UCD::codepoint_t>(w[i]);
+                        if (!item.chars.contains(c)) return constant(item.beyond.contains(c) == (in == 1));
+                    }
+                    return K[0];
+                };
+                //  Whether a run item passes over all of a non-empty result w.
+                auto resultThrough = [&](const std::u32string & w, size_t x) -> PabloAST * {
+                    if (w.empty()) return zeroes;
+                    PabloAST * v = ones;
+                    for (char32_t ch : w) {
+                        if (ch == ldml::StringRuleKept) {
+                            v = wb.createAnd(v, classAt(0, items[x].chars));
+                        } else if (!items[x].chars.contains(static_cast<UCD::codepoint_t>(ch))) {
+                            return zeroes;
+                        }
+                    }
+                    return v;
+                };
                 //  The positions known to have an outcome: of the subgroup that
                 //  applies, or of all the possible ones (given for each class, and
                 //  for the base).
@@ -6521,9 +6651,7 @@ void FusedRules::generatePabloMethod() {
                         }
                         cThru[c] = t;
                     }
-                    thru[x] = withStrings(settled(cThru, baseThrough(x)), [&](const std::u32string & w) {
-                        return constant(!w.empty() && replacementOutcome(w, items[x], 1) == 2);
-                    });
+                    thru[x] = withStrings(settled(cThru, baseThrough(x)), [&](const std::u32string & w) {return resultThrough(w, x);});
                 }
                 //  The outcome of the subgroups of class c for item x at distance j,
                 //  known in (in) or known out (!in).
@@ -6554,15 +6682,7 @@ void FusedRules::generatePabloMethod() {
                             if (items[x].run && j == 1) base = wb.createOr(base, wb.createAnd(baseThrough(x), K[0]));
                             std::vector<PabloAST *> byClass(numClasses);
                             for (size_t c = 0; c < numClasses; c++) byClass[c] = outcomeOf(c, x, j, in);
-                            //  (The result of a string match: deleted, as the position
-                            //  before it; shorter than j, the item before it; passed over
-                            //  by a run item, as before it.)
-                            auto stringValue = [&](const std::u32string & w) -> PabloAST * {
-                                const unsigned l = static_cast<unsigned>(w.size());
-                                if (l < j) return K[j - l - 1];
-                                const int o = replacementOutcome(w, items[x], j);
-                                return o == 2 ? static_cast<PabloAST *>(K[0]) : constant(o == in);
-                            };
+                            auto stringValue = [&](const std::u32string & w) {return resultValue(w, x, j, in);};
                             Var * const C = vars[x].C[in][j - 1];
                             newY.emplace_back(C, wb.createOr(C, withStrings(settled(byClass, base), stringValue)));
                         }
@@ -6673,7 +6793,9 @@ void FusedRules::generatePabloMethod() {
                         }
                     }
                 }
-                wb.createAssign(Progress, progress);
+                //  (New decisions count as progress: a run of candidates of a rule
+                //  overlapping itself may be decided without changing any item.)
+                wb.createAssign(Progress, wb.createOr(progress, decisionProgress));
             }
             pb.createWhile(Progress, wb);
             //  The converted subgroups apply where their before contexts hold, and
@@ -6681,12 +6803,12 @@ void FusedRules::generatePabloMethod() {
             for (size_t g = 0; g < numGroups; g++) {
                 if (cand[g]) atOf[g] = known(pb, g, true);
             }
-            //  The converted string rules apply where their before contexts hold; the
+            //  The string rules decided in the loop apply where known to; the
             //  subgroups not within their matches applied (other than at their first
             //  positions), as settle has them.
             PabloAST * stringsWithin = zeroes;
             for (size_t r : convStrings) {
-                firstOf[r] = knownBefore(pb, mConfig.strings[r].before, candS[r], true);
+                firstOf[r] = DT[r];
                 for (unsigned o = 1; o < mConfig.strings[r].text.size(); o++) {
                     stringsWithin = pb.createOr(stringsWithin, pb.createAdvance(firstOf[r], o));
                 }

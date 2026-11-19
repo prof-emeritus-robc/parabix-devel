@@ -320,7 +320,9 @@ transforms it can affect, and against ICU.
    of a run, which the rules alone do not say.
    Checks: the tconv tests (`tconv_filter_run_end_test`, the insertion and
    DivCode tests) pass, and insertions under global filters, with one group
-   and with several, give the previous output.
+   and with several, give the previous output. On the CLDR test data of the
+   151 transforms with a filter (am_Ethi-d0_Morse included), with `--lines`,
+   the output equals the previous build's.
    Remaining:
    - **UTF-8 mode** has no run ends: a group with single-character rules
      whose contexts end a filtered run is applied in Unicode mode. Of the CLDR
@@ -342,9 +344,21 @@ transforms it can affect, and against ICU.
    `PropertyClasses`) compute their streams within an If on the mask
    (`kernel::computeMasked`; `-masked-block-skip`, default on, which the
    kernel names encode as `+MaskZIf`/`+MaskPIf`). The normalization and tconv
-   tests pass. Remaining:
-   - measure against `-masked-block-skip=0` at several densities (a Greek
-     filter on Greek and on German text);
+   tests pass, and the CLDR test data of the 151 transforms with a filter give
+   the previous output.
+
+   el-Latn-t-el-m0-bgn (a filter of the Greek letters) on 10 MB of Wikibooks
+   text, cycles of its two masked class kernels over the whole text
+   (`-EnableCycleCounter`, one thread), without / with the skip:
+
+   | Text | Greek in the text | Kernel 1 | Kernel 2 |
+   |---|---|---|---|
+   | German | 0% | 31,999 / 2,551 | 28,778 / 2,332 |
+   | Greek | 50% | 22,293 / 20,758 | 19,480 / 18,010 |
+
+   The skip costs nothing where the mask is dense. The run times are the
+   same (0.28 s and 0.17 s with 4 threads): these kernels are 0.5% of the
+   transform. Remaining:
    - the NFC stages and the masked case maps, whose masks are applied within
      their own kernels;
    - narrower masks for the case maps' expanding slots.

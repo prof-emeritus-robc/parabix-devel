@@ -40,14 +40,14 @@ tokenizer also needs:
 ## Build
 
 ```bash
-git clone https://cs-git-research.cs.sfu.ca/cameron/parabix-devel.git
+git clone https://github.com/prof-emeritus-robc/parabix-devel.git
 cd parabix-devel
-mkdir build19 && cd build19
+mkdir <build directory> && cd <build directory>
 cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j8 tokenizer
+make -j$(nproc) tokenizer
 ```
 
-The binary is `build19/bin/tokenizer`. `build19` is only a name: it is the
+The binary is `<build directory>/bin/tokenizer`. `<build directory>` is only a name: it is the
 default path of the scripts in `tokenizer-test/`, which take `--tokenizer=PATH`
 for any other build.
 
@@ -59,7 +59,7 @@ names also encode their tables and options, so switching options is safe.
 ## Quick start
 
 ```bash
-T=build19/bin/tokenizer
+T=<build directory>/bin/tokenizer
 M=tools/lex/tokenizer_files/merges.txt
 
 # Pre-tokenize only (default UAX#29 word boundaries), one pre-token per line
@@ -612,7 +612,7 @@ Timings, speed-ups and the measurement conditions are in [tokenizer-test/README.
 
 `tokenizer-test/` holds the scripts that compare against HuggingFace and tiktoken
 and the benchmarks. None of them run under `make check`. Each takes `--tokenizer PATH`
-(default `build19/bin/tokenizer`); pass the recommended options to the BPE scripts
+(default `<build directory>/bin/tokenizer`); pass the recommended options to the BPE scripts
 (`--parabix-args="$BEST"`), or they test the slow merge-kernel design.
 
 | Script | Kind | What it covers |

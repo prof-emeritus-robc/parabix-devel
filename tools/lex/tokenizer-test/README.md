@@ -163,8 +163,8 @@ before quoting one.
 ## Requirements
 
 - **Python 3.10+**.
-- **A built tokenizer**, by default `<repo>/build19/bin/tokenizer`
-  (`make -C build19 -j8 tokenizer`); every script takes `--tokenizer PATH`.
+- **A built tokenizer**, by default `<repo>/<build directory>/bin/tokenizer`
+  (`make -C <build directory> -$(nproc) tokenizer`); every script takes `--tokenizer PATH`.
 - **HuggingFace `tokenizers`** and **`tiktoken`** from PyPI. The results below use
   `tokenizers` 0.23.3 and `tiktoken` 0.14.0. `compare_bpe.py` and `bench_bpe.py`
   import both.
@@ -197,12 +197,12 @@ from any directory. Defaults and overrides:
 
 | Option | Default | Scripts |
 |---|---|---|
-| `--tokenizer PATH` | `<repo>/build19/bin/tokenizer` | all |
+| `--tokenizer PATH` | `<repo>/<build directory>/bin/tokenizer` | all |
 | `--merges PATH` | `<repo>/tools/lex/tokenizer_files/merges.txt` | `compare_bpe*`, `bench_bpe*`, `bench_configs`, `selfmerge_test` |
 | `--vocab PATH` | `<repo>/tools/lex/tokenizer_files/vocab.json` | `compare_bpe*` |
 | `--tokenizer-json PATH` | `<repo>/tools/lex/tokenizer_files/tokenizer.json` | `compare_bpe*`, `bench_bpe*` |
 | `--input PATH` | none (required) | `compare_bpe*`; `bench_bpe*` take `--input FILE …`, `--sweep --sweep-source FILE` or `--openwebtext`; `bench_pretokenizers` takes `--input FILE …` |
-| `--input PATH` | `<repo>/build19/test.txt` (not in the repo) | `compare_normalizers`, `compare_pretokenizers` |
+| `--input PATH` | `<repo>/<build directory>/test.txt` (not in the repo) | `compare_normalizers`, `compare_pretokenizers` |
 | `--input PATH` | `tokenizer_files/val_2MB.txt` (no longer in the repo) | `bench_configs` |
 
 So pass `--input` to every script except `selfmerge_test.py`, which writes its
@@ -572,4 +572,4 @@ The tokenizer's options are documented once, in the parent
 - **Compare equal threads and equal caches**: `--thread-num=N` with
   `--baseline-threads N`, and `--bench-cold-cache` with `--hf-cache=match`.
 - **`dyld: Library not loaded: @rpath/libparabix_*.dylib`** means the framework
-  libraries are stale: run `make -C build19 -j8 tokenizer`.
+  libraries are stale: run `make -C <build directory> -$(nproc) tokenizer`.

@@ -27,24 +27,32 @@ UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterfa
 }
 
 UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterface & ts, re::PropertyExpression * pe, StreamSet * Source, StreamSet * property, pablo::BitMovementMode mode)
-: UnicodePropertyKernelBuilder(ts, pe, Source, property, mode, [&]() -> std::string {
+: UnicodePropertyKernelBuilder(ts, pe, Source, StreamMask(), property, mode) {
+
+}
+
+UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterface & ts, re::PropertyExpression * pe, StreamSet * Source, StreamMask mask, StreamSet * property, pablo::BitMovementMode mode)
+: UnicodePropertyKernelBuilder(ts, pe, Source, mask, property, mode, [&]() -> std::string {
     return std::to_string(Source->getNumElements()) +
            "x" + std::to_string(Source->getFieldWidth()) +
             pe->getFullName() +
             UTF::kernelAnnotation() +
-            pablo::BitMovementMode_string(mode);
+            pablo::BitMovementMode_string(mode) +
+            maskSuffix(mask);
 }()) {
 
 }
 
-UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterface & ts, re::PropertyExpression * pe, StreamSet * Source, StreamSet * property, pablo::BitMovementMode mode, std::string && propValueName)
+UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterface & ts, re::PropertyExpression * pe, StreamSet * Source, StreamMask mask, StreamSet * property, pablo::BitMovementMode mode, std::string && propValueName)
 : PabloKernel(ts,
 "UCD:" + getStringHash(propValueName) ,
 {},
-{Binding{"property_stream", property}})
+{maskedOutput(mask, "property_stream", property)})
 , mPropNameValue(propValueName)
 , mPropertyExpr(pe)
-, mBitMovement(mode) {
+, mBitMovement(mode)
+, mHasMask(mask.mask != nullptr)
+, mMaskKind(mask.kind) {
     // Only the LookAhead mode, which marks the first byte of each UTF-8 sequence,
     // looks ahead (to the end of the sequence); the Advance mode marks the last byte.
     if (mode == pablo::BitMovementMode::LookAhead) {
@@ -52,6 +60,7 @@ UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterfa
     } else {
         mInputStreamSets.push_back(Binding{"source", Source});
     }
+    addMaskInputs(mask, mInputStreamSets);
 }
 
 llvm::StringRef UnicodePropertyKernelBuilder::getSignature() const {
@@ -60,16 +69,15 @@ llvm::StringRef UnicodePropertyKernelBuilder::getSignature() const {
 
 void UnicodePropertyKernelBuilder::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
-    UTF::UTF_Compiler unicodeCompiler(getInput(0), pb, mBitMovement);
     pablo::Var * propertyVar = pb.createVar(mPropertyExpr->getFullName(), pb.createZeroes());
-    if (mPropertyExpr->getKind() == re::PropertyExpression::Kind::Codepoint) {
-        re::CC * propertyCC = llvm::cast<re::CC>(mPropertyExpr->getResolvedRE());
-        unicodeCompiler.compile({propertyVar}, {propertyCC});
-    } else {
+    if (mPropertyExpr->getKind() != re::PropertyExpression::Kind::Codepoint) {
         llvm::report_fatal_error("UnicodePropertyKernelBuilder requires a non-boundary property expression");
     }
-    Var * const property_stream = getOutputStreamVar("property_stream");
-    pb.createAssign(pb.createExtract(property_stream, pb.getInteger(0)), propertyVar);
+    computeMasked(pb, *this, mHasMask, [&](PabloBuilder & body) {
+        UTF::UTF_Compiler unicodeCompiler(getInput(0), body, mBitMovement);
+        unicodeCompiler.compile({propertyVar}, {llvm::cast<re::CC>(mPropertyExpr->getResolvedRE())});
+    });
+    assignMasked(pb, *this, {propertyVar}, "property_stream", mHasMask, mMaskKind);
 }
 
 UnicodePropertyBasis::UnicodePropertyBasis(LLVMTypeSystemInterface & ts, UCD::EnumeratedPropertyObject * enumObj, StreamSet * Source, StreamSet * PropertyBasis)

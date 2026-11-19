@@ -8,12 +8,14 @@
 #  ldml::EnumerateRepeatedCaptures), also with two captures.  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
-#  tconv_repeated_captures_test.py <tconv binary>
+#  tconv_repeated_captures_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("([bcd]) \u02d0 \u2192 $1 $1 ;\n"
          "([xy]) ([pq]) w \u2192 $2 $1 $2 ;\n"

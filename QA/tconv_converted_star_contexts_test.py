@@ -11,12 +11,14 @@
 #  breathing written h.  The rules are from Greek-Latin, reduced.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_converted_star_contexts_test.py <tconv binary>
+#  tconv_converted_star_contexts_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = (
     ":: NFD (NFC) ;\n"

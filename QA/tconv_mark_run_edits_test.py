@@ -11,12 +11,14 @@
 #  ICU's (as given by its createFromRules on the same rules), including on a
 #  run longer than a block and with a mark outside the filter.
 #
-#  tconv_mark_run_edits_test.py <tconv binary>
+#  tconv_mark_run_edits_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 LONG = 700
 

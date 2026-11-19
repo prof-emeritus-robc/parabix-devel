@@ -9,12 +9,14 @@
 #  context) follows (see ldml::ComposeRevisits, prefixRunConflict).  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
-#  tconv_prefix_run_exceptions_test.py <tconv binary>
+#  tconv_prefix_run_exceptions_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("t \\u0361 s a \u2192 A ;\n"
          "t \\u0361 s i \u2192 I ;\n"

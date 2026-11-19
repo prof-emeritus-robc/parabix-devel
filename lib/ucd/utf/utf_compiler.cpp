@@ -506,6 +506,9 @@ protected:
     virtual void prepareSuffix(unsigned scope, PabloBuilder & pb) = 0;
     virtual void prepareScope(unsigned scope, PabloBuilder & pb) = 0;
     virtual PabloAST * adjustPosition(PabloAST * t, unsigned from, unsigned to, PabloBuilder & pb) = 0;
+    //  The basis of the first code unit adjusted (mScopeBasis[0] and
+    //  mCodeUnitCompiler[0]), once it is extracted from the basis Var.
+    virtual void adjustBasis() {}
 };
 
 bool U8_Compiler::costModelExceedsThreshhold(CC_List & ccs, unsigned from_pos, unsigned threshhold) {
@@ -541,6 +544,7 @@ void U8_Compiler::compile(Target_List targets, CC_List & ccs) {
         mScopeBasis[0][0] = mPB.createExtract(mBasisVar, mPB.getInteger(0));
         mCodeUnitCompiler[0] = std::make_unique<cc::Direct_CC_Compiler>(mScopeBasis[0][0]);
     }
+    adjustBasis();
     createInitialHierarchy(ccs);
 }
 
@@ -922,7 +926,11 @@ protected:
     void prepareScope(unsigned scope, PabloBuilder & pb) override;
     Basis_Set & getBasis(U8_Seq_Kind k, unsigned pos) override;
     PabloAST * adjustPosition(PabloAST * t, unsigned from, unsigned to, PabloBuilder & pb) override;
+    void adjustBasis() override;
     unsigned mExtraLookahead;
+    //  The basis as given, from which the code units are looked ahead: the first
+    //  at the extra lookahead, and the k-th suffix at the extra lookahead + k.
+    Basis_Set mRawBasis;
 };
 
 class U8_Advance_Compiler : public U8_Compiler {
@@ -945,13 +953,29 @@ void U8_Lookahead_Compiler::setExtraLookahead(unsigned extraLookahead) {
     mExtraLookahead = extraLookahead;
 }
 
+//  With an extra lookahead, the classes are those of the character starting that
+//  many positions ahead, so its first code unit is also looked ahead (not only
+//  its suffixes): the first code unit's basis is the basis looked ahead.
+void U8_Lookahead_Compiler::adjustBasis() {
+    mRawBasis = mScopeBasis[0];
+    if (mExtraLookahead == 0) return;
+    for (unsigned i = 0; i < mRawBasis.size(); i++) {
+        mScopeBasis[0][i] = mPB.createLookahead(mRawBasis[i], mExtraLookahead);
+    }
+    if (mScopeBasis[0].size() == 1) {
+        mCodeUnitCompiler[0] = std::make_unique<cc::Direct_CC_Compiler>(mScopeBasis[0][0]);
+    } else {
+        mCodeUnitCompiler[0] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(mScopeBasis[0]);
+    }
+}
+
 void U8_Lookahead_Compiler::prepareSuffix(unsigned scope, PabloBuilder & pb) {
     if (mSeqData[scope].byte1CC->empty()) return;
     for (unsigned sfx = 1; sfx <= scope; sfx++) {
         if (mSeqData[sfx].suffixTest == nullptr) {
             if (mScopeBasis[0].size() == 8) {
-                PabloAST * sfxbit7 = pb.createLookahead(mScopeBasis[0][7], mExtraLookahead + sfx);
-                PabloAST * sfxbit6 = pb.createLookahead(mScopeBasis[0][6], mExtraLookahead + sfx);
+                PabloAST * sfxbit7 = pb.createLookahead(mRawBasis[7], mExtraLookahead + sfx);
+                PabloAST * sfxbit6 = pb.createLookahead(mRawBasis[6], mExtraLookahead + sfx);
                 mSeqData[sfx].suffixTest = pb.createAnd(sfxbit7, pb.createNot(sfxbit6));
             } else {
                 prepareScope(scope, pb);
@@ -972,11 +996,11 @@ void U8_Lookahead_Compiler::prepareScope(unsigned scope, PabloBuilder & pb) {
         if (basis_needed) {
             mScopeBasis[sfx].resize(mScopeBasis[0].size());
             if (mScopeBasis[0].size() == 1) {
-                mScopeBasis[sfx][0] = pb.createLookahead(mScopeBasis[0][0], mExtraLookahead + sfx);
+                mScopeBasis[sfx][0] = pb.createLookahead(mRawBasis[0], mExtraLookahead + sfx);
                 mCodeUnitCompiler[sfx] = std::make_unique<cc::Direct_CC_Compiler>(mScopeBasis[sfx][0]);
             } else {
                 for (unsigned i = 0; i < 6; i++) {
-                    mScopeBasis[sfx][i] = pb.createLookahead(mScopeBasis[0][i], mExtraLookahead + sfx);
+                    mScopeBasis[sfx][i] = pb.createLookahead(mRawBasis[i], mExtraLookahead + sfx);
                 }
                 // Set the expected suffix bits - the final suffixTest will confirm.
                 mScopeBasis[sfx][6] = pb.createZeroes();

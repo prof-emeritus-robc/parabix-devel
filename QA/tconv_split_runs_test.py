@@ -9,12 +9,14 @@
 #  U+1031 U+1037), from Zawgyi-my's third group.  The expected results are
 #  ICU's (createFromRules, each line a text).
 #
-#  tconv_split_runs_test.py <tconv binary>
+#  tconv_split_runs_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 GROUPS = [

@@ -14,12 +14,14 @@
 #  implementable, unless --use-ICU=0.  Skipped (passing) if tconv is built
 #  without ICU.
 #
-#  tconv_icu_test.py <tconv binary>
+#  tconv_icu_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = "a b+ c → X ;\nq { b → Z ;\nb → Y ;\n"
 BREAKS = ":: [\u0e01-\u0e5b] ;\n:: Any-BreakInternal ;\n\u0e1e → p ;\n"

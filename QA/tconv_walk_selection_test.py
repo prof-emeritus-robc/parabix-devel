@@ -15,12 +15,14 @@
 #  at a character outside the filter (…, which ends ICU's text, where
 #  [^0-9\.] matches; the rules are compound, as those of the CLDR transforms).
 #
-#  tconv_walk_selection_test.py <tconv binary>
+#  tconv_walk_selection_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 LONG = 700
 

@@ -13,12 +13,14 @@
 #  selector is at a fixed offset from the start.  The expected results are
 #  ICU's (createFromRules, each line a text).
 #
-#  tconv_capture_variants_test.py <tconv binary>
+#  tconv_capture_variants_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 TONES = "$vowel = [aAeEiIoOuUvV];\n$consonant = [[a-z A-Z] - [$vowel]];\n([aAeE]) ($vowel* $consonant*) 1 \u2192 $1 \u0304 $2 ;\n([aAeE]) ($vowel* $consonant*) 2 \u2192 $1 \u0301 $2 ;\n([aAeE]) ($vowel* $consonant*) 3 \u2192 $1 \u030c $2 ;\n([aAeE]) ($vowel* $consonant*) 4 \u2192 $1 \u0300 $2 ;\n([aAeE]) ($vowel* $consonant*) 5 \u2192 $1 $2 ;\n($vowel) ($consonant*) 1 \u2192 $1 \u0304 $2 ;\n($vowel) ($consonant*) 2 \u2192 $1 \u0301 $2 ;\n($vowel) ($consonant*) 3 \u2192 $1 \u030c $2 ;\n($vowel) ($consonant*) 4 \u2192 $1 \u0300 $2 ;\n($vowel) ($consonant*) 5 \u2192 $1 $2 ;\n[:Letter:] { 1 \u2192 \u0304 ;\n[:Letter:] { 2 \u2192 \u0301 ;\n[:Letter:] { 3 \u2192 \u030c ;\n[:Letter:] { 4 \u2192 \u0300 ;\n[:Letter:] { 5 \u2192 ;\n"
 

@@ -13,6 +13,12 @@
 #  - regression: the small cases in nfd/TestFiles and nfc/TestFiles, concatenated
 #    into one input per tool (each ends in a newline, so nothing composes across
 #    them), checked against the concatenated ExpectedOutput files;
+#  - masked: nfc with -nfc-mask (NFC_Masked, in place and focused, and NFC_U21
+#    with -nfc-u21, focused and in place, with the output mask's selections), and
+#    likewise nfd and nfkd with -nfd-mask (NFD_Masked, and NFD_U21 with
+#    -nfd-u21), each run of the characters of a set normalized by itself and the
+#    others unchanged, on the focus text, checked against unicodedata.normalize
+#    of each run;
 #  - focus: a generated text mixing sparse and dense work, run with a small
 #    --segment-size so that segment boundaries fall inside work regions, checked
 #    against Python's unicodedata.normalize.  The default focus mode runs for nfd
@@ -51,7 +57,7 @@ REGRESSION_CASES = [
              ('nfd/TestFiles', 'singletons'), ('nfd/TestFiles', 'x212b_323'),
              (NORMALIZATION_DIR, 'lv_t')], 'nfd/ExpectedOutput'),
     ('nfc', [('nfc/TestFiles', 'self_composable_test'), ('nfc/TestFiles', 'x212b_323'),
-             (NORMALIZATION_DIR, 'lv_t')], 'nfc/ExpectedOutput'),
+             (NORMALIZATION_DIR, 'lv_t'), ('nfc/TestFiles', 'composition_regressions')], 'nfc/ExpectedOutput'),
 ]
 
 FOCUS_COMMON = ['--thread-num=3', '--segment-size=1024']
@@ -66,6 +72,48 @@ FOCUS_CASES = [
 ]
 
 FORM = {'nfd': 'NFD', 'nfc': 'NFC', 'nfkd': 'NFKD'}
+
+# (-nfc-mask ranges, the characters of the set): everything but the marks of
+# class 220 (U+0316..U+0333), or but the Latin capitals.
+MASK_CASES = [
+    ('0-315,334-10ffff', lambda c: not 0x316 <= ord(c) <= 0x333),
+    ('0-40,5b-10ffff', lambda c: not 0x41 <= ord(c) <= 0x5A),
+]
+
+
+def masked(form, text, within, select='all'):
+    out = []
+    i = 0
+    while i < len(text):
+        j = i
+        inside = within(text[i])
+        while j < len(text) and within(text[j]) == inside:
+            j += 1
+        if select == 'all' or (select == 'inside') == inside:
+            out.append(unicodedata.normalize(form, text[i:j]) if inside else text[i:j])
+        i = j
+    return ''.join(out)
+
+# (flags, -nfc-mask-select) of the masked cases: in place, and focused.
+MASK_MODES = [
+    (['-NoFocus'], 'all'),
+    ([], 'all'),
+    (['-thread-num=3', '-segment-size=1'], 'inside'),
+    (['-focus-filter=byte', '-reintegrate=byte-replace'], 'outside'),
+    (['-nfc-u21'], 'all'),
+    (['-nfc-u21', '-NoFocus'], 'outside'),
+    (['-nfc-u21', '-thread-num=3', '-segment-size=1'], 'inside'),
+]
+
+# (tool, flags, -nfd-mask-select, mask case) of the masked decompositions.
+DECOMPOSITION_MASK_MODES = [
+    ('nfd', [], 'all', 0),
+    ('nfd', ['-NoFocus'], 'inside', 1),
+    ('nfd', ['-nfd-u21'], 'outside', 0),
+    ('nfd', ['-nfd-u21', '-NoFocus', '-thread-num=3', '-segment-size=1'], 'all', 1),
+    ('nfkd', ['-thread-num=3', '-segment-size=1'], 'all', 1),
+    ('nfkd', ['-nfd-u21'], 'inside', 0),
+]
 
 
 def read(path):
@@ -90,12 +138,32 @@ def main():
             write(path, b''.join(read(os.path.join(d, f)) for d, f in files))
             expected = b''.join(read(os.path.join(expected_dir, f + '.' + tool)) for _, f in files)
             cases.append((tool, [], path, expected, 'regression files'))
+            if tool == 'nfc':
+                cases.append((tool, ['-nfc-u21'], path, expected, 'regression files, U21'))
+            if tool == 'nfd':
+                cases.append((tool, ['-nfd-u21'], path, expected, 'regression files, U21'))
         text = focus_text()
         focus_path = os.path.join(tmp, 'focus_text')
         write(focus_path, text.encode('utf-8'))
         for tool, flags in FOCUS_CASES:
             expected = unicodedata.normalize(FORM[tool], text).encode('utf-8')
             cases.append((tool, FOCUS_COMMON + flags, focus_path, expected, 'focus text'))
+        # NFC on the 21-bit basis (nfc -nfc-u21), unmasked.
+        for flags in (['-nfc-u21'], ['-nfc-u21', '-NoFocus']):
+            cases.append(('nfc', flags, focus_path, unicodedata.normalize('NFC', text).encode('utf-8'), 'focus text, U21'))
+        # NFD and NFKD on the 21-bit basis (-nfd-u21), unmasked.
+        for tool, flags in (('nfd', ['-nfd-u21']), ('nfkd', ['-nfd-u21', '-NoFocus'])):
+            cases.append((tool, flags, focus_path, unicodedata.normalize(FORM[tool], text).encode('utf-8'), 'focus text, U21'))
+        for spec, within in MASK_CASES:
+            for flags, select in MASK_MODES:
+                expected = masked('NFC', text, within, select).encode('utf-8')
+                cases.append(('nfc', flags + ['-nfc-mask=' + spec, '-nfc-mask-select=' + select], focus_path, expected,
+                              'focus text, masked'))
+        for tool, flags, select, m in DECOMPOSITION_MASK_MODES:
+            spec, within = MASK_CASES[m]
+            expected = masked(FORM[tool], text, within, select).encode('utf-8')
+            cases.append((tool, flags + ['-nfd-mask=' + spec, '-nfd-mask-select=' + select], focus_path, expected,
+                          'focus text, masked'))
         failures = []
         for tool, flags, path, expected, label in cases:
             result = subprocess.run([os.path.join(bin_dir, tool)] + flags + [path], stdout=subprocess.PIPE)

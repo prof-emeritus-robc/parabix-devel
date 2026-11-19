@@ -8,6 +8,7 @@ NAME
     kernel.unicode
 SRC
     charclasses.cpp
+    divcode.cpp
     char_replacement.cpp
     boundary_kernels.cpp
     UCD_property_kernel.cpp

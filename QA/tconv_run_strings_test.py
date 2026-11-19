@@ -8,12 +8,14 @@
 #  rules are applied alone and selected with other string rules.  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
-#  tconv_run_strings_test.py <tconv binary>
+#  tconv_run_strings_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("[{i\u032f} i ɪ]+ → i ;\n"
          "[{u\u032f} u w]+ → u ;\n"

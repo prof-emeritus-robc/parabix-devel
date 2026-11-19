@@ -209,6 +209,25 @@ void PipelineCompiler::updateThreadLocalMemoryAfterTerminationPhiNodes(KernelBui
         mThreadLocalStartOffset[streamSet] = mThreadLocalStartOffsetAtExitPhi[streamSet];
         mThreadLocalEndOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalEndOffset[streamSet], exitBlock);
         mThreadLocalEndOffset[streamSet] = mThreadLocalEndOffsetAtExitPhi[streamSet];
+        copyThreadLocalOffsetsToInOutReplacements(streamSet);
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief copyThreadLocalOffsetsToInOutReplacements
+ *
+ * A stream set that replaces a thread-local stream set in place (an InOut binding) shares its memory, so it has
+ * the same offsets.  Only the thread-local stream sets themselves have the PHI nodes that merge their offsets
+ * across the partition root's loop (mIsThreadLocalStreamSet), so whenever their offsets are reassigned, those of
+ * their replacements must be too; otherwise a replacement keeps the offsets computed in the block that (re)allocates
+ * the thread-local memory, which does not dominate the kernels that use them.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::copyThreadLocalOffsetsToInOutReplacements(const size_t streamSet) {
+    if (streamSet > LastStreamSet) return;
+    for (auto inOut = streamSet; LLVM_UNLIKELY(out_degree(inOut, InOutStreamSetReplacement)); ) {
+        inOut = child(inOut, InOutStreamSetReplacement);
+        mThreadLocalStartOffset[inOut] = mThreadLocalStartOffset[streamSet];
+        mThreadLocalEndOffset[inOut] = mThreadLocalEndOffset[streamSet];
     }
 }
 
@@ -366,11 +385,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
                         buf->setCapacity(b, b.CreateMulRational(off, Rational{bw, ts}));
                     }
 
-                    for (auto inOut = streamSet; LLVM_UNLIKELY(out_degree(inOut, InOutStreamSetReplacement)); ) {
-                        inOut = child(inOut, InOutStreamSetReplacement);
-                        mThreadLocalStartOffset[inOut] = start;
-                        mThreadLocalEndOffset[inOut] = end;
-                    }
+                    copyThreadLocalOffsetsToInOutReplacements(streamSet);
                 }
 
                 #if defined(PRINT_DEBUG_MESSAGES) && !defined(PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY)
@@ -496,6 +511,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
         endPhi->addIncoming(mThreadLocalEndOffsetAtEntryPhi[streamSet], entryBlock);
         endPhi->addIncoming(mThreadLocalEndOffset[streamSet], afterExpansion);
         mThreadLocalEndOffset[streamSet] = endPhi;
+        copyThreadLocalOffsetsToInOutReplacements(streamSet);
     }
 
     remapThreadLocalBufferMemory(b);

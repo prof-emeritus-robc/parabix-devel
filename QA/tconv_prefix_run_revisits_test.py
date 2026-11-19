@@ -14,12 +14,14 @@
 #  either not implementable (exit status 2) or as ICU applies them.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_prefix_run_revisits_test.py <tconv binary>
+#  tconv_prefix_run_revisits_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 REVISIT = ("te \\~ \u2192 | t ;\n"
          "to \\~ \u2192 | t ;\n"

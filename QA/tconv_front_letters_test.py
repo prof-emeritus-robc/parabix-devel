@@ -11,12 +11,14 @@
 #  uppercase letter).  The rules are Greek-Latin's main group, reduced.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_front_letters_test.py <tconv binary>
+#  tconv_front_letters_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = (
     ":: NFD (NFC) ;\n"

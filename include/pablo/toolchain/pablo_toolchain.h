@@ -49,6 +49,9 @@ extern bool EnableProvisionalLookAheadStride;
 // Let Pablo kernels with the LocalCarries attribute rebuild their carries at each segment start.
 extern bool EnableLocalCarries;
 
+// Check that each iteration of a While advances the lowest bit of its condition.
+extern bool CheckWhileProgress;
+
 // Report the CarryExtent of each compiled Pablo kernel, or the statement that prevents it.
 extern bool ShowCarryExtent;
 extern std::string PabloIllustrateBitstreamRegEx;

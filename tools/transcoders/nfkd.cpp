@@ -16,6 +16,7 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/streamutils/focused_transform.h>
 #include <kernel/unicode/normalization/normalization.h>
+#include "decomposition_modes.h"
 #include <toolchain/toolchain.h>
 #include <toolchain/toolio.h>
 #include <kernel/pipeline/driver/cpudriver.h>
@@ -71,13 +72,14 @@ XfrmFunctionType generate_NFKD_pipeline(CPUDriver & driver) {
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
-    StreamSet * const OutputBytes = NFKD.build(P, ByteStream, BasisBits);
+    StreamSet * OutputBytes = DecompositionModes(P, NFD_builder, UCD::DecompositionOptions::NFKD, NFKD.getOptions(), ByteStream, BasisBits);
+    if (OutputBytes == nullptr) OutputBytes = NFKD.build(P, ByteStream, BasisBits);
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&NFKD_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&NFKD_Options, &DecompositionModeOptions(), &toolio::InputOutputOptions, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     toolio::Input in;
     if (!toolio::openInput(inputFile, in) || !toolio::openOutput()) {
         return 1;

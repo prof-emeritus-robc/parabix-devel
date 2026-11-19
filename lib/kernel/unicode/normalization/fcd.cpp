@@ -127,11 +127,18 @@ protected:
     }
 };
 
-void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions) {
+void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions, StreamSet * Mask) {
     std::vector<re::CC *> ccs;
     for (const UCD::UnicodeSet & s : FCD_ClassSets()) ccs.push_back(re::makeCC(s, &cc::Unicode));
     StreamSet * const Classes = P.CreateStreamSet(ccs.size());
-    P.CreateKernelCall<CharClassesKernel>(ccs, U21, Classes);
+    //  Outside the mask, lccc = tccc = 0 (the classes zeroed): each such
+    //  character is a boundary on both sides, as a starter that does not
+    //  decompose, so no violation is found across it.
+    if (Mask) {
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, StreamMask{Mask, MaskKind::Zeroing}, Classes);
+    } else {
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, Classes);
+    }
     StreamSet * const Index = P.CreateStreamSet(1);
     StreamSet * const FirstV = P.CreateStreamSet(1);
     StreamSet * const NonStarters = P.CreateStreamSet(1);

@@ -612,6 +612,37 @@ void PipelineCompiler::initializeKernelLoopExitPhis(KernelBuilder & b) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief releasePreInvocationLockAtInsufficientIO
+ *
+ * A data-parallel kernel whose input is insufficient exits its loop after zero or more executions in this segment.
+ * It publishes the item counts it reached (the counts the next segment starts from, written before the release
+ * in writeKernelCall), releases its pre-invocation lock and acquires its post-invocation lock.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::releasePreInvocationLockAtInsufficientIO(KernelBuilder & b) {
+    assert (mAllowDataParallelExecution);
+    if (LLVM_LIKELY(!mKernelIsInternallySynchronized)) {
+        for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
+            const BufferPort & br = mBufferGraph[e];
+            if (LLVM_UNLIKELY(br.isRelative())) {
+                continue;
+            }
+            assert (mProcessedItemCountPtr[br.Port]);
+            b.CreateAlignedStore(mAlreadyProcessedPhi[br.Port], mProcessedItemCountPtr[br.Port], SizeTyABIAlignment);
+        }
+        for (const auto e : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
+            const BufferPort & br = mBufferGraph[e];
+            if (LLVM_UNLIKELY(br.isRelative())) {
+                continue;
+            }
+            assert (mProducedItemCountPtr[br.Port]);
+            b.CreateAlignedStore(mAlreadyProducedPhi[br.Port], mProducedItemCountPtr[br.Port], SizeTyABIAlignment);
+        }
+    }
+    releaseSynchronizationLock(b, mKernelId, SYNC_LOCK_PRE_INVOCATION, mSegNo);
+    acquireSynchronizationLockWithTimingInstrumentation(b, mKernelId, SYNC_LOCK_POST_INVOCATION, mSegNo);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief writeInsufficientIOExit
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::writeInsufficientIOExit(KernelBuilder & b) {
@@ -628,14 +659,29 @@ void PipelineCompiler::writeInsufficientIOExit(KernelBuilder & b) {
 
     if (mKernelJumpToNextUsefulPartition) {
         assert (mIsPartitionRoot);
-        // TODO: check whether we need to release/acquire the pre/post locks here too
+        if (LLVM_UNLIKELY(mAllowDataParallelExecution)) {
+            // A data-parallel root that executed at least once in this segment still holds its pre-invocation
+            // lock: writeKernelCall delays the release while the kernel has more input, and this iteration, which
+            // finds the input insufficient, goes to the loop exit. Release the lock and take the post-invocation
+            // lock here, as the non-root path below does, or the next segment waits on the lock forever. (When
+            // the root has not executed, the jump to the next useful partition releases its locks.)
+            const auto prefix = makeKernelName(mKernelId);
+            BasicBlock * const releaseLocks =
+                b.CreateBasicBlock(prefix + "_insufficientIOReleaseLocks", mKernelLoopExit);
+            BasicBlock * const exitOrJump =
+                b.CreateBasicBlock(prefix + "_insufficientIOExitOrJump", mKernelLoopExit);
+            b.CreateLikelyCondBr(mExecutedAtLeastOnceAtLoopEntryPhi, releaseLocks, exitOrJump);
+            b.SetInsertPoint(releaseLocks);
+            releasePreInvocationLockAtInsufficientIO(b);
+            b.CreateBr(exitOrJump);
+            b.SetInsertPoint(exitOrJump);
+        }
         b.CreateLikelyCondBr(mExecutedAtLeastOnceAtLoopEntryPhi, mKernelLoopExit, mKernelJumpToNextUsefulPartition);
     } else {
         // if this is not a partition root, it is not responsible for determining
         // whether the partition is out of input
         if (LLVM_UNLIKELY(mAllowDataParallelExecution)) {
-            releaseSynchronizationLock(b, mKernelId, SYNC_LOCK_PRE_INVOCATION, mSegNo);
-            acquireSynchronizationLockWithTimingInstrumentation(b, mKernelId, SYNC_LOCK_POST_INVOCATION, mSegNo);
+            releasePreInvocationLockAtInsufficientIO(b);
         }
         b.CreateBr(mKernelLoopExit);
     }

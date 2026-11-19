@@ -10,12 +10,14 @@
 #  ywm̥ (as the greedy form would, by m then \u0325); $v+ takes ü (u \u0308)
 #  before [b-d]+.  The expected results are ICU's.
 #
-#  tconv_possessive_lookahead_test.py <tconv binary>
+#  tconv_possessive_lookahead_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 RULES = ("$cons = [{m\\u0325}{d\\u0361\\u0292} b d m] ;\n"
          "yw } $cons* [x \\u0325 \\u0361] → X ;\n"

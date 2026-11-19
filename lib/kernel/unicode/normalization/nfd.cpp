@@ -356,24 +356,30 @@ void LVT_Indexes::generatePabloMethod() {
 
 class LVT2NFD : public pablo::PabloKernel {
 public:
+    //  With a mask, only the syllables at its positions are decomposed.
     LVT2NFD(LLVMTypeSystemInterface & ts,
                StreamSet * Basis, StreamSet * L_index, StreamSet * V_index, StreamSet * T_index,
-               StreamSet * NFD_Basis);
+               StreamSet * NFD_Basis, StreamSet * Mask = nullptr);
 protected:
     void generatePabloMethod() override;
+    const bool mHasMask;
 };
 
 LVT2NFD::LVT2NFD (LLVMTypeSystemInterface & ts,
                         StreamSet * Basis, StreamSet * L_index, StreamSet * V_index, StreamSet * T_index,
-                        StreamSet * NFD_Basis)
-: PabloKernel(ts, "Hangul::LVT2NFD_" + std::to_string(Basis->getNumElements()) + "x1",
+                        StreamSet * NFD_Basis, StreamSet * Mask)
+: PabloKernel(ts, "Hangul::LVT2NFD_" + std::to_string(Basis->getNumElements()) + "x1" + (Mask ? "_mask" : ""),
 // inputs
-{Binding{"basis", Basis},
-    Binding{"L_index", L_index},
-    Binding{"V_index", V_index},
-    Binding{"T_index", T_index}},
+[&] {
+    Bindings b{Binding{"basis", Basis},
+               Binding{"L_index", L_index},
+               Binding{"V_index", V_index},
+               Binding{"T_index", T_index}};
+    if (Mask) b.emplace_back("mask", Mask);
+    return b;
+}(),
 // output
-{Binding{"NFD_Basis", NFD_Basis}}) {
+{Binding{"NFD_Basis", NFD_Basis}}), mHasMask(Mask != nullptr) {
     addAttribute(kernel::LocalCarries());
 }
 
@@ -385,6 +391,7 @@ void LVT2NFD::generatePabloMethod() {
     std::vector<PabloAST *> T_index = getInputStreamSet("T_index");
     BixNumCompiler bnc0(pb);
     PabloAST * Hangul_precomposed = pb.createAnd(bnc0.UGE(basis, Hangul::SBase), bnc0.ULT(basis, Hangul::SBase + Hangul::SCount));
+    if (mHasMask) Hangul_precomposed = pb.createAnd(Hangul_precomposed, getInputStreamSet("mask")[0]);
     // Set up Vars to receive the generated basis values.
     std::vector<Var *> basisVar(21);
     for (unsigned i = 0; i < 21; i++) {
@@ -600,101 +607,101 @@ static BitMovementMode SpanMode(BitMovementMode m) {
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) mPB.captureByteData(#name, name)
 
 
-StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis) {
-
+//  NFD or NFKD on the 21-bit basis (see NFD_U21_Pipeline): the decompositions,
+//  the Hangul syllables decomposed, and the canonical ordering of the runs of
+//  nonzero combining classes.  Within a mask, only the characters of the mask
+//  are decomposed, and only the runs of the mask (with the positions inserted
+//  for the decompositions of its characters) are ordered: a character outside
+//  the mask is unchanged, and none moves across it.
+static StreamSet * U21_Decomposition(PipelineBuilder & P, UCD::DecompositionOptions form, StreamSet * U21_Basis,
+                                     StreamSet * Mask, StreamSet ** SpreadMaskOut) {
+    PipelineBuilder & mPB = P;     // (for SHOW_STREAM, SHOW_BIXNUM)
     // Now we have a Unicode-indexed representation of all significant
     // sequences for NFD processing.
-    UCD::NFD_Engine NFD_engine(UCD::DecompositionOptions::NFD);
+    UCD::NFD_Engine NFD_engine(form);
     // Expand to make room for decompositions.
     auto insert_ccs = NFD_engine.UnicodeInsertLengthBixNumSets();
     auto bit_translate_ccs = NFD_engine.UnicodeBitTransformSets();
 
-    StreamSet * NFD_Basis = U21_CharToShortStringPipeline(mPB, insert_ccs, bit_translate_ccs, U21_Basis);
+    StreamSet * SpreadMask = nullptr;
+    StreamSet * NFD_Basis = U21_CharToShortStringPipeline(P, insert_ccs, bit_translate_ccs, U21_Basis, Mask, &SpreadMask);
+    if (SpreadMaskOut) *SpreadMaskOut = SpreadMask;
+    //  (The mask over the expanded text: the positions inserted are those of
+    //  the decompositions of characters within it.)
+    if (Mask && SpreadMask) {
+        StreamSet * const Spread = P.CreateStreamSet(1);
+        SpreadByMask(P, SpreadMask, Mask, Spread);
+        StreamSet * const Inserted = P.CreateStreamSet(1);
+        P.CreateKernelCall<bixnum::NEQ_immediate>(SpreadMask, 1, Inserted);
+        StreamSet * const Expanded = P.CreateStreamSet(1);
+        OrCombine(P, Spread, Inserted, Expanded);
+        Mask = Expanded;
+    }
 
     //  The Hangul decomposition algorithm calculates replacements for LV and
     //  LVT characters using calculations based on three 5-bit indexes for
     //  the L, V and T characters.
-    StreamSet * const LIndexBixNum = mPB.CreateStreamSet(L_Index_bits);
-    StreamSet * const VIndexBixNum = mPB.CreateStreamSet(V_Index_bits);
-    StreamSet * const TIndexBixNum = mPB.CreateStreamSet(T_Index_bits);
-    mPB.CreateKernelCall<LVT_Indexes>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum);
+    StreamSet * const LIndexBixNum = P.CreateStreamSet(L_Index_bits);
+    StreamSet * const VIndexBixNum = P.CreateStreamSet(V_Index_bits);
+    StreamSet * const TIndexBixNum = P.CreateStreamSet(T_Index_bits);
+    P.CreateKernelCall<LVT_Indexes>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum);
     SHOW_BIXNUM(LIndexBixNum);
     SHOW_BIXNUM(VIndexBixNum);
     SHOW_BIXNUM(TIndexBixNum);
 
     // Given the L, V and T indexes, the replacements for LV and LVT characters
     // can be calculated to determine the correct 21-bit representations at
-    // <L, V> and <L, V, T> positions.
-    StreamSet * const Hangul_NFD_Basis = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<LVT2NFD>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum, Hangul_NFD_Basis);
+    // <L, V> and <L, V, T> positions (within the mask).
+    StreamSet * const Hangul_NFD_Basis = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<LVT2NFD>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum, Hangul_NFD_Basis, Mask);
     SHOW_BIXNUM(Hangul_NFD_Basis);
 
     NFD_Basis = Hangul_NFD_Basis;
 
     UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(getPropertyObject(UCD::ccc));
-    StreamSet * const CCC_Basis = mPB.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    mPB.CreateKernelCall<UnicodePropertyBasis>(enumObj, NFD_Basis, CCC_Basis);
+    StreamSet * const CCC_Basis = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
+    P.CreateKernelCall<UnicodePropertyBasis>(enumObj, NFD_Basis, CCC_Basis);
     SHOW_BIXNUM(CCC_Basis);
 
-    StreamSet * const CCC_NonZero = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
+    StreamSet * CCC_NonZero = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
     SHOW_STREAM(CCC_NonZero);
+    if (Mask) {
+        StreamSet * const Within = P.CreateStreamSet(1, 1);
+        AndCombine(P, CCC_NonZero, Mask, Within);
+        CCC_NonZero = Within;
+    }
 
-    StreamSet * const Sorted_Basis = mPB.CreateStreamSet(NFD_Basis->getNumElements(), 1);
-    SortRuns(mPB, CCC_NonZero, CCC_Basis, NFD_Basis, Sorted_Basis);
+    StreamSet * const Sorted_Basis = P.CreateStreamSet(NFD_Basis->getNumElements(), 1);
+    SortRuns(P, CCC_NonZero, CCC_Basis, NFD_Basis, Sorted_Basis);
     SHOW_BIXNUM(Sorted_Basis);
 
     return Sorted_Basis;
 }
 
-StreamSet * NFD_PipelineBuilder::NFKD_U21_Pipeline(StreamSet * U21_Basis) {
-
-    // Now we have a Unicode-indexed representation of all significant
-    // sequences for NFD processing.
-    UCD::NFD_Engine NFD_engine(UCD::DecompositionOptions::NFKD);
-    // Expand to make room for decompositions.
-    auto insert_ccs = NFD_engine.UnicodeInsertLengthBixNumSets();
-    auto bit_translate_ccs = NFD_engine.UnicodeBitTransformSets();
-
-    StreamSet * NFD_Basis = U21_CharToShortStringPipeline(mPB, insert_ccs, bit_translate_ccs, U21_Basis);
-
-    //  The Hangul decomposition algorithm calculates replacements for LV and
-    //  LVT characters using calculations based on three 5-bit indexes for
-    //  the L, V and T characters.
-    StreamSet * const LIndexBixNum = mPB.CreateStreamSet(L_Index_bits);
-    StreamSet * const VIndexBixNum = mPB.CreateStreamSet(V_Index_bits);
-    StreamSet * const TIndexBixNum = mPB.CreateStreamSet(T_Index_bits);
-    mPB.CreateKernelCall<LVT_Indexes>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum);
-    SHOW_BIXNUM(LIndexBixNum);
-    SHOW_BIXNUM(VIndexBixNum);
-    SHOW_BIXNUM(TIndexBixNum);
-
-    // Given the L, V and T indexes, the replacements for LV and LVT characters
-    // can be calculated to determine the correct 21-bit representations at
-    // <L, V> and <L, V, T> positions.
-    StreamSet * const Hangul_NFD_Basis = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<LVT2NFD>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum, Hangul_NFD_Basis);
-    SHOW_BIXNUM(Hangul_NFD_Basis);
-
-    NFD_Basis = Hangul_NFD_Basis;
-
-    UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(getPropertyObject(UCD::ccc));
-    StreamSet * const CCC_Basis = mPB.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    mPB.CreateKernelCall<UnicodePropertyBasis>(enumObj, NFD_Basis, CCC_Basis);
-    SHOW_BIXNUM(CCC_Basis);
-
-    StreamSet * const CCC_NonZero = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
-    SHOW_STREAM(CCC_NonZero);
-
-    StreamSet * const Sorted_Basis = mPB.CreateStreamSet(NFD_Basis->getNumElements(), 1);
-    SortRuns(mPB, CCC_NonZero, CCC_Basis, NFD_Basis, Sorted_Basis);
-    SHOW_BIXNUM(Sorted_Basis);
-
-    return Sorted_Basis;
+StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis, StreamSet * Mask, StreamSet ** SpreadMask) {
+    return U21_Decomposition(mPB, UCD::DecompositionOptions::NFD, U21_Basis, Mask, SpreadMask);
 }
 
-void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * NFD_WorkItems) {
+StreamSet * NFD_PipelineBuilder::NFKD_U21_Pipeline(StreamSet * U21_Basis, StreamSet * Mask, StreamSet ** SpreadMask) {
+    return U21_Decomposition(mPB, UCD::DecompositionOptions::NFKD, U21_Basis, Mask, SpreadMask);
+}
+
+//  With a mask, the candidates within it: the decomposables outside it are not,
+//  and the characters outside it count as not reorderable.
+static void maskCandidates(PipelineBuilder & P, StreamSet *& Decomposable, StreamSet *& CCC_0, StreamSet * Mask) {
+    if (Mask == nullptr) return;
+    StreamSet * const within = P.CreateStreamSet(1, 1);
+    AndCombine(P, Decomposable, Mask, within);
+    Decomposable = within;
+    StreamSet * const outside = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<bixnum::EQ_immediate>(Mask, 0, outside);
+    StreamSet * const nr = P.CreateStreamSet(1, 1);
+    OrCombine(P, CCC_0, outside, nr);
+    CCC_0 = nr;
+}
+
+void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * NFD_WorkItems, StreamSet * Mask) {
     re::PropertyExpression * dtCanProp = re::makePropertyExpression("dt", "Can");
     dtCanProp = cast<re::PropertyExpression>(UCD::linkAndResolve(dtCanProp));
     StreamSet * DT_Can = mPB.CreateStreamSet(1, 1);
@@ -703,21 +710,22 @@ void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet
 
     re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
     CCC0_Prop = cast<re::PropertyExpression>(UCD::linkAndResolve(CCC0_Prop));
-    StreamSet * const CCC_0 = mPB.CreateStreamSet(1, 1);
+    StreamSet * CCC_0 = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, U8_Basis, CCC_0, mBitMovement);
     SHOW_STREAM(CCC_0);
+    maskCandidates(mPB, DT_Can, CCC_0, Mask);
 
     mPB.CreateKernelCall<NFD_Focus>(u8index, DT_Can, CCC_0, NFD_WorkItems, mBitMovement);
     SHOW_STREAM(NFD_WorkItems);
 }
 
-void NFD_PipelineBuilder::DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask) {
+void NFD_PipelineBuilder::DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * Mask) {
     StreamSet * const u8index = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     SHOW_STREAM(u8index);
 
     StreamSet * NFD_WorkItems = mPB.CreateStreamSet(1, 1);
-    DetermineNFD_WorkItems(BasisBits, u8index, NFD_WorkItems);
+    DetermineNFD_WorkItems(BasisBits, u8index, NFD_WorkItems, Mask);
 
     mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask, SpanMode(mBitMovement));
     SHOW_STREAM(WorkSelectionMask);
@@ -730,22 +738,23 @@ NFD_BixData & NFD_PipelineBuilder::NFKD_Data() {
     return *mNFKD_Data;
 }
 
-void NFD_PipelineBuilder::DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask) {
+void NFD_PipelineBuilder::DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * Mask) {
     StreamSet * const u8index = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     SHOW_STREAM(u8index);
 
     // The characters that NFKD decomposes (at their last byte), in place of
     // NFD's dt=Can.
-    StreamSet * const Decomposable = mPB.CreateStreamSet(1, 1);
+    StreamSet * Decomposable = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{NFKD_Data().Decomposable_CC()}, BasisBits, Decomposable, mBitMovement);
     SHOW_STREAM(Decomposable);
 
     re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
     CCC0_Prop = cast<re::PropertyExpression>(UCD::linkAndResolve(CCC0_Prop));
-    StreamSet * const CCC_0 = mPB.CreateStreamSet(1, 1);
+    StreamSet * CCC_0 = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, BasisBits, CCC_0, mBitMovement);
     SHOW_STREAM(CCC_0);
+    maskCandidates(mPB, Decomposable, CCC_0, Mask);
 
     StreamSet * const NFKD_WorkItems = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<NFD_Focus>(u8index, Decomposable, CCC_0, NFKD_WorkItems, mBitMovement);
@@ -755,9 +764,10 @@ void NFD_PipelineBuilder::DetermineNFKD_WorkSelection(StreamSet * BasisBits, Str
     SHOW_STREAM(WorkSelectionMask);
 }
 
-void NFD_PipelineBuilder::ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask) {
+void NFD_PipelineBuilder::ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask,
+                                                        StreamSet * Mask) {
     mPB.SetStageLabel("placement");
-    ComputeWorkPlacement(mPB, NFKD_Data().UTF8_Insertion_BixNumCCs(), NFKD_Data().UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask, mBitMovement);
+    ComputeWorkPlacement(mPB, NFKD_Data().UTF8_Insertion_BixNumCCs(), NFKD_Data().UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask, mBitMovement, Mask);
     SHOW_STREAM(FinalWorkPlacementMask);
 }
 
@@ -776,39 +786,59 @@ void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * Wor
     SHOW_BIXNUM(WorkingBasis);
 }
 
-void NFD_PipelineBuilder::ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask) {
+void NFD_PipelineBuilder::ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask,
+                                                   StreamSet * Mask) {
     mPB.SetStageLabel("placement");
-    ComputeWorkPlacement(mPB, NFD_Data.UTF8_Insertion_BixNumCCs(), NFD_Data.UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask, mBitMovement);
+    ComputeWorkPlacement(mPB, NFD_Data.UTF8_Insertion_BixNumCCs(), NFD_Data.UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask, mBitMovement, Mask);
     SHOW_STREAM(FinalWorkPlacementMask);
 }
 
-void NFD_PipelineBuilder::NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis) {
-    mPB.SetStageLabel("transform");
-
-    StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed, mBitMovement);
-    SHOW_BIXNUM(U21_u8indexed);
-
-    // the positions of the decoded codepoints
-    StreamSet * const WorkingU8index = mPB.CreateStreamSet(1, 1);
-    if (mBitMovement == BitMovementMode::Advance) {
-        mPB.CreateKernelCall<UTF8_index>(WorkingBasis, WorkingU8index);
-    } else {
-        mPB.CreateKernelCall<UTF8_InitialMask>(WorkingBasis, WorkingU8index);
+//  The UTF-8 bytes of characters given a mask over the characters (21-bit): the
+//  mask spread to the bytes of each character, as U21_to_UTF8 encodes them.
+class U8_InheritLead final : public pablo::PabloKernel {
+public:
+    U8_InheritLead(LLVMTypeSystemInterface & ts, StreamSet * Leads, StreamSet * Spread, StreamSet * Bytes)
+    : PabloKernel(ts, "U8_InheritLead", {Binding{"Leads", Leads}, Binding{"Spread", Spread}}, {Binding{"Bytes", Bytes}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const trail = pb.createInFile(pb.createNot(getInputStreamSet("Leads")[0]));
+        PabloAST * const lead = getInputStreamSet("Spread")[0];
+        PabloAST * const follow = pb.createAnd(pb.createAdvance(lead, 1), trail);
+        PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, trail), trail);
+        writeOutputStreamSet("Bytes", std::vector<PabloAST *>{pb.createOr(lead, runs)});
     }
-    SHOW_STREAM(WorkingU8index);
+};
 
-    StreamSet * const U21_focus = mPB.CreateStreamSet(21, 1);
-    FilterByMask(mPB, WorkingU8index, U21_u8indexed, U21_focus);
-    SHOW_BIXNUM(U21_focus);
-
-    StreamSet * NFD_U21_Results = NFD_U21_Pipeline(U21_focus);
-
-    U21_to_UTF8(mPB, NFD_U21_Results, TransformedBasis);
-    SHOW_BIXNUM(TransformedBasis);
+static void U21_MaskToU8(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask21, StreamSet * BytesMask) {
+    //  (The bytes after the first of each character: 1 for 2 or 4 bytes, 2 for 3 or 4.)
+    UCD::UnicodeSet bit0 = UCD::UnicodeSet(0x80, 0x7FF) + UCD::UnicodeSet(0x10000, 0x10FFFF);
+    UCD::UnicodeSet bit1 = UCD::UnicodeSet(0x800, 0x10FFFF);
+    StreamSet * const Extra = P.CreateStreamSet(2, 1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(bit0, &cc::Unicode), re::makeCC(bit1, &cc::Unicode)}, U21, Extra);
+    StreamSet * const Leads = P.CreateStreamSet(1, 1);
+    InsertionSpreadMask(P, Extra, Leads, kernel::InsertPosition::After);
+    StreamSet * const Spread = P.CreateStreamSet(1, 1);
+    SpreadByMask(P, Leads, Mask21, Spread);
+    P.CreateKernelCall<U8_InheritLead>(Leads, Spread, BytesMask);
 }
 
-void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis) {
+//  The mask over the result of a decomposition within a mask: the positions
+//  inserted are those of characters within it.
+static StreamSet * DecomposedMask(PipelineBuilder & P, StreamSet * Mask, StreamSet * SpreadMask) {
+    if (SpreadMask == nullptr) return Mask;
+    StreamSet * const spread = P.CreateStreamSet(1, 1);
+    SpreadByMask(P, SpreadMask, Mask, spread);
+    StreamSet * const inserted = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<bixnum::EQ_immediate>(SpreadMask, 0, inserted);
+    StreamSet * const result = P.CreateStreamSet(1, 1);
+    OrCombine(P, spread, inserted, result);
+    return result;
+}
+
+void NFD_PipelineBuilder::U8_Decomposition(UCD::DecompositionOptions form, StreamSet * WorkingBasis, StreamSet * TransformedBasis,
+                                           StreamSet * Mask, StreamSet * OutputMask) {
+    if (OutputMask && Mask == nullptr) llvm::report_fatal_error("NFD: an output mask requires a mask");
     mPB.SetStageLabel("transform");
 
     StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
@@ -828,10 +858,160 @@ void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet *
     FilterByMask(mPB, WorkingU8index, U21_u8indexed, U21_focus);
     SHOW_BIXNUM(U21_focus);
 
-    StreamSet * NFD_U21_Results = NFKD_U21_Pipeline(U21_focus);
+    StreamSet * Mask21 = nullptr;
+    if (Mask) {
+        Mask21 = mPB.CreateStreamSet(1, 1);
+        FilterByMask(mPB, WorkingU8index, Mask, Mask21);
+    }
+    StreamSet * SpreadMask = nullptr;
+    StreamSet * const Results = U21_Decomposition(mPB, form, U21_focus, Mask21, &SpreadMask);
 
-    U21_to_UTF8(mPB, NFD_U21_Results, TransformedBasis);
+    U21_to_UTF8(mPB, Results, TransformedBasis);
     SHOW_BIXNUM(TransformedBasis);
+    if (OutputMask) U21_MaskToU8(mPB, Results, DecomposedMask(mPB, Mask21, SpreadMask), OutputMask);
+}
+
+void NFD_PipelineBuilder::NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis, StreamSet * Mask, StreamSet * OutputMask) {
+    U8_Decomposition(UCD::DecompositionOptions::NFD, WorkingBasis, TransformedBasis, Mask, OutputMask);
+}
+
+void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis, StreamSet * Mask, StreamSet * OutputMask) {
+    U8_Decomposition(UCD::DecompositionOptions::NFKD, WorkingBasis, TransformedBasis, Mask, OutputMask);
+}
+
+StreamSet * NFD_PipelineBuilder::NFD_Masked(UCD::DecompositionOptions form, const FocusOptions & options, StreamSet * Bytes,
+                                            StreamSet * Basis, StreamSet * Mask, StreamSet * OutputMask) {
+    PipelineBuilder & P = mPB;
+    if (!options.Focus) {
+        StreamSet * const Transformed = P.CreateStreamSet(8, 1);
+        U8_Decomposition(form, Basis, Transformed, Mask, OutputMask);
+        StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(Transformed, OutputBytes);
+        return OutputBytes;
+    }
+    const bool nfkd = form == UCD::DecompositionOptions::NFKD;
+    const FocusedTransform D(options,
+        [this, nfkd, Mask](PipelineBuilder &, StreamSet * basis, StreamSet * workMask) {
+            if (nfkd) DetermineNFKD_WorkSelection(basis, workMask, Mask); else DetermineNFD_WorkSelection(basis, workMask, Mask);
+        },
+        [this, nfkd, Mask](PipelineBuilder &, StreamSet * basis, StreamSet * workMask, StreamSet * placementMask) {
+            if (nfkd) ComputeNFKD_WorkPlacementMask(basis, workMask, placementMask, Mask);
+            else ComputeWorkPlacementMask(basis, workMask, placementMask, Mask);
+        },
+        [](PipelineBuilder &, StreamSet *, StreamSet *) {
+            llvm::report_fatal_error("NFD_Masked: the transform is applied with the focused mask");
+        });
+    StreamSet * const workMask = D.focus(P, Basis);
+    StreamSet * const focusedBasis = D.filter(P, Bytes, Basis, workMask);
+    StreamSet * const focusedMask = P.CreateStreamSet(1, 1);
+    FilterByMask(P, workMask, Mask, focusedMask);
+    StreamSet * const placementMask = D.placement(P, Basis, workMask);
+    StreamSet * const transformedBasis = P.CreateStreamSet(8, 1);
+    StreamSet * const transformedMask = OutputMask ? P.CreateStreamSet(1, 1) : nullptr;
+    U8_Decomposition(form, focusedBasis, transformedBasis, focusedMask, transformedMask);
+    StreamSet * const outputBytes = D.reintegrate(P, workMask, placementMask, Bytes, Basis, transformedBasis);
+    if (OutputMask) {
+        StreamSet * const notWork = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<bixnum::EQ_immediate>(workMask, 0, notWork);
+        StreamSet * const unmodified = P.CreateStreamSet(1, 1);
+        FilterByMask(P, notWork, Mask, unmodified);
+        MergeByMask(P, placementMask, transformedMask, unmodified, OutputMask);
+    }
+    return outputBytes;
+}
+
+//  The work of a focused decomposition of a 21-bit basis: the decomposables and
+//  the reorderable characters (within the mask), and the character after each.
+class U21_DecompositionFocus final : public pablo::PabloKernel {
+public:
+    U21_DecompositionFocus(LLVMTypeSystemInterface & ts, StreamSet * Candidates, StreamSet * Work)
+    : PabloKernel(ts, "U21_DecompositionFocus", {Binding{"Candidates", Candidates}}, {Binding{"Work", Work}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> c = getInputStreamSet("Candidates");
+        PabloAST * const cand = pb.createOr(c[0], c[1]);
+        writeOutputStreamSet("Work", std::vector<PabloAST *>{pb.createInFile(pb.createOr(cand, pb.createAdvance(cand, 1)))});
+    }
+};
+
+StreamSet * NFD_PipelineBuilder::NFD_U21(UCD::DecompositionOptions form, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask,
+                                         bool focus, StreamSet ** SpreadMaskOut) {
+    PipelineBuilder & P = mPB;
+    if (OutputMask && Mask == nullptr) llvm::report_fatal_error("NFD_U21: an output mask requires a mask");
+    if (!focus) {
+        StreamSet * SpreadMask = nullptr;
+        StreamSet * const Result = U21_Decomposition(P, form, U21, Mask, &SpreadMask);
+        if (SpreadMaskOut) *SpreadMaskOut = SpreadMask;
+        if (OutputMask) {
+            StreamSet * const m = DecomposedMask(P, Mask, SpreadMask);
+            AndCombine(P, m, m, OutputMask);
+        }
+        return Result;
+    }
+    auto classes = [&](std::vector<re::CC *> ccs, StreamSet * restriction, StreamSet * out) {
+        if (restriction) {
+            P.CreateKernelCall<CharClassesKernel>(std::move(ccs), U21, StreamMask{restriction, MaskKind::Zeroing}, out);
+        } else {
+            P.CreateKernelCall<CharClassesKernel>(std::move(ccs), U21, out);
+        }
+    };
+    //  The work: the decomposables and the characters of nonzero ccc, with the
+    //  character after each.
+    auto * cccObj = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
+    re::CC * decomposable = nullptr;
+    if (form == UCD::DecompositionOptions::NFKD) {
+        decomposable = NFKD_Data().Decomposable_CC();
+    } else {
+        auto * dtObj = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::dt));
+        decomposable = re::makeCC(dtObj->GetCodepointSet(UCD::DT_ns::Can), &cc::Unicode);
+    }
+    re::CC * const nonzero = re::makeCC(UCD::UnicodeSet(0, 0x10FFFF) - cccObj->GetCodepointSet(UCD::CCC_ns::NR), &cc::Unicode);
+    StreamSet * const Candidates = P.CreateStreamSet(2, 1);
+    classes({decomposable, nonzero}, Mask, Candidates);
+    StreamSet * const Work = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<U21_DecompositionFocus>(Candidates, Work);
+    SHOW_STREAM(Work);
+    StreamSet * const Focused = P.CreateStreamSet(21, 1);
+    FilterByMask(P, Work, U21, Focused);
+    StreamSet * FocusedMask = nullptr;
+    if (Mask) {
+        FocusedMask = P.CreateStreamSet(1, 1);
+        FilterByMask(P, Work, Mask, FocusedMask);
+    }
+    StreamSet * FocusedSpread = nullptr;
+    StreamSet * const Transformed = U21_Decomposition(P, form, Focused, FocusedMask, &FocusedSpread);
+    //  The placement: the source with the same insertions at the work (within
+    //  the mask), whose expanded work positions are those of the result.
+    StreamSet * restriction = Work;
+    if (Mask) {
+        restriction = P.CreateStreamSet(1, 1);
+        AndCombine(P, Work, Mask, restriction);
+    }
+    UCD::NFD_Engine engine(form);
+    auto insertSets = engine.UnicodeInsertLengthBixNumSets();
+    std::vector<re::CC *> insertCCs;
+    for (auto & set : insertSets) insertCCs.push_back(re::makeCC(set, &cc::Unicode));
+    StreamSet * const InsertBixNum = P.CreateStreamSet(insertCCs.size(), 1);
+    classes(insertCCs, restriction, InsertBixNum);
+    StreamSet * const SourceSpread = P.CreateStreamSet(1, 1);
+    InsertionSpreadMask(P, InsertBixNum, SourceSpread, kernel::InsertPosition::After);
+    StreamSet * const Placement = P.CreateStreamSet(1, 1);
+    ExpandFilter(P, SourceSpread, Work, Placement);
+    SHOW_STREAM(Placement);
+    if (SpreadMaskOut) *SpreadMaskOut = SourceSpread;
+    StreamSet * const NotWork = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<bixnum::EQ_immediate>(Work, 0, NotWork);
+    StreamSet * const Unmodified = P.CreateStreamSet(21, 1);
+    FilterByMask(P, NotWork, U21, Unmodified);
+    StreamSet * const Output = P.CreateStreamSet(21, 1);
+    MergeByMask(P, Placement, Transformed, Unmodified, Output);
+    if (OutputMask) {
+        StreamSet * const UnmodifiedMask = P.CreateStreamSet(1, 1);
+        FilterByMask(P, NotWork, Mask, UnmodifiedMask);
+        MergeByMask(P, Placement, DecomposedMask(P, FocusedMask, FocusedSpread), UnmodifiedMask, OutputMask);
+    }
+    return Output;
 }
 
 FocusedTransform NFD_FocusedTransform(NFD_PipelineBuilder & builder, const FocusOptions & options) {

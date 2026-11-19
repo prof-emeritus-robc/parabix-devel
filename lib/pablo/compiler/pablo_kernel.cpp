@@ -326,7 +326,9 @@ void PabloKernel::addAutomaticAttributes() {
             }
         }
     }
-    if (!EnableProvisionalLookAheadStride || (mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
+    // A provisional stride writes into the next segment's output, so its kernel cannot run
+    // segments concurrently: that would undo the point of rebuilding the carries.
+    if (!EnableProvisionalLookAheadStride || hasLocalCarries() || (mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
         return;
     }
     bool hasLookAhead = false;
@@ -339,7 +341,8 @@ void PabloKernel::addAutomaticAttributes() {
 }
 
 bool PabloKernel::isCachable() const {
-    return (mFlags & Kernel::KernelFlags::RequiresIllustratorObject) == 0;
+    // (The progress checks of the Whiles are not in the kernels' names: not cached.)
+    return (mFlags & Kernel::KernelFlags::RequiresIllustratorObject) == 0 && !CheckWhileProgress;
 }
 
 void PabloKernel::linkExternalMethods(KernelBuilder & b) {

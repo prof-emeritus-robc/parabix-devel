@@ -13,12 +13,14 @@
 #  (tconv --plan), and their result must be ICU's (as given by its
 #  createFromRules on the same rules), including on a line longer than a block.
 #
-#  tconv_kept_captures_test.py <tconv binary>
+#  tconv_kept_captures_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 LONG = 300
 

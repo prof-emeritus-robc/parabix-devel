@@ -17,12 +17,14 @@
 #      are matched against the text itself: not where the capture rules apply.
 #  The expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_insertion_fold_test.py <tconv binary>
+#  tconv_insertion_fold_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 GROUPS = [

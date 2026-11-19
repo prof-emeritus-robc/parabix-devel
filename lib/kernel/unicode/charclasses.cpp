@@ -12,6 +12,7 @@
 #include <re/adt/re_name.h>
 #include <ucd/utf/utf_compiler.h>
 #include <pablo/pablo.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
@@ -41,27 +42,91 @@ std::string makeSignature(const StreamSet * const basis, std::vector<re::CC *> &
     return tmp;
 }
 
+static llvm::cl::opt<bool> MaskedBlockSkip("masked-block-skip",
+    llvm::cl::desc("Compute the streams of the kernels with a mask (class and property kernels) within an If on the "
+                   "mask, skipping the blocks without mask bits (default on)"),
+    llvm::cl::init(true));
+
+std::string kernel::maskSuffix(const StreamMask & mask) {
+    if (mask.mask == nullptr) return "";
+    return std::string(mask.kind == MaskKind::Zeroing ? "+MaskZ" : "+MaskP") + (MaskedBlockSkip ? "If" : "");
+}
+
+void kernel::computeMasked(PabloBuilder & pb, PabloKernel & kernel, bool hasMask, const std::function<void (PabloBuilder &)> & compute) {
+    if (!hasMask || !MaskedBlockSkip) {
+        compute(pb);
+        return;
+    }
+    PabloBuilder body = pb.createScope();
+    pb.createIf(kernel.getInputStreamSet("mask")[0], body);
+    compute(body);
+}
+
+void kernel::addMaskInputs(const StreamMask & mask, Bindings & inputs) {
+    if (mask.mask == nullptr) return;
+    inputs.emplace_back("mask", mask.mask);
+    if (mask.kind == MaskKind::PassThru) {
+        if (LLVM_UNLIKELY(mask.base == nullptr)) report_fatal_error("a PassThru mask requires a base stream set");
+        inputs.emplace_back("base", mask.base);
+    }
+}
+
+Binding kernel::maskedOutput(const StreamMask & mask, std::string name, StreamSet * output) {
+    if (mask.mask != nullptr && mask.kind == MaskKind::PassThru) return Binding{std::move(name), output, FixedRate(), InOut("base")};
+    return Binding{std::move(name), output};
+}
+
+void kernel::assignMasked(PabloBuilder & pb, PabloKernel & kernel, const std::vector<PabloAST *> & computed,
+                          const std::string & name, bool hasMask, MaskKind kind) {
+    Var * const out = kernel.getOutputStreamVar(name);
+    PabloAST * const mask = hasMask ? kernel.getInputStreamSet("mask")[0] : nullptr;
+    std::vector<PabloAST *> base;
+    if (hasMask && kind == MaskKind::PassThru) base = kernel.getInputStreamSet("base");
+    for (unsigned i = 0; i < computed.size(); i++) {
+        PabloAST * v = computed[i];
+        if (mask) {
+            v = pb.createAnd(v, mask);
+            if (kind == MaskKind::PassThru) v = pb.createOr(v, pb.createAnd(base[i], pb.createNot(mask)));
+        }
+        pb.createAssign(pb.createExtract(out, pb.getInteger(i)), v);
+    }
+}
+
 CharClassesKernel::CharClassesKernel(LLVMTypeSystemInterface & ts, 
                                      std::vector<re::CC *> ccs,
                                      StreamSet * BasisBits,
                                      StreamSet * CharClasses,
                                      BitMovementMode mode)
-: CharClassesKernel(ts, makeSignature(BasisBits, ccs), std::move(ccs), BasisBits, CharClasses, mode) {
+: CharClassesKernel(ts, makeSignature(BasisBits, ccs), std::move(ccs), BasisBits, StreamMask(), CharClasses, mode) {
 
 }
 
-CharClassesKernel::CharClassesKernel(LLVMTypeSystemInterface & ts, std::string signature, std::vector<re::CC *> && ccs, StreamSet * BasisBits, StreamSet * CharClasses, BitMovementMode mode)
+CharClassesKernel::CharClassesKernel(LLVMTypeSystemInterface & ts,
+                                     std::vector<re::CC *> ccs,
+                                     StreamSet * BasisBits,
+                                     StreamMask mask,
+                                     StreamSet * CharClasses,
+                                     BitMovementMode mode)
+: CharClassesKernel(ts, makeSignature(BasisBits, ccs) + maskSuffix(mask), std::move(ccs), BasisBits, mask, CharClasses, mode) {
+
+}
+
+CharClassesKernel::CharClassesKernel(LLVMTypeSystemInterface & ts, std::string signature, std::vector<re::CC *> && ccs, StreamSet * BasisBits,
+                                     StreamMask mask, StreamSet * CharClasses, BitMovementMode mode)
 : PabloKernel(ts, "cc_" + getStringHash(signature) + UTF::kernelAnnotation() +
-              pablo::BitMovementMode_string(mode)
-, {}, {Binding{"charclasses", CharClasses}})
+              pablo::BitMovementMode_string(mode) + maskSuffix(mask)
+, {}, {maskedOutput(mask, "charclasses", CharClasses)})
 , mCCs(ccs)
 , mSignature(signature)
-, mBitMovement(mode) {
+, mBitMovement(mode)
+, mHasMask(mask.mask != nullptr)
+, mMaskKind(mask.kind) {
     if (mode == pablo::BitMovementMode::LookAhead) {
         mInputStreamSets.push_back(Binding{"basis", BasisBits, FixedRate(), LookAhead(3)});
     } else {
         mInputStreamSets.push_back(Binding{"basis", BasisBits});
     }
+    addMaskInputs(mask, mInputStreamSets);
 }
 
 llvm::StringRef CharClassesKernel::getSignature() const {
@@ -72,16 +137,17 @@ void CharClassesKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     unsigned n = mCCs.size();
 
-    UTF::UTF_Compiler unicodeCompiler(getInput(0), pb, mBitMovement);
     std::vector<Var *> mpx;
     for (unsigned i = 0; i < n; i++) {
         mpx.push_back(pb.createVar("mpx_basis" + std::to_string(i), pb.createZeroes()));
     }
-    unicodeCompiler.compile(mpx, mCCs);
-    for (unsigned i = 0; i < mpx.size(); i++) {
-        Extract * const r = pb.createExtract(getOutput(0), pb.getInteger(i));
-        pb.createAssign(r, pb.createInFile(mpx[i]));
-    }
+    computeMasked(pb, *this, mHasMask, [&](PabloBuilder & body) {
+        UTF::UTF_Compiler unicodeCompiler(getInput(0), body, mBitMovement);
+        unicodeCompiler.compile(mpx, mCCs);
+    });
+    std::vector<PabloAST *> classes;
+    for (unsigned i = 0; i < mpx.size(); i++) classes.push_back(pb.createInFile(mpx[i]));
+    assignMasked(pb, *this, classes, "charclasses", mHasMask, mMaskKind);
 }
 
 ByteClassesKernel::ByteClassesKernel(LLVMTypeSystemInterface & ts,

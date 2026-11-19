@@ -11,13 +11,15 @@
 #  each treatment of ill-formed input.  A transform with a filter must be in
 #  Unicode mode.  (Skipped without the CLDR transforms.)
 #
-#  tconv_utf8_mode_test.py <tconv binary>
+#  tconv_utf8_mode_test.py <tconv binary> [--extended-testing]
 
 import os
 import random
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 UTF8 = {
     # transform: characters it maps (some of them)

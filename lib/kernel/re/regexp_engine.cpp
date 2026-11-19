@@ -1799,6 +1799,7 @@ RE_PipelineBuilder::MatchStarts RE_PipelineBuilder::matchStartPipeline(RE * re) 
         }
         return MatchStarts{chainMatchStarts(segments), 1};
     }
+    prepareExternals(re);
     StreamSet * const ends = mPB.CreateStreamSet(1);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, ends);
     if (r.first == r.second) {
@@ -2020,6 +2021,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
             mPB.captureBitstream("chainSpans", spans);
         }
     } else if (!uniquePrefixSpans(re, spans) && !lengthClassSpans(re, spans)) {
+        prepareExternals(re);
         StreamSet * matchEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, matchEnd);
         auto minlgth = getLengthRange(re, mCtxt.mLengthAlphabet).first;
@@ -2111,12 +2113,23 @@ StreamSet * RE_PipelineBuilder::classStream(RE * re, CC * cc) {
     // must then be the one used.
     StreamSet * strm = nullptr;
     if (Name * const n = dyn_cast<Name>(re)) {
+        if (n->getDefinition()) compileExternal(n);
         auto f = mCtxt.mExternals.find(n->getFullName());
         if (f != mCtxt.mExternals.end()) strm = f->second.extStream;
     }
     if (strm == nullptr) {
         strm = mPB.CreateStreamSet(1);
-        compileClasses(std::vector<re::CC *>{cc}, strm);
+        std::set<Name *> names;
+        re::gatherNames(re, names);
+        if (names.empty()) {
+            compileClasses(std::vector<re::CC *>{cc}, strm);
+        } else {
+            // A class over externals (e.g. \W, the complement of the property
+            // word): computed from them rather than from the codepoints.
+            assert (grepOffset(re, mCtxt.mIndexStream != nullptr) == 0);
+            prepareExternals(re);
+            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, strm);
+        }
     }
     // Within a text mask, the positions of the class in the text of matches
     // (classStream is used for the classes of the stars of chains, outside
@@ -2142,6 +2155,7 @@ bool RE_PipelineBuilder::uniquePrefixSpans(RE * re, StreamSet * spans) {
     const auto pfxLgth = fp->second.lgthRange.first;
     const auto pfxOffset = fp->second.offset;
     RE * const split = makeSeq({pfxName, suffix});
+    prepareExternals(suffix);
     StreamSet * const matchEnd = mPB.CreateStreamSet(1);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, split, matchEnd);
     StreamSet * const endBack = uniquePrefixEndsBack(pfxStrm, matchEnd);
@@ -2318,6 +2332,7 @@ bool RE_PipelineBuilder::lengthClassSpans(RE * re, StreamSet * spans) {
     if (classes.empty()) return false;
     std::vector<StreamSet *> allSpans;
     for (const auto & c : classes) {
+        prepareExternals(c.second);
         StreamSet * const matchEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, c.second, matchEnd);
         StreamSet * const span = (classes.size() == 1) ? spans : mPB.CreateStreamSet(1);
@@ -2983,6 +2998,7 @@ void RE_PipelineBuilder::fixedLengthStarts(RE * re, int length, StreamSet * out)
     // A match of length L marked at its last code unit plus the offset g
     // begins L - 1 + g positions before the mark.
     const int shift = std::max(0, length - 1 + static_cast<int>(grepOffset(re)));
+    prepareExternals(re);
     if (shift == 0) {
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, out);
     } else {
@@ -4659,11 +4675,10 @@ RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
                                  preconditionReport(failures));
     }
 
-    for (auto m : M.PE.mNameMap) {
-        if (re::PropertyExpression * pe = dyn_cast<re::PropertyExpression>(m.second)) {
-            compileProperty(pe);
-        }
-    }
+    // The properties named by M.PE are compiled when used (see compileExternal):
+    // a kernel compiled here could have no reader (e.g. when a class of a
+    // lookahead chain is compiled from its codepoints), and a family kernel
+    // without a reader breaks the pipeline.
 
     for (auto m : M.CCnamer.mNameMap) {
         std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};

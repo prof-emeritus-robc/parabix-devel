@@ -499,9 +499,24 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
     const PabloAST * const cond = whileStatement->getCondition();
     Value * outerCondition = compileExpression(b, cond);
     Value * const outerCond = mCarryManager->generateEntrySummaryTest(b, outerCondition);
+
+    // (-CheckWhileProgress: the position of the lowest bit of a condition, the
+    // block width if none, and whether it has none.)
+    auto lowestOf = [&](Value * const condition) -> std::pair<Value *, Value *> {
+        const auto width = condition->getType()->getPrimitiveSizeInBits();
+        Value * const bits = b.CreateBitCast(condition, b.getIntNTy(width));
+        Value * const low = b.CreateZExtOrTrunc(b.CreateCountForwardZeroes(bits), b.getInt64Ty());
+        return {low, b.CreateIsNull(bits)};
+    };
+    Value * const entryLow = CheckWhileProgress ? lowestOf(outerCondition).first : nullptr;
     b.CreateCondBr(outerCond, whileBodyBlock, whileEndBlock);
 
     b.SetInsertPoint(whileBodyBlock);
+    PHINode * lowPhi = nullptr;
+    if (LLVM_UNLIKELY(CheckWhileProgress)) {
+        lowPhi = b.CreatePHI(b.getInt64Ty(), 2, "while.low");
+        lowPhi->addIncoming(entryLow, whileEntryBlock);
+    }
 
     //
     // There are 3 sets of Phi nodes for the while loop.
@@ -611,6 +626,23 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
     // Terminate the while loop body with a conditional branch back.
     Value * const innerCondition = compileExpression(b, cond);
     Value * const exitCond = mCarryManager->generateExitSummaryTest(b, innerCondition);
+    if (LLVM_UNLIKELY(CheckWhileProgress)) {
+        // Another iteration must start from a later lowest bit than this one did
+        // (or from none, with only carries pending).
+        const auto next = lowestOf(innerCondition);
+        Value * const progress = b.CreateOr(b.CreateNot(exitCond), b.CreateOr(next.second, b.CreateICmpUGT(next.first, lowPhi)));
+        std::string condName;
+        raw_string_ostream out(condName);
+        PabloPrinter::print(cond, out);
+        std::string message;
+        for (const char c : mKernel->getName() + ": While " + out.str()) {
+            message += c;
+            if (c == '%') message += '%';
+        }
+        message += " made no progress: lowest bit at %" PRIu64 ", then at %" PRIu64;
+        b.CreateAssert(progress, message, lowPhi, next.first);
+        lowPhi->addIncoming(next.first, b.GetInsertBlock());
+    }
     b.CreateCondBr(exitCond, whileBodyBlock, whileEndBlock);
 
     whileEndBlock->moveAfter(whileExitBlock);

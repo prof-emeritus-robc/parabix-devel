@@ -10,12 +10,14 @@
 #  a run (w U+1037).  The expected results are ICU's (createFromRules, each
 #  line a text).
 #
-#  tconv_leading_runs_test.py <tconv binary>
+#  tconv_leading_runs_test.py <tconv binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
+
+from tconv_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 GROUPS = [

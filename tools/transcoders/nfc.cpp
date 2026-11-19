@@ -18,6 +18,15 @@
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/unicode/normalization/normalization.h>
+#include <kernel/unicode/normalization/nfc_tables.h>
+#include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/utf8_support.h>
+#include <kernel/unicode/utf8_decoder.h>
+#include <kernel/unicode/utf8gen.h>
+#include <kernel/streamutils/deletion.h>
+#include <kernel/bitwise/bixnum_kernel.h>
+#include <re/adt/re_cc.h>
+#include <re/cc/cc_compiler.h>
 #include <toolchain/fileutil.h>
 #include <toolchain/toolchain.h>
 #include <toolchain/toolio.h>
@@ -36,6 +45,23 @@ static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<bool> MultiStage("MultiStage", cl::desc("Use separate pipelines for the focus, transform and reintegration stages"), cl::init(false), cl::cat(NFC_Options));
 static cl::opt<bool> ByteFiltering("ByteFiltering", cl::desc("Use byte filtering for focused work (alias of -focus-filter=byte)"), cl::init(false), cl::cat(NFC_Options));
 
+static cl::opt<bool> DumpNFC_Tables("dump-nfc-tables", cl::desc("Print the NFC analysis (NFC_Tables) in the text form of "
+                                    "scripts/UCD/nfc_generator.py --dump-tables, and exit"), cl::init(false), cl::cat(NFC_Options), cl::Hidden);
+static cl::opt<std::string> NFC_MaskSet("nfc-mask", cl::desc("Normalize only within the characters of a set (hexadecimal "
+                                       "ranges, e.g. 41-5a,300-36f): each run of them by itself, the others unchanged "
+                                       "(NFC_Masked, focused or with -NoFocus in place; for testing)"), cl::init(""), cl::cat(NFC_Options), cl::Hidden);
+static cl::opt<bool> NFC_U21Mode("nfc-u21", cl::desc("Normalize on the 21-bit basis (NFC_U21): the input decoded, and the "
+                                 "result encoded to UTF-8 (for testing)"), cl::init(false), cl::cat(NFC_Options), cl::Hidden);
+static cl::opt<bool> NFC_U21ViaUTF8("nfc-u21-via-utf8", cl::desc("With -nfc-u21, normalize the 21-bit basis by encoding it to "
+                                    "UTF-8, the focused NFC of the bytes, and decoding the result (for measurement)"),
+                                    cl::init(false), cl::cat(NFC_Options), cl::Hidden);
+enum class MaskSelect {All, Inside, Outside};
+static cl::opt<MaskSelect> NFC_MaskSelect("nfc-mask-select", cl::desc("With -nfc-mask, print only the output bytes inside or "
+                                          "outside the output mask (for testing it)"),
+    cl::values(clEnumValN(MaskSelect::All, "all", "all the output (default)"),
+               clEnumValN(MaskSelect::Inside, "inside", "the bytes within the output mask"),
+               clEnumValN(MaskSelect::Outside, "outside", "the bytes outside it")),
+    cl::init(MaskSelect::All), cl::cat(NFC_Options), cl::Hidden);
 static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers (alias of -focus-layers=filter)"), cl::init(false), cl::cat(NFC_Options));
 
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -146,7 +172,93 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
     source_logic(P, ByteStream, BasisBits);
 
     StreamSet * OutputBytes = nullptr;
-    if (!NFC.getOptions().Focus) {
+    //  (-nfc-mask: the bytes of the characters of the set.)
+    StreamSet * Mask = nullptr;
+    if (!NFC_MaskSet.empty()) {
+        //  (-nfc-mask: the bytes of the characters of the set.)
+        UCD::UnicodeSet set;
+        const std::string spec = NFC_MaskSet;
+        for (size_t pos = 0; pos < spec.size(); ) {
+            size_t comma = spec.find(',', pos);
+            if (comma == std::string::npos) comma = spec.size();
+            const std::string r = spec.substr(pos, comma - pos);
+            const size_t dash = r.find('-');
+            const unsigned lo = std::stoul(r.substr(0, dash), nullptr, 16);
+            const unsigned hi = dash == std::string::npos ? lo : std::stoul(r.substr(dash + 1), nullptr, 16);
+            set = set + UCD::UnicodeSet(lo, hi);
+            pos = comma + 1;
+        }
+        StreamSet * const firsts = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(set, &cc::Unicode)}, BasisBits, firsts,
+                                              pablo::BitMovementMode::LookAhead);
+        StreamSet * const u8index = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+        Mask = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<U8Spans>(firsts, u8index, Mask, pablo::BitMovementMode::Advance);
+    }
+    if (NFC_U21Mode) {
+        //  (-nfc-u21: the characters decoded, normalized on the 21-bit basis, and encoded.)
+        StreamSet * const U21_u8indexed = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
+        StreamSet * const u8index = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+        StreamSet * const U21 = P.CreateStreamSet(21, 1);
+        FilterByMask(P, u8index, U21_u8indexed, U21);
+        StreamSet * Mask21 = nullptr;
+        if (Mask) {
+            Mask21 = P.CreateStreamSet(1, 1);
+            FilterByMask(P, u8index, Mask, Mask21);
+        }
+        StreamSet * const OutputMask = Mask && NFC_MaskSelect != MaskSelect::All ? P.CreateStreamSet(1, 1) : nullptr;
+        StreamSet * Result = nullptr;
+        if (NFC_U21ViaUTF8) {
+            StreamSet * const Basis8 = P.CreateStreamSet(8, 1);
+            U21_to_UTF8(P, U21, Basis8);
+            StreamSet * const Bytes8 = P.CreateStreamSet(1, 8);
+            P.CreateKernelCall<P2SKernel>(Basis8, Bytes8);
+            StreamSet * const Normalized = NFC.build(P, Bytes8, Basis8);
+            StreamSet * const NormalizedBasis = P.CreateStreamSet(8, 1);
+            Selected_S2P(P, Normalized, NormalizedBasis);
+            StreamSet * const Decoded = P.CreateStreamSet(21, 1);
+            P.CreateKernelCall<UTF8_Decoder>(NormalizedBasis, Decoded);
+            StreamSet * const index = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<UTF8_index>(NormalizedBasis, index);
+            Result = P.CreateStreamSet(21, 1);
+            FilterByMask(P, index, Decoded, Result);
+        } else {
+            Result = NFC_U21(P, U21, Mask21, OutputMask, NFC.getOptions().Focus);
+        }
+        if (OutputMask) {
+            StreamSet * selected = OutputMask;
+            if (NFC_MaskSelect == MaskSelect::Outside) {
+                selected = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<bixnum::EQ_immediate>(OutputMask, 0, selected);
+            }
+            StreamSet * const Selected = P.CreateStreamSet(21, 1);
+            FilterByMask(P, selected, Result, Selected);
+            Result = Selected;
+        }
+        StreamSet * const OutputBasis = P.CreateStreamSet(8, 1);
+        U21_to_UTF8(P, Result, OutputBasis);
+        OutputBytes = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(OutputBasis, OutputBytes);
+    } else if (Mask) {
+        StreamSet * const OutputMask = NFC_MaskSelect == MaskSelect::All ? nullptr : P.CreateStreamSet(1, 1);
+        OutputBytes = NFC_Masked(P, NFC.getOptions(), ByteStream, BasisBits, Mask, OutputMask);
+        if (OutputMask) {
+            StreamSet * selected = OutputMask;
+            if (NFC_MaskSelect == MaskSelect::Outside) {
+                selected = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<bixnum::EQ_immediate>(OutputMask, 0, selected);
+            }
+            StreamSet * const OutputBasis = P.CreateStreamSet(8, 1);
+            Selected_S2P(P, OutputBytes, OutputBasis);
+            StreamSet * const SelectedBasis = P.CreateStreamSet(8, 1);
+            FilterByMask(P, selected, OutputBasis, SelectedBasis);
+            OutputBytes = P.CreateStreamSet(1, 8);
+            P.CreateKernelCall<P2SKernel>(SelectedBasis, OutputBytes);
+        }
+    } else if (!NFC.getOptions().Focus) {
         // The whole text is transformed, with room for decompositions inserted only
         // within the work regions.
         P.SetStageLabel("focus");
@@ -170,6 +282,10 @@ int main(int argc, char *argv[]) {
     //  ParseCommandLineOptions uses the LLVM CommandLine processor, but we also add
     //  standard Parabix command line options such as -help, -ShowPablo and many others.
     codegen::ParseCommandLineOptions(argc, argv, {&NFC_Options, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    if (DumpNFC_Tables) {
+        NFC_Tables::get().dump(llvm::outs());
+        return 0;
+    }
     if (MultiStage && !NFC_FocusOptions().Focus) {
         llvm::report_fatal_error("-MultiStage requires focus (not -NoFocus)");
     }

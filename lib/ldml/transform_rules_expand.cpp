@@ -14,6 +14,12 @@
 #include <re/adt/adt.h>
 #include <ldml/transform_plan.h>
 #include "charset_analysis.h"
+#include <cctype>
+#include <ucd/algo/normalization.h>
+#include <ucd/data/PropertyAliases.h>
+#include <ucd/data/PropertyObjects.h>
+#include <ucd/data/PropertyObjectTable.h>
+#include <ucd/data/PropertyValueAliases.h>
 
 using namespace llvm;
 using namespace re;
@@ -428,6 +434,97 @@ static RuleSide * rebindResult(const RuleSide * result, const Capture * capture,
                             result->getAfterContext());
 }
 
+static bool charactersOnly(const RE * re);
+
+//  The characters a pattern of a result writes, added to chars; false if not
+//  known (a function call, or a pattern of another kind).  (A reference writes
+//  characters of the text, already counted.)
+static bool resultChars(const RE * re, CharSetAnalysis & sets, UCD::UnicodeSet & chars) {
+    if (re == nullptr || isa<Reference>(re) || isa<Start>(re) || isa<End>(re)) return true;
+    if (const Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n) || n->getDefinition() == nullptr) return false;
+        return resultChars(n->getDefinition(), sets, chars);
+    }
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (!resultChars(e, sets, chars)) return false;
+        return true;
+    }
+    if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (!resultChars(e, sets, chars)) return false;
+        return true;
+    }
+    if (isa<CC>(re)) {
+        chars = chars + sets.setOf(const_cast<RE *>(re), false);
+        return true;
+    }
+    return false;
+}
+
+//  For each rule (with a global filter and transform rules, see
+//  MoveTextAnchors): whether the characters its text may meet within a run of
+//  the filter are known, and those characters.  A run starts with characters
+//  of the filter; each rule set writes the characters of its results there
+//  (counted for all the rules of the set, which may revisit what any of them
+//  writes), NFD and NFKD the decompositions of the characters before them, NFC
+//  and NFKC (also) any character with a decomposition; Null nothing.  After
+//  any other transform, or a result calling a function, they are not known.
+static std::vector<std::pair<bool, UCD::UnicodeSet>> reachableChars(const std::vector<Rule *> & rules, const UCD::UnicodeSet & filterChars,
+                                                                    CharSetAnalysis & sets) {
+    std::vector<std::pair<bool, UCD::UnicodeSet>> out(rules.size());
+    UCD::UnicodeSet reach = filterChars;
+    bool known = true;
+    auto decompositions = [&](UCD::DecompositionOptions option) {
+        using namespace UCD;
+        auto * const dt = cast<EnumeratedPropertyObject>(getPropertyObject(property_t::dt));
+        UnicodeSet mapped = ~dt->GetCodepointSet(DT_ns::None);
+        if (option == NFD) mapped = dt->GetCodepointSet(DT_ns::Can);
+        mapped = mapped + UnicodeSet(0xAC00, 0xD7A3);   // (Hangul syllables)
+        NFD_Engine engine(option);
+        UnicodeSet added;
+        for (const auto & range : reach & mapped) {
+            for (codepoint_t cp = range.first; cp <= range.second; cp++) {
+                for (char32_t d : engine.decompose(std::u32string(1, cp))) added.insert(d);
+            }
+        }
+        reach = reach + added;
+    };
+    size_t i = 0;
+    while (i < rules.size()) {
+        if (const TransformRule * t = dyn_cast<TransformRule>(rules[i])) {
+            std::string id = t->getForwardID().getText();
+            std::transform(id.begin(), id.end(), id.begin(), [](unsigned char ch) {return std::tolower(ch);});
+            if (id.compare(0, 4, "any-") == 0) id = id.substr(4);
+            if (id == "nfd") {
+                decompositions(UCD::NFD);
+            } else if (id == "nfkd") {
+                decompositions(UCD::NFKD);
+            } else if (id == "nfc" || id == "nfkc") {
+                decompositions(id == "nfc" ? UCD::NFD : UCD::NFKD);
+                auto * const dt = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::property_t::dt));
+                reach = reach + ~dt->GetCodepointSet(UCD::DT_ns::None) + UCD::UnicodeSet(0xAC00, 0xD7A3);
+            } else if (id != "null") {
+                known = false;
+            }
+            out[i] = {known, reach};
+            i++;
+            continue;
+        }
+        //  A rule set: the rules up to the next transform rule.
+        size_t j = i;
+        while (j < rules.size() && !isa<TransformRule>(rules[j])) j++;
+        for (size_t k = i; k < j; k++) {
+            const ConversionRule * c = dyn_cast<ConversionRule>(rules[k]);
+            const RuleSide * const result = c ? c->getResultSide(Direction::Forward) : nullptr;
+            if (result == nullptr) continue;
+            known &= resultChars(result->getText(), sets, reach) && resultChars(result->getCompletedResult(), sets, reach)
+                     && resultChars(result->getResultToRevisit(), sets, reach);
+        }
+        for (size_t k = i; k < j; k++) out[k] = {known, reach};
+        i = j;
+    }
+    return out;
+}
+
 std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
     //  With a global filter and transform rules, ICU applies each rule set to
     //  each run of the characters of the filter (in the text given, which the
@@ -449,13 +546,24 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
     CharSetAnalysis sets;
     static const UCD::UnicodeSet nonCharacters = UCD::UnicodeSet(0xFDD0, 0xFDEF);
     const UCD::UnicodeSet filterChars = runs ? sets.setOf(filter->getFilterSet(), false) - nonCharacters : UCD::UnicodeSet();
+    //  The characters the text of each rule may meet within a run: those of
+    //  the filter, and those the steps before it (and the rules of its own rule
+    //  set, through the text they revisit) may write there; unknown (all
+    //  characters, no restriction) after a transform other than Null and the
+    //  normalizations, or a result calling a function.
+    const std::vector<std::pair<bool, UCD::UnicodeSet>> reachable = runs ? reachableChars(rules, filterChars, sets)
+                                                                          : std::vector<std::pair<bool, UCD::UnicodeSet>>();
+    size_t index = 0;
+    const UCD::UnicodeSet * within = nullptr;   // those of the rule (nullptr: unknown)
     auto withinFilter = [&](RE * set) -> RE * {
-        if (!runs || set == nullptr) return set;
-        const UCD::UnicodeSet chars = sets.setOf(set, false) & filterChars;
+        if (!runs || set == nullptr || within == nullptr) return set;
+        const UCD::UnicodeSet chars = sets.setOf(set, false) & *within;
         return chars.empty() ? nullptr : makeCC(chars);
     };
     std::vector<Rule *> out;
-    for (Rule * r : rules) {
+    for (; index < rules.size(); index++) {
+        Rule * const r = rules[index];
+        within = runs && reachable[index].first ? &reachable[index].second : nullptr;
         ConversionRule * c = dyn_cast<ConversionRule>(r);
         const RuleSide * source = c ? c->getSourceSide(Direction::Forward) : nullptr;
         if (source == nullptr || source->getText() == nullptr) {
@@ -465,13 +573,39 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
         RE * const text = source->getText();
         std::vector<RE *> items;
         if (Seq * seq = dyn_cast<Seq>(text)) items.assign(seq->begin(), seq->end()); else items.push_back(text);
+        //  The sets of the text within the characters it may meet in a run: a
+        //  rule with a set of none of them never applies, and is removed (the
+        //  rules after it then do not yield to it, as order disambiguation
+        //  would make them: uz_Cyrl-uz/BGN's $lowerVowels ы → y, ы outside the
+        //  filter and written by no step before, would keep а → a from applying
+        //  before ы).  (The set of a capture is kept as it is, unless empty
+        //  there: its references would need rebinding.)
+        bool restricted = false, never = false;
+        if (within) {
+            for (RE *& item : items) {
+                Capture * const capture = dyn_cast<Capture>(item);
+                RE * const set = capture ? capture->getCapturedRE() : item;
+                if (!CharSetAnalysis::isSet(set) || !charactersOnly(set)) continue;
+                const UCD::UnicodeSet chars = sets.setOf(set, false);
+                const UCD::UnicodeSet met = chars & *within;
+                if (met.empty()) {
+                    never = true;
+                    break;
+                }
+                if (!capture && !(met == chars)) {
+                    item = makeCC(met);
+                    restricted = true;
+                }
+            }
+        }
+        if (never) continue;
         RE * before = source->getBeforeContext();
         RE * const after = source->getAfterContext();
         RuleSide * const result = c->getResultSide(Direction::Forward);
         auto rule = [&](RE * b, const std::vector<RE *> & t, RE * a, RuleSide * r = nullptr) {
             return makeConversionRule(makeRuleSide(b, makeSeq(t.begin(), t.end()), a), Direction::Forward, r ? r : result);
         };
-        bool changed = false;
+        bool changed = restricted;
         //  ^ at the start of the text: its before context.
         if (before == nullptr && items.size() > 1 && isa<Start>(items.front())) {
             before = makeStart();

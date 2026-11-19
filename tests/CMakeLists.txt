@@ -28,6 +28,9 @@ endfunction(parabix_add_kernel_test)
 parabix_add_kernel_test(meta_tests kernel.streamutils)
 parabix_add_kernel_test(test_scan kernel.basis kernel.scan kernel.unicode kernel.util)
 parabix_add_kernel_test(test_data_rearrangement kernel.scan)
+# (Run with -VerifyIR: the bug it covers gave invalid IR, which crashed only sometimes.)
+parabix_add_executable(NAME inout_thread_local SRC inout_thread_local.cpp DEPS testing kernel.streamutils kernel.bitwise)
+add_test(NAME inout_thread_local WORKING_DIRECTORY ${TEST_BIN_DIR} COMMAND ./inout_thread_local -VerifyIR)
 parabix_add_kernel_test(test_bit_movement kernel.streamutils)
 parabix_add_kernel_test(test_run_replace kernel.streamutils)
 parabix_add_kernel_test(index_test kernel.streamutils)
@@ -41,6 +44,8 @@ parabix_add_kernel_test(test_emptystreamset kernel.basis kernel.streamutils)
 parabix_add_kernel_test(test_truncatedstreamset kernel.io)
 parabix_add_kernel_test(test_sorting kernel.streamutils)
 parabix_add_kernel_test(test_hex_decode kernel.util)
+# A family call whose output is unread (its kernel is removed from the pipeline).
+parabix_add_kernel_test(unread_family_call kernel.streamutils)
 
 # ProvisionalLookAheadStride: compare provisional and normal processing of a lookahead chain with a reference
 parabix_add_executable(NAME provisional_lookahead SRC provisional_lookahead.cpp

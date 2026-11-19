@@ -63,6 +63,12 @@ static cl::opt<bool, true> EnableLocalCarriesOption("LocalCarries", cl::location
     cl::desc("Let Pablo kernels with the LocalCarries attribute rebuild their carries at each segment start (default true)"),
     cl::cat(codegen::CodeGenOptions), cl::init(true));
 
+bool CheckWhileProgress = false;
+static cl::opt<bool, true> CheckWhileProgressOption("CheckWhileProgress", cl::location(CheckWhileProgress),
+    cl::desc("Check that each iteration of a Pablo While (within a block) advances the lowest bit of its "
+             "condition, failing with the kernel and positions otherwise (Pablo kernels are then not cached)"),
+    cl::cat(codegen::CodeGenOptions), cl::init(false));
+
 bool ShowCarryExtent = false;
 static cl::opt<bool, true> ShowCarryExtentOption("ShowCarryExtent", cl::location(ShowCarryExtent),
     cl::desc("Report the CarryExtent of each compiled Pablo kernel, or the statement that prevents rebuilding its carries"),

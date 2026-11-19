@@ -59,6 +59,7 @@
 //  transforms invoked directly are applied in stages: one that invokes another
 //  not implemented is applied by ICU as a whole.)
 
+#include <cctype>
 #include <fcntl.h>
 #include <unistd.h>
 #include <thread>
@@ -99,6 +100,7 @@
 #include <re/adt/adt.h>
 #include <re/transforms/resolve_possessive.h>
 #include <re/analysis/re_analysis.h>
+#include <re/analysis/nullable.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
@@ -106,11 +108,14 @@
 #include <ucd/utf/transchar.h>
 #include <ldml/transform_plan.h>
 #include <ldml/shape_groups.h>
+#include <ldml/divcode_plan.h>
+#include <kernel/unicode/divcode.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <set>
 #include <sstream>
 #include <re/adt/re_name.h>
@@ -149,6 +154,35 @@ static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::desc("Rounds of matching before contexts against the converted text, which the conversions of a group may change "
              "(exact for chains of up to this many such rules; 0 matches them against the text itself)"),
     cl::init(8), cl::cat(TconvOptions));
+static cl::opt<bool> ConvertedContextWhile("converted-context-while",
+    cl::desc("Resolve the before contexts matched against the converted text in a correction kernel of single-character rules "
+             "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
+             "§1; default on, --converted-context-while=0 for the rounds)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> MaskedNormalization("masked-normalization",
+    cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
+             "NFD_PipelineBuilder::NFD_Masked and NFC_Masked in UTF-8 mode), rather than with the characters outside the "
+             "filter replaced by barriers (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> U21NFC("u21-nfc",
+    cl::desc("In Unicode mode, compose (NFC, NFKC, FCC) on the 21-bit basis (NFC_U21; within a filter with its mask), "
+             "rather than by the conversion to UTF-8 and back (and barrier substitution within a filter) (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> FusedPriority("fused-priority",
+    cl::desc("Match the earlier rules that a rule yields to at the same position (see TransformStep::stringPriority) "
+             "in the fused kernels, where their contexts are fused contexts (default on; 0: by the regular expression "
+             "engine, a pipeline for each)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> CaseMapMarks("case-map-marks",
+    cl::desc("Apply the case mappings that the function calls of a group's rules expand to (&Any-Lower($1), ...) at the "
+             "positions marked where they apply, after the group, instead of as the changes of their characters "
+             "(default on; Unicode mode, see CaseMapSplit)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> UCDPropertyKernels("ucd-property-kernels",
+    cl::desc("Compute the Unicode properties of a group's rules each by a kernel of its own (UnicodePropertyKernelBuilder, "
+             "shared and cached across transforms), and the classes of the fused kernels made of them from their streams, "
+             "instead of compiling those classes from their characters (default on; Unicode mode)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool, true> CaptureVariants("capture-variants",
     cl::desc("Merge MultipleCaptureMultipleReplacement rules differing only in one character of a text and their results "
              "into one set, matched once (see ldml::MultipleCaptureMultipleReplacementSet::variants)"),
@@ -201,6 +235,14 @@ static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied b
                                    cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> BoundRegions("bound-regions",
+    cl::desc("With --lines (and --lines-regions), also apply in one run a transform whose conversion groups have contexts that "
+             "are not line-bound, bounded by the lines in the fused kernels and the engine (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> LinesRegions("lines-regions",
+    cl::desc("With --lines, apply a transform whose components all support region scope (see --plan --lines) in one run "
+             "over the whole input, each line a region of a mask (default on; --lines-regions=0 for one run per line)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(TconvOptions));
@@ -208,6 +250,27 @@ static cl::opt<bool> DisableEngineSearchReplace("disable-engine-search-replace",
                                                 cl::desc("Apply no conversion group by the search and replace of the regular "
                                                          "expression engine (see engineSearchReplace)"),
                                                 cl::init(false), cl::cat(TconvOptions));
+static cl::opt<unsigned> DivCodeCodes("divcode-codes",
+    cl::desc("Smoke test of the Div32Code/Div64Code kernels: replace each character of the input by U+10000 | (its external "
+             "classes << 10) | its code, in the alphabet of the given conversion group (numbered from 1, as by "
+             "--divcode-report) of the transform's own rules; the alphabet is described on the standard error"),
+    cl::init(0), cl::cat(TconvOptions), cl::Hidden);
+static cl::opt<bool> DivCodeGroups("divcode-groups",
+    cl::desc("Apply the conversion groups eligible for DivCode kernels (see --divcode-report) by them (see "
+             "doc/ldml-divcode-plan.md; default on, --divcode-groups=0 for the regular plan)"),
+    cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool, true> DivCodeFamilies("divcode-families",
+    cl::desc("Plan the families of string rules with before contexts matched against the converted text that cover "
+             "their texts (doc/ldml-divcode-plan.md §11; default on, --divcode-families=0 keeps their groups on the "
+             "regular plan)"),
+    cl::location(ldml::DivCodeFamilies), cl::init(true), cl::cat(TconvOptions));
+static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32, the default) "
+                                      "or 6 (div64)"),
+                                      cl::init(5), cl::cat(TconvOptions));
+static cl::opt<bool> DivCodeReport("divcode-report",
+    cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
+             "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
+    cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> KernelCounts("kernel-counts", cl::desc("Report the conversion groups of the transform (with their rules and "
                                   "kernels) and the kernels of its pipeline, built without compiling it, and exit"),
                                   cl::init(false), cl::cat(TconvOptions));
@@ -490,6 +553,8 @@ public:
         std::string reason;     // why Unicode mode
     };
     const Mode & mode(const ldml::TransformEntry * entry);
+    //  The mode of the steps of an analysis (of a rules file, or of an entry).
+    Mode modeOf(const TransformAnalysis & a);
 private:
     std::map<std::string, Mode> mModes;
     //  The common analysis of a set of parsed rules (trivial and nullable
@@ -1419,6 +1484,182 @@ protected:
     }
 };
 
+//  The starts and follows of the regions of a mask (its runs of 1 bits): the
+//  first positions of the runs, and the positions after them (outside the
+//  mask), as the regular expression engine takes regions (RE_context::
+//  matchStarts and matchFollows).
+class RegionEdges : public pablo::PabloKernel {
+public:
+    RegionEdges(LLVMTypeSystemInterface & ts, StreamSet * Regions, StreamSet * Starts, StreamSet * Follows)
+    : PabloKernel(ts, "RegionEdges", {Binding{"Regions", Regions}}, {Binding{"Starts", Starts}, Binding{"Follows", Follows}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const r = getInputStreamSet("Regions")[0];
+        PabloAST * const before = pb.createAdvance(r, 1);
+        writeOutputStreamSet("Starts", std::vector<PabloAST *>{pb.createAnd(r, pb.createNot(before))});
+        writeOutputStreamSet("Follows", std::vector<PabloAST *>{pb.createInFile(pb.createAnd(before, pb.createNot(r)))});
+    }
+};
+
+//  Transforms applied to part of a text (see doc/masked-transforms-plan.md).
+//  The context scope of a mask: what the contexts and anchors of a run of its
+//  positions see.  Text: the whole text, as under an ICU filter.  Region: the
+//  run only, as a text of its own (not yet supported).
+enum class ContextScope {Text, Region};
+
+//  The positions where a transform applies (the 1 bits of apply, each run of
+//  them applied as a run), what a kernel with the mask produces outside them
+//  (see MaskKind), and the scope of their contexts.
+//  insertBefore (text scope): an insertion within the runs is made only before
+//  one of their positions, as ICU's compound transforms under a filter insert
+//  where the cursor stops in a run; not for the filter of a transform of one
+//  conversion group, which checks its filter only for the characters it
+//  replaces (see RulePipelineBuilder::insertionGroup).
+struct TransformMask {
+    StreamSet * apply = nullptr;
+    MaskKind kind = MaskKind::PassThru;
+    ContextScope scope = ContextScope::Text;
+    bool insertBefore = true;
+};
+
+//  The changes a stage makes to the positions of a text, in order: positions
+//  deleted (keep: 1 at the positions kept), or inserted (spread: 0 at the
+//  positions inserted, as by InsertionSpreadMask).  An inserted position is
+//  within a mask if the position before it is (Inherit: it belongs to the run
+//  of the character it follows), or always (In), or never (Out).  The caller
+//  keeps its other streams in step with the text by the map.
+struct PositionMap {
+    enum class Inserted {Inherit, In, Out};
+    struct Edit {
+        StreamSet * keep = nullptr;
+        StreamSet * spread = nullptr;
+        Inserted inserted = Inserted::Inherit;
+    };
+    std::vector<Edit> edits;
+    void remove(StreamSet * keep) {edits.push_back(Edit{keep, nullptr, Inserted::Inherit});}
+    void insert(StreamSet * spread, Inserted inserted = Inserted::Inherit) {edits.push_back(Edit{nullptr, spread, inserted});}
+    void append(const PositionMap & m) {edits.insert(edits.end(), m.edits.begin(), m.edits.end());}
+    bool empty() const {return edits.empty();}
+};
+
+//  The text produced by a stage, and the changes to its positions.
+struct Staged {
+    StreamSet * text = nullptr;
+    PositionMap positions;
+    Staged(StreamSet * t) : text(t) {}
+    Staged(StreamSet * t, PositionMap p) : text(t), positions(std::move(p)) {}
+};
+
+//  The masks of the filters in effect (the innermost last, each within the ones
+//  before it), all of text scope, kept in step with the text by the position
+//  maps of the stages.  The streams mapped are cached, so that a stage that
+//  needs the mapped active mask itself (e.g. to place its replacements) and
+//  the update of the masks after it share their kernels.
+class TransformMasks {
+public:
+    explicit TransformMasks(PipelineBuilder & P) : mP(P) {}
+    bool empty() const {return mMasks.empty();}
+    size_t size() const {return mMasks.size();}
+    const TransformMask & operator[](size_t i) const {return mMasks[i];}
+    //  The innermost mask's positions, or nullptr without a filter.
+    StreamSet * active() const {return mMasks.empty() ? nullptr : mMasks.back().apply;}
+    void push(StreamSet * apply, ContextScope scope = ContextScope::Text) {
+        mMasks.push_back(TransformMask{apply, MaskKind::PassThru, scope});
+    }
+    void pop() {mMasks.pop_back();}
+    //  The innermost mask does not restrict insertions (see TransformMask::insertBefore).
+    void insertAnywhere() {mMasks.back().insertBefore = false;}
+    //  The innermost mask restricting insertions, or nullptr.
+    StreamSet * insertionMask() const {
+        for (auto m = mMasks.rbegin(); m != mMasks.rend(); ++m) if (m->insertBefore) return m->apply;
+        return nullptr;
+    }
+    //  A mask outside all others (taken out by popOutermost).
+    void pushOutermost(StreamSet * apply) {mMasks.insert(mMasks.begin(), TransformMask{apply});}
+    StreamSet * popOutermost() {
+        StreamSet * const apply = mMasks.front().apply;
+        mMasks.erase(mMasks.begin());
+        return apply;
+    }
+    //  The masks taken out (for a stage on a text without them), and put back.
+    std::vector<TransformMask> release() {
+        std::vector<TransformMask> masks = std::move(mMasks);
+        mMasks.clear();
+        return masks;
+    }
+    void restore(std::vector<TransformMask> && masks) {mMasks = std::move(masks);}
+    //  The positions of every mask replaced (by a stage that carries the masks
+    //  through itself, as the engine's search and replace does).
+    std::vector<StreamSet *> applyStreams() const {
+        std::vector<StreamSet *> streams;
+        for (const TransformMask & m : mMasks) streams.push_back(m.apply);
+        return streams;
+    }
+    void setApplyStreams(const std::vector<StreamSet *> & streams) {
+        for (size_t k = 0; k < mMasks.size(); k++) mMasks[k].apply = streams[k];
+    }
+    //  The positions added to every mask.
+    void include(StreamSet * positions) {
+        for (TransformMask & m : mMasks) {
+            StreamSet * const combined = mP.CreateStreamSet(1);
+            OrCombine(mP, m.apply, positions, combined);
+            m.apply = combined;
+        }
+    }
+    //  The run ends of the innermost mask (text scope): the positions outside it,
+    //  where an after context's set with the end of a run (ldml::FilterRunEndMark,
+    //  see ldml::MoveTextAnchors) matches, as ICU applies a compound transform to
+    //  each run of a filter; nullptr without a mask.
+    StreamSet * runEnds() {return mMasks.empty() ? nullptr : complement(mMasks.back().apply);}
+    //  The complement of a stream of one bit per position (cached).
+    StreamSet * complement(StreamSet * s) {
+        StreamSet *& c = mCache[{s, nullptr, Complement}];
+        if (c == nullptr) {
+            c = mP.CreateStreamSet(1);
+            Invert(mP, s, c);
+        }
+        return c;
+    }
+    //  A mask (of one bit per position) after the changes of a map.
+    StreamSet * mapped(StreamSet * mask, const PositionMap & map) {
+        for (const PositionMap::Edit & e : map.edits) mask = mapped(mask, e);
+        return mask;
+    }
+    void keepInStep(const PositionMap & map) {
+        for (TransformMask & m : mMasks) m.apply = mapped(m.apply, map);
+    }
+private:
+    enum Op {Complement, Filter, Inherit, In, Out};
+    StreamSet * mapped(StreamSet * mask, const PositionMap::Edit & e) {
+        const Op op = e.keep ? Filter : e.inserted == PositionMap::Inserted::Inherit ? Inherit
+                    : e.inserted == PositionMap::Inserted::In ? In : Out;
+        StreamSet * const by = e.keep ? e.keep : e.spread;
+        auto f = mCache.find({mask, by, op});
+        if (f != mCache.end()) return f->second;
+        StreamSet * result = mP.CreateStreamSet(1);
+        if (op == Filter) {
+            FilterByMask(mP, e.keep, mask, result);
+        } else {
+            SpreadByMask(mP, e.spread, mask, result);
+            if (op == Inherit) {
+                StreamSet * const inherited = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<InheritMask>(e.spread, result, inherited);
+                result = inherited;
+            } else if (op == In) {
+                StreamSet * const combined = mP.CreateStreamSet(1);
+                OrCombine(mP, result, complement(e.spread), combined);
+                result = combined;
+            }
+        }
+        mCache[{mask, by, op}] = result;
+        return result;
+    }
+    PipelineBuilder & mP;
+    std::vector<TransformMask> mMasks;
+    std::map<std::tuple<StreamSet *, StreamSet *, Op>, StreamSet *> mCache;
+};
+
 //  The positions where the single-character rules of a conversion group may
 //  apply, given the matches of its string rules that apply (see TransformStep::
 //  coverStringRules): not those covered by the matches, from the position after
@@ -1617,24 +1858,25 @@ private:
     const WalkConfig mConfig;
 };
 
-//  The streams of Classes, those at the indices given ORed with the positions
-//  outside Mask (see ldml::FilterRunEndMark).
-class OutsideMask final : public pablo::PabloKernel {
+//  The streams of Classes, those at the indices given ORed with the run ends of
+//  a mask of text scope (RunEnds, see TransformMasks::runEnds and
+//  ldml::FilterRunEndMark).
+class WithRunEnds final : public pablo::PabloKernel {
 public:
-    OutsideMask(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * Mask, const std::vector<unsigned> & indices, StreamSet * Out)
-    : PabloKernel(ts, "OutsideMask" + std::to_string(Classes->getNumElements()) + [&] {
+    WithRunEnds(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * RunEnds, const std::vector<unsigned> & indices, StreamSet * Out)
+    : PabloKernel(ts, "WithRunEnds" + std::to_string(Classes->getNumElements()) + [&] {
                       std::string s;
                       for (unsigned i : indices) s += "_" + std::to_string(i);
                       return s;
                   }(),
-                  {Binding{"Classes", Classes}, Binding{"Mask", Mask}}, {Binding{"Out", Out}})
+                  {Binding{"Classes", Classes}, Binding{"RunEnds", RunEnds}}, {Binding{"Out", Out}})
     , mIndices(indices) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST *> classes = getInputStreamSet("Classes");
-        PabloAST * const outside = pb.createNot(getInputStreamSet("Mask")[0]);
-        for (unsigned i : mIndices) classes[i] = pb.createOr(classes[i], outside);
+        PabloAST * const ends = getInputStreamSet("RunEnds")[0];
+        for (unsigned i : mIndices) classes[i] = pb.createOr(classes[i], ends);
         writeOutputStreamSet("Out", classes);
     }
 private:
@@ -2730,6 +2972,17 @@ struct ConversionOutcome {
     //  If keptAt >= 0: the character itself is kept, at index keptAt of the
     //  result (out is the rest).
     int keptAt = -1;
+    //  An empty outcome of a unit of a string rule's match whose whole result
+    //  is not empty: the converted text before the positions after the match
+    //  is not empty either (see convertedContextMatters).
+    bool partial = false;
+    //  Whether the unit may be the last of its match (false only where it is
+    //  known not to be): the converted text before the position after a match
+    //  ends with what its last unit writes, and positions within a match are
+    //  not anchors of other rules (the match covers them), so the empty outcome
+    //  of a unit that is not the last of a match whose result is not empty is
+    //  never what the item of a context adjacent to a rule sees.
+    bool last = true;
     size_t length() const {return out.size() + (keptAt >= 0 ? 1 : 0);}
     //  The characters of the result: those of out, and the characters kept.
     UCD::UnicodeSet resultChars() const {
@@ -2748,8 +3001,14 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
             if (!chars.empty()) outcomes.push_back(ConversionOutcome{chars, m.replacement});
         }
     }
+    //  (Whether a result keeps or writes some character.)
+    auto nonEmpty = [](const std::u32string & replacement) {
+        for (char32_t c : replacement) if (c != ldml::StringRuleDeleted) return true;
+        return false;
+    };
     for (const ldml::StringRule & sr : step.stringRules) {
         const size_t n = sr.text.size(), m = sr.replacement.size();
+        const bool partial = nonEmpty(sr.replacement);
         for (size_t j = 0; j < n; j++) {
             std::u32string out;
             if (j + 1 < n) {
@@ -2763,7 +3022,7 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
                 continue;
             }
             if (!out.empty() && out.front() == ldml::StringRuleDeleted) out = out.substr(1);
-            outcomes.push_back(ConversionOutcome{sr.text[j], out});
+            outcomes.push_back(ConversionOutcome{sr.text[j], out, -1, out.empty() && partial, j + 1 == n});
         }
         if (!sr.run.empty()) outcomes.push_back(ConversionOutcome{sr.run, std::u32string()});
     }
@@ -2771,6 +3030,7 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
     //  rules: Ti by Ri, or an insertion around a kept character).
     auto textOutcomes = [&](const std::vector<UCD::UnicodeSet> & text, const std::u32string & replacement) {
         const size_t n = text.size(), m = replacement.size();
+        const bool partial = nonEmpty(replacement);
         for (size_t j = 0; j < n; j++) {
             std::u32string out;
             if (j + 1 < n) {
@@ -2778,11 +3038,31 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
             } else if (j < m) {
                 out = replacement.substr(j);
             }
-            outcomes.push_back(ConversionOutcome{text[j], out});
+            outcomes.push_back(ConversionOutcome{text[j], out, -1, out.empty() && partial});
         }
     };
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) textOutcomes(r.first, r.firstReplacement);
+        //  With a capture that cannot be empty, the units of T0 are never the last
+        //  of a match, and the match's result is not empty (the capture is kept,
+        //  or moved): an empty outcome of a unit of T0 is partial, and not last.
+        bool captureFollows = false;
+        for (re::RE * c : set.captures) captureFollows |= !re::isNullable(c);
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            if (!captureFollows) {
+                textOutcomes(r.first, r.firstReplacement);
+                continue;
+            }
+            const size_t n = r.first.size(), m = r.firstReplacement.size();
+            for (size_t j = 0; j < n; j++) {
+                std::u32string out;
+                if (j + 1 < n) {
+                    if (j < m) out = r.firstReplacement.substr(j, 1);
+                } else if (j < m) {
+                    out = r.firstReplacement.substr(j);
+                }
+                outcomes.push_back(ConversionOutcome{r.first[j], out, -1, out.empty(), false});
+            }
+        }
         //  (Those of each variant.)
         std::vector<const std::vector<ldml::BoundaryReplacement> *> lists{&set.replacements};
         for (const auto & v : set.variants) lists.push_back(&v.replacements);
@@ -2805,14 +3085,22 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
 //  character is in the set of an item (the last character of its converted
 //  text, for the item adjacent to the rule), deletes a character (the context
 //  then sees the characters before it), or (for the items further from the
-//  rule) changes the length of the text.
+//  rule) changes the length of the text.  An item adjacent to the rule that is
+//  only the text boundary (^, [$]) changes only where all the converted text
+//  before it may be deleted: not by the units of a string rule's match whose
+//  whole result is not empty (ConversionOutcome::partial).
 static bool convertedContextMatters(const FusedContexts & before, const std::vector<ConversionOutcome> & outcomes) {
     for (const FusedContext & alt : before) {
         const size_t B = alt.size();
         for (size_t k = 0; k < B; k++) {
             const size_t d = B - k;     // 1: adjacent to the rule
             const UCD::UnicodeSet & S = alt[k].chars;
+            const bool boundaryOnly = d == 1 && S.empty() && alt[k].boundary && !alt[k].star;
             for (const ConversionOutcome & o : outcomes) {
+                if (boundaryOnly && o.partial) continue;
+                //  (An empty unit within a match that writes something, not its
+                //  last: never what an adjacent item sees; see ConversionOutcome.)
+                if (d == 1 && o.length() == 0 && o.partial && !o.last) continue;
                 if (o.length() == 0) return true;
                 if (d > 1 && o.length() != 1) return true;
                 //  The last character kept: whether it is in the set does not change.
@@ -2823,6 +3111,19 @@ static bool convertedContextMatters(const FusedContexts & before, const std::vec
         }
     }
     return false;
+}
+
+//  Whether a before context of a group may match differently in the converted
+//  text (see convertedContextMatters), or is not a sequence of sets.
+static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * engineBefore) {
+    if (engineBefore == nullptr) return false;
+    FusedContexts before;
+    return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
+}
+
+//  Whether the DivCode kernels apply a plan (an eligible one).
+static bool divCodeApplies(const ldml::DivCodePlan & plan) {
+    return plan.eligible();
 }
 
 //  The notes of tconv --plan on the before contexts of a conversion group that
@@ -2845,6 +3146,101 @@ static bool hasConvertedSubgroup(const ldml::TransformStep & step, const std::ve
     return false;
 }
 
+
+//  Whether the contexts of the rules of a conversion group are line-bound (see
+//  regionScope): they match a line within the text as they match the
+//  line taken as a text, without bounds at the line's ends.
+static bool groupLineBound(const ldml::TransformStep & step) {
+    //  A context is line-bound if it matches a line within the text as it
+    //  matches the line taken as a text: in the text, the position beyond the
+    //  line (after its end, or before its start) holds a line feed, or is
+    //  beyond the text.  An item of one position (a class, or an alternation or
+    //  difference of classes, see single) matches the line feed if its set has
+    //  it, and beyond the line if it has U+FFFF (as in ICU, see
+    //  UnicodeSet::matches) or the anchor of that end (Start in a before
+    //  context, End in an after one).  The outermost item of a context (the
+    //  last of an after context, the first of a before context) may reach the
+    //  position beyond the line, and must match both or neither; an inner item
+    //  must match neither, so that the outermost cannot reach past it.  A
+    //  lookaround (toward the outside of the context) of an item holds or fails
+    //  on the line feed as beyond the end if the item matches both or neither.
+    //  No item may match a mark of tconv's (which can stand for a position
+    //  outside a filter, e.g. FilterRunEndMark) or the deletion mark.  Other
+    //  constructs (e.g. anchors elsewhere) are not line-bound.
+    static const UCD::UnicodeSet marks = UCD::UnicodeSet(0xD800, 0xDFFF) + UCD::UnicodeSet(0xFDD0, 0xFDEF);
+    struct Single {
+        UCD::UnicodeSet set;
+        bool beyond = false;
+    };
+    std::function<std::optional<Single> (const re::RE *, bool)> single = [&](const re::RE * re, bool after) -> std::optional<Single> {
+        if (const re::CC * cc = llvm::dyn_cast<re::CC>(re)) return Single{*cc, cc->contains(0xFFFF)};
+        if (llvm::isa<re::Any>(re)) return Single{UCD::UnicodeSet(0, 0x10FFFF), false};
+        if ((after && llvm::isa<re::End>(re)) || (!after && llvm::isa<re::Start>(re))) return Single{UCD::UnicodeSet(), true};
+        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
+            if (n->getDefinition() == nullptr) return std::nullopt;
+            return single(n->getDefinition(), after);
+        }
+        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+            Single u;
+            for (const re::RE * r : *alt) {
+                const std::optional<Single> s = single(r, after);
+                if (!s) return std::nullopt;
+                u.set = u.set + s->set;
+                u.beyond |= s->beyond;
+            }
+            return u;
+        }
+        if (const re::Diff * d = llvm::dyn_cast<re::Diff>(re)) {
+            const std::optional<Single> l = single(d->getLH(), after), r = single(d->getRH(), after);
+            if (!l || !r) return std::nullopt;
+            return Single{l->set - r->set, l->beyond && !r->beyond};
+        }
+        return std::nullopt;
+    };
+    std::function<bool (const re::RE *, bool, bool)> lineBound = [&](const re::RE * re, bool after, bool outermost) -> bool {
+        if (re == nullptr) return true;
+        if (const std::optional<Single> s = single(re, after)) {
+            if (s->set.intersects(marks)) return false;
+            const bool lf = s->set.contains(0x0A);
+            return lf == s->beyond && (!lf || outermost);
+        }
+        if (const re::Seq * seq = llvm::dyn_cast<re::Seq>(re)) {
+            const size_t n = seq->size();
+            for (size_t i = 0; i < n; i++) {
+                const size_t outer = after ? n - 1 : 0;
+                if (!lineBound((*seq)[i], after, outermost && i == outer)) return false;
+            }
+            return true;
+        }
+        if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+            for (const re::RE * r : *alt) if (!lineBound(r, after, outermost)) return false;
+            return true;
+        }
+        if (const re::Rep * rep = llvm::dyn_cast<re::Rep>(re)) return lineBound(rep->getRE(), after, false);
+        if (const re::Assertion * a = llvm::dyn_cast<re::Assertion>(re)) {
+            const auto toward = after ? re::Assertion::Kind::LookAhead : re::Assertion::Kind::LookBehind;
+            const std::optional<Single> s = single(a->getAsserted(), after);
+            return s && a->getKind() == toward && !s->set.intersects(marks) && s->set.contains(0x0A) == s->beyond;
+        }
+        if (const re::Capture * c = llvm::dyn_cast<re::Capture>(re)) return lineBound(c->getCapturedRE(), after, outermost);
+        if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) {
+            return n->getDefinition() && lineBound(n->getDefinition(), after, outermost);
+        }
+        return false;
+    };
+    //  (The contexts as the engine matches them, with their variables expanded,
+    //  where the plan has them.)
+    auto contextsBound = [&](const re::RE * before, const re::RE * after, const re::RE * engineBefore, const re::RE * engineAfter) {
+        return lineBound(engineBefore ? engineBefore : before, false, true) && lineBound(engineAfter ? engineAfter : after, true, true);
+    };
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        if (!contextsBound(s.before, s.after, s.engineBefore, s.engineAfter)) return false;
+    }
+    for (const ldml::StringRule & r : step.stringRules) {
+        if (!contextsBound(r.before, r.after, r.engineBefore, r.engineAfter)) return false;
+    }
+    return true;
+}
 
 //  The MultipleCaptureMultipleReplacement rules whose before contexts the
 //  conversions of their group may make match differently in the converted text
@@ -3555,15 +3951,30 @@ struct FusedMatchSource {
     unsigned index = 0;
 };
 
+//  An earlier rule of the group that a rule of a fused kernel yields to at the
+//  same position (see ldml::TransformStep::stringPriority and subgroupPriority):
+//  the rule applies only where this does not match there.  Its text (from the
+//  position) and contexts are matched in the kernel, against the text itself
+//  (as ICU tries the earlier rule first), with the characters of its text within
+//  the mask if masked (an earlier string rule, as RulePipelineBuilder::
+//  conversionGroup's matchFirsts has them).
+struct FusedYield {
+    std::vector<UCD::UnicodeSet> text;
+    FusedContexts before{FusedContext()}, after{FusedContext()};
+    bool masked = false;
+};
+
 //  A string rule of a fused kernel.  Matched in the kernel, with its contexts
 //  and within the mask, or (match >= 0, an index in FusedRulesConfig::sources)
 //  given by an input stream of its matches at their first positions, already
-//  restricted to the mask (and selected, where string rules overlap).
+//  restricted to the mask (and selected, where string rules overlap).  When
+//  matched in the kernel, it yields to the rules of yields.
 struct FusedStringRule {
     std::vector<UCD::UnicodeSet> text;
     std::u32string replacement;
     FusedContexts before{FusedContext()}, after{FusedContext()};
     int match = -1;
+    std::vector<FusedYield> yields;
     bool converted = false;     // in a correction kernel: its before context is matched against the converted text
     UCD::UnicodeSet run;        // the set of the run following the text, deleted (see ldml::StringRule::run)
     //  The run of a set with strings (see ldml::StringRule::runStrings).
@@ -3583,13 +3994,16 @@ struct FusedStringRule {
 //  A subgroup whose before context is matched against the converted text, but
 //  whose after context is not a fused context (an unbounded repetition), may
 //  have the positions of its characters where its after context matches given
-//  instead (afterMatch, with no after context).
+//  instead (afterMatch, with no after context).  When matched in the kernel, its
+//  rules yield to the rules of yields.
 struct FusedSubgroup {
     FusedContexts before{FusedContext()}, after{FusedContext()};
     std::vector<ldml::CharMapping> mappings;
     int match = -1;
+    std::vector<FusedYield> yields;
     int afterMatch = -1;
     bool converted = false;     // as for FusedStringRule
+    bool caseMaps = false;      // its case mappings may be applied by marks (see CaseMapSplit)
 };
 
 //  An insertion rule (see ldml::InsertionRule) in a correction kernel, at the
@@ -3740,6 +4154,26 @@ struct FusedRulesConfig {
     //  round, of the rules applied where selected, are given (without the state
     //  in).
     bool staged = false;
+    //  A correction kernel whose rules matched against the converted text are
+    //  all single-character rules (subgroups) with before contexts of fixed
+    //  items, possibly with a repeated set, as are those of its insertion rules
+    //  (see resolvableByWhile): their before
+    //  contexts are resolved by a While loop, exactly, instead of in rounds (see
+    //  FusedRules::generatePabloMethod).  The rounds remain for the selection of
+    //  the string matches, which does not depend on the converted text.
+    bool resolve = false;
+    //  The case mappings marked in the state given or by the subgroups (see
+    //  CaseMapSplit), whose outcomes a correction kernel takes into account.
+    std::set<unsigned> marks;
+    //  Region scope (see RulePipelineBuilder::boundRegions): InText gives the
+    //  positions of the regions (runs of 1 bits, not adjacent), and the
+    //  contexts are bounded by them.  An item of a context at a distance d from
+    //  the position matches as at that distance from the end (or start) of a text
+    //  when a position between them (or the item's own) is outside the region:
+    //  only if it is a boundary item.  In a correction kernel, the converted text
+    //  is walked back within the region (see stepBack), its first position
+    //  as the start of a text.
+    bool region = false;
 };
 
 //  The results of the rules of a conversion group, accumulated by its fused
@@ -3753,7 +4187,138 @@ struct FusedState {
     std::map<unsigned, StreamSet *> insertions;
     StreamSet * spans = nullptr;
     StreamSet * starts = nullptr;
+    //  The positions marked for each case mapping (see CaseMapSplit).
+    std::map<unsigned, StreamSet *> marks;
 };
+
+//  Case mappings applied at marked positions.  A subgroup of a fused kernel
+//  whose mappings map more than CaseMapMinChars characters each to its full
+//  case mapping (lc, uc or tc), as the expansion of a function call &Any-Lower($1),
+//  &Any-Upper($1) or &Any-Title($1) gives them (see ldml::ExpandFunctionCalls),
+//  marks the positions where these apply, instead of writing their changes;
+//  the group then applies the case mapping at the marked positions
+//  (RulePipelineBuilder::maskedStringOverrides), with the classes of the case
+//  mapping shared by every transform.  Its other mappings (literal) are
+//  applied as before.  (--case-map-marks; see RulePipelineBuilder::conversionGroup.)
+static constexpr size_t CaseMapMinChars = 64;
+static constexpr unsigned CaseMapCount = 3;
+static const UCD::property_t CaseMapProperty[CaseMapCount] = {UCD::lc, UCD::uc, UCD::tc};
+
+struct CaseMapData {
+    UCD::UnicodeSet reflexive;                              // mapped to themselves
+    std::map<UCD::codepoint_t, std::u32string> changed;     // the others, with their values
+    unsigned maxLength = 1;
+};
+
+static const CaseMapData & caseMapData(unsigned p) {
+    static std::unique_ptr<CaseMapData> data[CaseMapCount];
+    if (!data[p]) {
+        data[p] = std::make_unique<CaseMapData>();
+        auto * const obj = cast<UCD::StringOverridePropertyObject>(UCD::getPropertyObject(CaseMapProperty[p]));
+        data[p]->reflexive = obj->GetReflexiveSet();
+        for (const auto & range : UCD::UnicodeSet(0, 0x10FFFF) - data[p]->reflexive) {
+            for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
+                const std::u32string v = obj->GetU32StringValue(cp);
+                data[p]->changed.emplace(cp, v);
+                data[p]->maxLength = std::max<unsigned>(data[p]->maxLength, static_cast<unsigned>(v.size()));
+            }
+        }
+    }
+    return *data[p];
+}
+
+static std::u32string caseMapValue(unsigned p, UCD::codepoint_t cp) {
+    const CaseMapData & d = caseMapData(p);
+    const auto f = d.changed.find(cp);
+    return f == d.changed.end() ? std::u32string(1, static_cast<char32_t>(cp)) : f->second;
+}
+
+//  The mappings of a subgroup split into a case mapping (caseMap, or -1 if
+//  none applies) and the rest (literal).
+struct CaseMapSplit {
+    int caseMap = -1;
+    std::vector<ldml::CharMapping> literal;
+    UCD::UnicodeSet literalAll;     // the characters of the literal mappings
+};
+
+struct FusedSubgroup;
+static CaseMapSplit caseMapSplit(const FusedSubgroup & g);
+
+//  The characters (of any) whose case mapping p has length l.
+static UCD::UnicodeSet caseMapLengthChars(unsigned p, unsigned l) {
+    const CaseMapData & d = caseMapData(p);
+    UCD::UnicodeSet s = l == 1 ? d.reflexive : UCD::UnicodeSet();
+    for (const auto & c : d.changed) {
+        if (c.second.size() == l) s.insert(c.first);
+    }
+    return s;
+}
+
+//  The changes of case mapping p at index i of its values, by bit (as the
+//  group's changes: at index 0, of the character; at the others, of the
+//  deletion mark that fills a position inserted; see conversionGroup).
+static const std::vector<UCD::UnicodeSet> & caseMapChangeSets(unsigned p, unsigned i) {
+    static std::map<std::pair<unsigned, unsigned>, std::vector<UCD::UnicodeSet>> memo;
+    std::vector<UCD::UnicodeSet> & sets = memo[{p, i}];
+    if (sets.empty()) {
+        sets.assign(21, UCD::UnicodeSet());
+        for (const auto & c : caseMapData(p).changed) {
+            if (c.second.size() <= i) continue;
+            const UCD::codepoint_t diff = (i == 0 ? c.first : DeletionMark) ^ static_cast<UCD::codepoint_t>(c.second[i]);
+            for (unsigned b = 0; b < 21; b++) {
+                if ((diff >> b) & 1) sets[b].insert(c.first);
+            }
+        }
+    }
+    return sets;
+}
+
+//  The characters whose case mapping p has a character in a set (in), or not
+//  (!in), at index i.
+static UCD::UnicodeSet caseMapSlotChars(unsigned p, unsigned i, const UCD::UnicodeSet & set, bool in) {
+    const CaseMapData & d = caseMapData(p);
+    UCD::UnicodeSet s;
+    if (i == 0) s = in ? (d.reflexive & set) : (d.reflexive - set);
+    for (const auto & c : d.changed) {
+        if (c.second.size() > i && set.contains(static_cast<UCD::codepoint_t>(c.second[i])) == in) s.insert(c.first);
+    }
+    return s;
+}
+
+static CaseMapSplit caseMapSplit(const FusedSubgroup & g) {
+    CaseMapSplit split;
+    if (!g.caseMaps) {
+        split.literal = g.mappings;
+        return split;
+    }
+    //  The case mapping that most characters follow, if more than CaseMapMinChars.
+    size_t best = CaseMapMinChars;
+    for (unsigned p = 0; p < CaseMapCount; p++) {
+        size_t n = 0;
+        for (const ldml::CharMapping & m : g.mappings) {
+            bool all = true;
+            for (const auto & range : m.chars) {
+                for (UCD::codepoint_t cp = range.first; all && cp <= range.second; cp++) all = caseMapValue(p, cp) == m.replacement;
+            }
+            if (all) n += m.chars.count();
+        }
+        if (n > best) {
+            best = n;
+            split.caseMap = static_cast<int>(p);
+        }
+    }
+    for (const ldml::CharMapping & m : g.mappings) {
+        bool all = split.caseMap >= 0;
+        for (const auto & range : m.chars) {
+            for (UCD::codepoint_t cp = range.first; all && cp <= range.second; cp++) all = caseMapValue(split.caseMap, cp) == m.replacement;
+        }
+        if (!all) {
+            split.literal.push_back(m);
+            split.literalAll = split.literalAll + m.chars;
+        }
+    }
+    return split;
+}
 
 //  The input lookahead and outputs of a fused kernel.
 struct FusedLayout {
@@ -3762,13 +4327,23 @@ struct FusedLayout {
     unsigned changePositions = 0;   // the positions i of the replacements, with outputs
     std::set<unsigned> insertCounts;
     std::vector<StreamSet *> sourceSets;
+    std::set<unsigned> marks;               // the case mappings marked (given, or by its subgroups)
     FusedLayout(const FusedRulesConfig & c, const FusedState & in) {
+        //  (The lookaheads of the earlier rules yielded to.)
+        auto addYields = [&](const std::vector<FusedYield> & yields) {
+            for (const FusedYield & y : yields) {
+                const unsigned n = y.text.size();
+                for (const FusedContext & a : y.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
+                if (y.masked) maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
+            }
+        };
         for (const FusedStringRule & r : c.strings) {
             const unsigned n = r.text.size(), m = r.resultLength();
             lookahead = std::max(lookahead, runLookahead(r.runStrings));
             if (r.match < 0) {
                 for (const FusedContext & a : r.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
                 maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
+                addYields(r.yields);
             }
             if (!c.matchOnly || c.staged) {
                 changePositions = std::max<unsigned>(changePositions, m > n ? m - n + 1 : 1);
@@ -3779,7 +4354,10 @@ struct FusedLayout {
             if (g.match < 0 && g.afterMatch < 0) {
                 for (const FusedContext & a : g.after) lookahead = std::max<unsigned>(lookahead, a.size());
             }
-            for (const ldml::CharMapping & m : g.mappings) {
+            if (g.match < 0) addYields(g.yields);
+            const CaseMapSplit split = caseMapSplit(g);
+            if (split.caseMap >= 0 && !c.matchOnly) marks.insert(static_cast<unsigned>(split.caseMap));
+            for (const ldml::CharMapping & m : split.literal) {
                 changePositions = std::max<unsigned>(changePositions, std::max<size_t>(m.replacement.size(), 1));
                 if (m.replacement.size() > 1) insertCounts.insert(m.replacement.size() - 1);
             }
@@ -3787,6 +4365,7 @@ struct FusedLayout {
         if (!c.matchOnly || c.staged) {
             changePositions = std::max<unsigned>(changePositions, in.changes.size());
             for (const auto & k : in.insertions) insertCounts.insert(k.first);
+            for (const auto & k : in.marks) marks.insert(k.first);
         }
         //  An insertion of m characters after a position whose converted text has
         //  k + 1 characters (k inserted after it) or none (deleted, the first
@@ -3816,7 +4395,8 @@ struct FusedLayout {
 class TextPositions : public pablo::PabloKernel {
 public:
     TextPositions(LLVMTypeSystemInterface & ts, StreamSet * U21, StreamSet * InText)
-    : PabloKernel(ts, "TextPositions", {Binding{"U21", U21}}, {Binding{"InText", InText}}) {}
+    : PabloKernel(ts, "TextPositions" + (U21->getNumElements() == 21 ? std::string() : std::to_string(U21->getNumElements())),
+                  {Binding{"U21", U21}}, {Binding{"InText", InText}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -3863,7 +4443,25 @@ struct FusedSubgroupPlan {
     std::vector<UCD::UnicodeSet> mux;
     std::vector<std::vector<UCD::UnicodeSet>> indexBits;
     std::map<unsigned, UCD::UnicodeSet> insertIndices;
-    explicit FusedSubgroupPlan(const FusedSubgroup & g) {
+    //  With a case mapping applied by marks (see CaseMapSplit): which, and the
+    //  characters of the other mappings, from which alone the changes are made
+    //  (all is still the characters of every mapping).
+    int caseMap = -1;
+    UCD::UnicodeSet literalAll;
+    explicit FusedSubgroupPlan(const FusedSubgroup & sg) {
+        const CaseMapSplit split = caseMapSplit(sg);
+        if (split.caseMap >= 0) {
+            FusedSubgroup lit = sg;
+            lit.caseMaps = false;
+            lit.mappings = split.literal;
+            *this = FusedSubgroupPlan(lit);
+            caseMap = split.caseMap;
+            literalAll = split.literalAll;
+            all = UCD::UnicodeSet();
+            for (const ldml::CharMapping & m : sg.mappings) all = all + m.chars;
+            return;
+        }
+        const FusedSubgroup & g = sg;
         size_t total = 0;
         bool small = false;
         for (const ldml::CharMapping & mp : g.mappings) {
@@ -3959,6 +4557,201 @@ struct FusedSubgroupPlan {
     }
 };
 
+//  The resolution of the before contexts of a correction kernel by a While loop
+//  (FusedRulesConfig::resolve): possible if the rules matched against the
+//  converted text are all subgroups whose before contexts are fixed sequences
+//  of items, possibly with a repeated set (S T*, see ContextExpansion), as are
+//  those of the insertion rules.
+static bool resolvableByWhile(const FusedRulesConfig & c) {
+    if (!ConvertedContextWhile || c.rounds == 0 || c.staged || c.matchOnly) return false;
+    auto starsOk = [](const FusedContexts & before) {
+        for (const FusedContext & alt : before) {
+            for (size_t k = 0; k < alt.size(); k++) {
+                //  (A repetition has the item beyond it before it: see ContextExpansion.)
+                if (alt[k].star && (k == 0 || alt[k - 1].star)) return false;
+            }
+        }
+        return true;
+    };
+    for (const FusedInsertion & ins : c.insertions) {
+        if (!starsOk(ins.before)) return false;
+    }
+    for (const FusedStringRule & r : c.strings) {
+        if (r.converted) return false;
+    }
+    bool any = false;
+    for (const FusedSubgroup & g : c.subgroups) {
+        if (!g.converted) continue;
+        any = true;
+        if (!starsOk(g.before)) return false;
+    }
+    return any || !c.insertions.empty();
+}
+
+//  An item of the before contexts resolved by the While loop, and the greatest
+//  distance before the position at which a context has it (the j-th last
+//  character of the converted text before the position, for j = 1 .. depth).
+//  A plain item: whether that character is in its set (or, if there is none,
+//  whether it holds before the text: boundary).  A run item (run), a repeated
+//  set with the item beyond it (X T* in text order): going back from that
+//  character over the characters of the set (chars, T), whether the first other
+//  one is in the set of the item beyond (beyond, X; or, if there is none, whether
+//  it holds before the text: boundary, X's).
+struct ResolvedItem {
+    UCD::UnicodeSet chars;
+    bool boundary;
+    unsigned depth;
+    bool run = false;
+    UCD::UnicodeSet beyond;
+    std::string key() const {
+        return (run ? "r" + setKey(beyond) + "|" : "p") + setKey(chars) + (boundary ? "$" : "");
+    }
+};
+
+//  The item of an alternative at index k (the repetition at k with the item
+//  beyond it, at k - 1, as one run item), or none: the item beyond a repetition.
+static bool resolvedItemAt(const FusedContext & alt, size_t k, ResolvedItem & item) {
+    if (k + 1 < alt.size() && alt[k + 1].star) return false;
+    item = ResolvedItem{alt[k].chars, alt[k].boundary, 0};
+    if (alt[k].star) {
+        item.run = true;
+        item.beyond = alt[k - 1].chars;
+        item.boundary = alt[k - 1].boundary;
+    }
+    return true;
+}
+
+static std::vector<ResolvedItem> resolvedItems(const FusedRulesConfig & c) {
+    std::vector<ResolvedItem> items;
+    std::map<std::string, size_t> index;
+    std::vector<const FusedContexts *> contexts;
+    for (const FusedSubgroup & g : c.subgroups) {
+        if (g.converted) contexts.push_back(&g.before);
+    }
+    //  (An insertion rule's item at distance d: the d-th last character up to
+    //  and including the position, see FusedInsertion.)
+    for (const FusedInsertion & ins : c.insertions) contexts.push_back(&ins.before);
+    for (const FusedContexts * before : contexts) {
+        for (const FusedContext & alt : *before) {
+            const unsigned B = static_cast<unsigned>(alt.size());
+            for (unsigned k = 0; k < B; k++) {
+                ResolvedItem at;
+                if (!resolvedItemAt(alt, k, at)) continue;
+                const auto f = index.emplace(at.key(), items.size());
+                if (f.second) items.push_back(at);
+                ResolvedItem & item = items[f.first->second];
+                item.depth = std::max(item.depth, B - k);
+            }
+        }
+    }
+    return items;
+}
+
+//  Of the characters of the mappings of a subgroup: those whose replacements
+//  have a length (0: deleted), and of these, those whose replacements have a
+//  character in a set (in), or not (!in), at an index.
+static std::set<unsigned> mappingLengths(const FusedSubgroup & g) {
+    std::set<unsigned> lengths;
+    for (const ldml::CharMapping & m : g.mappings) lengths.insert(static_cast<unsigned>(m.replacement.size()));
+    return lengths;
+}
+
+static UCD::UnicodeSet mappingLengthChars(const FusedSubgroup & g, unsigned length) {
+    UCD::UnicodeSet chars;
+    for (const ldml::CharMapping & m : g.mappings) {
+        if (m.replacement.size() == length) chars = chars + m.chars;
+    }
+    return chars;
+}
+
+//  How a replacement of length l >= j settles a resolved item at distance j
+//  (from its character at index l - j): known not to hold (0), known to hold
+//  (1), or, for a run item whose characters there and before are all in its
+//  set, as the item holds before the position (2).
+static int replacementOutcome(const std::u32string & r, const ResolvedItem & x, unsigned j) {
+    const int top = static_cast<int>(r.size()) - static_cast<int>(j);
+    if (!x.run) return x.chars.contains(static_cast<UCD::codepoint_t>(r[top])) ? 1 : 0;
+    for (int i = top; i >= 0; i--) {
+        const UCD::codepoint_t c = static_cast<UCD::codepoint_t>(r[i]);
+        if (!x.chars.contains(c)) return x.beyond.contains(c) ? 1 : 0;
+    }
+    return 2;
+}
+
+//  The characters of a subgroup whose replacements have length l and settle
+//  item x at distance j as given (see replacementOutcome).
+static UCD::UnicodeSet mappingItemChars(const FusedSubgroup & g, const ResolvedItem & x, unsigned l, unsigned j, int outcome) {
+    UCD::UnicodeSet chars;
+    for (const ldml::CharMapping & m : g.mappings) {
+        if (m.replacement.size() != l) continue;
+        if (replacementOutcome(m.replacement, x, j) == outcome) chars = chars + m.chars;
+    }
+    return chars;
+}
+
+//  A converted subgroup's outcomes in the While loop: of its literal mappings,
+//  and of its case mapping (if any, see CaseMapSplit) outside their characters.
+struct SubgroupOutcomes {
+    FusedSubgroup literal;
+    int caseMap = -1;
+    UCD::UnicodeSet literalAll;
+    std::set<unsigned> lengths;     // of either
+};
+static SubgroupOutcomes subgroupOutcomes(const FusedSubgroup & g);
+
+//  The same for case mapping p (of any character, see CaseMapSplit).
+static UCD::UnicodeSet caseMapItemChars(unsigned p, const ResolvedItem & x, unsigned l, unsigned j, int outcome) {
+    const CaseMapData & d = caseMapData(p);
+    UCD::UnicodeSet chars;
+    if (l == 1 && j == 1) {
+        //  (The characters mapped to themselves.)
+        if (!x.run) {
+            chars = outcome == 1 ? (d.reflexive & x.chars) : outcome == 0 ? (d.reflexive - x.chars) : UCD::UnicodeSet();
+        } else {
+            chars = outcome == 2 ? (d.reflexive & x.chars) : outcome == 1 ? ((d.reflexive & x.beyond) - x.chars)
+                                                                         : (d.reflexive - x.chars - x.beyond);
+        }
+    }
+    for (const auto & c : d.changed) {
+        if (c.second.size() == l && replacementOutcome(c.second, x, j) == outcome) chars.insert(c.first);
+    }
+    return chars;
+}
+
+static SubgroupOutcomes subgroupOutcomes(const FusedSubgroup & g) {
+    SubgroupOutcomes o;
+    const CaseMapSplit split = caseMapSplit(g);
+    o.literal = g;
+    o.literal.caseMaps = false;
+    o.literal.mappings = split.literal;
+    o.caseMap = split.caseMap;
+    o.literalAll = split.literalAll;
+    o.lengths = mappingLengths(o.literal);
+    if (o.caseMap >= 0) {
+        for (unsigned l = 1; l <= caseMapData(o.caseMap).maxLength; l++) o.lengths.insert(l);
+    }
+    return o;
+}
+
+//  The sets of the items of the before contexts matched against the converted
+//  text, for the outcomes of the positions marked for case mappings.
+static std::vector<UCD::UnicodeSet> convertedItemSets(const FusedRulesConfig & c) {
+    std::vector<UCD::UnicodeSet> sets;
+    auto addContexts = [&](const FusedContexts & before) {
+        for (const FusedContext & alt : before) {
+            for (const FusedItem & item : alt) sets.push_back(item.chars);
+        }
+    };
+    for (const FusedStringRule & r : c.strings) {
+        if (r.converted) addContexts(r.before);
+    }
+    for (const FusedSubgroup & g : c.subgroups) {
+        if (g.converted) addContexts(g.before);
+    }
+    for (const FusedInsertion & ins : c.insertions) addContexts(ins.before);
+    return sets;
+}
+
 //  The character classes that a fused kernel uses (computed by a
 //  CharClassesKernel and looked ahead in the fused kernel), each once.
 static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
@@ -3970,6 +4763,13 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
     auto addContext = [&](const FusedContexts & alternatives) {
         for (const FusedContext & items : alternatives) {
             for (const FusedItem & item : items) add(item.chars);
+        }
+    };
+    auto addYields = [&](const std::vector<FusedYield> & yields) {
+        for (const FusedYield & y : yields) {
+            for (const UCD::UnicodeSet & t : y.text) add(t);
+            addContext(y.before);
+            addContext(y.after);
         }
     };
     for (const FusedStringRule & r : c.strings) {
@@ -3984,6 +4784,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         for (const UCD::UnicodeSet & t : r.text) add(t);
         addContext(r.before);
         addContext(r.after);
+        addYields(r.yields);
     }
     if (c.matchOnly) return sets;
     for (const FusedInsertion & ins : c.insertions) {
@@ -3996,6 +4797,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
             add(plan.all);
             addContext(g.before);
             if (g.afterMatch < 0) addContext(g.after);
+            addYields(g.yields);
         }
         for (const UCD::UnicodeSet & set : plan.mux) add(set);
         for (const auto & position : plan.bitSets) {
@@ -4003,9 +4805,214 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         }
         for (const FusedSubgroupPlan::Large & l : plan.large) add(l.chars);
         for (const auto & k : plan.byInsertion) add(k.second);
+        if (plan.caseMap >= 0) add(plan.literalAll);
+    }
+    if (c.rounds > 0 && !c.marks.empty()) {
+        //  The outcomes of the positions marked for case mappings (their lengths,
+        //  and whether their characters are in the sets of the items).
+        const std::vector<UCD::UnicodeSet> itemSets = convertedItemSets(c);
+        for (unsigned p : c.marks) {
+            const unsigned maxLength = caseMapData(p).maxLength;
+            for (unsigned l = 1; l <= maxLength; l++) add(caseMapLengthChars(p, l));
+            for (unsigned i = 0; i < maxLength; i++) {
+                for (const UCD::UnicodeSet & set : itemSets) add(caseMapSlotChars(p, i, set, true));
+            }
+        }
+    }
+    if (c.resolve) {
+        //  The outcomes of the converted subgroups for the items (see the While
+        //  loop in FusedRules::generatePabloMethod).
+        const std::vector<ResolvedItem> items = resolvedItems(c);
+        for (const FusedSubgroup & g : c.subgroups) {
+            if (!g.converted) continue;
+            const SubgroupOutcomes o = subgroupOutcomes(g);
+            if (o.caseMap >= 0) add(o.literalAll);
+            for (unsigned l : o.lengths) {
+                add(mappingLengthChars(o.literal, l));
+                if (o.caseMap >= 0) add(caseMapLengthChars(o.caseMap, l));
+                for (const ResolvedItem & item : items) {
+                    for (unsigned j = 1; j <= std::min(item.depth, l); j++) {
+                        for (int outcome = 0; outcome <= (item.run ? 2 : 1); outcome++) {
+                            add(mappingItemChars(o.literal, item, l, j, outcome));
+                            if (o.caseMap >= 0) add(caseMapItemChars(o.caseMap, item, l, j, outcome));
+                        }
+                    }
+                }
+            }
+        }
     }
     return sets;
 }
+
+//  The Unicode properties of a conversion group's rules, each computed by a
+//  kernel of its own (UnicodePropertyKernelBuilder: named by the property, so
+//  shared, and cached, across transforms), from whose streams the classes of the
+//  fused kernels made of them are computed (PropertyClasses), instead of being
+//  compiled from their characters (see RulePipelineBuilder::conversionGroup,
+//  fusedClasses; --ucd-property-kernels).  Only properties of more than
+//  PropertyMinRanges ranges, at most PropertyMaxCount of them.
+static constexpr size_t PropertyMinRanges = 32;
+static constexpr size_t PropertyMaxCount = 8;
+
+struct GroupProperty {
+    re::PropertyExpression * pe;
+    UCD::UnicodeSet set;
+};
+
+static size_t rangeCount(const UCD::UnicodeSet & set) {
+    return static_cast<size_t>(std::distance(set.begin(), set.end()));
+}
+
+static void collectProperties(re::RE * re, std::vector<GroupProperty> & out, std::set<std::string> & seen) {
+    if (re == nullptr) return;
+    if (re::PropertyExpression * pe = dyn_cast<re::PropertyExpression>(re)) {
+        if (pe->getKind() != re::PropertyExpression::Kind::Codepoint) return;
+        //  (Resolved on a copy, as linking modifies property expressions; see
+        //  ldml::CharSetAnalysis::propertySet.)
+        re::PropertyExpression * const copy = re::makePropertyExpression(pe->getKind(), pe->getPropertyIdentifier(),
+                                                                 pe->getOperator(), pe->getValueString());
+        if (isa<re::Any>(UCD::linkProperties(copy)) || copy->getPropertyCode() < 0) return;
+        UCD::resolveProperties(UCD::standardizeProperties(copy));
+        re::CC * const cc = dyn_cast_or_null<re::CC>(copy->getResolvedRE());
+        if (cc == nullptr || rangeCount(*cc) <= PropertyMinRanges) return;
+        if (seen.insert(copy->getFullName()).second && out.size() < PropertyMaxCount) {
+            out.push_back(GroupProperty{copy, UCD::UnicodeSet(*cc)});
+        }
+    } else if (re::Name * n = dyn_cast<re::Name>(re)) {
+        collectProperties(n->getDefinition(), out, seen);
+    } else if (re::Alt * a = dyn_cast<re::Alt>(re)) {
+        for (re::RE * x : *a) collectProperties(x, out, seen);
+    } else if (re::Seq * s = dyn_cast<re::Seq>(re)) {
+        for (re::RE * x : *s) collectProperties(x, out, seen);
+    } else if (re::Rep * r = dyn_cast<re::Rep>(re)) {
+        collectProperties(r->getRE(), out, seen);
+    } else if (re::Diff * d = dyn_cast<re::Diff>(re)) {
+        collectProperties(d->getLH(), out, seen);
+        collectProperties(d->getRH(), out, seen);
+    } else if (re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+        collectProperties(x->getLH(), out, seen);
+        collectProperties(x->getRH(), out, seen);
+    } else if (re::Assertion * as = dyn_cast<re::Assertion>(re)) {
+        collectProperties(as->getAsserted(), out, seen);
+    } else if (re::Capture * c = dyn_cast<re::Capture>(re)) {
+        collectProperties(c->getCapturedRE(), out, seen);
+    }
+}
+
+//  A class set as the union of cells of the properties (the characters in
+//  exactly the properties of a mask), without the characters of out, with
+//  those of in.
+struct PropertyFormula {
+    std::vector<uint32_t> cells;
+    UCD::UnicodeSet in, out;
+};
+
+//  The cells of the properties: by mask, the non-empty ones.
+static std::vector<std::pair<uint32_t, UCD::UnicodeSet>> propertyCells(const std::vector<GroupProperty> & props) {
+    std::vector<std::pair<uint32_t, UCD::UnicodeSet>> cells{{0, UCD::UnicodeSet(0, 0x10FFFF)}};
+    for (size_t k = 0; k < props.size(); k++) {
+        std::vector<std::pair<uint32_t, UCD::UnicodeSet>> next;
+        for (const auto & c : cells) {
+            const UCD::UnicodeSet inK = c.second & props[k].set, outK = c.second - props[k].set;
+            if (!inK.empty()) next.emplace_back(c.first | (1u << k), inK);
+            if (!outK.empty()) next.emplace_back(c.first, outK);
+        }
+        cells = std::move(next);
+    }
+    return cells;
+}
+
+//  The formula of a set, if the characters it adds and removes have far fewer
+//  ranges than the set: each cell is taken if what it adds beyond the set has
+//  fewer ranges than what it has of the set.
+static bool propertyFormula(const UCD::UnicodeSet & set, const std::vector<std::pair<uint32_t, UCD::UnicodeSet>> & cells,
+                            PropertyFormula & f) {
+    const size_t ranges = rangeCount(set);
+    if (ranges <= PropertyMinRanges) return false;
+    f = PropertyFormula();
+    UCD::UnicodeSet taken;
+    for (const auto & c : cells) {
+        const UCD::UnicodeSet inS = c.second & set;
+        if (inS.empty()) continue;
+        if (rangeCount(c.second - set) < rangeCount(inS)) {
+            f.cells.push_back(c.first);
+            taken = taken + c.second;
+        }
+    }
+    if (f.cells.empty()) return false;
+    f.in = set - taken;
+    f.out = taken - set;
+    return 4 * (rangeCount(f.in) + rangeCount(f.out)) < ranges;
+}
+
+//  The classes given by property formulas: from the streams of the properties
+//  (Props, one stream set of one stream each) and the basis (for the
+//  characters added and removed), within the text.
+class PropertyClasses final : public pablo::PabloKernel {
+public:
+    PropertyClasses(LLVMTypeSystemInterface & ts, std::vector<std::string> names, std::vector<PropertyFormula> formulas,
+                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes, StreamMask mask = StreamMask())
+    : PropertyClasses(ts, signature(names, formulas) + maskSuffix(mask), std::move(formulas), U21, props, classes, mask) {}
+    bool hasSignature() const override { return true; }
+    llvm::StringRef getSignature() const override { return mSignature; }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder entry(getEntryScope());
+        std::vector<Var *> vars;
+        for (size_t i = 0; i < mFormulas.size(); i++) vars.push_back(entry.createVar("class" + std::to_string(i), entry.createZeroes()));
+        //  (Within an If on the mask, with one; see kernel::computeMasked.)
+        std::vector<PabloAST *> out;
+        computeMasked(entry, *this, mHasMask, [&](PabloBuilder & pb) {
+            const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+            cc::Parabix_CC_Compiler_Builder ccc(basis);
+            std::vector<PabloAST *> p;
+            for (size_t k = 0; k < mNumProps; k++) p.push_back(getInputStreamSet("P" + std::to_string(k))[0]);
+            std::map<uint32_t, PabloAST *> cellOf;
+            auto cell = [&](uint32_t mask) {
+                PabloAST *& c = cellOf[mask];
+                if (c) return c;
+                c = pb.createOnes();
+                for (size_t k = 0; k < mNumProps; k++) c = pb.createAnd(c, ((mask >> k) & 1) ? p[k] : pb.createNot(p[k]));
+                return c;
+            };
+            for (const PropertyFormula & f : mFormulas) {
+                PabloAST * u = pb.createZeroes();
+                for (uint32_t mask : f.cells) u = pb.createOr(u, cell(mask));
+                if (!f.out.empty()) u = pb.createAnd(u, pb.createNot(ccc.compileCC(re::makeCC(f.out, &cc::Unicode), pb)));
+                if (!f.in.empty()) u = pb.createOr(u, ccc.compileCC(re::makeCC(f.in, &cc::Unicode), pb));
+                pb.createAssign(vars[out.size()], pb.createInFile(u));
+                out.push_back(vars[out.size()]);
+            }
+        });
+        assignMasked(entry, *this, out, "Classes", mHasMask, mMaskKind);
+    }
+private:
+    PropertyClasses(LLVMTypeSystemInterface & ts, std::string && sig, std::vector<PropertyFormula> && formulas,
+                    StreamSet * U21, const std::vector<StreamSet *> & props, StreamSet * classes, StreamMask mask)
+    : PabloKernel(ts, "PropertyClasses_" + getStringHash(sig) + maskSuffix(mask), [&] {
+          Bindings b{Binding{"U21", U21}};
+          for (size_t k = 0; k < props.size(); k++) b.emplace_back("P" + std::to_string(k), props[k]);
+          addMaskInputs(mask, b);
+          return b;
+      }(), {maskedOutput(mask, "Classes", classes)}),
+      mFormulas(std::move(formulas)), mNumProps(props.size()), mHasMask(mask.mask != nullptr), mMaskKind(mask.kind),
+      mSignature(std::move(sig)) {}
+    static std::string signature(const std::vector<std::string> & names, const std::vector<PropertyFormula> & formulas) {
+        std::string s = "PropertyClasses";
+        for (const std::string & n : names) s += "|" + n;
+        for (const PropertyFormula & f : formulas) {
+            s += "/";
+            for (uint32_t m : f.cells) s += std::to_string(m) + ",";
+            s += "+" + setKey(f.in) + "-" + setKey(f.out);
+        }
+        return s;
+    }
+    const std::vector<PropertyFormula> mFormulas;
+    const size_t mNumProps;
+    const bool mHasMask;
+    const MaskKind mMaskKind;
+    const std::string mSignature;
+};
 
 //  The fused kernel of a chunk of the rules of a conversion group (see above),
 //  given the classes of fusedClassSets in Classes.  Out holds the stream sets
@@ -4048,6 +5055,11 @@ private:
           return v;
       }()),
       mCoverageIn(mConfig.coverage && in.spans != nullptr),
+      mMarksIn([&] {
+          std::set<unsigned> v;
+          for (const auto & k : in.marks) v.insert(k.first);
+          return v;
+      }()),
       mSignature(std::move(sig)) {
         //  Other than a correction kernel, a kernel matches fixed sequences of sets (Advances
         //  only), unless a string rule deletes the run following its text.
@@ -4058,11 +5070,18 @@ private:
             return B;
         };
         unsigned extent = 0;
+        auto yieldExtent = [&](const std::vector<FusedYield> & yields) {
+            for (const FusedYield & y : yields) extent = std::max(extent, beforeLength(y.before) + static_cast<unsigned>(y.text.size()) - 1);
+        };
         for (const FusedStringRule & r : mConfig.strings) {
             if (!r.run.empty()) return;
             extent = std::max(extent, beforeLength(r.before) + static_cast<unsigned>(r.text.size()) - 1);
+            yieldExtent(r.yields);
         }
-        for (const FusedSubgroup & g : mConfig.subgroups) extent = std::max(extent, beforeLength(g.before));
+        for (const FusedSubgroup & g : mConfig.subgroups) {
+            extent = std::max(extent, beforeLength(g.before));
+            yieldExtent(g.yields);
+        }
         if (extent > 0) addAttribute(kernel::LocalCarries(extent));
     }
     static Bindings inputs(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * U21, StreamSet * Classes,
@@ -4087,6 +5106,7 @@ private:
                 if (in.changes[i]) b.emplace_back("ChangesIn" + std::to_string(i), in.changes[i]);
             }
             for (const auto & k : in.insertions) b.emplace_back("InsertIn" + std::to_string(k.first), k.second);
+            for (const auto & k : in.marks) b.emplace_back("MarkIn" + std::to_string(k.first), k.second);
             if (c.coverage && in.spans) {
                 b.emplace_back("SpansIn", in.spans);
                 b.emplace_back("StartsIn", in.starts);
@@ -4102,6 +5122,7 @@ private:
         }
         for (unsigned i = 0; i < l.changePositions; i++) b.emplace_back("Changes" + std::to_string(i), out.changes[i]);
         for (unsigned k : l.insertCounts) b.emplace_back("Insert" + std::to_string(k), out.insertions.at(k));
+        for (unsigned k : l.marks) b.emplace_back("Mark" + std::to_string(k), out.marks.at(k));
         if (c.coverage) {
             b.emplace_back("Spans", out.spans);
             b.emplace_back("Starts", out.starts);
@@ -4124,6 +5145,15 @@ private:
         }
         s += ")";
     }
+    static void appendYields(std::string & s, const std::vector<FusedYield> & yields) {
+        for (const FusedYield & y : yields) {
+            s += "y";
+            for (const UCD::UnicodeSet & t : y.text) appendSet(s, t);
+            appendContext(s, y.before);
+            appendContext(s, y.after);
+            if (y.masked) s += "m";
+        }
+    }
     //  Everything that shapes the generated code (hashed for the kernel name).
     static std::string signature(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * Mask, StreamSet * Allowed,
                                  const FusedState & in) {
@@ -4143,12 +5173,14 @@ private:
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
             if (c.staged) s += "T";
+            if (c.resolve) s += "W";
             for (const FusedRulesConfig::Selection & sel : c.selection) {
                 s += "/" + std::to_string(sel.length) + (sel.selfOverlapping ? "s" : "");
                 for (size_t p : sel.predecessors) s += "." + std::to_string(p);
             }
         }
         if (c.coverage) s += "V";
+        if (c.region) s += "Rg";
         if (Mask) s += "K" + std::to_string(l.maskLookahead);
         if (Allowed) s += "A";
         s += "L" + std::to_string(l.lookahead) + "S";
@@ -4158,8 +5190,10 @@ private:
         s += "/";
         for (const auto & k : in.insertions) s += std::to_string(k.first) + ",";
         if (c.coverage && in.spans) s += "v";
+        for (const auto & k : in.marks) s += "m" + std::to_string(k.first);
         s += "O" + std::to_string(l.changePositions) + "/";
         for (unsigned k : l.insertCounts) s += std::to_string(k) + ",";
+        for (unsigned k : l.marks) s += "M" + std::to_string(k);
         auto source = [&](int match) {
             const FusedMatchSource & src = c.sources[match];
             return "@" + std::to_string(std::find(l.sourceSets.begin(), l.sourceSets.end(), src.streamSet) - l.sourceSets.begin())
@@ -4185,6 +5219,7 @@ private:
             } else {
                 appendContext(s, r.before);
                 appendContext(s, r.after);
+                appendYields(s, r.yields);
             }
             if (r.converted) s += "c";
         }
@@ -4203,8 +5238,10 @@ private:
             } else {
                 appendContext(s, g.before);
                 if (g.afterMatch >= 0) s += "a" + source(g.afterMatch); else appendContext(s, g.after);
+                appendYields(s, g.yields);
             }
             if (g.converted) s += "c";
+            if (g.caseMaps) s += "C";
             for (const ldml::CharMapping & m : g.mappings) {
                 appendSet(s, m.chars);
                 s += ">";
@@ -4221,6 +5258,7 @@ private:
     const std::vector<bool> mChangesIn;
     const std::set<unsigned> mInsertIn;
     const bool mCoverageIn;
+    const std::set<unsigned> mMarksIn;
     const std::string mSignature;
 };
 
@@ -4240,13 +5278,45 @@ void FusedRules::generatePabloMethod() {
         PabloAST * const c = getInputStreamSet("Classes")[f->second];
         return offset ? pb.createLookahead(c, offset) : c;
     };
-    //  The positions past the end of the text at an offset after them, and
-    //  those before the start of the text at an offset before them.
+    //  With regions (see FusedRulesConfig::region): the positions whose region
+    //  extends to the positions at each offset after (or before) them.
+    std::vector<PabloAST *> regionAhead{ones}, regionBehind{ones};
+    auto withinAhead = [&](unsigned offset) {
+        while (regionAhead.size() <= offset) {
+            const unsigned o = regionAhead.size();
+            regionAhead.push_back(pb.createAnd(regionAhead.back(), pb.createLookahead(inText, o)));
+        }
+        return regionAhead[offset];
+    };
+    auto withinBehind = [&](unsigned offset) {
+        while (regionBehind.size() <= offset) {
+            const unsigned d = regionBehind.size();
+            regionBehind.push_back(pb.createAnd(regionBehind.back(), pb.createAdvance(inText, d)));
+        }
+        return regionBehind[offset];
+    };
+    //  The positions past the end of the text (or region) at an offset after
+    //  them, and those before the start of the text (or region) at an offset
+    //  before them.
     auto pastEnd = [&](unsigned offset) {
+        if (mConfig.region) return pb.createInFile(pb.createNot(withinAhead(offset)));
         return pb.createInFile(pb.createNot(pb.createLookahead(inText, offset)));
     };
     auto beforeStart = [&](unsigned offset) {
+        if (mConfig.region) return pb.createInFile(pb.createNot(withinBehind(offset)));
         return pb.createInFile(pb.createNot(pb.createAdvance(ones, offset)));
+    };
+    //  A step back to the previous position, within the region (in a correction
+    //  kernel, where the converted text is walked back: a position outside the
+    //  region is as beyond the start of the text, firstPosition below).
+    auto stepBack = [&](PabloAST * v) {
+        PabloAST * const p = pb.createAdvance(v, 1);
+        return mConfig.region ? pb.createAnd(p, pb.createAdvance(inText, 1)) : p;
+    };
+    //  The positions within the region of the positions of C after those of M
+    //  (as MatchStar(M, C), not past the region).
+    auto regionStar = [&](PabloAST * M, PabloAST * C) {
+        return pb.createMatchStar(M, mConfig.region ? pb.createAnd(C, inText) : C);
     };
     //  The positions at which a before context matches the B items of one of
     //  its alternatives before them, and an after context those of one of its
@@ -4259,6 +5329,7 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k = 0; k < B; k++) {
                 const unsigned d = B - k;
                 PabloAST * item = pb.createAdvance(classAt(0, alt[k].chars), d);
+                if (mConfig.region) item = pb.createAnd(item, withinBehind(d));
                 if (alt[k].boundary) item = pb.createOr(item, beforeStart(d));
                 m = pb.createAnd(m, item);
             }
@@ -4270,6 +5341,7 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k = 0; k < alt.size(); k++) {
                 const unsigned o = afterOffset + k;
                 PabloAST * item = classAt(o, alt[k].chars);
+                if (mConfig.region) item = pb.createAnd(item, withinAhead(o));
                 if (alt[k].boundary) item = pb.createOr(item, pastEnd(o));
                 m = pb.createAnd(m, item);
             }
@@ -4284,6 +5356,22 @@ void FusedRules::generatePabloMethod() {
     };
     PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
     PabloAST * const allowed = mHasAllowed ? getInputStreamSet("Allowed")[0] : mask;
+    //  The positions where none of the earlier rules yielded to matches (with
+    //  its text from the position), or nullptr if there are none.
+    auto notYielded = [&](const std::vector<FusedYield> & yields) -> PabloAST * {
+        if (yields.empty()) return nullptr;
+        PabloAST * earlier = zeroes;
+        for (const FusedYield & y : yields) {
+            const unsigned n = y.text.size();
+            PabloAST * m = contexts(y.before, y.after, n);
+            for (unsigned j = 0; j < n; j++) {
+                m = pb.createAnd(m, classAt(j, y.text[j]));
+                if (mask && y.masked) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
+            }
+            earlier = pb.createOr(earlier, m);
+        }
+        return pb.createNot(earlier);
+    };
 
     //  The matches of the string rules, at their first positions, and the
     //  positions where the rules of the subgroups apply.  In a correction kernel,
@@ -4301,6 +5389,7 @@ void FusedRules::generatePabloMethod() {
             m = pb.createAnd(m, classAt(j, r.text[j]));
             if (mask) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
         }
+        if (PabloAST * const free = notYielded(r.yields)) m = pb.createAnd(m, free);
         starts.push_back(m);
     }
     if (mConfig.selected >= 0) {
@@ -4330,6 +5419,9 @@ void FusedRules::generatePabloMethod() {
         PabloAST * at = g.match >= 0 ? source(g.match)
                         : g.afterMatch >= 0 ? pb.createAnd(source(g.afterMatch), contexts(before, FusedContexts{FusedContext()}, 1))
                         : pb.createAnd(classAt(0, plan.all), contexts(before, g.after, 1));
+        if (g.match < 0) {
+            if (PabloAST * const free = notYielded(g.yields)) at = pb.createAnd(at, free);
+        }
         if (allowed && !mConfig.groupCoverage) at = pb.createAnd(at, allowed);
         ats.push_back(at);
     }
@@ -4351,6 +5443,7 @@ void FusedRules::generatePabloMethod() {
         std::map<unsigned, PabloAST *> insert;
         PabloAST * spans;
         PabloAST * firsts;
+        std::map<unsigned, PabloAST *> marks;    // by case mapping (see CaseMapSplit)
     };
     auto stateIn = [&]() {
         Results res;
@@ -4363,6 +5456,7 @@ void FusedRules::generatePabloMethod() {
         }
         res.spans = mCoverageIn ? getInputStreamSet("SpansIn")[0] : zeroes;
         res.firsts = mCoverageIn ? getInputStreamSet("StartsIn")[0] : zeroes;
+        for (unsigned k : mLayout.marks) res.marks[k] = mMarksIn.count(k) ? getInputStreamSet("MarkIn" + std::to_string(k))[0] : zeroes;
         return res;
     };
     //  The results of the rules applied at the positions given (the first
@@ -4448,6 +5542,12 @@ void FusedRules::generatePabloMethod() {
         for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
             const FusedSubgroupPlan plan(mConfig.subgroups[g]);
             PabloAST * const at = atOf[g];
+            if (plan.caseMap >= 0) {
+                //  The positions of the characters of the case mapping, marked.
+                PabloAST *& m = res.marks[static_cast<unsigned>(plan.caseMap)];
+                if (m == nullptr) m = zeroes;
+                m = pb.createOr(m, plan.literalAll.empty() ? at : pb.createAnd(at, pb.createNot(classAt(0, plan.literalAll))));
+            }
             if (plan.multiplexed) {
                 //  The number of the mapping of the character, and the sets of
                 //  numbers compiled over its bits.
@@ -4638,13 +5738,46 @@ void FusedRules::generatePabloMethod() {
                 if (set.empty()) return zeroes;
                 return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
             };
-            PabloAST * const deleted = pb.createAnd(pb.createNot(anyInsert),
-                                                    pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark))));
+            //  (The positions marked for case mappings: their outcomes those of the
+            //  case mappings, see CaseMapSplit.)
+            PabloAST * marked = zeroes;
+            unsigned markedLength = 0;
+            for (const auto & k : res.marks) {
+                if (k.second == nullptr || k.second == zeroes) continue;
+                marked = pb.createOr(marked, k.second);
+                markedLength = std::max(markedLength, caseMapData(k.first).maxLength);
+            }
+            PabloAST * const unmarked = pb.createNot(marked);
+            //  A slot's membership in a set, at the marked positions as their case mappings give it.
+            auto markedSlot = [&](PabloAST * v, unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                if (marked == zeroes) return v;
+                v = pb.createAnd(v, unmarked);
+                for (const auto & k : res.marks) {
+                    if (k.second && k.second != zeroes && i < caseMapData(k.first).maxLength) {
+                        v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapSlotChars(k.first, i, set, true))));
+                    }
+                }
+                return v;
+            };
+            PabloAST * const deleted = pb.createAnd(unmarked, pb.createAnd(pb.createNot(anyInsert),
+                                                    pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark)))));
             PabloAST * const kept = pb.createInFile(pb.createNot(deleted));
-            std::vector<PabloAST *> length(maxInsert + 2, zeroes);     // length[l]: the converted text has l characters
+            std::vector<PabloAST *> length(std::max(maxInsert + 2, markedLength + 1), zeroes);     // length[l]: the converted text has l characters
             length[1] = pb.createAnd(kept, pb.createNot(anyInsert));
             for (const auto & k : res.insert) length[k.first + 1] = pb.createOr(length[k.first + 1], k.second);
-            PabloAST * const noneKeptBefore = pb.createInFile(pb.createNot(pb.createMatchStar(pb.createAdvance(kept, 1), ones)));
+            if (marked != zeroes) {
+                for (unsigned l = 1; l < length.size(); l++) {
+                    PabloAST * v = pb.createAnd(length[l], unmarked);
+                    for (const auto & k : res.marks) {
+                        if (k.second && k.second != zeroes && l <= caseMapData(k.first).maxLength) {
+                            v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapLengthChars(k.first, l))));
+                        }
+                    }
+                    length[l] = v;
+                }
+            }
+            PabloAST * const noneKeptBefore = mConfig.region ? pb.createInFile(pb.createNot(regionStar(stepBack(kept), ones)))
+                                              : pb.createInFile(pb.createNot(pb.createMatchStar(pb.createAdvance(kept, 1), ones)));
             //  Whether the j-th last character of the converted text up to each
             //  position (j = 1, its last) is in a set (or, before the start of the
             //  text, whether the item holds there), for j = 1 .. depth.
@@ -4654,13 +5787,13 @@ void FusedRules::generatePabloMethod() {
                 const UCD::UnicodeSet inReplaced = item.chars & replaced;
                 auto slotIn = [&](unsigned i) -> PabloAST * {
                     if (i == 0) {
-                        return pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, item.chars)),
-                                           pb.createAnd(changed0, slotClass(0, inReplaced)));
+                        return markedSlot(pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, item.chars)),
+                                                      pb.createAnd(changed0, slotClass(0, inReplaced))), 0, item.chars);
                     }
-                    return slotClass(i, inReplaced);
+                    return markedSlot(slotClass(i, inReplaced), i, item.chars);
                 };
                 auto previous = [&](PabloAST * v) {
-                    PabloAST * p = pb.createAdvance(v, 1);
+                    PabloAST * p = stepBack(v);
                     return item.boundary ? pb.createOr(p, firstPosition) : p;
                 };
                 while (V.size() < depth) {
@@ -4672,7 +5805,7 @@ void FusedRules::generatePabloMethod() {
                         x = pb.createOr(x, pb.createAnd(length[l], v));
                     }
                     //  A deleted position: as the position before it.
-                    PabloAST * carried = pb.createMatchStar(pb.createAnd(pb.createAdvance(x, 1), deleted), deleted);
+                    PabloAST * carried = pb.createMatchStar(pb.createAnd(stepBack(x), deleted), deleted);
                     if (item.boundary) carried = pb.createOr(carried, noneKeptBefore);
                     V.push_back(pb.createOr(x, pb.createAnd(deleted, carried)));
                 }
@@ -4686,10 +5819,10 @@ void FusedRules::generatePabloMethod() {
             auto memberOf = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
                 const UCD::UnicodeSet inReplaced = set & replaced;
                 if (i == 0) {
-                    return pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)),
-                                       pb.createAnd(changed0, slotClass(0, inReplaced)));
+                    return markedSlot(pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)),
+                                                  pb.createAnd(changed0, slotClass(0, inReplaced))), 0, set);
                 }
-                return slotClass(i, inReplaced);
+                return markedSlot(slotClass(i, inReplaced), i, set);
             };
             //  For a possessive repetition of S at depth j, with T beyond it: whether,
             //  going back from the j-th last character of the converted text up to
@@ -4715,7 +5848,7 @@ void FusedRules::generatePabloMethod() {
                     return std::make_pair(found, allS);
                 };
                 auto previous = [&](PabloAST * v) {
-                    PabloAST * p = pb.createAdvance(v, 1);
+                    PabloAST * p = stepBack(v);
                     return T.boundary ? pb.createOr(p, firstPosition) : p;
                 };
                 if (U.empty()) {
@@ -4727,10 +5860,11 @@ void FusedRules::generatePabloMethod() {
                         x = pb.createOr(x, pb.createAnd(length[l], w.first));
                         through = pb.createOr(through, pb.createAnd(length[l], w.second));
                     }
-                    PabloAST * carried = pb.createMatchStar(pb.createAdvance(x, 1), through);
+                    if (mConfig.region) through = pb.createAnd(through, inText);
+                    PabloAST * carried = pb.createMatchStar(stepBack(x), through);
                     if (T.boundary) {
                         PabloAST * const noneBefore = pb.createInFile(pb.createNot(
-                            pb.createMatchStar(pb.createAdvance(pb.createInFile(pb.createNot(through)), 1), ones)));
+                            regionStar(stepBack(pb.createInFile(pb.createNot(through))), ones)));
                         carried = pb.createOr(carried, noneBefore);
                     }
                     U.push_back(pb.createOr(x, pb.createAnd(through, carried)));
@@ -4749,7 +5883,7 @@ void FusedRules::generatePabloMethod() {
                         }
                         y = pb.createOr(y, pb.createAnd(length[l], v));
                     }
-                    PabloAST * carried = pb.createMatchStar(pb.createAnd(pb.createAdvance(y, 1), deleted), deleted);
+                    PabloAST * carried = pb.createMatchStar(pb.createAnd(stepBack(y), deleted), deleted);
                     if (T.boundary) carried = pb.createOr(carried, noneKeptBefore);
                     U.push_back(pb.createOr(y, pb.createAnd(deleted, carried)));
                 }
@@ -4769,10 +5903,10 @@ void FusedRules::generatePabloMethod() {
                         PabloAST * item;
                         bool boundary = alt[k].boundary;
                         if (alt[k].star) {
-                            item = pb.createAdvance(runIn(alt[k].chars, alt[k - 1], d), 1);
+                            item = stepBack(runIn(alt[k].chars, alt[k - 1], d));
                             boundary = alt[k - 1].boundary;
                         } else {
-                            item = pb.createAdvance(lastIn(alt[k], d), 1);
+                            item = stepBack(lastIn(alt[k], d));
                         }
                         if (boundary) item = pb.createOr(item, firstPosition);
                         m = pb.createAnd(m, item);
@@ -4800,6 +5934,22 @@ void FusedRules::generatePabloMethod() {
                 std::map<unsigned, PabloAST *> baseLength;      // l: the position has l characters
                 baseLength[1] = pb.createAnd(inText, pb.createNot(pb.createOr(baseAnyInsert, baseDeleted)));
                 for (const auto & k : base.insert) baseLength[k.first + 1] = k.second;
+                //  (The marked positions, as their case mappings give them; base and
+                //  res have the same marks.)
+                if (marked != zeroes) {
+                    for (unsigned l = 1; l <= markedLength; l++) {
+                        if (!baseLength.count(l)) baseLength[l] = zeroes;
+                    }
+                    for (auto & bl : baseLength) {
+                        PabloAST * v = pb.createAnd(bl.second, unmarked);
+                        for (const auto & k : res.marks) {
+                            if (k.second && k.second != zeroes && bl.first <= caseMapData(k.first).maxLength) {
+                                v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapLengthChars(k.first, bl.first))));
+                            }
+                        }
+                        bl.second = v;
+                    }
+                }
                 auto ownExcluded = [&](const FusedItem & item, unsigned j) -> PabloAST * {
                     lastIn(item, j);
                     const std::vector<PabloAST *> & V = memo[{setKey(item.chars), item.boundary}];
@@ -4890,20 +6040,525 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
             return;
         }
-        //  Round 0: the before contexts matched against the text itself.
-        matchConverted(none, none);
-        settle();
-        //  Each further round: the converted text from the results so far (with the
-        //  texts inserted), and the before contexts matched against it.  (A rule
-        //  whose before context sees the result of another such rule is right after
-        //  as many rounds as such rules precede it in a chain.)
-        for (unsigned round = 1; round <= mConfig.rounds; round++) {
+        if (mConfig.resolve) {
+            //  The before contexts of the converted subgroups resolved by a While
+            //  loop (doc/round-replacement.md §1; the form of doc/ldml-divcode-plan.md
+            //  §10), exact at any chain length.
+            //
+            //  The string matches that apply, and the positions of the subgroups not
+            //  covered by them, as after the rounds: they do not depend on the
+            //  converted text (no string rule is converted).  The candidates of a
+            //  converted subgroup are its positions without its before context.
+            const size_t numGroups = mConfig.subgroups.size();
+            for (unsigned round = 0; round <= mConfig.rounds; round++) {
+                for (size_t g = 0; g < numGroups; g++) {
+                    if (mConfig.subgroups[g].converted) atOf[g] = ats[g];
+                }
+                settle();
+            }
+            std::vector<PabloAST *> cand(numGroups, nullptr), notCand(numGroups, nullptr), atBase = atOf;
+            PabloAST * dep = zeroes;                    // the positions where a converted subgroup may apply
+            for (size_t g = 0; g < numGroups; g++) {
+                if (!mConfig.subgroups[g].converted) continue;
+                cand[g] = atOf[g];
+                notCand[g] = pb.createNot(cand[g]);
+                dep = pb.createOr(dep, cand[g]);
+                atBase[g] = zeroes;
+            }
+            //  (And where an insertion rule may apply.)
+            const size_t numIns = mConfig.insertions.size();
+            std::vector<PabloAST *> notInsAfter(numIns);
+            for (size_t i = 0; i < numIns; i++) {
+                dep = pb.createOr(dep, insAfter[i]);
+                notInsAfter[i] = pb.createNot(insAfter[i]);
+            }
+            //  The base outcome of each position: where no converted subgroup
+            //  applies (the state given, the string rules and the other subgroups),
+            //  its length and its characters.
             Results base = stateIn();
-            addResults(base, firstOf, atOf);
-            Results res = base;
-            addInsertions(res, insAt);
-            matchConverted(res, base);
+            addResults(base, firstOf, atBase);
+            unsigned maxInsert = 0;
+            PabloAST * anyInsert = zeroes;
+            for (const auto & k : base.insert) {
+                maxInsert = std::max(maxInsert, k.first);
+                anyInsert = pb.createOr(anyInsert, k.second);
+            }
+            std::vector<std::vector<PabloAST *>> slot(maxInsert + 1, std::vector<PabloAST *>(21));
+            PabloAST * changed0 = zeroes;
+            for (unsigned b = 0; b < 21; b++) {
+                slot[0][b] = pb.createXor(basis[b], base.changes[0][b]);
+                changed0 = pb.createOr(changed0, base.changes[0][b]);
+            }
+            for (unsigned i = 1; i <= maxInsert; i++) {
+                for (unsigned b = 0; b < 21; b++) {
+                    PabloAST * const c = i < base.changes.size() ? base.changes[i][b] : zeroes;
+                    slot[i][b] = ((DeletionMark >> b) & 1) ? pb.createNot(c) : c;
+                }
+            }
+            std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> slotCompiler(maxInsert + 1);
+            for (unsigned i = 0; i <= maxInsert; i++) slotCompiler[i] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(slot[i]);
+            auto slotClass = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                if (set.empty()) return zeroes;
+                return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
+            };
+            //  (The positions marked for case mappings: their outcomes those of the
+            //  case mappings, see CaseMapSplit.)
+            PabloAST * marked = zeroes;
+            unsigned markedLength = 0;
+            for (const auto & k : base.marks) {
+                if (k.second == nullptr || k.second == zeroes) continue;
+                marked = pb.createOr(marked, k.second);
+                markedLength = std::max(markedLength, caseMapData(k.first).maxLength);
+            }
+            PabloAST * const unmarked = pb.createNot(marked);
+            PabloAST * const baseDeleted = pb.createAnd(pb.createAnd(inText, unmarked), pb.createAnd(pb.createNot(anyInsert),
+                                                        pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark)))));
+            std::vector<PabloAST *> baseLength(std::max(maxInsert + 2, markedLength + 1), zeroes);     // [l]: l characters (l >= 1)
+            baseLength[1] = pb.createAnd(pb.createAnd(inText, pb.createNot(baseDeleted)), pb.createNot(anyInsert));
+            for (const auto & k : base.insert) baseLength[k.first + 1] = pb.createOr(baseLength[k.first + 1], k.second);
+            if (marked != zeroes) {
+                for (unsigned l = 1; l < baseLength.size(); l++) {
+                    PabloAST * v = pb.createAnd(baseLength[l], unmarked);
+                    for (const auto & k : base.marks) {
+                        if (k.second && k.second != zeroes && l <= caseMapData(k.first).maxLength) {
+                            v = pb.createOr(v, pb.createAnd(k.second, classAt(0, caseMapLengthChars(k.first, l))));
+                        }
+                    }
+                    baseLength[l] = v;
+                }
+            }
+            //  Whether slot i of the base outcome is in a set, or not.
+            auto baseIn = [&](unsigned i, const UCD::UnicodeSet & set, bool in) -> PabloAST * {
+                const UCD::UnicodeSet inReplaced = set & replaced;
+                PabloAST * m;
+                if (i == 0) {
+                    m = pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)), pb.createAnd(changed0, slotClass(0, inReplaced)));
+                } else {
+                    m = slotClass(i, inReplaced);
+                }
+                if (marked != zeroes) {
+                    m = pb.createAnd(m, unmarked);
+                    for (const auto & k : base.marks) {
+                        if (k.second && k.second != zeroes && i < caseMapData(k.first).maxLength) {
+                            m = pb.createOr(m, pb.createAnd(k.second, classAt(0, caseMapSlotChars(k.first, i, set, true))));
+                        }
+                    }
+                }
+                return in ? m : pb.createAnd(inText, pb.createNot(m));
+            };
+
+            const std::vector<ResolvedItem> items = resolvedItems(mConfig);
+            std::map<std::string, size_t> itemIndex;
+            for (size_t x = 0; x < items.size(); x++) itemIndex.emplace(items[x].key(), x);
+            PabloAST * const independent = pb.createAnd(inText, pb.createNot(dep));
+            PabloAST * const del0 = pb.createAnd(baseDeleted, independent);
+            //  At the start of the text: an item holds there (K1) or not (K0).
+            auto startOf = [&](const ResolvedItem & item, bool in) {
+                return item.boundary == in ? firstPosition : zeroes;
+            };
+            //  The positions whose base outcome has length l >= j and settles item x
+            //  at distance j as given (see replacementOutcome).
+            std::map<std::tuple<size_t, unsigned, unsigned, int>, PabloAST *> baseMemo;
+            auto baseOutcome = [&](size_t x, unsigned l, unsigned j, int outcome) -> PabloAST * {
+                PabloAST *& memo = baseMemo[std::make_tuple(x, l, j, outcome)];
+                if (memo) return memo;
+                const ResolvedItem & item = items[x];
+                const int top = static_cast<int>(l - j);
+                PabloAST * r;
+                if (!item.run) {
+                    r = outcome == 2 ? zeroes : baseIn(top, item.chars, outcome == 1);
+                } else {
+                    //  Going back from slot top: the first slot not in the set is in
+                    //  the set beyond (1) or not (0), or all are in the set (2).
+                    PabloAST * found[2] = {zeroes, zeroes};
+                    PabloAST * all = ones;
+                    for (int i = top; i >= 0; i--) {
+                        PabloAST * const inT = baseIn(i, item.chars, true);
+                        PabloAST * const first = pb.createAnd(all, pb.createNot(inT));
+                        PabloAST * const inX = baseIn(i, item.beyond, true);
+                        found[1] = pb.createOr(found[1], pb.createAnd(first, inX));
+                        found[0] = pb.createOr(found[0], pb.createAnd(first, pb.createNot(inX)));
+                        all = pb.createAnd(all, inT);
+                    }
+                    r = outcome == 2 ? all : found[outcome];
+                }
+                memo = pb.createAnd(baseLength[l], r);
+                return memo;
+            };
+            //  The positions whose base outcome passes over a run item at distance 1
+            //  (all its characters in the item's set).
+            auto baseThrough = [&](size_t x) -> PabloAST * {
+                PabloAST * t = zeroes;
+                for (unsigned l = 1; l < baseLength.size(); l++) {
+                    if (baseLength[l] != zeroes) t = pb.createOr(t, baseOutcome(x, l, 1, 2));
+                }
+                return t;
+            };
+            //  The value of item x at distance j (known in, or known out) for the
+            //  base outcome, given the items before the position (K, by distance).
+            //  At distance 1, a run item's passing over is left to the caller (the
+            //  positions passed over, through which K is carried).
+            auto baseValue = [&](PabloBuilder & b, size_t x, unsigned j, int in, const std::vector<PabloAST *> & K) -> PabloAST * {
+                PabloAST * y = zeroes;
+                for (unsigned l = 1; l < baseLength.size(); l++) {
+                    if (baseLength[l] == zeroes) continue;
+                    if (l >= j) {
+                        y = b.createOr(y, baseOutcome(x, l, j, in));
+                        if (items[x].run && j > 1) y = b.createOr(y, b.createAnd(baseOutcome(x, l, j, 2), K[0]));
+                    } else {
+                        y = b.createOr(y, b.createAnd(baseLength[l], K[j - l - 1]));
+                    }
+                }
+                return y;
+            };
+
+            //  The state, by item and distance j (1 .. depth): Y[1] and Y[0], the
+            //  positions at which item x at distance j from the next position is
+            //  known to hold, or known not to, given the converted text up to and
+            //  including the position; K[1] and K[0], the same before the position;
+            //  KDel, the positions known to be deleted; and for each run item,
+            //  Thru, the positions known to be passed over (all their characters in
+            //  its set).  Every Var only gains bits: in a While loop, the carries of
+            //  the previous block reach the first iteration only
+            //  (doc/ldml-divcode-plan.md §10).
+            //
+            //  Before the loop, the positions where no converted subgroup applies.
+            //  (The initial values are kept as expressions: an expression over the
+            //  Vars built before the loop would be reused for the same expression
+            //  in its body.)
+            //  With insertion rules, C is the same as Y without the text inserted at
+            //  the position (the converted text up to and including the position's
+            //  character, against which the insertion rules match their before
+            //  contexts, see FusedInsertion); without them, C is Y.
+            struct ItemVars {
+                std::vector<Var *> Y[2], C[2], K[2];      // [0]: known out, [1]: known in
+                Var * Thru = nullptr;
+                PabloAST * thru0 = nullptr;
+            };
+            std::vector<ItemVars> vars(items.size());
+            unsigned varCount = 0;
+            for (size_t x = 0; x < items.size(); x++) {
+                const ResolvedItem & item = items[x];
+                PabloAST * over1 = del0;
+                if (item.run) {
+                    vars[x].thru0 = pb.createAnd(baseThrough(x), independent);
+                    over1 = pb.createOr(del0, vars[x].thru0);
+                    vars[x].Thru = pb.createVar("Thru" + std::to_string(x), vars[x].thru0);
+                }
+                for (int in = 0; in <= 1; in++) {
+                    std::vector<PabloAST *> k;
+                    for (unsigned j = 1; j <= item.depth; j++) {
+                        PabloAST * const y = pb.createAnd(baseValue(pb, x, j, in, k), independent);
+                        k.push_back(pb.createMatchStar(pb.createOr(stepBack(y), startOf(item, in)), j == 1 ? over1 : del0));
+                        const std::string suffix = std::to_string(varCount++);
+                        vars[x].Y[in].push_back(pb.createVar("Y" + suffix, y));
+                        vars[x].C[in].push_back(numIns ? pb.createVar("C" + suffix, y) : vars[x].Y[in].back());
+                        vars[x].K[in].push_back(pb.createVar("K" + suffix, k.back()));
+                    }
+                }
+            }
+            Var * const KDel = pb.createVar("KDel", del0);
+            //  (With regions, the positions whose previous position is in the region:
+            //  the loop steps back only within the region, see stepBack.)
+            PabloAST * const previousInRegion = mConfig.region ? pb.createAdvance(inText, 1) : nullptr;
+            Var * const Progress = pb.createVar("Progress", dep);
+
+            //  Whether a converted subgroup's before context is known to hold at
+            //  each position (in), or known not to (!in), from K[1] and K[0].
+            auto known = [&](PabloBuilder & b, size_t g, bool in) -> PabloAST * {
+                PabloAST * match = in ? zeroes : ones;
+                for (const FusedContext & alt : mConfig.subgroups[g].before) {
+                    PabloAST * m = in ? ones : zeroes;
+                    const unsigned B = static_cast<unsigned>(alt.size());
+                    for (unsigned k = 0; k < B; k++) {
+                        ResolvedItem at;
+                        if (!resolvedItemAt(alt, k, at)) continue;
+                        PabloAST * const v = vars[itemIndex.at(at.key())].K[in][B - k - 1];
+                        m = in ? b.createAnd(m, v) : b.createOr(m, v);
+                    }
+                    match = in ? b.createOr(match, m) : b.createAnd(match, m);
+                }
+                return b.createAnd(cand[g], match);
+            };
+            //  Whether insertion rule i's before context is known to hold (in) or
+            //  known not to (!in), with its after context, from C (by item, polarity
+            //  and distance).
+            auto insKnown = [&](PabloBuilder & b, size_t i, bool in, const std::function<PabloAST *(size_t, int, unsigned)> & C) {
+                PabloAST * match = in ? zeroes : ones;
+                for (const FusedContext & alt : mConfig.insertions[i].before) {
+                    PabloAST * m = in ? ones : zeroes;
+                    const unsigned B = static_cast<unsigned>(alt.size());
+                    for (unsigned k = 0; k < B; k++) {
+                        ResolvedItem at;
+                        if (!resolvedItemAt(alt, k, at)) continue;
+                        PabloAST * const v = C(itemIndex.at(at.key()), in, B - k);
+                        m = in ? b.createAnd(m, v) : b.createOr(m, v);
+                    }
+                    match = in ? b.createOr(match, m) : b.createAnd(match, m);
+                }
+                return in ? b.createAnd(insAfter[i], match) : b.createOr(notInsAfter[i], match);
+            };
+
+            //  The loop.  Each iteration decides the converted subgroups at the
+            //  positions whose items are known, and adds the outcomes to the state:
+            //  of the subgroup that applies, or of the base where none does; or, at a
+            //  position not yet decided, where every possible outcome agrees (so
+            //  only chains of positions whose outcomes differ take iterations).
+            //  It ends when no item becomes known.
+            //  The converted subgroups by their mappings: those with the same
+            //  mappings (differing in their contexts) have the same outcomes, so
+            //  their decisions are combined before the outcomes are (where one of
+            //  them applies; where each does not or has the outcome).
+            std::vector<std::vector<size_t>> classes;
+            {
+                std::map<std::string, size_t> classIndex;
+                for (size_t g = 0; g < numGroups; g++) {
+                    if (!cand[g]) continue;
+                    std::string key = mConfig.subgroups[g].caseMaps ? "C" : "";
+                    for (const ldml::CharMapping & m : mConfig.subgroups[g].mappings) {
+                        key += setKey(m.chars) + ">";
+                        for (char32_t c : m.replacement) key += std::to_string(c) + ",";
+                        key += ";";
+                    }
+                    const auto f = classIndex.emplace(key, classes.size());
+                    if (f.second) classes.emplace_back();
+                    classes[f.first->second].push_back(g);
+                }
+            }
+            const size_t numClasses = classes.size();
+            PabloBuilder wb = pb.createScope();
+            {
+                //  Where a subgroup of each class is known to apply (TC), and where
+                //  every one is known not to or is not a candidate (RC).
+                std::vector<PabloAST *> TC(numClasses), RC(numClasses);
+                for (size_t c = 0; c < numClasses; c++) {
+                    TC[c] = zeroes;
+                    RC[c] = ones;
+                    for (size_t g : classes[c]) {
+                        TC[c] = wb.createOr(TC[c], known(wb, g, true));
+                        RC[c] = wb.createAnd(RC[c], wb.createOr(notCand[g], known(wb, g, false)));
+                    }
+                }
+                //  The positions known to have an outcome: of the subgroup that
+                //  applies, or of all the possible ones (given for each class, and
+                //  for the base).
+                auto settled = [&](const std::vector<PabloAST *> & byClass, PabloAST * base) {
+                    PabloAST * any = zeroes;
+                    PabloAST * all = base;
+                    for (size_t c = 0; c < numClasses; c++) {
+                        any = wb.createOr(any, wb.createAnd(TC[c], byClass[c]));
+                        all = wb.createAnd(all, wb.createOr(RC[c], byClass[c]));
+                    }
+                    return wb.createOr(any, all);
+                };
+                //  The outcomes of each class, of its literal mappings and of its case
+                //  mapping (outside their characters).
+                std::vector<SubgroupOutcomes> outcomesOf;
+                std::vector<PabloAST *> notLiteral;
+                for (size_t c = 0; c < numClasses; c++) {
+                    outcomesOf.push_back(subgroupOutcomes(mConfig.subgroups[classes[c].front()]));
+                    const SubgroupOutcomes & o = outcomesOf.back();
+                    notLiteral.push_back(o.caseMap < 0 ? nullptr : o.literalAll.empty() ? ones : wb.createNot(classAt(0, o.literalAll)));
+                }
+                auto lengthClass = [&](size_t c, unsigned l) -> PabloAST * {
+                    const SubgroupOutcomes & o = outcomesOf[c];
+                    PabloAST * v = classAt(0, mappingLengthChars(o.literal, l));
+                    if (o.caseMap >= 0) v = wb.createOr(v, wb.createAnd(notLiteral[c], classAt(0, caseMapLengthChars(o.caseMap, l))));
+                    return v;
+                };
+                auto itemClass = [&](size_t c, size_t x, unsigned l, unsigned j, int outcome) -> PabloAST * {
+                    const SubgroupOutcomes & o = outcomesOf[c];
+                    PabloAST * v = classAt(0, mappingItemChars(o.literal, items[x], l, j, outcome));
+                    if (o.caseMap >= 0) v = wb.createOr(v, wb.createAnd(notLiteral[c], classAt(0, caseMapItemChars(o.caseMap, items[x], l, j, outcome))));
+                    return v;
+                };
+                //  The positions known to be deleted.
+                std::vector<PabloAST *> cDel(numClasses);
+                for (size_t c = 0; c < numClasses; c++) cDel[c] = classAt(0, mappingLengthChars(outcomesOf[c].literal, 0));
+                PabloAST * const delChar = settled(cDel, baseDeleted);
+                //  The positions known to be passed over by each run item.
+                std::vector<PabloAST *> thru(items.size(), nullptr);
+                for (size_t x = 0; x < items.size(); x++) {
+                    if (!items[x].run) continue;
+                    std::vector<PabloAST *> cThru(numClasses);
+                    for (size_t c = 0; c < numClasses; c++) {
+                        PabloAST * t = zeroes;
+                        for (unsigned l : outcomesOf[c].lengths) {
+                            if (l >= 1) t = wb.createOr(t, itemClass(c, x, l, 1, 2));
+                        }
+                        cThru[c] = t;
+                    }
+                    thru[x] = settled(cThru, baseThrough(x));
+                }
+                //  The outcome of the subgroups of class c for item x at distance j,
+                //  known in (in) or known out (!in).
+                auto outcomeOf = [&](size_t c, size_t x, unsigned j, int in) -> PabloAST * {
+                    const std::vector<Var *> & K = vars[x].K[in];
+                    PabloAST * v = zeroes;
+                    for (unsigned l : outcomesOf[c].lengths) {
+                        PabloAST * w;
+                        if (l >= j) {
+                            w = itemClass(c, x, l, j, in);
+                            if (items[x].run) w = wb.createOr(w, wb.createAnd(itemClass(c, x, l, j, 2), K[0]));
+                        } else {
+                            w = wb.createAnd(lengthClass(c, l), K[j - l - 1]);
+                        }
+                        v = wb.createOr(v, w);
+                    }
+                    return v;
+                };
+                std::vector<std::pair<Var *, PabloAST *>> newY;
+                for (size_t x = 0; x < items.size(); x++) {
+                    for (int in = 0; in <= 1; in++) {
+                        const std::vector<Var *> & K = vars[x].K[in];
+                        const std::vector<PabloAST *> k(K.begin(), K.end());
+                        for (unsigned j = 1; j <= items[x].depth; j++) {
+                            //  The base outcome (a deleted position: the item before it;
+                            //  a run item passing over at distance 1: as before it).
+                            PabloAST * base = wb.createOr(baseValue(wb, x, j, in, k), wb.createAnd(baseDeleted, K[j - 1]));
+                            if (items[x].run && j == 1) base = wb.createOr(base, wb.createAnd(baseThrough(x), K[0]));
+                            std::vector<PabloAST *> byClass(numClasses);
+                            for (size_t c = 0; c < numClasses; c++) byClass[c] = outcomeOf(c, x, j, in);
+                            Var * const C = vars[x].C[in][j - 1];
+                            newY.emplace_back(C, wb.createOr(C, settled(byClass, base)));
+                        }
+                    }
+                }
+                PabloAST * del = delChar;
+                if (numIns) {
+                    //  The insertion rules, decided on the characters' outcomes; then
+                    //  the full outcomes: the text inserted by the rule that applies,
+                    //  after the character's outcome, or the character's outcome where
+                    //  none does; or where every possible one agrees.
+                    std::vector<std::vector<PabloAST *>> newC[2];
+                    for (int in = 0; in <= 1; in++) newC[in].resize(items.size());
+                    {
+                        size_t a = 0;
+                        for (size_t x = 0; x < items.size(); x++) {
+                            for (int in = 0; in <= 1; in++) {
+                                for (unsigned j = 1; j <= items[x].depth; j++) newC[in][x].push_back(newY[a++].second);
+                            }
+                        }
+                    }
+                    for (const auto & c : newY) wb.createAssign(c.first, c.second);
+                    auto cOf = [&](size_t x, int in, unsigned d) {return newC[in][x][d - 1];};
+                    std::vector<PabloAST *> insT(numIns), insF(numIns), applies(numIns);
+                    PabloAST * noneBefore = ones;
+                    for (size_t i = 0; i < numIns; i++) {
+                        insT[i] = insKnown(wb, i, true, cOf);
+                        insF[i] = insKnown(wb, i, false, cOf);
+                        applies[i] = wb.createAnd(insT[i], noneBefore);
+                        noneBefore = wb.createAnd(noneBefore, insF[i]);
+                    }
+                    //  By the texts inserted: where a rule inserting it applies, and
+                    //  where every such rule is known not to.
+                    std::vector<std::u32string> texts;
+                    std::vector<PabloAST *> textApplies, textF;
+                    for (size_t i = 0; i < numIns; i++) {
+                        const std::u32string & t = mConfig.insertions[i].text;
+                        const size_t n = std::find(texts.begin(), texts.end(), t) - texts.begin();
+                        if (n == texts.size()) {
+                            texts.push_back(t);
+                            textApplies.push_back(zeroes);
+                            textF.push_back(ones);
+                        }
+                        textApplies[n] = wb.createOr(textApplies[n], applies[i]);
+                        textF[n] = wb.createAnd(textF[n], insF[i]);
+                    }
+                    //  The value of text n for item x at distance j.
+                    auto insValue = [&](size_t n, size_t x, unsigned j, int in) -> PabloAST * {
+                        const std::u32string & t = texts[n];
+                        const unsigned m = static_cast<unsigned>(t.size());
+                        if (j > m) return newC[in][x][j - m - 1];
+                        const int o = replacementOutcome(t, items[x], j);
+                        return o == 2 ? newC[in][x][0] : (o == in ? ones : zeroes);
+                    };
+                    newY.clear();
+                    for (size_t x = 0; x < items.size(); x++) {
+                        for (int in = 0; in <= 1; in++) {
+                            for (unsigned j = 1; j <= items[x].depth; j++) {
+                                PabloAST * applied = zeroes;
+                                PabloAST * all = newC[in][x][j - 1];
+                                for (size_t n = 0; n < texts.size(); n++) {
+                                    PabloAST * const v = insValue(n, x, j, in);
+                                    applied = wb.createOr(applied, wb.createAnd(textApplies[n], v));
+                                    all = wb.createAnd(all, wb.createOr(textF[n], v));
+                                }
+                                Var * const Y = vars[x].Y[in][j - 1];
+                                newY.emplace_back(Y, wb.createOr(Y, wb.createOr(applied, all)));
+                            }
+                        }
+                    }
+                    //  Deleted, or passed over by a run item: the character's outcome
+                    //  so, and no text inserted (or a text all in the item's set).
+                    del = wb.createAnd(delChar, noneBefore);
+                    for (size_t x = 0; x < items.size(); x++) {
+                        if (!items[x].run) continue;
+                        PabloAST * ok = ones;
+                        for (size_t i = 0; i < numIns; i++) {
+                            const std::u32string & t = mConfig.insertions[i].text;
+                            if (t.empty() || replacementOutcome(t, items[x], 1) != 2) ok = wb.createAnd(ok, insF[i]);
+                        }
+                        thru[x] = wb.createAnd(wb.createOr(thru[x], delChar), ok);
+                    }
+                }
+                del = wb.createOr(KDel, del);
+                wb.createAssign(KDel, del);
+                for (size_t x = 0; x < items.size(); x++) {
+                    if (!items[x].run) continue;
+                    thru[x] = wb.createOr(vars[x].Thru, thru[x]);
+                    wb.createAssign(vars[x].Thru, thru[x]);
+                }
+                for (const auto & a : newY) wb.createAssign(a.first, a.second);
+                //  K[1] and K[0] from the new state, through the deleted positions
+                //  (and those a run item passes over).
+                PabloAST * progress = zeroes;
+                size_t a = 0;
+                for (size_t x = 0; x < items.size(); x++) {
+                    for (int in = 0; in <= 1; in++) {
+                        for (unsigned j = 1; j <= items[x].depth; j++) {
+                            Var * const K = vars[x].K[in][j - 1];
+                            PabloAST * const y = newY[a++].second;
+                            PabloAST * const over = (items[x].run && j == 1) ? wb.createOr(del, thru[x]) : del;
+                            PabloAST * back = wb.createAdvance(y, 1);
+                            if (previousInRegion) back = wb.createAnd(back, previousInRegion);
+                            PabloAST * const src = wb.createOr(wb.createOr(back, startOf(items[x], in)), K);
+                            PabloAST * const kk = wb.createOr(K, wb.createMatchStar(src, over));
+                            progress = wb.createOr(progress, wb.createAnd(kk, wb.createNot(K)));
+                            wb.createAssign(K, kk);
+                        }
+                    }
+                }
+                wb.createAssign(Progress, progress);
+            }
+            pb.createWhile(Progress, wb);
+            //  The converted subgroups apply where their before contexts hold, and
+            //  each insertion rule where its contexts hold and no earlier one's do.
+            for (size_t g = 0; g < numGroups; g++) {
+                if (cand[g]) atOf[g] = known(pb, g, true);
+            }
+            auto finalC = [&](size_t x, int in, unsigned d) -> PabloAST * {return vars[x].C[in][d - 1];};
+            PabloAST * noneBefore = ones;
+            for (size_t i = 0; i < numIns; i++) {
+                insAt[i] = pb.createAnd(insKnown(pb, i, true, finalC), noneBefore);
+                noneBefore = pb.createAnd(noneBefore, insKnown(pb, i, false, finalC));
+            }
+        } else {
+            //  Round 0: the before contexts matched against the text itself.
+            matchConverted(none, none);
             settle();
+            //  Each further round: the converted text from the results so far (with the
+            //  texts inserted), and the before contexts matched against it.  (A rule
+            //  whose before context sees the result of another such rule is right after
+            //  as many rounds as such rules precede it in a chain.)
+            for (unsigned round = 1; round <= mConfig.rounds; round++) {
+                Results base = stateIn();
+                addResults(base, firstOf, atOf);
+                Results res = base;
+                addInsertions(res, insAt);
+                matchConverted(res, base);
+                settle();
+            }
         }
     }
 
@@ -4912,6 +6567,10 @@ void FusedRules::generatePabloMethod() {
     addInsertions(res, insAt);
     for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), res.changes[i]);
     for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
+    for (unsigned k : mLayout.marks) {
+        PabloAST * const m = res.marks.count(k) && res.marks[k] ? res.marks[k] : zeroes;
+        writeOutputStreamSet("Mark" + std::to_string(k), std::vector<PabloAST *>{m});
+    }
     if (mConfig.coverage) {
         writeOutputStreamSet("Spans", std::vector<PabloAST *>{res.spans});
         writeOutputStreamSet("Starts", std::vector<PabloAST *>{res.firsts});
@@ -5181,7 +6840,6 @@ protected:
 //    - DeferredRuns: the runs of the texts of the self-reproducing rules
 //      applied (and of the rules known to write the same block after it),
 //      each written in the positions reserved after its trigger.
-constexpr unsigned DeferredBlockingDepth = 8;
 //  (A copy counts runs of up to 16 characters, which bounds the positions
 //  reserved after each trigger.)
 constexpr unsigned DeferredRunBits = 4;
@@ -5251,7 +6909,7 @@ public:
     DeferredPlan(LLVMTypeSystemInterface & ts, DeferredConfig config, const std::vector<StreamSet *> & Matches, StreamSet * Classes,
                  const std::vector<StreamSet *> & Runs, StreamSet * Mask, StreamSet * Written, StreamSet * Count, StreamSet * Info,
                  StreamSet * Reach, const std::vector<StreamSet *> & Bare = {})
-    : PabloKernel(ts, "DeferredPlan_" + getStringHash(config.signature()),
+    : PabloKernel(ts, "DeferredPlanW_" + getStringHash(config.signature()),
                   [&] {
                       Bindings b;
                       for (size_t i = 0; i < Matches.size(); i++) {
@@ -5319,18 +6977,32 @@ protected:
         //  The triggers whose before contexts may not reach back to a trigger not yet
         //  replaced: the triggers that match a rule, or are not ready themselves
         //  (and may match once ready), block those they may reach.  A trigger
-        //  that is ready and matches no rule stays as it is.  (Through chains of
-        //  up to DeferredBlockingDepth triggers, each blocked by the one before.)
-        auto blockedBy = [&](PabloAST * blocking) {
-            return pb.createMatchStar(pb.createAdvance(deferredTexts(pb, blocking, classes, mConfig.numTails), 1), reach);
+        //  that is ready and matches no rule stays as it is.  Through chains of
+        //  any length, each trigger blocked by the one before: a While loop whose
+        //  frontier is the triggers just blocked, which block in turn.  Its Vars
+        //  only gain bits, and each iteration starts again from all the blocking
+        //  triggers (Sources), so that the loop is exact although its carries from
+        //  the previous block reach its first iteration only (see
+        //  doc/ldml-divcode-plan.md §10).  (The initial values are built on the
+        //  streams, not on the Vars, which an expression in the loop body could
+        //  otherwise be taken for.)
+        auto blockedBy = [&](PabloBuilder & b, PabloAST * blocking) {
+            return b.createMatchStar(b.createAdvance(deferredTexts(b, blocking, classes, mConfig.numTails), 1), reach);
         };
-        PabloAST * blocking = pb.createAnd(triggers, matched);
-        PabloAST * blocked = blockedBy(blocking);
-        for (unsigned j = 0; j < DeferredBlockingDepth; j++) {
-            blocking = pb.createAnd(triggers, pb.createOr(matched, blocked));
-            blocked = blockedBy(blocking);
+        PabloAST * const matchedTriggers = pb.createAnd(triggers, matched);
+        PabloAST * const blocked0 = blockedBy(pb, matchedTriggers);
+        Var * const Blocked = pb.createVar("Blocked", blocked0);
+        Var * const Sources = pb.createVar("Sources", matchedTriggers);
+        Var * const Frontier = pb.createVar("Frontier", pb.createAnd(pb.createAnd(triggers, blocked0), pb.createNot(matched)));
+        {
+            PabloBuilder wb = pb.createScope();
+            PabloAST * const sources = wb.createOr(Sources, Frontier);
+            wb.createAssign(Sources, sources);
+            wb.createAssign(Blocked, wb.createOr(Blocked, blockedBy(wb, sources)));
+            wb.createAssign(Frontier, wb.createAnd(wb.createAnd(triggers, Blocked), wb.createNot(Sources)));
+            pb.createWhile(Frontier, wb);
         }
-        PabloAST * const ready = pb.createAnd(triggers, pb.createNot(blocked));
+        PabloAST * const ready = pb.createAnd(triggers, pb.createNot(Blocked));
         //  The first rule matching at each ready trigger (none, if the length of its
         //  capture is not known).
         PabloAST * taken = pb.createZeroes();
@@ -5850,7 +7522,7 @@ public:
                   }(),
                   {Binding{"Candidates", Candidates}}),
       mSrcIndex(std::move(srcIndex)), mMatchOf(std::move(matchOf)), mTextLengths(std::move(textLengths)),
-      mInterferers(std::move(interferers)), mRuleBits(ruleBits), mMasked(Mask != nullptr) {}
+      mInterferers(std::move(interferers)), mMasked(Mask != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -5877,7 +7549,6 @@ private:
     const std::vector<unsigned> mMatchOf;
     const std::vector<unsigned> mTextLengths;
     const std::vector<std::vector<size_t>> mInterferers;
-    const unsigned mRuleBits;
     const bool mMasked;
 };
 
@@ -6669,7 +8340,7 @@ private:
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
+    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P) {}
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
     StreamSet * applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21);
@@ -6693,24 +8364,45 @@ public:
     //  stages of no kernels (for --kernel-counts: a transform that invokes them
     //  runs them as ICU stages, outside its pipelines).
     void omitICUBuiltIns() {mOmitICUBuiltIns = true;}
+    //  The lines of U21 as regions (see --lines and regionScope): a mask
+    //  of region scope, outside every filter, of the characters other than the
+    //  line feeds, which pass through unchanged.
+    void pushRegions(StreamSet * U21);
+    //  The contexts of the conversion groups that are not line-bound bounded by
+    //  the regions (see RegionScope::bounded): in the fused kernels, and by the
+    //  engine, with the starts and follows of the regions; such a group is not
+    //  applied by DivCode, nor the transforms by their shape groups.
+    void boundRegions() {mBoundRegions = true;}
 private:
     //  Filters.  As in ICU, a filter selects the characters of the text that a
     //  transform may change, once, when the transform is applied: the steps of
     //  the transform then apply only at the positions of these characters (and of
     //  the characters they are replaced by), while contexts match the whole text.
-    //  The positions are given by masks, one for each filter in effect (the
-    //  innermost last, each within the ones before it), which are kept in step
-    //  with the text as positions are inserted and deleted.
+    //  The positions are given by masks (TransformMask, of text scope), one for
+    //  each filter in effect (the innermost last, each within the ones before
+    //  it), which are kept in step with the text as positions are inserted and
+    //  deleted: each stage that inserts or deletes positions returns its
+    //  position map (Staged), and the masks are kept in step by it (inStep)
+    //  where the stage is applied.
     //  Two differences from ICU remain: ICU 74 ignores the global filter of a
     //  transform consisting of a single set of conversion rules (applied here),
     //  and a context added by DisambiguateOrder for a string rule (e.g., the
     //  [^d] of b } [^d] → Z for bd → Y ; b → Z ;) still sees a character
     //  outside the filter that keeps the string rule from applying.
     void pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21);
-    void popFilter() {mMasks.pop_back();}
-    StreamSet * activeMask() const {return mMasks.empty() ? nullptr : mMasks.back();}
-    void spreadMasks(StreamSet * SpreadMask);
-    void filterMasks(StreamSet * keep);
+    void popFilter() {mMasks.pop();}
+    StreamSet * activeMask() const {return mMasks.active();}
+    //  The positions of the regions (the mask of region scope, kept in step), if
+    //  their contexts are bounded (see boundRegions), or nullptr.
+    StreamSet * boundedRegions() const {
+        if (!mBoundRegions || mMasks.empty() || mMasks[0].scope != ContextScope::Region) return nullptr;
+        return mMasks[0].apply;
+    }
+    //  The text of a stage, with the masks kept in step with its positions.
+    StreamSet * inStep(const Staged & s) {
+        mMasks.keepInStep(s.positions);
+        return s.text;
+    }
     //  A context-free, single-character mapping of U21 (no contexts, and no
     //  characters deleted): without an active mask, simply map(U21).  With a
     //  mask, map is applied only to the masked characters, in a stream
@@ -6722,34 +8414,36 @@ private:
     //  to (e.g. the digit-length ranges of Any-Hex/Unicode, or a conversion
     //  group's characters by the length of their replacement); every other
     //  masked character is assumed to map to exactly one character.
-    StreamSet * localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
-                                      const std::function<StreamSet * (StreamSet *)> & map);
+    Staged localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
+                                 const std::function<StreamSet * (StreamSet *)> & map);
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
     StreamSet * normalization(const std::string & name, StreamSet * U21);
-    StreamSet * maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection = nullptr);
-    StreamSet * barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask, bool updateMasks);
-    StreamSet * fcc(StreamSet * U21);
-    StreamSet * fcd(StreamSet * U21);
-    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21);
+    Staged maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection = nullptr);
+    Staged barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask);
+    Staged fcc(StreamSet * U21, StreamSet * mask = nullptr);
+    Staged fcd(StreamSet * U21);
+    Staged maskedNFC(StreamSet * U21, StreamSet * selected);
+    Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
+    Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged deferredRules(const ldml::TransformStep & step, StreamSet * U21);
+    Staged prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * chainRevisitsGroup(const ldml::TransformStep & step, StreamSet * U21);
-    StreamSet * markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    Staged markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
-    StreamSet * hexJava(StreamSet * U21);
-    StreamSet * hexUnicode(StreamSet * U21);
-    StreamSet * hexC(StreamSet * U21);
-    StreamSet * hexXML(StreamSet * U21);
-    StreamSet * hexXML10(StreamSet * U21);
-    StreamSet * hexPerl(StreamSet * U21);
-    StreamSet * hexDecode(unsigned forms, StreamSet * U21);
-    StreamSet * remove(StreamSet * U21);
+    Staged hexJava(StreamSet * U21);
+    Staged hexUnicode(StreamSet * U21);
+    Staged hexC(StreamSet * U21);
+    Staged hexXML(StreamSet * U21);
+    Staged hexXML10(StreamSet * U21);
+    Staged hexPerl(StreamSet * U21);
+    Staged hexDecode(unsigned forms, StreamSet * U21);
+    Staged remove(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
-    StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
+    Staged maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                              StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text, StreamSet * U21);
@@ -6763,7 +8457,7 @@ private:
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
     NFD_PipelineBuilder mNFD;
-    std::vector<StreamSet *> mMasks;
+    TransformMasks mMasks;
     //  The positions following a run deleted by the prefix runs of the step
     //  before (if they only delete), for the blocking marks of the rules of
     //  this step (see ldml::DeletedRunBlockMark); and those of this step's
@@ -6773,17 +8467,22 @@ private:
     //  Likewise the characters followed by such a run (at the end of the text too).
     StreamSet * mDeletedRunAfter = nullptr;
     StreamSet * mNextDeletedRunAfter = nullptr;
-    //  Whether the transform applied is a single conversion group with its own
-    //  filter (or one where it is invoked), whose insertions the filter does
-    //  not restrict (see insertionGroup), and whether the transform about to be
-    //  applied is invoked with a filter.
-    bool mInsertAnywhere = false;
+    //  Whether the transform about to be applied is invoked with a filter.
     bool mInvokedWithFilter = false;
     unsigned mDepth = 0;
     std::vector<GroupCount> mGroupCounts;
     bool mOmitICUBuiltIns = false;
-    //  The letters of the front-letter revisits being applied (see frontLettersBegin).
+    //  The transform being applied, and its conversion group being applied
+    //  (numbered from 1, as by --divcode-report), for the names of kernels.
+    std::string mTransformLabel = "rules";
+    std::string mGroupLabel = "rulesG0";
+    //  The letters of the front-letter revisits being applied (see frontLettersBegin),
+    //  and the mask of the positions other than their placeholders.
     std::pair<char32_t, char32_t> mFrontLetters;
+    StreamSet * mFrontLetterMask = nullptr;
+    bool mBoundRegions = false;
+    //  The starts and follows of the regions (see RegionEdges), by the regions' stream.
+    std::map<StreamSet *, std::pair<StreamSet *, StreamSet *>> mRegionEdges;
 };
 
 //  The rules of a conversion group, of all kinds.
@@ -6807,36 +8506,21 @@ static const ldml::TransformPlan & finalSigmaPlan() {
     return plan;
 }
 
+void RulePipelineBuilder::pushRegions(StreamSet * U21) {
+    assert (mMasks.empty());
+    StreamSet * const lines = classes({UCD::UnicodeSet(0, 0x10FFFF) - UCD::UnicodeSet(0x0A)}, U21);
+    mMasks.push(lines, ContextScope::Region);
+}
+
 void RulePipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21) {
     PipelineBuilder & P = mP;
     StreamSet * mask = classes({filter}, U21);
     if (StreamSet * const outer = activeMask()) mask = combine(mask, outer, false);
     SHOW_STREAM(mask);
-    mMasks.push_back(mask);
+    mMasks.push(mask);
 }
 
-//  The masks after positions are inserted (where the spread mask is 0): each
-//  inserted position has the mask of the character it follows.
-void RulePipelineBuilder::spreadMasks(StreamSet * SpreadMask) {
-    for (StreamSet *& mask : mMasks) {
-        StreamSet * const spread = mP.CreateStreamSet(1);
-        SpreadByMask(mP, SpreadMask, mask, spread);
-        StreamSet * const inherited = mP.CreateStreamSet(1);
-        mP.CreateKernelCall<InheritMask>(SpreadMask, spread, inherited);
-        mask = inherited;
-    }
-}
-
-//  The masks after the positions not in keep are deleted.
-void RulePipelineBuilder::filterMasks(StreamSet * keep) {
-    for (StreamSet *& mask : mMasks) {
-        StreamSet * const filtered = mP.CreateStreamSet(1);
-        FilterByMask(mP, keep, mask, filtered);
-        mask = filtered;
-    }
-}
-
-StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
+Staged RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
                                                        const std::function<StreamSet * (StreamSet *)> & map) {
     StreamSet * const mask = activeMask();
     if (!mask) return map(U21);
@@ -6856,15 +8540,16 @@ StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const st
     //  The placement of the mapped characters among the untouched ones: as
     //  many positions as each masked character's replacement has (lengths),
     //  or one otherwise, inserted after its position (as for a conversion
-    //  group's longer replacements) -- expanding the masks in effect so that
-    //  the (now expanded) active mask spans each full replacement, which is
-    //  exactly the placement needed.
+    //  group's longer replacements) -- the inserted positions inheriting the
+    //  masks, so that the (expanded) active mask spans each full replacement,
+    //  which is exactly the placement needed.
+    PositionMap positions;
     std::vector<unsigned> counts;
-    std::vector<StreamSet *> positions;
+    std::vector<StreamSet *> at;
     for (const auto & l : lengths) {
         if (l.first == 1) continue;
         counts.push_back(l.first - 1);
-        positions.push_back(combine(classes({l.second}, U21), mask, false));
+        at.push_back(combine(classes({l.second}, U21), mask, false));
     }
     StreamSet * placement = mask;
     if (!counts.empty()) {
@@ -6873,91 +8558,96 @@ StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const st
         unsigned bits = 0;
         while ((maxCount >> bits) != 0) bits++;
         StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
-        P.CreateKernelCall<InsertionCounts>(counts, positions, InsertBixNum);
+        P.CreateKernelCall<InsertionCounts>(counts, at, InsertBixNum);
         SHOW_BIXNUM(InsertBixNum);
         StreamSet * const SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
-        spreadMasks(SpreadMask);
-        placement = activeMask();
+        positions.insert(SpreadMask);
+        placement = mMasks.mapped(mask, positions);
     }
     SHOW_STREAM(placement);
     StreamSet * const Merged = P.CreateStreamSet(21);
     MergeByMask(P, placement, Mapped, NonSelected, Merged);
     SHOW_BIXNUM(Merged);
-    return Merged;
+    return Staged(Merged, std::move(positions));
 }
 
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null" || (mOmitICUBuiltIns && isICUBuiltIn(name))) return U21;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
-        return activeMask() ? maskedNormalization(name, U21) : normalization(name, U21);
+        return activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
     }
-    if (name == "Any-FCD") return fcd(U21);
+    if (name == "Any-FCD") return inStep(fcd(U21));
     if (name == "Any-Lower" || name == "Any-Upper") {
         //  Full lowercasing: the Final_Sigma context of Σ, then the lc mapping.
         if (name == "Any-Lower") {
             for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
-                U21 = conversionGroup(step, U21);
+                U21 = inStep(conversionGroup(step, U21));
             }
         }
         const UCD::property_t prop = name == "Any-Lower" ? UCD::lc : UCD::uc;
-        if (StreamSet * const mask = activeMask()) return maskedStringOverrides({{prop, mask}}, U21);
+        if (StreamSet * const mask = activeMask()) return inStep(maskedStringOverrides({{prop, mask}}, U21));
         return U21_StringOverridePipeline(P, prop, U21);
     }
     if (name == "Any-Title") return titlecase(U21);
-    if (name == "Any-Hex") return hexJava(U21);
-    if (name == "Any-Hex/Java") return hexJava(U21);
-    if (name == "Any-Hex/Unicode") return hexUnicode(U21);
-    if (name == "Any-Hex/C") return hexC(U21);
-    if (name == "Any-Hex/XML") return hexXML(U21);
-    if (name == "Any-Hex/XML10") return hexXML10(U21);
-    if (name == "Any-Hex/Perl") return hexPerl(U21);
-    if (const unsigned forms = hexDecodeForms(name)) return hexDecode(forms, U21);
-    if (name == "Any-Remove") return remove(U21);
+    if (name == "Any-Hex") return inStep(hexJava(U21));
+    if (name == "Any-Hex/Java") return inStep(hexJava(U21));
+    if (name == "Any-Hex/Unicode") return inStep(hexUnicode(U21));
+    if (name == "Any-Hex/C") return inStep(hexC(U21));
+    if (name == "Any-Hex/XML") return inStep(hexXML(U21));
+    if (name == "Any-Hex/XML10") return inStep(hexXML10(U21));
+    if (name == "Any-Hex/Perl") return inStep(hexPerl(U21));
+    if (const unsigned forms = hexDecodeForms(name)) return inStep(hexDecode(forms, U21));
+    if (name == "Any-Remove") return inStep(remove(U21));
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
 //  Hex-Any (and its variants): the escapes decoded (within the filter, if any),
-//  with the masks kept in step with the positions deleted.
-StreamSet * RulePipelineBuilder::hexDecode(unsigned forms, StreamSet * U21) {
+//  with the positions deleted.
+Staged RulePipelineBuilder::hexDecode(unsigned forms, StreamSet * U21) {
     PipelineBuilder & P = mP;
     std::vector<StreamSet *> keeps;
     StreamSet * const decoded = P.CreateStreamSet(21, 1);
     HexAnyPipeline(P, forms, U21, activeMask(), decoded, keeps);
-    for (StreamSet * keep : keeps) filterMasks(keep);
+    PositionMap positions;
+    for (StreamSet * keep : keeps) positions.remove(keep);
     SHOW_BIXNUM(decoded);
-    return decoded;
+    return Staged(decoded, std::move(positions));
 }
 
-//  Any-Remove: the characters within the filter deleted, with the masks kept in
-//  step; without a filter, every character (an empty text).
-StreamSet * RulePipelineBuilder::remove(StreamSet * U21) {
+//  Any-Remove: the characters within the filter deleted; without a filter,
+//  every character (an empty text).
+Staged RulePipelineBuilder::remove(StreamSet * U21) {
     PipelineBuilder & P = mP;
     StreamSet * const mask = activeMask();
     if (!mask) return P.CreateEmptyStreamSet(21, 1);
-    StreamSet * const keep = P.CreateStreamSet(1);
-    Invert(P, mask, keep);
+    StreamSet * const keep = mMasks.complement(mask);
     StreamSet * const kept = P.CreateStreamSet(21, 1);
     FilterByMask(P, keep, U21, kept);
-    filterMasks(keep);
+    PositionMap positions;
+    positions.remove(keep);
     SHOW_BIXNUM(kept);
-    return kept;
+    return Staged(kept, std::move(positions));
 }
 
 StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    if (name == "Any-NFD") return mNFD.NFD_U21_Pipeline(U21);
-    if (name == "Any-NFKD") return mNFD.NFKD_U21_Pipeline(U21);
-    if (name == "Any-FCC") return fcc(U21);
-    if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
+    const bool focus = NormalizationFocusOptions().Focus;
+    if (name == "Any-NFD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFD, U21, nullptr, nullptr, focus);
+    if (name == "Any-NFKD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
+    if (name == "Any-FCC") return fcc(U21).text;
+    if (name == "Any-NFKC") U21 = mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
+    if (U21NFC) return NFC_U21(P, U21);
     StreamSet * const basis = UTF8_Of(P, U21);
     StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
     return U21_Of(P, BasisOf(P, composed));
 }
 
 //  A normalization within a filter.  As in ICU, each run of the characters of
-//  the filter is normalized by itself: the characters outside it are replaced by
+//  the filter is normalized by itself, by the masked kernels (NFD_U21, NFC_U21,
+//  see maskedNFC and fcc).  With --masked-normalization=0 (barrierNormalization),
+//  the characters outside it are replaced by
 //  the barrier codepoint, which is neither reordered nor composed, so that no
 //  character moves or composes across them; after the normalization, which keeps
 //  the barriers in order, they are replaced by the characters again.  The
@@ -6966,15 +8656,53 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
 //  it).  The characters of the normalized runs are all within the filter.
 //  With a selection, the characters normalized are those of the selection
 //  (within the active mask, if any) rather than of the active mask.
-StreamSet * RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection) {
+Staged RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection) {
     StreamSet * const selected = selection ? combine(selection, activeMask(), false) : activeMask();
-    return barrierNormalization(name, U21, selected, true);
+    //  NFD and NFKD by the masked pipeline (--masked-normalization): each run of
+    //  the selected characters decomposed and ordered by itself, the others
+    //  unchanged (as barriers); the positions inserted for the decompositions
+    //  belong to the runs of the characters they follow.
+    if (MaskedNormalization && (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFKC")) {
+        StreamSet * SpreadMask = nullptr;
+        const auto form = name == "Any-NFD" ? UCD::DecompositionOptions::NFD : UCD::DecompositionOptions::NFKD;
+        StreamSet * const Result = mNFD.NFD_U21(form, U21, selected, nullptr, NormalizationFocusOptions().Focus, &SpreadMask);
+        if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
+        PositionMap positions;
+        if (SpreadMask) positions.insert(SpreadMask);
+        if (name != "Any-NFKC") return Staged(Result, std::move(positions));
+        //  NFKC: the masked NFC of the masked NFKD, with the selection in step.
+        if (U21NFC) {
+            Staged composed = maskedNFC(Result, mMasks.mapped(selected, positions));
+            positions.append(composed.positions);
+            return Staged(composed.text, std::move(positions));
+        }
+    }
+    //  (NFC and FCC on the 21-bit basis within the selection.)
+    if (MaskedNormalization && U21NFC) {
+        if (name == "Any-NFC") return maskedNFC(U21, selected);
+        if (name == "Any-FCC") return fcc(U21, selected);
+    }
+    return barrierNormalization(name, U21, selected);
+}
+
+//  NFC within the selected characters (each run by itself, see NFC_U21): as a
+//  position map, the selected characters deleted and the composed ones
+//  (OutMask) inserted between the others, within the masks (as barrierNormalization).
+Staged RulePipelineBuilder::maskedNFC(StreamSet * U21, StreamSet * selected) {
+    StreamSet * const OutMask = mP.CreateStreamSet(1);
+    StreamSet * const Result = NFC_U21(mP, U21, selected, OutMask);
+    if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
+    PositionMap positions;
+    positions.remove(mMasks.complement(selected));
+    positions.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);
+    return Staged(Result, std::move(positions));
 }
 
 //  The normalization of the characters of mask, the others replaced by barriers
-//  (as is a barrier codepoint in the text), and restored after it; with
-//  updateMasks, the masks of the filters in effect are kept in step.
-StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * selected, bool updateMasks) {
+//  (as is a barrier codepoint in the text), and restored after it.  As a
+//  position map: the characters replaced by barriers deleted, and the
+//  normalized characters inserted between the barriers (where the masks hold).
+Staged RulePipelineBuilder::barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * selected) {
     PipelineBuilder & P = mP;
     StreamSet * const barrierChars = classes({UCD::UnicodeSet(BarrierMark)}, U21);
     StreamSet * const notBarrierChars = P.CreateStreamSet(1);
@@ -6985,10 +8713,8 @@ StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, 
     SHOW_BIXNUM(Work);
     StreamSet * const Normalized = normalization(name, Work);
     StreamSet * const barriers = classes({UCD::UnicodeSet(BarrierMark)}, Normalized);
-    StreamSet * const others = P.CreateStreamSet(1);
-    Invert(P, barriers, others);
-    StreamSet * const unmasked = P.CreateStreamSet(1);
-    Invert(P, mask, unmasked);
+    StreamSet * const others = mMasks.complement(barriers);
+    StreamSet * const unmasked = mMasks.complement(mask);
     //  The characters replaced by barriers, at the positions of the barriers.
     StreamSet * const outside = P.CreateStreamSet(21);
     FilterByMask(P, unmasked, U21, outside);
@@ -7001,32 +8727,28 @@ StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, 
     SHOW_BIXNUM(result);
     //  The masks hold at the normalized characters, and keep their values at
     //  the barriers.
-    if (updateMasks) for (StreamSet *& m : mMasks) {
-        StreamSet * const outer = P.CreateStreamSet(1);
-        FilterByMask(P, unmasked, m, outer);
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, barriers, outer, spread);
-        StreamSet * const combined = P.CreateStreamSet(1);
-        OrCombine(P, spread, others, combined);
-        m = combined;
-    }
-    return result;
+    PositionMap positions;
+    positions.remove(unmasked);
+    positions.insert(barriers, PositionMap::Inserted::In);
+    return Staged(result, std::move(positions));
 }
 
 //  Any-FCD (see FCD_RegionMask): the regions where the text fails the FCD test
 //  are decomposed, as NFD within a mask, the rest is left as it is.  Within a
 //  filter, as in ICU, each run of the filtered characters is taken by itself:
-//  the regions are found with the other characters replaced by the barrier
-//  codepoint (lccc = tccc = 0), and kept within the filter.
-StreamSet * RulePipelineBuilder::fcd(StreamSet * U21) {
+//  the regions are found under the filter's mask (the other characters with
+//  lccc = tccc = 0; with --masked-normalization=0, replaced by the barrier
+//  codepoint), and kept within the filter.
+Staged RulePipelineBuilder::fcd(StreamSet * U21) {
     PipelineBuilder & P = mP;
     StreamSet * text = U21;
-    if (StreamSet * const mask = activeMask()) {
+    StreamSet * const mask = activeMask();
+    if (mask && !MaskedNormalization) {
         text = P.CreateStreamSet(21);
         P.CreateKernelCall<ReplaceUnmasked>(U21, mask, text);
     }
     StreamSet * const Regions = P.CreateStreamSet(1);
-    FCD_RegionMask(P, text, Regions);
+    FCD_RegionMask(P, text, Regions, MaskedNormalization ? mask : nullptr);
     SHOW_STREAM(Regions);
     return maskedNormalization("Any-NFD", U21, Regions);
 }
@@ -7076,19 +8798,44 @@ static unsigned FCC_Passes() {
 //  adjacent to the composite, and is tried in the next pass; where it does not,
 //  it stays next to the starter, and so does nothing after it compose.  As many
 //  passes as nonstarters in a primary composite.
-StreamSet * RulePipelineBuilder::fcc(StreamSet * U21) {
+//  Within a mask (selected characters), each run of it by itself, with the
+//  position map: the decomposition's insertions, then each pass's.
+Staged RulePipelineBuilder::fcc(StreamSet * U21, StreamSet * mask) {
     PipelineBuilder & P = mP;
     auto * cccObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
     const UCD::UnicodeSet starterSet = cccObj->GetCodepointSet(UCD::CCC_ns::NR);
-    StreamSet * text = mNFD.NFD_U21_Pipeline(U21);
+    PositionMap positions;
+    StreamSet * text = nullptr;
+    if (mask) {
+        StreamSet * SpreadMask = nullptr;
+        text = mNFD.NFD_U21(UCD::DecompositionOptions::NFD, U21, mask, nullptr, NormalizationFocusOptions().Focus, &SpreadMask);
+        if (SpreadMask) {
+            positions.insert(SpreadMask);
+            mask = mMasks.mapped(mask, positions);
+        }
+    } else {
+        text = mNFD.NFD_U21(UCD::DecompositionOptions::NFD, U21, nullptr, nullptr, NormalizationFocusOptions().Focus);
+    }
     static const unsigned passes = FCC_Passes();
     for (unsigned i = 0; i < passes; i++) {
         StreamSet * const starters = classes({starterSet}, text);
-        StreamSet * const visible = P.CreateStreamSet(1);
+        StreamSet * visible = P.CreateStreamSet(1);
         P.CreateKernelCall<FCC_Window>(starters, visible);
-        text = barrierNormalization("Any-NFC", text, visible, false);
+        if (mask) visible = combine(visible, mask, false);
+        if (!U21NFC) {
+            text = barrierNormalization("Any-NFC", text, visible).text;
+            continue;
+        }
+        if (mask) {
+            Staged pass = maskedNFC(text, visible);
+            mask = mMasks.mapped(mask, pass.positions);
+            positions.append(pass.positions);
+            text = pass.text;
+        } else {
+            text = NFC_U21(P, text, visible);
+        }
     }
-    return text;
+    return Staged(text, std::move(positions));
 }
 
 //  Unicode titlecasing (see TitlecasePositions), with the word boundaries of
@@ -7098,7 +8845,7 @@ StreamSet * RulePipelineBuilder::fcc(StreamSet * U21) {
 StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
     PipelineBuilder & P = mP;
     for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
-        U21 = conversionGroup(step, U21);
+        U21 = inStep(conversionGroup(step, U21));
     }
     StreamSet * const boundaries = wordBoundaries(U21);
     UCD::BinaryPropertyObject * const casedObj = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(UCD::Cased));
@@ -7111,16 +8858,16 @@ StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
     SHOW_STREAM(lower);
     //  Within a filter, the words are those of the whole text.
     if (StreamSet * const mask = activeMask()) {
-        return maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21);
+        return inStep(maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21));
     }
-    return maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21);
+    return inStep(maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21));
 }
 
 //  Any-Hex/Java: each character encoded as UTF-16 code units, then
 //  each unit expressed as \u followed by 4 hexadecimal digits (JavaHexPipeline) --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexJava(StreamSet * U21) {
+Staged RulePipelineBuilder::hexJava(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
         {12, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // a surrogate pair: 2 \uXXXX
@@ -7138,7 +8885,7 @@ StreamSet * RulePipelineBuilder::hexJava(StreamSet * U21) {
 //  hexadecimal, of 4, 5 or 6 digits by its magnitude (UnicodeHexPipeline) --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
+Staged RulePipelineBuilder::hexUnicode(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // U+ and 4 digits
         {7, UCD::UnicodeSet(0x10000, 0xFFFFF)},     // U+ and 5 digits
@@ -7157,7 +8904,7 @@ StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
 //  each supplementary plane character as \Uxxxxxxxx (UnicodeHexPipeline) --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexC(StreamSet * U21) {
+Staged RulePipelineBuilder::hexC(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
         {10, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // \U and 8 digits
@@ -7175,7 +8922,7 @@ StreamSet * RulePipelineBuilder::hexC(StreamSet * U21) {
 //  where leading zeroes are deleted from <hexdigit>s, except for the last --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
+Staged RulePipelineBuilder::hexXML(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {5, UCD::UnicodeSet(0x0, 0xF)},            // &#x and 1 digit and ;
         {6, UCD::UnicodeSet(0x10, 0xFF)},          // &#x and 2 digits and ;
@@ -7197,7 +8944,7 @@ StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
 //  of its codepoint, without leading zeroes (XMLDecimalPipeline) -- a
 //  context-free, single-character mapping, so within a mask only the masked
 //  characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexXML10(StreamSet * U21) {
+Staged RulePipelineBuilder::hexXML10(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {4, UCD::UnicodeSet(0, 9)},                 // &# and 1 digit and ;
         {5, UCD::UnicodeSet(10, 99)},               // &# and 2 digits and ;
@@ -7220,7 +8967,7 @@ StreamSet * RulePipelineBuilder::hexXML10(StreamSet * U21) {
 //  where leading zeroes are deleted from <hexdigit>s, except for the last --
 //  a context-free, single-character mapping, so within a mask only the
 //  masked characters need be converted (localCharacterMapping).
-StreamSet * RulePipelineBuilder::hexPerl(StreamSet * U21) {
+Staged RulePipelineBuilder::hexPerl(StreamSet * U21) {
     static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
         {5, UCD::UnicodeSet(0x0, 0xF)},            // \x{ and 1 digit and }
         {6, UCD::UnicodeSet(0x10, 0xFF)},          // \x{ and 2 digits and }
@@ -7253,7 +9000,7 @@ StreamSet * RulePipelineBuilder::wordBoundaries(StreamSet * U21) {
 //  U21_StringOverridePipeline: positions are inserted after the characters
 //  mapped to longer strings, and the bits of each position of the replacements
 //  are changed (the first) or set (the further ones).
-StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides,
+Staged RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides,
                                                        StreamSet * U21) {
     PipelineBuilder & P = mP;
     struct Override {
@@ -7286,6 +9033,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         ZeroByMask(P, mask, streams, result);
         return result;
     };
+    PositionMap positions;
     if (insertionBits > 0) {
         StreamSet * InsertBixNum = nullptr;
         for (const Override & v : all) {
@@ -7299,7 +9047,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         StreamSet * const Expanded = P.CreateStreamSet(21, 1);
         SpreadByMask(P, SpreadMask, U21, Expanded);
         U21 = Expanded;
-        spreadMasks(SpreadMask);
+        positions.insert(SpreadMask);
         for (Override & v : all) {
             StreamSet * const spread = P.CreateStreamSet(1);
             SpreadByMask(P, SpreadMask, v.mask, spread);
@@ -7325,7 +9073,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         }
         result = next;
     }
-    return result;
+    return Staged(result, std::move(positions));
 }
 
 //  The options of tconv's uses of the regular expression engine: without
@@ -7346,7 +9094,7 @@ static re::RE * possessiveBefore(re::RE * engineBefore) {
 
 //  The name of the positions outside the global filter (see
 //  ldml::FilterRunEndMark) in the patterns of the engine: an external of the
-//  engine, the positions outside the active mask.
+//  engine, the run ends of the active mask (TransformMasks::runEnds).
 static const std::string FilterRunEndName = "tconvFilterRunEnd";
 static const std::string DeletedRunEndName = "tconvDeletedRunEnd";
 static const std::string NotDeletedRunEndName = "tconvNotDeletedRunEnd";
@@ -7469,10 +9217,19 @@ StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * 
 //  filter (the active mask) as FilterRunEndName, if the pattern refers to them.
 RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pattern) {
     RE_context context{&cc::Unicode, U21};
-    if (StreamSet * const mask = activeMask(); mask && usesExternal(pattern, FilterRunEndName)) {
-        StreamSet * const outside = mP.CreateStreamSet(1);
-        Invert(mP, mask, outside);
-        context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, outside});
+    //  (Matches, contexts and anchors within the regions, with bounded regions.)
+    if (StreamSet * const regions = boundedRegions()) {
+        auto & edges = mRegionEdges[regions];
+        if (edges.first == nullptr) {
+            edges.first = mP.CreateStreamSet(1);
+            edges.second = mP.CreateStreamSet(1);
+            mP.CreateKernelCall<RegionEdges>(regions, edges.first, edges.second);
+        }
+        context.matchStarts = edges.first;
+        context.matchFollows = edges.second;
+    }
+    if (StreamSet * const ends = mMasks.runEnds(); ends && usesExternal(pattern, FilterRunEndName)) {
+        context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ends});
     }
     const bool deleted = usesExternal(pattern, DeletedRunEndName), notDeleted = usesExternal(pattern, NotDeletedRunEndName);
     if (usesExternal(pattern, DeletedRunAfterName)) {
@@ -7754,12 +9511,13 @@ static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
 //  of sets; the matches of the other rules are given to them by the regular
 //  expression engine.
 //  The positions after which the insertion rules of a group may insert, within
-//  filters (see insertionGroup), or nullptr (everywhere).
+//  filters (see insertionGroup and TransformMask::insertBefore), or nullptr
+//  (everywhere).
 StreamSet * RulePipelineBuilder::insertionsEligible() {
-    const size_t restricting = mMasks.size() - (mInsertAnywhere && !mMasks.empty() ? 1 : 0);
-    if (restricting == 0) return nullptr;
+    StreamSet * const mask = mMasks.insertionMask();
+    if (mask == nullptr) return nullptr;
     StreamSet * const eligible = mP.CreateStreamSet(1);
-    mP.CreateKernelCall<ShiftBack>(mMasks[restricting - 1], eligible, 1);
+    mP.CreateKernelCall<ShiftBack>(mask, eligible, 1);
     return eligible;
 }
 
@@ -7769,7 +9527,7 @@ StreamSet * RulePipelineBuilder::insertionsEligible() {
 //  and, within a filter, where the next character is in the mask (see below).
 //  The positions are inserted after them (InsertionSpreadMask), and the texts
 //  written there.
-StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     //  Within a filter, ICU applies a compound transform (of several groups) to
     //  each run of the characters of the mask, inserting where the cursor stops
@@ -7807,12 +9565,9 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
     SHOW_STREAM(SpreadMask);
     StreamSet * const Expanded = P.CreateStreamSet(21, 1);
     SpreadByMask(P, SpreadMask, U21, Expanded);
-    spreadMasks(SpreadMask);
-    if (!mMasks.empty()) {
-        StreamSet * const inserted = P.CreateStreamSet(1);
-        Invert(P, SpreadMask, inserted);
-        for (StreamSet *& mask : mMasks) mask = combine(mask, inserted, true);
-    }
+    //  (The text inserted is within the masks.)
+    PositionMap inserted;
+    inserted.insert(SpreadMask, PositionMap::Inserted::In);
     //  The j-th position inserted after a position where rule i applies.
     StreamSet * const At = P.CreateStreamSet(positions.size());
     P.CreateKernelCall<CollectStreams>(positions, At);
@@ -7827,10 +9582,24 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
     StreamSet * const Result = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<InsertedTexts>(texts, shifted, Expanded, Result);
     SHOW_BIXNUM(Result);
-    return Result;
+    return Staged(Result, std::move(inserted));
 }
 
-StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    //  With bounded regions (see boundRegions), the regions of a group whose
+    //  contexts are not line-bound: its fused kernels bound its contexts by them
+    //  (FusedRulesConfig::region), and it is not applied by DivCode.
+    StreamSet * const regions = groupLineBound(step) ? nullptr : boundedRegions();
+    //  (A group without string rules: eligible only with rules whose before
+    //  contexts are matched against the converted text, see planDivCodeGroup.)
+    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter && !regions) {
+        ldml::DivCodeOptions options;
+        options.shift = DivCodeShift;
+        options.convertedBefore = convertedBeforeContext;
+        options.convertedRounds = ConvertedContextRounds;
+        const ldml::DivCodePlan plan = ldml::planDivCodeGroup(step, options);
+        if (divCodeApplies(plan)) return divCodeGroup(plan, U21);
+    }
     if (insertionsOnly(step)) return insertionGroup(step, U21);
     PreparedSearchReplace sr;
     if (!activeMask() && !mDeletedRunEnds && engineSearchReplace(step, &sr)) {
@@ -7851,14 +9620,17 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
         }
         return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
-            std::vector<StreamSet *> outerMasks = std::move(mMasks);
-            mMasks.clear();
-            StreamSet * const Mapped = conversionGroup(step, Selected);
-            mMasks = std::move(outerMasks);
+            //  (On the selected text alone, whose positions are placed by
+            //  localCharacterMapping.)
+            std::vector<TransformMask> outerMasks = mMasks.release();
+            StreamSet * const Mapped = conversionGroup(step, Selected).text;
+            mMasks.restore(std::move(outerMasks));
             return Mapped;
         });
     }
     PipelineBuilder & P = mP;
+    //  The positions inserted and deleted by the group.
+    PositionMap positionMap;
     //  The characters of a set that the group may change: those other than the
     //  deletion mark.
     auto restricted = [&](const UCD::UnicodeSet & chars) {
@@ -7948,14 +9720,44 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                          && convertedContextMatters(convertedBefores[r], outcomes);
     }
     //  The string rules applied only where earlier ones do not match at their
-    //  first positions (see ldml::TransformStep::stringPriority): their matches
-    //  are given to the kernels (see engineFirsts), with their before contexts
-    //  matched against the text as it is.
+    //  first positions (see ldml::TransformStep::stringPriority), with their
+    //  before contexts matched against the text as it is: matched by the fused
+    //  kernels, with the earlier rules (see FusedYield), where the contexts of
+    //  these are fused contexts (--fused-priority); otherwise their matches are
+    //  given to the kernels (see engineFirsts).  Likewise the subgroups.
     auto prioritized = [&](size_t r) {return r < step.stringPriority.size() && !step.stringPriority[r].empty();};
     auto yields = [&](size_t g) {return g < step.subgroupPriority.size() && !step.subgroupPriority[g].empty();};
+    //  An earlier rule as a FusedYield, if its contexts are fused contexts.
+    auto fusedYield = [&](const ldml::ConversionRule * e, FusedYield & y) -> bool {
+        for (size_t r = 0; r < numStringRules; r++) {
+            if (step.stringRules[r].rule != e) continue;
+            const ldml::StringRule & rule = step.stringRules[r];
+            y.text = texts[r];
+            y.masked = true;
+            return !texts[r].empty() && fusedContexts(rule.engineBefore, true, y.before) && fusedContexts(rule.engineAfter, false, y.after);
+        }
+        for (const ldml::CharMapSubgroup & g : step.subgroups) {
+            if (std::find(g.sourceRules.begin(), g.sourceRules.end(), e) == g.sourceRules.end()) continue;
+            const std::vector<ldml::PatternItem> text = ldml::patternItems(e->getSourceSide(ldml::Direction::Forward)->getText());
+            if (text.empty()) return false;
+            y.text = {text.front().chars};
+            return fusedContexts(g.engineBefore, true, y.before) && fusedContexts(g.engineAfter, false, y.after);
+        }
+        return false;
+    };
+    auto fusedYields = [&](const std::vector<const ldml::ConversionRule *> & earlier, std::vector<FusedYield> & ys) -> bool {
+        if (!FusedPriority) return false;
+        ys.clear();
+        for (const ldml::ConversionRule * e : earlier) {
+            ys.emplace_back();
+            if (!fusedYield(e, ys.back())) return false;
+        }
+        return true;
+    };
+    std::vector<std::vector<FusedYield>> stringYields(numStringRules);
     for (size_t r = 0; r < numStringRules; r++) {
         if (prioritized(r)) {
-            fusedMatch[r] = false;
+            fusedMatch[r] = fusedMatch[r] && fusedYields(step.stringPriority[r], stringYields[r]);
             convertible[r] = false;
         }
     }
@@ -8017,11 +9819,38 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         fr.replacement = step.stringRules[r].replacement;
         fr.before = befores[r];
         fr.after = afters[r];
+        if (fusedMatch[r]) fr.yields = stringYields[r];
         return fr;
     };
-    StreamSet * const inText = P.CreateStreamSet(1);
-    P.CreateKernelCall<TextPositions>(U21, inText);
+    //  (With regions, the positions of the regions instead; see FusedRulesConfig::region.)
+    StreamSet * inText = regions;
+    if (inText == nullptr) {
+        inText = P.CreateStreamSet(1);
+        P.CreateKernelCall<TextPositions>(U21, inText);
+    }
     //  The classes of the sets that a fused kernel uses.
+    //  Whether the group applies its case mappings by marks (see CaseMapSplit):
+    //  not with captures, sequential selection, insertion or deferred rules,
+    //  whose positions or texts the marked case mappings would have to follow.
+    const bool caseMapGroup = CaseMapMarks && U21->getNumElements() == 21 && step.captureReplacements.empty()
+                              && !step.sequentialSelection && step.insertions.empty() && step.deferred.empty()
+                              && step.copyCaptures.empty();
+    //  The Unicode properties of the group's rules (see GroupProperty), their
+    //  cells, and their streams (each computed once in the pipeline).
+    std::vector<GroupProperty> groupProps;
+    if (UCDPropertyKernels && U21->getNumElements() == 21) {
+        std::set<std::string> seen;
+        for (const ldml::ConversionRule * r : step.rules) {
+            for (const ldml::RuleSide * side : {r->getLeftSide(), r->getRightSide()}) {
+                if (side == nullptr) continue;
+                collectProperties(side->getBeforeContext(), groupProps, seen);
+                collectProperties(side->getText(), groupProps, seen);
+                collectProperties(side->getAfterContext(), groupProps, seen);
+            }
+        }
+    }
+    const std::vector<std::pair<uint32_t, UCD::UnicodeSet>> groupCells = propertyCells(groupProps);
+    std::vector<StreamSet *> propertyStreams;
     auto fusedClasses = [&](const FusedRulesConfig & config) -> StreamSet * {
         const std::vector<UCD::UnicodeSet> sets = fusedClassSets(config);
         if (sets.empty()) return nullptr;
@@ -8034,9 +9863,25 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 for (const UCD::UnicodeSet & set : plan.mux) muxKeys.insert(setKey(set));
             }
         }
-        std::vector<size_t> rest, mux;
+        std::vector<size_t> rest, mux, byProperties;
         for (size_t i = 0; i < sets.size(); i++) (muxKeys.count(setKey(sets[i])) ? mux : rest).push_back(i);
-        auto kernelOf = [&](const std::vector<size_t> & indices) {
+        //  The classes made of the group's properties (see PropertyFormula), from
+        //  their streams.
+        std::vector<PropertyFormula> formulas;
+        if (!groupProps.empty()) {
+            std::vector<size_t> others;
+            for (size_t i : rest) {
+                PropertyFormula f;
+                if (propertyFormula(sets[i], groupCells, f)) {
+                    byProperties.push_back(i);
+                    formulas.push_back(std::move(f));
+                } else {
+                    others.push_back(i);
+                }
+            }
+            rest = std::move(others);
+        }
+        auto kernelOf = [&](const std::vector<size_t> & indices, bool properties) {
             std::vector<re::CC *> ccs;
             std::vector<unsigned> outside;      // the sets with ldml::FilterRunEndMark
             for (size_t i : indices) {
@@ -8044,30 +9889,53 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 ccs.push_back(re::makeCC(sets[i], &cc::Unicode));
             }
             StreamSet * classes = P.CreateStreamSet(ccs.size());
-            P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+            if (properties) {
+                if (propertyStreams.empty()) {
+                    for (const GroupProperty & gp : groupProps) {
+                        StreamSet * const stream = P.CreateStreamSet(1);
+                        P.CreateKernelCall<UnicodePropertyKernelBuilder>(gp.pe, U21, stream);
+                        propertyStreams.push_back(stream);
+                    }
+                }
+                std::vector<std::string> names;
+                for (const GroupProperty & gp : groupProps) names.push_back(gp.pe->getFullName());
+                P.CreateKernelCall<PropertyClasses>(names, formulas, U21, propertyStreams, classes);
+            } else {
+                P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+            }
             if (!outside.empty()) {
                 //  (Their classes also hold the positions outside the filter.)
                 StreamSet * const marked = P.CreateStreamSet(ccs.size());
-                P.CreateKernelCall<OutsideMask>(classes, mask, outside, marked);
+                P.CreateKernelCall<WithRunEnds>(classes, mMasks.runEnds(), outside, marked);
                 classes = marked;
             }
             std::vector<UCD::UnicodeSet> of;
             for (size_t i : indices) of.push_back(sets[i]);
             return notAfterDeletedRuns(of, classes);
         };
-        if (mux.empty()) return kernelOf(rest);
+        if (mux.empty() && byProperties.empty()) return kernelOf(rest, false);
+        if (mux.empty() && rest.empty()) return kernelOf(byProperties, true);
         std::vector<std::vector<size_t>> parts;
-        if (!rest.empty()) parts.push_back(rest);
+        std::vector<bool> partByProperties;
+        if (!rest.empty()) {
+            parts.push_back(rest);
+            partByProperties.push_back(false);
+        }
+        if (!byProperties.empty()) {
+            parts.push_back(byProperties);
+            partByProperties.push_back(true);
+        }
         const size_t n = std::min<size_t>(MuxClassKernels, mux.size());
         for (size_t k = 0; k < n; k++) {
             std::vector<size_t> part;
             for (size_t j = k * mux.size() / n; j < (k + 1) * mux.size() / n; j++) part.push_back(mux[j]);
             parts.push_back(part);
+            partByProperties.push_back(false);
         }
         std::vector<StreamSet *> in;
         std::vector<std::pair<unsigned, unsigned>> where(sets.size());
         for (size_t p = 0; p < parts.size(); p++) {
-            in.push_back(kernelOf(parts[p]));
+            in.push_back(kernelOf(parts[p], partByProperties[p]));
             for (size_t j = 0; j < parts[p].size(); j++) where[parts[p][j]] = {static_cast<unsigned>(p), static_cast<unsigned>(j)};
         }
         StreamSet * const classes = P.CreateStreamSet(sets.size());
@@ -8163,10 +10031,16 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     };
     std::vector<Move> moves;
     auto applyFused = [&](FusedRulesConfig && config, StreamSet * allowedAt) {
+        if (caseMapGroup) {
+            for (FusedSubgroup & fg : config.subgroups) fg.caseMaps = true;
+        }
+        config.resolve = resolvableByWhile(config);
         const FusedLayout layout(config, state);
+        config.marks = layout.marks;
         FusedState out;
         for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
         for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+        for (unsigned k : layout.marks) out.marks[k] = P.CreateStreamSet(1);
         if (config.coverage) {
             out.spans = P.CreateStreamSet(1);
             out.starts = P.CreateStreamSet(1);
@@ -8175,6 +10049,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             out.starts = state.starts;
         }
         StreamSet * const classes = fusedClasses(config);
+        config.region = regions != nullptr;
         P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowedAt, state, out, nullptr);
         state = out;
     };
@@ -8806,6 +10681,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 matching.startsByLength = byLengthOf;
                 StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
                 const FusedState none;
+                matching.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(matching), U21, classes, inText, mask, nullptr, previous, none, starts);
                 StreamSet * const selected = P.CreateStreamSet(1);
                 P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
@@ -8816,6 +10692,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 FusedState out;
                 for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
                 for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+                applying.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(applying), U21, classes, inText, mask, nullptr, previous, out, nullptr);
                 previous = out;
             }
@@ -8880,6 +10757,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 StreamSet * const matches = P.CreateStreamSet(chunkLengths.size());
                 const FusedState none;
                 StreamSet * const classes = fusedClasses(config);
+                config.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, nullptr, none, none, matches);
                 for (size_t k = 0; k < chunkLengths.size(); k++) {
                     byLength[lengthIndex(chunkLengths[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
@@ -8983,6 +10861,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 StreamSet * const matches = P.CreateStreamSet(chunk.size());
                 const FusedState none;
                 StreamSet * const classes = fusedClasses(config);
+                config.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, nullptr, none, none, matches);
                 for (size_t k = 0; k < chunk.size(); k++) firsts[index[chunk[k]]] = SelectStringMatches::Source{matches, static_cast<unsigned>(k)};
             }
@@ -9098,7 +10977,9 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                         continue;
                     }
                 }
-                if (yields(g) || !fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
+                const bool fusedYielding = !yields(g) || fusedYields(step.subgroupPriority[g], fg.yields);
+                if (!fusedYielding || !fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
+                    fg.yields.clear();
                     fg.before = {FusedContext()};
                     fg.after = {FusedContext()};
                     UCD::UnicodeSet all;
@@ -9165,6 +11046,32 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     }
     std::vector<StreamSet *> changesAt = state.changes;
     std::map<unsigned, StreamSet *> inserting = state.insertions;
+    //  The case mappings at the positions marked for them (see CaseMapSplit),
+    //  applied with the group's own changes: the positions their values insert
+    //  after the character, and their changes at each index of the values, from
+    //  classes of the case mapping (shared by every transform), at the marked
+    //  positions.
+    //  (Each a class kernel with the marks as its mask: Zeroing, or with the
+    //  group's streams as the base it modifies in place, PassThru; the group
+    //  writes nothing at the marked positions.)
+    for (const auto & m : state.marks) {
+        const unsigned p = m.first;
+        auto maskedClasses = [&](const std::vector<UCD::UnicodeSet> & sets, StreamSet * base) {
+            std::vector<re::CC *> ccs;
+            for (const UCD::UnicodeSet & set : sets) ccs.push_back(re::makeCC(set, &cc::Unicode));
+            StreamSet * const result = P.CreateStreamSet(ccs.size());
+            const StreamMask mask{m.second, base ? MaskKind::PassThru : MaskKind::Zeroing, base};
+            P.CreateKernelCall<CharClassesKernel>(ccs, U21, mask, result);
+            return result;
+        };
+        const unsigned maxLength = caseMapData(p).maxLength;
+        for (unsigned l = 2; l <= maxLength; l++) {
+            StreamSet * const base = inserting.count(l - 1) ? inserting[l - 1] : nullptr;
+            inserting[l - 1] = maskedClasses({caseMapLengthChars(p, l)}, base);
+        }
+        if (changesAt.size() < maxLength) changesAt.resize(maxLength, nullptr);
+        for (unsigned i = 0; i < maxLength; i++) changesAt[i] = maskedClasses(caseMapChangeSets(p, i), changesAt[i]);
+    }
 
     //  Phase 3.  The positions inserted, and the changes applied.
     StreamSet * result = U21;
@@ -9192,7 +11099,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         P.CreateKernelCall<FillInsertedPositions>(SpreadMask, Expanded, Marked);
         SHOW_BIXNUM(Marked);
         result = Marked;
-        spreadMasks(SpreadMask);
+        positionMap.insert(SpreadMask);
         for (Swap & sw : swaps) {
             StreamSet * const spread = P.CreateStreamSet(1);
             SpreadByMask(P, SpreadMask, sw.marks, spread);
@@ -9234,7 +11141,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * const filtered = P.CreateStreamSet(21);
         FilterByMask(P, keep, result, filtered);
         result = filtered;
-        filterMasks(keep);
+        positionMap.remove(keep);
         for (Swap & sw : swaps) {
             StreamSet * const marks = P.CreateStreamSet(1);
             FilterByMask(P, keep, sw.marks, marks);
@@ -9324,8 +11231,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * const merged = P.CreateStreamSet(21);
         MergeByMask(P, inserted, extracted, rest, merged);
         result = merged;
-        filterMasks(keepRest);
-        spreadMasks(SpreadMask);
+        positionMap.remove(keepRest);
+        positionMap.insert(SpreadMask);
         for (size_t later = m + 1; later < moves.size(); later++) {
             for (StreamSet ** mk : {&moves[later].startI, &moves[later].startJ, &moves[later].endJ}) {
                 StreamSet * const filtered = P.CreateStreamSet(1);
@@ -9336,7 +11243,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
         }
     }
-    return result;
+    return Staged(result, std::move(positionMap));
 }
 
 //  The choice of plans for the segments of a transform (see
@@ -9456,8 +11363,18 @@ static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap &
                 outcomes = conversionOutcomes(step);
                 outcomesKnown = true;
             }
+            //  (The end of a run of a global filter, ldml::FilterRunEndMark, is
+            //  the class of the positions outside the mask in Unicode mode only.)
+            auto marksRunEnd = [](const FusedContexts & alts) {
+                for (const FusedContext & alt : alts) {
+                    for (const FusedItem & item : alt) if (ldml::marksFilterRunEnd(item.chars)) return true;
+                }
+                return false;
+            };
             if (!fusedContexts(g.engineBefore, true, before)) {
                 other(true, "single-character rules with before contexts that are not sequences of sets");
+            } else if (marksRunEnd(before) || (fusedContexts(g.engineAfter, false, after) && marksRunEnd(after))) {
+                other(true, "single-character rules with contexts at the end of a filtered run");
             } else if (convertedContextMatters(before, outcomes)) {
                 other(true, "single-character rules with before contexts matched against the converted text");
             } else {
@@ -9522,6 +11439,21 @@ static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml
 
 static bool utf8BuiltIn(const std::string & name);
 
+//  The DivCode plan of a conversion group for its UTF-8 code units (see
+//  ldml::DivCodeOptions::utf8), and the pipeline applying such a plan (see
+//  DivCodeTranslate).
+static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
+    ldml::DivCodeOptions options;
+    options.shift = DivCodeShift;
+    options.convertedBefore = convertedBeforeContext;
+    options.convertedRounds = ConvertedContextRounds;
+    options.utf8 = true;
+    return ldml::planDivCodeGroup(step, options);
+}
+static Staged DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
+                                   StreamSet * Basis, TransformMasks & Masks,
+                                   const std::vector<StreamSet *> & afterStreams = {});
+
 const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEntry * entry) {
     const std::string name = entry->canonicalName;
     auto f = mModes.find(name);
@@ -9542,6 +11474,22 @@ const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEnt
     if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) unicode("ill-formed UTF-8 aborting (--utf8-errors=abort-on-error)");
     mModes.emplace(name, Mode{false, "a transform invoking itself"});     // (while in progress)
     const TransformAnalysis & a = analyze(entry);
+    if (m.utf8) m = modeOf(a);
+    if (m.utf8 && ApplyShapeGroups && shapeChoice(mRegistry, *this, entry).any()) unicode("segments applied by shape groups");
+    mModes[name] = m;
+    return mModes[name];
+}
+
+TransformAnalyzer::Mode TransformAnalyzer::modeOf(const TransformAnalysis & a) {
+    Mode m;
+    m.utf8 = true;
+    auto unicode = [&](const std::string & why) {
+        if (m.utf8) {
+            m.utf8 = false;
+            m.reason = why;
+        }
+    };
+    if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) unicode("ill-formed UTF-8 aborting (--utf8-errors=abort-on-error)");
     if (!a.implementable) unicode("not implemented by tconv's own rules");
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (!m.utf8) break;
@@ -9556,11 +11504,11 @@ const TransformAnalyzer::Mode & TransformAnalyzer::mode(const ldml::TransformEnt
         }
         kernel::UTF8_CharMap map;
         std::string why;
-        if (!utf8CharMap(step, map, why)) unicode("a conversion group with " + why);
+        if (!utf8CharMap(step, map, why) && !(DivCodeGroups && divCodeApplies(utf8DivCodePlan(step)))) {
+            unicode("a conversion group with " + why);
+        }
     }
-    if (m.utf8 && ApplyShapeGroups && shapeChoice(mRegistry, *this, entry).any()) unicode("segments applied by shape groups");
-    mModes[name] = m;
-    return mModes[name];
+    return m;
 }
 
 //  A transform in UTF-8 mode (see TransformAnalyzer::mode) applied to the
@@ -9572,21 +11520,45 @@ class UTF8PipelineBuilder {
 public:
     UTF8PipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                         std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
+    : mMasks(P), mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
+    //  The lines as regions, as in Unicode mode (see RulePipelineBuilder::pushRegions).
+    void pushRegions(StreamSet * Basis) {
+        assert (mMasks.empty());
+        pushFilter(UCD::UnicodeSet(0, 0x10FFFF) - UCD::UnicodeSet(0x0A), Basis);
+        std::vector<StreamSet *> streams = mMasks.applyStreams();
+        mMasks.pop();
+        mMasks.push(streams.back(), ContextScope::Region);
+    }
+    //  The steps of an analysis (of a transform named name, or a rules file).
+    StreamSet * applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis);
 private:
     StreamSet * builtIn(const std::string & name, StreamSet * Basis);
     StreamSet * normalization(const std::string & name, StreamSet * Basis);
-    StreamSet * maskedNormalization(const std::string & name, StreamSet * Basis);
+    Staged maskedNormalization(const std::string & name, StreamSet * Basis);
     StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
     //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
     //  masks of the filters in effect (the innermost last, within the ones
     //  before it), over the bytes of the characters each selects, kept in step
     //  with the text as bytes are deleted and inserted.
     void pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis);
-    void popFilter() {mMasks.pop_back();}
-    std::vector<StreamSet *> * masks() {return mMasks.empty() ? nullptr : &mMasks;}
-    std::vector<StreamSet *> mMasks;
+    void popFilter() {mMasks.pop();}
+    StreamSet * inStep(const Staged & s) {
+        mMasks.keepInStep(s.positions);
+        return s.text;
+    }
+    //  kernel::UTF8_CharMapPipeline within the masks, which it keeps in step
+    //  itself (the bytes inserted after a character have its mask).
+    StreamSet * charMap(const kernel::UTF8_CharMap & map, StreamSet * Basis,
+                        const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * applies = nullptr) {
+        std::vector<StreamSet *> masks = mMasks.applyStreams();
+        StreamSet * const result = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextual, applies, masks.empty() ? nullptr : &masks);
+        mMasks.setApplyStreams(masks);
+        return result;
+    }
+    TransformMasks mMasks;
+    //  The conversion group being applied, for the names of kernels.
+    std::string mGroupLabel;
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count);
     PipelineBuilder & mP;
     const ldml::TransformRegistry & mRegistry;
@@ -9597,15 +11569,20 @@ private:
 
 StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * Basis) {
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, Basis);
+    return applyAnalysis(entry->canonicalName, mAnalyzer.analyze(entry), Basis);
+}
+
+StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis) {
     const bool outermost = mDepth++ == 0;
-    const TransformAnalysis & a = mAnalyzer.analyze(entry);
     if (a.plan.filter) pushFilter(a.plan.filterSet, Basis);
+    size_t group = 0;
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, Basis);
             Basis = transform(mRegistry.lookup(step.transform.getText()), Basis);
             if (step.filter) popFilter();
         } else {
+            mGroupLabel = name + "G" + std::to_string(++group);
             Basis = conversionGroup(step, Basis, outermost);
         }
     }
@@ -9619,12 +11596,17 @@ StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     std::string reason;
     std::vector<const ldml::CharMapSubgroup *> contextual;
     UCD::UnicodeSet contextualChars;
-    if (!utf8CharMap(step, map, reason, &contextual, &contextualChars)) {
-        llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
-    }
     const size_t kernels = mP.getNumOfKernelCalls();
+    if (!utf8CharMap(step, map, reason, &contextual, &contextualChars)) {
+        //  A group with string rules, by its DivCode plan on the UTF-8 code units.
+        const ldml::DivCodePlan plan = utf8DivCodePlan(step);
+        if (!DivCodeGroups || !divCodeApplies(plan)) llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
+        Basis = inStep(DivCodeGroupPipeline(mP, plan, mGroupLabel, Basis, mMasks));
+        if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
+        return Basis;
+    }
     StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(mP, contextual, Basis);
-    Basis = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextualChars, applies, masks());
+    Basis = charMap(map, Basis, contextualChars, applies);
     if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
     return Basis;
 }
@@ -9638,7 +11620,7 @@ static bool utf8BuiltIn(const std::string & name) {
 StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
     if (name == "Any-Null") return Basis;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
-        return mMasks.empty() ? normalization(name, Basis) : maskedNormalization(name, Basis);
+        return mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
     }
     if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " not in UTF-8 mode"));
@@ -9741,17 +11723,45 @@ void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet *
     P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(filter, &cc::Unicode)}, Basis, firsts,
                                           pablo::BitMovementMode::LookAhead);
     StreamSet * const spans = P.CreateStreamSet(1);
-    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.empty() ? nullptr : mMasks.back(), spans);
-    mMasks.push_back(spans);
+    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.active(), spans);
+    mMasks.push(spans);
 }
 
 //  A normalization within a filter, as in Unicode mode (see RulePipelineBuilder::
-//  barrierNormalization): each run of the characters of the filter normalized by
-//  itself, the characters outside it (and any barrier in the text) replaced in
-//  place by the barriers of their lengths, and restored after the normalization,
-//  which keeps the barriers in order; the masks are kept in step.
-StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
+//  maskedNormalization): each run of the characters of the filter normalized by
+//  itself, by the masked kernels; the masks are kept in step.  With
+//  --masked-normalization=0, the characters outside it (and any barrier in the
+//  text) are replaced in place by the barriers of their lengths, and restored
+//  after the normalization, which keeps the barriers in order.
+Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
     PipelineBuilder & P = mP;
+    //  By the masked kernels of the bytes (NFD_Masked, NFC_Masked; focused unless
+    //  -NoFocus): as a position map, the bytes of the filter deleted and those
+    //  normalized (the output mask) inserted.  NFKC is the masked NFKD, then the
+    //  masked NFC of its output mask.
+    if (MaskedNormalization && (name == "Any-NFC" || name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFKC")) {
+        StreamSet * mask = mMasks.active();
+        StreamSet * bytes = BytesOf(P, Basis);
+        PositionMap positions;
+        if (name != "Any-NFC") {
+            NFD_PipelineBuilder NFD_builder(P);
+            const auto form = name == "Any-NFD" ? UCD::DecompositionOptions::NFD : UCD::DecompositionOptions::NFKD;
+            StreamSet * const OutMask = P.CreateStreamSet(1);
+            bytes = NFD_builder.NFD_Masked(form, NormalizationFocusOptions(), bytes, Basis, mask, OutMask);
+            Basis = BasisOf(P, bytes);
+            positions.remove(mMasks.complement(mask));
+            positions.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);
+            if (name != "Any-NFKC") return Staged(Basis, std::move(positions));
+            mask = OutMask;
+        }
+        StreamSet * const OutMask = P.CreateStreamSet(1);
+        bytes = NFC_Masked(P, NormalizationFocusOptions(), bytes, Basis, mask, OutMask);
+        PositionMap composed;
+        composed.remove(mMasks.complement(mask));
+        composed.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);
+        positions.append(composed);
+        return Staged(BasisOf(P, bytes), std::move(positions));
+    }
     UCD::UnicodeSet barrierSet;
     for (UCD::codepoint_t c : UTF8_Barriers) barrierSet.insert(c);
     auto barrierSpans = [&](StreamSet * basis) {
@@ -9765,15 +11775,13 @@ StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, S
     StreamSet * const notBarriers = P.CreateStreamSet(1);
     Invert(P, barrierSpans(Basis), notBarriers);
     StreamSet * const selected = P.CreateStreamSet(1);
-    AndCombine(P, mMasks.back(), notBarriers, selected);
-    StreamSet * const unselected = P.CreateStreamSet(1);
-    Invert(P, selected, unselected);
+    AndCombine(P, mMasks.active(), notBarriers, selected);
+    StreamSet * const unselected = mMasks.complement(selected);
     StreamSet * const Work = P.CreateStreamSet(8);
     P.CreateKernelCall<UTF8_ReplaceUnselected>(Basis, selected, Work);
     StreamSet * const Normalized = normalization(name, Work);
     StreamSet * const barriers = barrierSpans(Normalized);
-    StreamSet * const others = P.CreateStreamSet(1);
-    Invert(P, barriers, others);
+    StreamSet * const others = mMasks.complement(barriers);
     //  The bytes of the characters replaced, at the bytes of the barriers.
     StreamSet * const outside = P.CreateStreamSet(8);
     FilterByMask(P, unselected, Basis, outside);
@@ -9784,17 +11792,11 @@ StreamSet * UTF8PipelineBuilder::maskedNormalization(const std::string & name, S
     StreamSet * const result = P.CreateStreamSet(8);
     OrCombine(P, kept, restored, result);
     //  The masks hold at the normalized characters, and keep their values at
-    //  the barriers.
-    for (StreamSet *& m : mMasks) {
-        StreamSet * const outer = P.CreateStreamSet(1);
-        FilterByMask(P, unselected, m, outer);
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, barriers, outer, spread);
-        StreamSet * const combined = P.CreateStreamSet(1);
-        OrCombine(P, spread, others, combined);
-        m = combined;
-    }
-    return result;
+    //  the barriers (see RulePipelineBuilder::barrierNormalization).
+    PositionMap positions;
+    positions.remove(unselected);
+    positions.insert(barriers, PositionMap::Inserted::In);
+    return Staged(result, std::move(positions));
 }
 
 //  The full case mapping of a string override property (lc or uc): each
@@ -9831,13 +11833,12 @@ StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet
                 for (const ldml::CharMapping & m : g.mappings) {
                     if (m.replacement != std::u32string(1, U'ς')) continue;
                     StreamSet * const applies = utf8Applies(mP, {&g}, Basis);
-                    Basis = kernel::UTF8_CharMapPipeline(mP, {{m.chars, m.replacement}}, Basis, m.chars, applies, masks());
+                    Basis = charMap({{m.chars, m.replacement}}, Basis, m.chars, applies);
                 }
             }
         }
     }
-    return kernel::UTF8_CharMapPipeline(mP, fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis, UCD::UnicodeSet(),
-                                        nullptr, masks());
+    return charMap(fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis);
 }
 
 //  A transform in UTF-8 mode on the UTF-8 code units of a text, made
@@ -9845,23 +11846,33 @@ StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet
 //  kernel::WellFormedUTF8 and codegen::UTF8Errors).
 static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                      const ldml::TransformEntry * entry, StreamSet * Basis,
-                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr) {
+                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr, bool regions = false) {
     UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
-    return builder.transform(entry, kernel::WellFormedUTF8(P, Basis));
+    StreamSet * const text = kernel::WellFormedUTF8(P, Basis);
+    if (regions) builder.pushRegions(text);
+    return builder.transform(entry, text);
 }
 
 static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
-                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry,
+                                                  bool regions = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
-    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream));
+    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream), nullptr, regions);
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
     return P.compile();
 }
 
 StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21) {
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
+    //  (The label of the transform for the names of kernels, while it is applied.)
+    struct Label {
+        std::string & label;
+        const std::string saved;
+        Label(std::string & l, const std::string & v) : label(l), saved(l) {label = v;}
+        ~Label() {label = saved;}
+    } transformLabel(mTransformLabel, entry->canonicalName);
     const TransformAnalysis & a = mAnalyzer.analyze(entry);
     if (ApplyShapeGroups) {
         //  (A transform the regular plan does not implement, by its shape
@@ -9873,7 +11884,7 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
         //  (Within a filter, where the engine supports its passes within it, see
         //  RulePipelineBuilder::applyShapeStep.)
         const TransformAnalyzer::ShapeChoice & choice = shapeChoice(mRegistry, mAnalyzer, entry);
-        if (choice.any() && (!activeMask() || choice.appliesInFilter())) {
+        if (choice.any() && (!activeMask() || choice.appliesInFilter()) && !boundedRegions()) {
             const TransformAnalyzer::ShapeChoice * outer = mShapeChoice;
             mShapeChoice = &choice;
             U21 = applyAnalysis(a, U21);
@@ -9933,22 +11944,25 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
         if (!mask) {
             engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result);
         } else {
-            //  (Every match lies within each mask.)
-            StreamSet * masks = mMasks.front();
-            if (mMasks.size() > 1) {
-                masks = mP.CreateStreamSet(mMasks.size());
-                mP.CreateKernelCall<CollectStreams>(mMasks, masks);
+            //  (Every match lies within each mask.  The engine carries the masks
+            //  through the replacement.)
+            std::vector<StreamSet *> streams = mMasks.applyStreams();
+            StreamSet * masks = streams.front();
+            if (streams.size() > 1) {
+                masks = mP.CreateStreamSet(streams.size());
+                mP.CreateKernelCall<CollectStreams>(streams, masks);
             }
-            StreamSet * const resultMasks = mP.CreateStreamSet(mMasks.size());
+            StreamSet * const resultMasks = mP.CreateStreamSet(streams.size());
             engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result, masks, resultMasks);
-            for (size_t k = 0; k < mMasks.size(); k++) {
-                if (mMasks.size() == 1) {
-                    mMasks[k] = resultMasks;
+            for (size_t k = 0; k < streams.size(); k++) {
+                if (streams.size() == 1) {
+                    streams[k] = resultMasks;
                     break;
                 }
-                mMasks[k] = mP.CreateStreamSet(1);
-                mP.CreateKernelCall<StreamSelect>(mMasks[k], Select(resultMasks, {static_cast<unsigned>(k)}));
+                streams[k] = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<StreamSelect>(streams[k], Select(resultMasks, {static_cast<unsigned>(k)}));
             }
+            mMasks.setApplyStreams(streams);
         }
         if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
         return result;
@@ -9961,10 +11975,10 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
             U21 = searchReplace(i, U21);
             continue;
         }
-        for (const ldml::TransformStep & s : step.maps[i].steps) U21 = conversionGroup(s, U21);
+        for (const ldml::TransformStep & s : step.maps[i].steps) U21 = inStep(conversionGroup(s, U21));
         if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
     }
-    for (const ldml::TransformStep & s : step.markMap.steps) U21 = conversionGroup(s, U21);
+    for (const ldml::TransformStep & s : step.markMap.steps) U21 = inStep(conversionGroup(s, U21));
     if (outermost && rules > 0) mGroupCounts.push_back({rules, mP.getNumOfKernelCalls() - kernels});
     return U21;
 }
@@ -10004,7 +12018,7 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
 //  each start is counted among the roughs taken (compressed: those of a start
 //  follow one another, from its first), and shifted back to the start (up to
 //  65 letters a start).
-StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     const ldml::FrontLetterRevisits & f = step.frontLetters;
     FrontLetterLayout L;
@@ -10080,16 +12094,14 @@ StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & s
     StreamSet * const Kept = P.CreateStreamSet(21), * const KeptCounts = P.CreateStreamSet(CountBits);
     FilterByMask(P, Keep, Lowered, Kept);
     FilterByMask(P, Keep, Counts, KeptCounts);
-    filterMasks(Keep);
     StreamSet * const SpreadMask = P.CreateStreamSet(1);
     InsertionSpreadMask(P, KeptCounts, SpreadMask, kernel::InsertPosition::Before);
     StreamSet * const Spread = P.CreateStreamSet(21);
     SpreadByMask(P, SpreadMask, Kept, Spread);
-    for (StreamSet *& mask : mMasks) {
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, SpreadMask, mask, spread);
-        mask = spread;
-    }
+    //  (The placeholders outside the masks.)
+    PositionMap positions;
+    positions.remove(Keep);
+    positions.insert(SpreadMask, PositionMap::Inserted::Out);
     StreamSet * const Inserted = P.CreateStreamSet(1);
     Invert(P, SpreadMask, Inserted);
     StreamSet * const SpreadLetters = P.CreateStreamSet(2);
@@ -10097,26 +12109,27 @@ StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & s
     StreamSet * const Filled = P.CreateStreamSet(21);
     P.CreateKernelCall<FrontLetterFill>(SpreadMask, Spread, SpreadLetters, Filled);
     SHOW_BIXNUM(Filled);
-    mMasks.insert(mMasks.begin(), SpreadMask);
+    //  (The placeholders are kept out of the steps until frontLettersEnd by a
+    //  mask outside the others, pushed once the masks are in step.)
+    mFrontLetterMask = SpreadMask;
     mFrontLetters = {f.lowerLetter, f.upperLetter};
-    return Filled;
+    return Staged(Filled, std::move(positions));
 }
 
 //  The placeholders of the front-letter revisits (outside the first mask) as
 //  their letters, within the filters (as the replacements of the roughs).
 StreamSet * RulePipelineBuilder::frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    StreamSet * const front = mMasks.front();
-    mMasks.erase(mMasks.begin());
+    StreamSet * const front = mMasks.popOutermost();
     StreamSet * const Placed = P.CreateStreamSet(1);
     Invert(P, front, Placed);
     StreamSet * const Result = P.CreateStreamSet(21);
     P.CreateKernelCall<FrontLetterPlace>(mFrontLetters.first, mFrontLetters.second, U21, Placed, Result);
-    for (StreamSet *& mask : mMasks) mask = combine(mask, Placed, true);
+    mMasks.include(Placed);
     return Result;
 }
 
-StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     //  The families (by P), each with its texts and the index of their A.
     std::vector<UCD::UnicodeSet> firsts;
@@ -10212,6 +12225,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
     StreamSet * const Counts = countBits ? P.CreateStreamSet(countBits) : nullptr;
     StreamSet * Delete = anyEmpty || interior ? P.CreateStreamSet(1) : nullptr;
     P.CreateKernelCall<PrefixRuns>(runClasses, families, lengths, U21, Classes, activeMask(), Result, Select, Counts, Delete);
+    PositionMap positions;
     if (Counts) {
         StreamSet * const SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, Counts, SpreadMask, kernel::InsertPosition::After);
@@ -10224,7 +12238,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         spread(Select);
         if (Delete) spread(Delete);
         //  The inserted positions are within the filters, as the A positions.
-        spreadMasks(SpreadMask);
+        positions.insert(SpreadMask);
     }
     if (maxLength > 0) {
         std::vector<StreamSet *> selected{Select};
@@ -10242,7 +12256,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         Invert(P, Delete, keep);
         StreamSet * const kept = P.CreateStreamSet(21);
         FilterByMask(P, keep, Result, kept);
-        filterMasks(keep);
+        positions.remove(keep);
         Result = kept;
         if (!Counts) {
             //  The positions following the runs deleted (after each P, at the
@@ -10270,7 +12284,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
             }
         }
     }
-    return Result;
+    return Staged(Result, std::move(positions));
 }
 
 //  The chain revisits of a group (ChainRevisits).
@@ -10289,7 +12303,7 @@ StreamSet * RulePipelineBuilder::chainRevisitsGroup(const ldml::TransformStep & 
 //  The mark run edits of a group (MarkRunEdits), on the starts of the
 //  matches of [P1] R* T of each family from the regular expression engine;
 //  the deleted positions are then removed.
-StreamSet * RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     std::vector<UCD::UnicodeSet> sets;
     auto index = [&](const UCD::UnicodeSet & s) {
@@ -10343,11 +12357,12 @@ StreamSet * RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & s
     Invert(P, Delete, keep);
     StreamSet * const kept = P.CreateStreamSet(21);
     FilterByMask(P, keep, Result, kept);
-    filterMasks(keep);
-    return kept;
+    PositionMap positions;
+    positions.remove(keep);
+    return Staged(kept, std::move(positions));
 }
 
-StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
+Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     DeferredConfig config;
     for (const ldml::DeferredRule & d : step.deferred) {
@@ -10405,7 +12420,10 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
     InsertionSpreadMask(P, reserve, SpreadMask, kernel::InsertPosition::After);
     StreamSet * X = P.CreateStreamSet(21);
     SpreadByMask(P, SpreadMask, U21, X);
-    spreadMasks(SpreadMask);
+    PositionMap positions;
+    positions.insert(SpreadMask);
+    //  The active mask over the reserved positions.
+    StreamSet * const reservedMask = activeMask() ? mMasks.mapped(activeMask(), positions) : nullptr;
     StreamSet * live = SpreadMask;
     //  The positions written by the deferred rules in the rounds so far, and the
     //  blocks written by the self-reproducing rules (see DeferredRuns).
@@ -10425,7 +12443,7 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
     };
     for (unsigned round = 0; round < DeferredRounds; round++) {
         StreamSet * const text = compact(X);
-        StreamSet * const mask = compact(activeMask());
+        StreamSet * const mask = compact(reservedMask);
         StreamSet * const textWritten = compact(written);
         config.masked = mask != nullptr;
         config.written = textWritten != nullptr;
@@ -10495,7 +12513,7 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
             std::vector<std::vector<size_t>> interferers;
             for (const ldml::DeferredRule & d : step.deferred) interferers.push_back(d.runInterferers);
             P.CreateKernelCall<DeferredCandidates>(srcIndex, matchOf, config.textLengths, interferers, srcBits, textMatches,
-                                                   compact(written), compact(activeMask()), candidates);
+                                                   compact(written), compact(reservedMask), candidates);
             SHOW_STREAM(candidates);
             //  The text with the positions written and the live positions.
             std::vector<std::pair<unsigned, unsigned>> textOrder;
@@ -10529,16 +12547,14 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
     }
     //  The positions not live deleted, once.
     StreamSet * const result = compact(X);
-    filterMasks(live);
+    positions.remove(live);
     SHOW_BIXNUM(result);
-    return result;
+    return Staged(result, std::move(positions));
 }
 
 StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, StreamSet * U21) {
     const bool invokedWithFilter = mInvokedWithFilter;
     mInvokedWithFilter = false;
-    const bool insertAnywhere = mInsertAnywhere;
-    mInsertAnywhere = a.plan.steps.size() == 1 && (a.plan.filter || invokedWithFilter);
     const bool outermost = mDepth++ == 0;
     StreamSet * const deletedRunEnds = mDeletedRunEnds;
     StreamSet * const nextDeletedRunEnds = mNextDeletedRunEnds;
@@ -10547,11 +12563,18 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mNextDeletedRunEnds = nullptr;
     mNextDeletedRunAfter = nullptr;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
+    //  A transform of one conversion group inserts anywhere within its own filter,
+    //  or the one it is invoked with (see TransformMask::insertBefore).
+    if (a.plan.steps.size() == 1 && a.plan.steps[0].kind == ldml::TransformStep::Kind::Conversion
+        && (a.plan.filter || invokedWithFilter)) {
+        mMasks.insertAnywhere();
+    }
     //  The segments applied by their shape groups (see TransformAnalyzer::
     //  ShapeChoice): their shape groups in place of their conversion groups.
     const TransformAnalyzer::ShapeChoice * const choice = mShapeChoice;
     mShapeChoice = nullptr;
     size_t segment = 0;
+    size_t group = 0;
     std::vector<bool> applied(choice ? choice->useShapes.size() : 0, false);
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
@@ -10580,15 +12603,19 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             mInvokedWithFilter = false;
             if (step.filter) popFilter();
         } else {
+            mGroupLabel = mTransformLabel + "G" + std::to_string(++group);
             const size_t kernels = mP.getNumOfKernelCalls();
-            if (step.hasFrontLetters) U21 = frontLettersBegin(step, U21);
-            if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
-            if (!step.markRunEditRules.empty()) U21 = markRunEditsGroup(step, U21);
-            if (!step.prefixRuns.empty()) U21 = prefixRunsGroup(step, U21);
-            if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
-                U21 = conversionGroup(step, U21);
+            if (step.hasFrontLetters) {
+                U21 = inStep(frontLettersBegin(step, U21));
+                mMasks.pushOutermost(mFrontLetterMask);
             }
-            if (!step.deferred.empty()) U21 = deferredRules(step, U21);
+            if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
+            if (!step.markRunEditRules.empty()) U21 = inStep(markRunEditsGroup(step, U21));
+            if (!step.prefixRuns.empty()) U21 = inStep(prefixRunsGroup(step, U21));
+            if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
+                U21 = inStep(conversionGroup(step, U21));
+            }
+            if (!step.deferred.empty()) U21 = inStep(deferredRules(step, U21));
             if (step.frontLettersEnd) U21 = frontLettersEnd(step, U21);
             if (outermost && groupRules(step) > 0) mGroupCounts.push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         }
@@ -10600,18 +12627,20 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mDeletedRunAfter = deletedRunAfter;
     mNextDeletedRunAfter = nextDeletedRunAfter;
     mDepth--;
-    mInsertAnywhere = insertAnywhere;
     return U21;
 }
 
 static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
-                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry,
+                                                  bool regions = false, bool bounded = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
+    if (regions) builder.pushRegions(U21);
+    if (bounded) builder.boundRegions();
     StreamSet * const Result = builder.transform(entry, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
@@ -10630,6 +12659,167 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
 //  A built-in transform that only the direct pipeline implements (Any-CaseFold)
 //  is counted in its direct pipeline, including the kernels decoding the input
 //  and encoding the result.
+//  --divcode-report: the DivCode plan of each conversion group with string rules
+//  (see ldml/divcode_plan.h, doc/ldml-divcode-plan.md), one JSON object per
+//  line: whether it is eligible (or its problems), and for div32 and div64, its
+//  alphabet, rules (split by the blocks of their first sets), leaves, and the
+//  bits its translations change (by the XOR technique: at each position of a
+//  match, from a known character or a gap to a known character; the bits above
+//  the low s shared by the matches with the same offset, source block and
+//  target block).
+static std::string jsonEscape(const std::string & s) {
+    std::string r;
+    for (char c : s) {
+        if (c == '"' || c == '\\') {r += '\\'; r += c;}
+        else if (static_cast<unsigned char>(c) < 0x20) {char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); r += b;}
+        else r += c;
+    }
+    return r;
+}
+
+static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
+    const unsigned s = plan.shift;
+    size_t expanding = 0, deleting = 0, maxExpansion = 0, maxLeaf = 0, upperNaive = 0, lower = 0, setPositions = 0, maxLength = 0;
+    std::map<std::tuple<size_t, UCD::codepoint_t, UCD::codepoint_t>, unsigned> pairs;
+    for (const ldml::DivRule & d : plan.rules) {
+        if (d.expansion()) expanding++;
+        if (d.deletions()) deleting++;
+        maxExpansion = std::max(maxExpansion, d.expansion());
+        maxLength = std::max(maxLength, d.length());
+        const size_t n = d.length(), m = d.result.size();
+        for (size_t i = 0; i < m; i++) {
+            if (i < n && d.text[i].count() != 1) {setPositions++; continue;}
+            const UCD::codepoint_t src = i < n ? d.text[i].begin()->first : 0, dst = d.result[i];
+            const unsigned upper = __builtin_popcount((src ^ dst) >> s);
+            upperNaive += upper;
+            lower += __builtin_popcount((src ^ dst) & ((1u << s) - 1));
+            if (upper) pairs[std::make_tuple(i, src >> s, dst >> s)] = upper;
+        }
+    }
+    size_t upperShared = 0;
+    for (const auto & p : pairs) upperShared += p.second;
+    for (const auto & l : plan.leaves) maxLeaf = std::max(maxLeaf, l.size());
+    std::string r = "{\"blocks\": " + std::to_string(plan.blocks.size()) + ", \"code_bits\": " + std::to_string(plan.codeBits)
+        + ", \"rules\": " + std::to_string(plan.rules.size()) + ", \"max_leaf\": " + std::to_string(maxLeaf)
+        + ", \"stages\": " + std::to_string(plan.stages) + ", \"overlap_pairs\": " + std::to_string(plan.overlapPairs)
+        + ", \"converted_rules\": " + std::to_string(plan.convertedRules) + ", \"propagating\": " + std::to_string(plan.propagating.count())
+        + ", \"after_streams\": " + std::to_string(plan.afterStreams.size())
+        + ", \"stage_rules\": [" + [&]() {
+              std::vector<size_t> n(plan.stages + 1, 0);
+              for (const ldml::DivRule & d : plan.rules) n[d.stage]++;
+              std::string r;
+              for (size_t i = 0; i < n.size(); i++) r += (i ? ", " : "") + std::to_string(n[i]);
+              return r;
+          }() + "]"
+        + ", \"max_length\": " + std::to_string(maxLength)
+        + ", \"external_sets\": " + std::to_string(plan.externalSets.size())
+        + ", \"expanding_rules\": " + std::to_string(expanding) + ", \"max_expansion\": " + std::to_string(maxExpansion)
+        + ", \"deleting_rules\": " + std::to_string(deleting)
+        + ", \"xor_upper\": " + std::to_string(upperNaive) + ", \"xor_upper_shared\": " + std::to_string(upperShared)
+        + ", \"xor_pairs\": " + std::to_string(pairs.size()) + ", \"xor_lower\": " + std::to_string(lower)
+        + ", \"set_positions\": " + std::to_string(setPositions)
+        + ", \"alphabet\": \"Div" + std::string(s == 5 ? "32" : "64") + "Code_" + DivCodeKernel::alphabetName(plan.blocks) + "\""
+        + ", \"hash\": \"" + plan.contentHash + "\"}";
+    return r;
+}
+
+static int printDivCodeReportOf(const std::string & name, const TransformAnalysis & a);
+
+static int printDivCodeReport(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
+    TransformAnalyzer analyzer(registry);
+    return printDivCodeReportOf(entry->canonicalName, analyzer.analyze(entry));
+}
+
+static int printDivCodeReportOf(const std::string & name, const TransformAnalysis & a) {
+    size_t group = 0;
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) continue;
+        group++;
+        ldml::DivCodeOptions options;
+        options.convertedBefore = convertedBeforeContext;
+        options.convertedRounds = ConvertedContextRounds;
+        options.shift = 5;
+        const ldml::DivCodePlan p32 = ldml::planDivCodeGroup(step, options);
+        //  (A group without string rules: only with rules whose before contexts
+        //  are matched against the converted text, see planDivCodeGroup.)
+        if (step.stringRules.empty() && !p32.dependent()) continue;
+        options.shift = 6;
+        const ldml::DivCodePlan p64 = ldml::planDivCodeGroup(step, options);
+        std::string problems;
+        for (const std::string & p : p32.problems) problems += (problems.empty() ? "\"" : ", \"") + jsonEscape(p) + "\"";
+        //  (Problems of div64 alone: the code bits.)
+        for (const std::string & p : p64.problems) {
+            if (std::find(p32.problems.begin(), p32.problems.end(), p) == p32.problems.end()) {
+                problems += (problems.empty() ? "\"" : ", \"") + jsonEscape("div64: " + p) + "\"";
+            }
+        }
+        toolio::out() << "{\"transform\": \"" << jsonEscape(name) << "\", \"implementable\": "
+                      << (a.implementable ? "true" : "false") << ", \"group\": " << group
+                      << ", \"string_rules\": " << step.stringRules.size() << ", \"subgroups\": " << step.subgroups.size()
+                      << ", \"source_rules\": " << p32.sourceRules
+                      << ", \"eligible\": " << (p32.eligible() ? "true" : "false")
+                      << ", \"eligible64\": " << (p64.eligible() ? "true" : "false")
+                      << ", \"problems\": [" << problems << "]"
+                      << ", \"div32\": " << divCodeShiftReport(p32) << ", \"div64\": " << divCodeShiftReport(p64)
+                      << ", \"converted_families\": [" << [&]() {
+                          //  (Phase 2: see ldml::DivConvertedFamily.)
+                          std::string r;
+                          for (const ldml::DivConvertedFamily & f : p32.convertedFamilies) {
+                              std::string text;
+                              for (const auto & set : step.stringRules[f.stringRules[0]].text) {
+                                  std::string one;
+                                  for (const auto & range : set) {
+                                      if (one.size() > 40) break;
+                                      for (UCD::codepoint_t c = range.first; c <= range.second && one.size() <= 40; c++) {
+                                          if (c < 0x80) {one += static_cast<char>(c); continue;}
+                                          const unsigned n = c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+                                          one += static_cast<char>((0xF00u >> n) | (c >> (6 * (n - 1))));
+                                          for (unsigned i = n - 1; i-- > 0; ) one += static_cast<char>(0x80 | ((c >> (6 * i)) & 0x3F));
+                                      }
+                                  }
+                                  text += (set.count() == 1 ? one : "[" + one + "]");
+                              }
+                              r += std::string(r.empty() ? "" : ", ") + "{\"text\": \"" + jsonEscape(text) + "\", \"rules\": "
+                                   + std::to_string(f.stringRules.size()) + ", \"covering\": " + (f.covering ? "true" : "false")
+                                   + (f.completed ? ", \"completed\": " + std::to_string(f.completed) : std::string())
+                                   + (f.covering ? std::string(", \"propagating\": ") + (f.propagating ? "true" : "false")
+                                                   + ", \"deleted\": " + (f.deleted ? "true" : "false") : std::string())
+                                   + (f.reason.empty() ? "" : ", \"reason\": \"" + jsonEscape(f.reason) + "\"") + "}";
+                          }
+                          return r;
+                      }() << "]"
+                      << ", \"converted\": " << [&]() {
+                          //  The rules whose before contexts are matched against the
+                          //  converted text (see convertedContextMatters), and what the
+                          //  group's conversions do.
+                          size_t strings = 0, stringsExpanding = 0, subgroups = 0, singles = 0, items = 0;
+                          for (const ldml::StringRule & sr : step.stringRules) {
+                              if (sr.engineBefore && convertedBeforeContext(step, sr.engineBefore)) {
+                                  strings++;
+                                  if (sr.replacement.size() > sr.text.size()) stringsExpanding++;
+                              }
+                          }
+                          for (const ldml::CharMapSubgroup & g : step.subgroups) {
+                              if (g.engineBefore && convertedBeforeContext(step, g.engineBefore)) {
+                                  subgroups++;
+                                  singles += g.mappings.size();
+                              }
+                          }
+                          bool deletes = false, expands = false;
+                          for (const ConversionOutcome & o : conversionOutcomes(step)) {
+                              deletes |= o.length() == 0;
+                              expands |= o.length() > 1;
+                          }
+                          (void)items;
+                          return "{\"string_rules\": " + std::to_string(strings) + ", \"string_rules_expanding\": "
+                                 + std::to_string(stringsExpanding) + ", \"subgroups\": " + std::to_string(subgroups)
+                                 + ", \"mappings\": " + std::to_string(singles) + ", \"group_deletes\": " + (deletes ? "true" : "false")
+                                 + ", \"group_expands\": " + (expands ? "true" : "false") + "}";
+                      }() << "}\n";
+    }
+    return 0;
+}
+
 static int printKernelCounts(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
     TransformAnalyzer analyzer(registry);
     const TransformAnalysis & a = analyzer.analyze(entry);
@@ -10719,24 +12909,124 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
 //  A pipeline for a transform compiled from an ad hoc rules file (--rules-file),
 //  given its already-computed analysis (see TransformAnalyzer::analyzeRulesFile).
 static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver, const ldml::TransformRegistry & registry,
-                                                               TransformAnalyzer & analyzer, const TransformAnalysis & a) {
+                                                               TransformAnalyzer & analyzer, const TransformAnalysis & a,
+                                                               bool regions = false, bool bounded = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
+    if (regions) builder.pushRegions(U21);
+    if (bounded) builder.boundRegions();
     StreamSet * const Result = builder.applyAnalysis(a, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
 }
 
+//  Region scope (see --lines and doc/masked-transforms-plan.md, step 3): the
+//  reason a transform cannot be applied to the regions of a mask (each line)
+//  in one run, as each region by itself, or "" if it can: every component it
+//  uses must keep to the region of each position, seeing nothing outside it.
+//  The components supported are the class kernels; the case maps (Any-Upper,
+//  Any-Lower and Any-Title: neither the Final_Sigma context nor a word crosses
+//  a line feed); the normalization forms, FCD and FCC included (each run of a
+//  mask normalized by itself, see maskedNormalization); Any-Hex (and its
+//  forms), Any-Remove and Any-Null; and conversion groups without revisits
+//  whose rules have line-bound contexts, if any.  The n characters of a match
+//  are all within the mask, and a context is line-bound if it has no anchors
+//  and none of its classes matches a line feed (or a mark of tconv's, such as
+//  FilterRunEndMark, which can stand for one), so that it matches within the
+//  line as it does at the end of the line taken as a text.  The filters of the
+//  transform (within the mask) and the transforms it invokes are as well.  Each
+//  line is then a region; the line feeds, outside the mask, pass through
+//  unchanged.
+//  A conversion group whose contexts are not line-bound is supported too (step
+//  4): its contexts are then bounded by the regions (bounded, see
+//  RulePipelineBuilder::boundRegions), in the fused kernels (see
+//  FusedRulesConfig::region; also the before contexts matched against the
+//  converted text, in rounds or by the While loop) and by the engine (region
+//  starts and follows), and it is not applied by DivCode, shape groups or in
+//  UTF-8 mode.
+struct RegionScope {
+    std::string problem;
+    bool bounded = false;
+    bool supported() const {return problem.empty();}
+};
+
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                               const ldml::TransformEntry * entry);
+
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                               const TransformAnalysis & a) {
+    RegionScope scope;
+    auto fail = [&](const std::string & p) {
+        scope.problem = p;
+        return scope;
+    };
+    if (!a.implementable) return fail("not implementable by the regular plan");
+    auto revisits = [](const ldml::RuleSide * result) {
+        if (result == nullptr || !result->hasCursor()) return false;
+        if (result->getCursorOffset() != 0) return true;
+        re::RE * const rv = result->getResultToRevisit();
+        return rv != nullptr && !(llvm::isa<re::Seq>(rv) && llvm::cast<re::Seq>(rv)->empty());
+    };
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
+            if (used == nullptr) return fail("unknown transform " + step.transform.getText());
+            const RegionScope inner = regionScope(registry, analyzer, used);
+            if (!inner.supported()) return fail(used->canonicalName + ": " + inner.problem);
+            scope.bounded |= inner.bounded;
+            continue;
+        }
+        if (!step.insertions.empty()) return fail("insertion rules");
+        if (!step.deferred.empty() || !step.copyCaptures.empty()) return fail("deferred rules");
+        if (!step.prefixRuns.empty()) return fail("prefix runs");
+        if (!step.chainRevisitRules.empty()) return fail("chain revisits");
+        if (!step.markRunEditRules.empty()) return fail("mark run edits");
+        if (!step.captureReplacements.empty()) return fail("capture replacements");
+        if (step.hasFrontLetters || step.frontLettersEnd) return fail("front-letter revisits");
+        for (const ldml::ConversionRule * r : step.rules) {
+            if (revisits(r->getRightSide())) return fail("a rule with a revisit");
+        }
+        if (!groupLineBound(step)) {
+            if (!BoundRegions) return fail("a context not bound to the line");
+            scope.bounded = true;
+        }
+    }
+    return scope;
+}
+
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                               const ldml::TransformEntry * entry) {
+    if (entry->isBuiltIn()) {
+        static const std::vector<std::string> supported = {
+            "Any-Null", "Any-Upper", "Any-Lower", "Any-Title", "Any-NFD", "Any-NFKD", "Any-NFC", "Any-NFKC",
+            "Any-FCD", "Any-FCC", "Any-Remove", "Any-Hex", "Any-Hex/Java", "Any-Hex/Unicode", "Any-Hex/C", "Any-Hex/XML", "Any-Hex/XML10",
+            "Any-Hex/Perl"};
+        if (std::find(supported.begin(), supported.end(), entry->canonicalName) != supported.end()) return RegionScope();
+        RegionScope s;
+        s.problem = "the built-in " + entry->canonicalName;
+        return s;
+    }
+    return regionScope(registry, analyzer, analyzer.analyze(entry));
+}
+
+//  The line printed by --plan --lines.
+static void printRegionScope(const RegionScope & scope) {
+    toolio::out() << "  region scope (--lines): "
+                  << (!scope.supported() ? "per-line runs: " + scope.problem
+                      : scope.bounded ? "supported, one run, contexts bounded by the lines" : "supported, one run") << "\n";
+}
+
 //  Applies a transform function to the input: the whole text, or with --lines,
 //  each line as a text of its own (given through a pipe), followed by its line
-//  break.
-static void applyToInput(const std::function<void (int)> & fn, int fd) {
-    if (!Lines) {
+//  break; with regions, the function applies to each line as a region of the
+//  whole text (see regionScope), in one run.
+static void applyToInput(const std::function<void (int)> & fn, int fd, bool regions = false) {
+    if (!Lines || regions) {
         fn(fd);
         return;
     }
@@ -11090,6 +13380,1710 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
     }
 }
 
+//  The code bixnum of a DivCode plan's alphabet (see kernel::DivCodeKernel).
+static StreamSet * DivCodeOf(PipelineBuilder & P, const ldml::DivCodePlan & plan, StreamSet * Basis,
+                             BitMovementMode mode = BitMovementMode::LookAhead) {
+    StreamSet * const Code = P.CreateStreamSet(std::max(plan.codeBits, 1u));
+    P.CreateKernelCall<DivCodeKernel>(plan.shift, plan.blocks, Basis, Code, mode);
+    return Code;
+}
+
+//  The class streams of a DivCode plan's external sets (one each), or nullptr.
+static StreamSet * DivCodeExternalsOf(PipelineBuilder & P, const ldml::DivCodePlan & plan, StreamSet * Basis,
+                                      BitMovementMode mode = BitMovementMode::LookAhead) {
+    if (plan.externalSets.empty()) return nullptr;
+    std::vector<re::CC *> ccs;
+    for (const UCD::UnicodeSet & s : plan.externalSets) ccs.push_back(re::makeCC(s, &cc::Unicode));
+    StreamSet * const Externals = P.CreateStreamSet(ccs.size());
+    if (Basis->getNumElements() == 21) {
+        P.CreateKernelCall<CharClassesKernel>(ccs, Basis, Externals);
+    } else {
+        P.CreateKernelCall<CharClassesKernel>(ccs, Basis, Externals, mode);
+    }
+    return Externals;
+}
+
+//  The translation kernel of a DivCode plan without expansions (see
+//  doc/ldml-divcode-plan.md, section 4.5): the rules of the plan (string rules
+//  and single-character rules) matched by their anchors in an If-hierarchy on
+//  the bits of the code, and applied by the XOR technique, with a deletion
+//  stream.
+//
+//  Inputs: U21, the code bixnum, the external class streams (if any), InText
+//  (the positions of the text), and the filter mask (if any; every position of
+//  a match must be within it, while contexts see the whole text).  Outputs: the
+//  converted U21 and Deleted (the positions to delete).
+//
+//  - Each set of the plan is tested on the pseudo-basis (the low shift bits of
+//    U21 and the code bits) at an offset from the anchor, by Lookahead of the
+//    input streams.  The character of an after item must be within the text
+//    (InText): beyond it the code is 0, and a set given by its complement
+//    includes the characters of code 0.  An item with the text boundary
+//    (negated) holds where that fails.
+//  - Before items are computed at the top level, Advance of their tests, as
+//    they do not depend on the conditions of the Ifs.
+//  - In the leaf of code A, the anchor test is leaf_A ∧ (the low bits of the
+//    first set): the If only skips blocks without the code.  A rule yields to
+//    the earlier rules (by priority) that match at its anchor.
+//  - The changes are accumulated in Vars escaping the Ifs: for each offset of a
+//    match, the matches whose constant change of the bits above the low shift
+//    bits is the same (one Var for each such value), each low bit changed, and
+//    the positions deleted; single-character rules apart, as they apply only
+//    outside the matches of the string rules (coverage).  They are advanced to
+//    their offsets once, after the hierarchy.
+//  The UTF-8 code units of a codepoint.
+static std::vector<uint32_t> utf8Units(UCD::codepoint_t c) {
+    if (c < 0x80) return {c};
+    if (c < 0x800) return {0xC0 | (c >> 6), 0x80 | (c & 0x3F)};
+    if (c < 0x10000) return {0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F)};
+    return {0xF0 | (c >> 18), 0x80 | ((c >> 12) & 0x3F), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F)};
+}
+
+//  The distinct after contexts of a DivCode plan (of its rules, then of its
+//  subgroups, in order), each tested by the Items kernel at the first unit of
+//  each character: a context of one item, its set within the text (its positive
+//  test; the translation kernels negate it and add the ends of filtered runs
+//  where they read it); a context of several items, whether it holds (its
+//  first item needs a character, so it never holds beyond the text).
+static std::vector<const ldml::DivContext *> divCodeAfterContexts(const ldml::DivCodePlan & plan, std::vector<size_t> * ruleItem = nullptr,
+                                                                   std::vector<size_t> * subgroupItem = nullptr) {
+    std::vector<const ldml::DivContext *> contexts;
+    std::map<std::string, size_t> index;
+    auto key = [](const ldml::DivContext & context) {
+        std::string r;
+        for (const ldml::DivContextItem & item : context.items) {
+            r += std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "") + ","
+                 + std::to_string(item.external) + ":";
+            for (const auto & range : item.set) r += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
+            r += ";";
+        }
+        return r;
+    };
+    auto add = [&](const ldml::DivContext & context) -> size_t {
+        if (!context.present()) return SIZE_MAX;
+        auto f = index.emplace(key(context), contexts.size());
+        if (f.second) contexts.push_back(&context);
+        return f.first->second;
+    };
+    for (const ldml::DivRule & d : plan.rules) {
+        const size_t i = add(d.after);
+        if (ruleItem) ruleItem->push_back(i);
+    }
+    for (const auto & sc : plan.subgroupContexts) {
+        const size_t i = add(sc.second);
+        if (subgroupItem) subgroupItem->push_back(i);
+    }
+    return contexts;
+}
+
+//  For each after context of a plan (see divCodeAfterContexts), its index among
+//  the contexts of several items (SIZE_MAX for a context of one item): those
+//  the Items kernel chains on the text before it is spread.  A context of one
+//  item is tested directly where it is read, in the spread text too.
+static std::vector<size_t> divCodeChainedIndex(const ldml::DivCodePlan & plan) {
+    std::vector<size_t> index;
+    size_t n = 0;
+    for (const ldml::DivContext * c : divCodeAfterContexts(plan)) index.push_back(c->items.size() > 1 ? n++ : SIZE_MAX);
+    return index;
+}
+
+static size_t divCodeChainedCount(const ldml::DivCodePlan & plan) {
+    size_t n = 0;
+    for (const ldml::DivContext * c : divCodeAfterContexts(plan)) if (c->items.size() > 1) n++;
+    return n;
+}
+
+class DivCodeItems final : public PabloKernel {
+public:
+    DivCodeItems(LLVMTypeSystemInterface & ts, const ldml::DivCodePlan & plan, const std::string & label,
+                 StreamSet * Basis, StreamSet * Code, StreamSet * Externals, StreamSet * InText, StreamSet * Mask, StreamSet * Items)
+    : PabloKernel(ts, std::string(plan.shift == 5 ? "Div32Code" : "Div64Code") + "Items_" + sanitized(label) + "_" + plan.contentHash
+                      + (Basis->getNumElements() == 8 ? "_U8" : "_U21") + (Mask ? "_m" : ""),
+                  {}, {Binding{"Items", Items}})
+    , mPlan(plan)
+    , mUTF8(Basis->getNumElements() == 8)
+    , mHasExternals(Externals != nullptr)
+    , mHasMask(Mask != nullptr) {
+        //  (The units of the characters of the longest context, and of the
+        //  last unit of a character of UTF-8.)
+        size_t longest = 1;
+        for (const ldml::DivContext * c : divCodeAfterContexts(plan)) longest = std::max(longest, c->items.size());
+        const unsigned L = static_cast<unsigned>(mUTF8 ? 4 * longest : longest);
+        auto bind = [&](const std::string & name, StreamSet * s) {
+            mInputStreamSets.push_back(Binding{name, s, FixedRate(1), LookAhead(L)});
+        };
+        bind("Basis", Basis);
+        bind("Code", Code);
+        bind("InText", InText);
+        if (Externals) bind("Externals", Externals);
+        if (Mask) bind("Mask", Mask);
+    }
+    static std::string sanitized(const std::string & label) {
+        std::string l;
+        for (char c : label) l += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+        return l;
+    }
+protected:
+    void generatePabloMethod() override;
+private:
+    const ldml::DivCodePlan mPlan;
+    const bool mUTF8;
+    const bool mHasExternals;
+    const bool mHasMask;
+};
+
+class DivCodeTranslate final : public PabloKernel {
+public:
+    //  Count: the number of positions to insert after each match of an expanding
+    //  rule (its expansion, at its last position), as the bixnum InsertCount;
+    //  Translate: the converted text, on the text spread by those counts (with
+    //  the spread mask Spread) if the plan expands.
+    //
+    //  The rules whose before contexts are matched against the converted text
+    //  (ldml::DivRule::converted; doc/ldml-divcode-plan.md §10) are applied by a
+    //  third mode, Converted, after Translate.  Their dependent positions (Dep):
+    //  where one of them matches, ignoring its before context, outside the string
+    //  matches, and where no other rule applies (no rule yields to them, so
+    //  wherever another applies, they do not).  Count reserves there the largest
+    //  expansion of those that match.  Translate applies the other rules,
+    //  leaving the dependent positions (and their reserved positions) as they
+    //  are, and gives Dep and, for each set of the converted items, the
+    //  positions just after a converted character in it and not in it (Ends).
+    //  Converted resolves what the converted character before each dependent
+    //  position is, by a monotone While loop, then applies the converted rules
+    //  to Translate's output (Prev, PrevDeleted), deleting the reserved
+    //  positions their results do not fill.
+    //
+    //  The text is the 21-bit codepoint basis (one position per character), or
+    //  the basis bits of UTF-8 code units (Basis of 8 streams; the code marked at
+    //  the first byte of each character).  The positions of a rule (offsets,
+    //  insertions, deletions) are code units: see Units.
+    enum class Mode {Count, Translate, Converted};
+    DivCodeTranslate(LLVMTypeSystemInterface & ts, const ldml::DivCodePlan & plan, const std::string & label, Mode mode,
+                     StreamSet * Basis, StreamSet * Code, StreamSet * Externals, StreamSet * InText, StreamSet * Mask,
+                     StreamSet * Spread, StreamSet * Items, StreamSet * Out, StreamSet * Deleted,
+                     StreamSet * Dep = nullptr, StreamSet * Ends = nullptr, StreamSet * Prev = nullptr, StreamSet * PrevDeleted = nullptr)
+    : PabloKernel(ts, kernelName(plan, label, mode, Basis->getNumElements() == 8, Mask != nullptr, Spread != nullptr), {},
+                  outputsOf(mode, Out, Deleted, Dep, Ends))
+    , mPlan(plan)
+    , mMode(mode)
+    , mUTF8(Basis->getNumElements() == 8)
+    , mHasExternals(Externals != nullptr)
+    , mHasMask(Mask != nullptr)
+    , mHasSpread(Spread != nullptr)
+    , mHasItems(Items != nullptr) {
+        mConvertedItems = plan.convertedItems;
+        for (const ldml::DivRule & d : plan.rules) {
+            mUnits.push_back(unitsOf(d, mUTF8, plan.shift));
+            if (d.converted) mConvertedChars = mConvertedChars + d.text[0];
+        }
+        //  The lookahead of the inputs: the units of a text and of an after item
+        //  (of up to 4 code units) from the anchor, past the gap after the match
+        //  in the spread text.
+        const unsigned E = Spread ? maxExpansion(plan, mUTF8) : 0, item = mUTF8 ? 4 : 1;
+        unsigned L = 0;
+        for (const Units & u : mUnits) L = std::max(L, u.N + E + item);
+        if (!plan.subgroupContexts.empty()) L = std::max(L, item + E + item);
+        auto bind = [&](const std::string & name, StreamSet * s) {
+            mInputStreamSets.push_back(Binding{name, s, FixedRate(1), LookAhead(L)});
+        };
+        bind("Basis", Basis);
+        bind("Code", Code);
+        if (Externals) bind("Externals", Externals);
+        bind("InText", InText);
+        if (Mask) bind("Mask", Mask);
+        if (Spread) bind("Spread", Spread);
+        if (Items) bind("Items", Items);
+        if (mode == Mode::Converted) {
+            mInputStreamSets.push_back(Binding{"Prev", Prev});
+            mInputStreamSets.push_back(Binding{"PrevDeleted", PrevDeleted});
+            mInputStreamSets.push_back(Binding{"Dep", Dep});
+            mInputStreamSets.push_back(Binding{"Ends", Ends});
+        }
+        //  Count and Translate have no carries but Advances, so they rebuild
+        //  them at each segment and have no state: their segments can run on
+        //  several threads at once.  (Converted's loop and MatchStars carry
+        //  arbitrarily far.)
+        if (mode != Mode::Converted) addAttribute(kernel::LocalCarries(carryExtentBound(plan, mUTF8, E)));
+    }
+    //  An upper bound on the CarryExtent of Count and Translate (the longest path
+    //  of Advances; the Pablo compiler verifies it): a before context steps
+    //  over each of its items (a character, then the gap after it); the changes
+    //  are moved to their offsets (within a text and the gap after it), and a
+    //  pass's covers move each string match over its text, for every pass; the
+    //  dependent positions step past a character; the tests of the after
+    //  items are moved from the largest offset they are tested at.
+    static unsigned carryExtentBound(const ldml::DivCodePlan & plan, bool utf8, unsigned E) {
+        const unsigned len = utf8 ? 4 : 1;
+        size_t items = 0;
+        unsigned N = 0;
+        for (const ldml::DivRule & d : plan.rules) {
+            items = std::max(items, d.before.items.size());
+            N = std::max(N, unitsOf(d, utf8, plan.shift).N);
+        }
+        for (const auto & sc : plan.subgroupContexts) items = std::max(items, sc.first.items.size());
+        //  (And the Advances of the tests of after items, by up to N + E.)
+        return static_cast<unsigned>(items) * (len + E) + (plan.stages + 2) * (N + E + len) + len + N + E;
+    }
+    static Bindings outputsOf(Mode mode, StreamSet * Out, StreamSet * Deleted, StreamSet * Dep, StreamSet * Ends) {
+        if (mode == Mode::Count) return Bindings{Binding{"InsertCount", Out}};
+        if (mode == Mode::Translate && Dep) return Bindings{Binding{"Out", Out}, Binding{"Deleted", Deleted}, Binding{"Dep", Dep}, Binding{"Ends", Ends}};
+        return Bindings{Binding{"Out", Out}, Binding{"Deleted", Deleted}};
+    }
+    static std::string kernelName(const ldml::DivCodePlan & plan, const std::string & label, Mode mode, bool utf8, bool mask, bool spread) {
+        std::string l;
+        for (char c : label) l += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+        return std::string(plan.shift == 5 ? "Div32Code" : "Div64Code")
+               + (mode == Mode::Count ? "Count_" : mode == Mode::Translate ? "Translate_" : "Converted_") + l + "_"
+               + plan.contentHash + (utf8 ? "_U8" : "_U21") + (mask ? "_m" : "") + (spread ? "_s" : "");
+    }
+    //  The distinct items of the before contexts of the converted rules.
+    static const std::vector<ldml::DivContextItem> & convertedItemsOf(const ldml::DivCodePlan & plan) {
+        return plan.convertedItems;
+    }
+    //  The code units of a rule: the offsets and lengths of the characters of
+    //  its text, their number N, the units of its result, and for each unit of
+    //  the text, the bits known (those of its first character) and the bits
+    //  that vary among the characters of its set.
+    struct Units {
+        std::vector<unsigned> offset, length;
+        unsigned N = 0;
+        std::vector<uint32_t> result;
+        std::vector<uint32_t> known, varying;
+        unsigned expansion() const {return result.size() > N ? static_cast<unsigned>(result.size()) - N : 0;}
+        unsigned deletions() const {return N > result.size() ? N - static_cast<unsigned>(result.size()) : 0;}
+    };
+    static Units unitsOf(const ldml::DivRule & d, bool utf8, unsigned shift = 5) {
+        Units u;
+        for (const UCD::UnicodeSet & t : d.text) {
+            const UCD::codepoint_t c = t.begin()->first;
+            const std::vector<uint32_t> units = utf8 ? utf8Units(c) : std::vector<uint32_t>{c};
+            UCD::codepoint_t lastBlock = c >> shift;
+            for (const auto & r : t) lastBlock = std::max<UCD::codepoint_t>(lastBlock, r.second >> shift);
+            const bool oneBlock = lastBlock == (c >> shift);
+            u.offset.push_back(u.N);
+            u.length.push_back(static_cast<unsigned>(units.size()));
+            for (size_t j = 0; j < units.size(); j++) {
+                uint32_t varying = 0;
+                if (t.count() > 1) {
+                    //  Within one block, only the low bits (of the last unit) vary.
+                    if (!oneBlock) varying = utf8 ? 0xFF : 0x1FFFFF;
+                    else if (j + 1 == units.size()) varying = (1u << shift) - 1;
+                }
+                u.known.push_back(units[j] & ~varying);
+                u.varying.push_back(varying);
+            }
+            u.N += static_cast<unsigned>(units.size());
+        }
+        for (char32_t c : d.result) {
+            for (uint32_t x : (utf8 ? utf8Units(c) : std::vector<uint32_t>{static_cast<uint32_t>(c)})) u.result.push_back(x);
+        }
+        return u;
+    }
+    static unsigned maxExpansion(const ldml::DivCodePlan & plan, bool utf8) {
+        unsigned E = 0;
+        for (const ldml::DivRule & d : plan.rules) E = std::max(E, unitsOf(d, utf8, plan.shift).expansion());
+        return E;
+    }
+    static bool deletes(const ldml::DivCodePlan & plan, bool utf8) {
+        for (const ldml::DivRule & d : plan.rules) if (unitsOf(d, utf8, plan.shift).deletions() > 0) return true;
+        //  (With converted rules and insertions: the reserved positions that their
+        //  results do not fill.)
+        return plan.dependent() && maxExpansion(plan, utf8) > 0;
+    }
+protected:
+    void generatePabloMethod() override;
+private:
+    //  The Vars of the changes (see above).
+    struct Key {
+        unsigned kind;      // 0: bits above the low ones (value), 1: a bit (value), 2: deleted,
+                            // 3: string matches of N units (value) of a stage (offset),
+                            // 4: matches inserting value positions after the offset (Count),
+                            // 5: matches whose result's last character ends at the offset, in the set of
+                            //    converted item value / 2 (value even) or not (odd),
+                            // 6: matches extending over value units,
+                            // 7: matches of the other single-character rules on characters of the
+                            //    converted rules (where these do not apply),
+                            // 8: the converted rules' matches ignoring their before contexts, with value
+                            //    the expansion (Count: at the offset of the count; Translate: 0),
+                            // 10: the converted rules' matches (Converted), extending over value units,
+                            // 11: the matches of a family's rules ignoring their before contexts (Count: at the
+                            //     offset of the count, with value the expansion; Translate: of N units (offset)
+                            //     of family value)
+        unsigned offset;
+        bool single;
+        unsigned value;
+        bool operator<(const Key & o) const {
+            return std::tie(kind, offset, single, value) < std::tie(o.kind, o.offset, o.single, o.value);
+        }
+    };
+    //  The changes of a rule: for each, its key and, for a bit changed where the
+    //  bit of the text is (flip: 1) or is not (flip: 0) set, the offset of that bit.
+    struct Change {
+        Key key;
+        int flip = -1;      // -1: where the rule matches; 0/1: where the text bit (key.value) at the offset is 0/1
+    };
+    std::vector<Change> changesOf(size_t r) const;
+    //  Whether a single-character rule (not converted) may match a character of
+    //  the converted rules (see Key kind 7).
+    bool onConverted(size_t r) const {
+        const ldml::DivRule & d = mPlan.rules[r];
+        return !d.converted && d.length() == 1 && mConvertedChars.intersects(d.text[0]);
+    }
+    //  The rules matched: in Count mode, those expanding, the string rules
+    //  (whose matches cover the single-character rules within them), and those
+    //  that determine the dependent positions; in Translate mode, all; in
+    //  Converted mode, the converted rules.
+    bool needed(size_t r) const {
+        const ldml::DivRule & d = mPlan.rules[r];
+        if (mMode == Mode::Converted) return d.converted || d.family >= 0;
+        if (mMode == Mode::Translate) return true;
+        return d.converted || mUnits[r].expansion() > 0 || d.length() > 1 || onConverted(r);
+    }
+    //  The distinct items of the before contexts of the converted rules, and the
+    //  characters of these rules.
+    std::vector<ldml::DivContextItem> mConvertedItems;
+    UCD::UnicodeSet mConvertedChars;
+    size_t convertedItem(const ldml::DivContextItem & item) const {
+        for (size_t i = 0; i < mConvertedItems.size(); i++) {
+            const ldml::DivContextItem & c = mConvertedItems[i];
+            if (c.kind == item.kind && c.set == item.set && c.negated == item.negated && c.runEnd == item.runEnd && c.external == item.external
+                    && c.throughKind == item.throughKind && c.through == item.through) return i;
+        }
+        return SIZE_MAX;
+    }
+    const ldml::DivCodePlan mPlan;
+    const Mode mMode;
+    const bool mUTF8;
+    const bool mHasExternals;
+    const bool mHasMask;
+    const bool mHasSpread;
+    const bool mHasItems;
+    std::vector<Units> mUnits;
+};
+
+std::vector<DivCodeTranslate::Change> DivCodeTranslate::changesOf(size_t r) const {
+    const ldml::DivRule & d = mPlan.rules[r];
+    const Units & u = mUnits[r];
+    const unsigned s = mPlan.shift, W = mUTF8 ? 8 : 21;
+    const uint32_t low = (1u << s) - 1;
+    const unsigned N = u.N, M = static_cast<unsigned>(u.result.size());
+    const bool single = d.length() == 1;
+    const bool converted = mPlan.dependent();
+    std::vector<Change> changes;
+    //  (The applied string matches, by stage: each cover reads the Vars of the
+    //  stages before it, which no later pass assigns, as the builder may reuse
+    //  an expression over the same Vars computed before a pass assigned them.)
+    const unsigned stage = std::max(d.stage, 1u);
+    if (mMode == Mode::Count) {
+        //  (A converted rule: the positions it may need, at its last unit.)
+        if (d.converted) return {Change{Key{8, N - 1, true, u.expansion()}}};
+        //  (A rule of a family: the positions it may need, and its certain match.)
+        if (d.family >= 0) return {Change{Key{11, N - 1, false, u.expansion()}}, Change{Key{3, stage, false, N}}};
+        if (M > N) changes.push_back(Change{Key{4, N - 1, single, M - N}});
+        if (!single) changes.push_back(Change{Key{3, stage, false, N}});
+        if (onConverted(r)) changes.push_back(Change{Key{7, 0, true, 0}});
+        return changes;
+    }
+    //  (Translate: a converted rule, only where it may apply.)
+    if (mMode == Mode::Translate && d.converted) return {Change{Key{8, 0, true, 0}}};
+    //  (Translate: a rule of a family, its match, which is certain, as a cover:
+    //  Converted applies its changes.)
+    if (mMode == Mode::Translate && d.family >= 0) {
+        return {Change{Key{11, N, false, static_cast<unsigned>(d.family)}}, Change{Key{6, 0, false, N}}, Change{Key{3, stage, false, N}}};
+    }
+    for (unsigned j = 0; j < std::max(N, M); j++) {
+        if (j >= M) {
+            changes.push_back(Change{Key{2, j, single, 0}});
+            continue;
+        }
+        const uint32_t dst = u.result[j];
+        //  (A unit inserted after the match: all bits 0 in the spread text.)
+        const uint32_t known = j < N ? u.known[j] : 0, varying = j < N ? u.varying[j] : 0;
+        const uint32_t x = (known ^ dst) & ~varying;
+        if (x >> s) changes.push_back(Change{Key{0, j, single, x >> s}});
+        for (unsigned b = 0; b < W; b++) {
+            if ((varying >> b) & 1) {
+                //  (A bit that varies: changed where it differs from that of dst.)
+                changes.push_back(Change{Key{1, j, single, b}, ((dst >> b) & 1) ? 0 : 1});
+            } else if (b < s && ((x & low) >> b) & 1) {
+                changes.push_back(Change{Key{1, j, single, b}});
+            }
+        }
+    }
+    //  With converted rules: where the result's last character ends (in the
+    //  set of each converted item or not), and how far the match extends.
+    if (converted && M > 0) {
+        for (size_t i = 0; i < mConvertedItems.size(); i++) {
+            //  (The character a before item sees after the result, §12 step 2.)
+            const bool in = mConvertedItems[i].set.contains(ldml::lastSeen(mConvertedItems[i], d.result));
+            changes.push_back(Change{Key{5, M, single, static_cast<unsigned>(2 * i + (in ? 0 : 1))}});
+        }
+    }
+    if (mMode == Mode::Converted) {
+        changes.push_back(Change{Key{10, 0, true, std::max(N, M)}});
+        return changes;
+    }
+    if (converted) {
+        changes.push_back(Change{Key{6, 0, single, std::max(N, M)}});
+        if (onConverted(r)) changes.push_back(Change{Key{7, 0, true, 0}});
+    }
+    if (!single) changes.push_back(Change{Key{3, stage, false, N}});
+    return changes;
+}
+
+void DivCodeTranslate::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const ldml::DivCodePlan & plan = mPlan;
+    const unsigned s = plan.shift, W = mUTF8 ? 8 : 21;
+    const UCD::codepoint_t low = (1u << s) - 1;
+    const std::vector<PabloAST *> U = getInputStreamSet("Basis");
+    const std::vector<PabloAST *> code = getInputStreamSet("Code");
+    const std::vector<PabloAST *> ext = mHasExternals ? getInputStreamSet("Externals") : std::vector<PabloAST *>{};
+    PabloAST * const inText = getInputStreamSet("InText")[0];
+    PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+    //  The positions inserted after the matches of expanding rules (within the text).
+    PabloAST * const gap = mHasSpread ? pb.createAnd(inText, pb.createNot(getInputStreamSet("Spread")[0])) : nullptr;
+    const unsigned k = static_cast<unsigned>(code.size());
+    PabloAST * const zeroes = pb.createZeroes();
+    const unsigned maxLen = mUTF8 ? 4 : 1;
+
+    //  Tests of sets on the pseudo-basis in a scope, at offsets from the anchor.
+    //  A character of a known length L has its low bits in its last unit (at
+    //  offset + L - 1); one of unknown length (UTF-8: of an item of a context),
+    //  in the last unit of the length its first byte gives.
+    struct Tests {
+        PabloBuilder & b;
+        const std::vector<PabloAST *> & U;
+        const std::vector<PabloAST *> & code;
+        unsigned s, k;
+        bool utf8;
+        std::map<std::pair<unsigned, unsigned>, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> full, lowOnly;
+        std::map<std::tuple<unsigned, unsigned, std::string>, PabloAST *> cache;
+        PabloAST * at(PabloAST * x, unsigned offset) {return offset ? b.createLookahead(x, offset) : x;}
+        static std::string key(const UCD::UnicodeSet & set) {
+            std::string r;
+            for (const auto & range : set) r += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
+            return r;
+        }
+        //  The positions at an offset that begin a UTF-8 character of length L.
+        PabloAST * lengthAt(unsigned offset, unsigned L) {
+            PabloAST * const b7 = at(U[7], offset), * const b6 = at(U[6], offset);
+            PabloAST * const b5 = at(U[5], offset), * const b4 = at(U[4], offset);
+            if (L == 1) return b.createNot(b7);
+            PabloAST * x = b.createAnd(b7, b6);
+            if (L == 2) return b.createAnd(x, b.createNot(b5));
+            x = b.createAnd(x, b5);
+            return L == 3 ? b.createAnd(x, b.createNot(b4)) : b.createAnd(x, b4);
+        }
+        //  The low bits of the character at an offset (of length L, or 0 if not known).
+        std::vector<PabloAST *> lowOf(unsigned offset, unsigned L) {
+            std::vector<PabloAST *> bits;
+            for (unsigned i = 0; i < s; i++) {
+                if (!utf8 || L > 0) {
+                    bits.push_back(at(U[i], offset + (utf8 ? L - 1 : 0)));
+                } else {
+                    PabloAST * x = nullptr;
+                    for (unsigned l = 1; l <= 4; l++) {
+                        PabloAST * const y = b.createAnd(lengthAt(offset, l), at(U[i], offset + l - 1));
+                        x = x ? b.createOr(x, y) : y;
+                    }
+                    bits.push_back(x);
+                }
+            }
+            return bits;
+        }
+        //  A set of pseudo-codepoints (over the low bits and the code bits).
+        PabloAST * pseudo(unsigned offset, const UCD::UnicodeSet & set, unsigned L) {
+            const auto k3 = std::make_tuple(offset, L, "p" + key(set));
+            auto f = cache.find(k3);
+            if (f != cache.end()) return f->second;
+            auto & c = full[{offset, L}];
+            if (!c) {
+                std::vector<PabloAST *> basis = lowOf(offset, L);
+                for (unsigned i = 0; i < k; i++) basis.push_back(at(code[i], offset));
+                c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(basis);
+            }
+            PabloAST * const t = c->compileCC(re::makeCC(set, &cc::Unicode), b);
+            cache.emplace(k3, t);
+            return t;
+        }
+        //  A set of values of the low bits (within a block known otherwise), of a
+        //  character of length L at an offset.
+        PabloAST * lowBits(unsigned offset, unsigned L, const UCD::UnicodeSet & set) {
+            if (set.count() == (1u << s)) return b.createOnes();
+            const auto k3 = std::make_tuple(offset, L, "l" + key(set));
+            auto f = cache.find(k3);
+            if (f != cache.end()) return f->second;
+            auto & c = lowOnly[{offset, L}];
+            if (!c) c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(lowOf(offset, L));
+            PabloAST * const t = c->compileCC(re::makeCC(set, &cc::Unicode), b);
+            cache.emplace(k3, t);
+            return t;
+        }
+    };
+    auto lowSet = [&](const UCD::UnicodeSet & chars) {
+        UCD::UnicodeSet r;
+        for (const auto & range : chars) {
+            //  (Within one block.)
+            r = r + UCD::UnicodeSet(range.first & low, range.second & low);
+        }
+        return r;
+    };
+    //  The length in units of the characters of a block.
+    auto blockLength = [&](unsigned code) -> unsigned {
+        return mUTF8 ? static_cast<unsigned>(utf8Units(plan.blocks[code - 1] << s).size()) : 1;
+    };
+    //  An after item at an offset from the anchor: its character, within the
+    //  text (beyond it, the code is 0, and a set given by its complement, which
+    //  includes the characters of code 0, would hold), in its set or, negated,
+    //  not in it or at the end of the text.
+    std::vector<size_t> ruleItem, subgroupItem;
+    divCodeAfterContexts(plan, &ruleItem, &subgroupItem);
+    const std::vector<PabloAST *> items = mHasItems ? getInputStreamSet("Items") : std::vector<PabloAST *>{};
+    const std::vector<size_t> chained = divCodeChainedIndex(plan);
+    //  A context of one item, tested at an offset: its positive test, on the
+    //  pseudo-basis of the character at the offset (of a length its first unit
+    //  gives), within the text.
+    auto positiveTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset) -> PabloAST * {
+        const ldml::DivContextItem & item = context.items[0];
+        PabloAST * const x = item.kind == ldml::DivContextItem::Kind::External ? t.at(ext[item.external], offset)
+                                                                                : t.pseudo(offset, plan.pseudoTest(item.set), 0);
+        return t.b.createAnd(x, t.at(inText, offset));
+    };
+    //  (Negated, not in the set; marking the end of a filtered run, also a
+    //  position of the text outside the mask.)
+    auto finishTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, PabloAST * x) -> PabloAST * {
+        const ldml::DivContextItem & item = context.items[0];
+        x = item.negated ? t.b.createNot(x) : x;
+        if (item.runEnd && mask) x = t.b.createOr(x, t.b.createAnd(t.at(inText, offset), t.b.createNot(t.at(mask, offset))));
+        return x;
+    };
+    auto singleTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset) -> PabloAST * {
+        return finishTest(t, context, offset, positiveTest(t, context, offset));
+    };
+    //  The tests of the contexts of one item at the offsets the leaves test
+    //  them at (see below), by item and offset.
+    std::map<std::pair<size_t, unsigned>, PabloAST *> singles;
+    auto itemTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, size_t index) -> PabloAST * {
+        //  (A context of several items: whether it holds, from the Items kernel.)
+        if (context.items.size() > 1) return t.at(items[chained[index]], offset);
+        //  (An after context computed by the engine: at the anchor, §12 step 3.)
+        if (context.items[0].kind == ldml::DivContextItem::Kind::Stream) {
+            return t.at(ext[plan.externalSets.size() + context.items[0].external], 0);
+        }
+        auto f = singles.find({index, offset});
+        return f != singles.end() ? f->second : singleTest(t, context, offset);
+    };
+
+    //  The before items, at the top level: tested at the first unit of each
+    //  character (not inserted), and moved to the position after its last.
+    Tests top{pb, U, code, s, k, mUTF8};
+
+    //  The contexts of one item after the texts, tested once each, at the
+    //  largest offset L the leaves test any of them at: the test at offset o of
+    //  position p is that at L of position p - (L - o), an Advance by L - o.
+    //  A rule tests its own after item past its text and its own gap (N + e),
+    //  and that of an earlier rule it yields to past any gap (N + g, g up to
+    //  the largest expansion); in the text before it is spread, past its text.
+    //  - The positive tests (in the set, within the text) at L are in an
+    //    If-hierarchy on the code at L, as the rules are: each in the If of the
+    //    codes of its set (where it can hold), the smallest the codes of its
+    //    set lie within.  A set given by its complement (see
+    //    DivCodePlan::pseudoTest), which holds for the characters of code 0,
+    //    holds within the text where its complement does not: the test of its
+    //    complement is in the If-hierarchy, and its negation at the top level.
+    //    (An external set: at the top level.)
+    //  - The Advances are at the top level: in an If, their carries would be
+    //    lost in the blocks where it is not entered.
+    //  - The first L - o positions of the text, which no test at L reaches, are
+    //    tested at o directly, in an If entered only at the start of the text
+    //    (and where a segment's carries are rebuilt, where the Advance is 0
+    //    too).
+    //  - The negation and the end of a filtered run are applied at o.
+    {
+        const unsigned E = maxExpansion(plan, mUTF8);
+        std::map<size_t, const ldml::DivContext *> contexts;
+        std::set<std::pair<size_t, unsigned>> uses;
+        for (size_t r = 0; r < plan.rules.size(); r++) {
+            const ldml::DivRule & d = plan.rules[r];
+            if (!needed(r) || !d.after.present() || d.after.items.size() != 1) continue;
+            if (d.after.items[0].kind == ldml::DivContextItem::Kind::Stream) continue;
+            const Units & u = mUnits[r];
+            contexts.emplace(ruleItem[r], &d.after);
+            if (!mHasSpread) {
+                uses.insert({ruleItem[r], u.N});
+                continue;
+            }
+            uses.insert({ruleItem[r], u.N + u.expansion()});
+            for (unsigned g = 0; g <= E; g++) uses.insert({ruleItem[r], u.N + g});
+        }
+        unsigned L = 0;
+        for (const auto & use : uses) L = std::max(L, use.second);
+        //  The positive tests at L, by item: the codes each can hold at (none:
+        //  at the top level).
+        std::map<size_t, PabloAST *> atL;
+        struct Guarded {
+            Var * var;
+            std::set<unsigned> codes;       // of the pseudo-codepoints tested
+            UCD::UnicodeSet tested;         // the set's, or its complement's
+            bool complement;
+        };
+        std::vector<Guarded> guarded;
+        PabloAST * const inTextL = top.at(inText, L);
+        for (const auto & c : contexts) {
+            const ldml::DivContextItem & item = c.second->items[0];
+            UCD::UnicodeSet tested;
+            bool complement = false;
+            if (item.kind != ldml::DivContextItem::Kind::External) {
+                tested = plan.pseudoTest(item.set);
+                if (!tested.empty() && (tested.min_codepoint() >> s) == 0) {
+                    tested = plan.pseudoSet(~item.set);
+                    complement = true;
+                }
+            }
+            std::set<unsigned> codes;
+            for (const auto & range : tested) {
+                for (unsigned v = range.first >> s; v <= (range.second >> s); v++) codes.insert(v);
+            }
+            if (item.kind == ldml::DivContextItem::Kind::External || codes.empty()) {
+                atL.emplace(c.first, positiveTest(top, *c.second, L));
+                continue;
+            }
+            Var * const v = pb.createVar("afterL" + std::to_string(guarded.size()), zeroes);
+            guarded.push_back(Guarded{v, std::move(codes), std::move(tested), complement});
+            atL.emplace(c.first, v);
+        }
+        std::vector<PabloAST *> codeL;
+        for (unsigned i = 0; i < k; i++) codeL.push_back(top.at(code[i], L));
+        //  The tests of the items whose codes lie within prefix (above bit),
+        //  in the scope of b where the code at L is within prefix (cond).
+        std::function<void (PabloBuilder &, Tests &, int, unsigned, PabloAST *, const std::vector<size_t> &)> guard;
+        guard = [&](PabloBuilder & b, Tests & t, int bit, unsigned prefix, PabloAST * cond, const std::vector<size_t> & these) {
+            std::vector<size_t> half[2];
+            for (size_t g : these) {
+                const Guarded & x = guarded[g];
+                const unsigned first = *x.codes.begin() >> bit & 1, last = *x.codes.rbegin() >> bit & 1;
+                if (bit < 0 || first != last) {
+                    //  (The pseudo-codepoints at L; within the text, unless the
+                    //  complement's, negated with InText at the top level.)
+                    PabloAST * const y = t.pseudo(L, x.tested, 0);
+                    b.createAssign(x.var, x.complement ? y : b.createAnd(y, t.at(inText, L)));
+                } else {
+                    half[first].push_back(g);
+                }
+            }
+            if (bit < 0) return;
+            for (unsigned v : {1u, 0u}) {
+                if (half[v].empty()) continue;
+                const unsigned p = (prefix << 1) | v;
+                PabloAST * c = v ? codeL[bit] : b.createNot(codeL[bit]);
+                if (cond) c = b.createAnd(cond, c);
+                if (p == 0) {
+                    //  (Codes other than 0 below.)
+                    PabloAST * any = zeroes;
+                    for (int j = 0; j < bit; j++) any = b.createOr(any, codeL[j]);
+                    c = b.createAnd(c, any);
+                }
+                PabloBuilder body = b.createScope();
+                b.createIf(c, body);
+                Tests inner{body, U, code, s, k, mUTF8};
+                guard(body, inner, bit - 1, p, c, half[v]);
+            }
+        };
+        if (!guarded.empty()) {
+            std::vector<size_t> all(guarded.size());
+            for (size_t g = 0; g < all.size(); g++) all[g] = g;
+            guard(pb, top, static_cast<int>(k) - 1, 0, nullptr, all);
+        }
+        //  (A set given by its complement: within the text where its complement
+        //  is not, after the hierarchy assigns the complement's test: a
+        //  statement reads a Var's value at its place in the program.)
+        for (const auto & c : contexts) {
+            for (const Guarded & x : guarded) {
+                if (x.complement && atL.at(c.first) == x.var) atL[c.first] = pb.createAnd(inTextL, pb.createNot(x.var));
+            }
+        }
+        //  The positions before the d-th of the text, and the direct tests there.
+        std::map<unsigned, PabloAST *> before;
+        std::map<std::pair<size_t, unsigned>, Var *> direct;
+        for (const auto & use : uses) {
+            const unsigned d = L - use.second;
+            if (d == 0) continue;
+            if (!before.count(d)) before.emplace(d, pb.createNot(pb.createAdvance(pb.createOnes(), d)));
+            direct.emplace(use, pb.createVar("direct" + std::to_string(direct.size()), zeroes));
+        }
+        if (!direct.empty()) {
+            PabloBuilder body = pb.createScope();
+            pb.createIf(before.rbegin()->second, body);
+            Tests t{body, U, code, s, k, mUTF8};
+            for (const auto & v : direct) {
+                const unsigned d = L - v.first.second;
+                body.createAssign(v.second, body.createAnd(before.at(d), positiveTest(t, *contexts.at(v.first.first), v.first.second)));
+            }
+        }
+        for (const auto & use : uses) {
+            const unsigned d = L - use.second;
+            PabloAST * const x = atL.at(use.first);
+            PabloAST * const positive = d == 0 ? x : pb.createOr(pb.createAdvance(x, d), direct.at(use));
+            singles.emplace(use, finishTest(top, *contexts.at(use.first), use.second, positive));
+        }
+    }
+
+    PabloAST * starts = inText;
+    if (mUTF8) starts = pb.createAnd(starts, pb.createNot(pb.createAnd(U[7], pb.createNot(U[6]))));
+    if (gap) starts = pb.createAnd(starts, pb.createNot(gap));
+    auto next = [&](PabloAST * x) {
+        x = pb.createAnd(x, starts);
+        PabloAST * moved = nullptr;
+        for (unsigned l = 1; l <= maxLen; l++) {
+            PabloAST * const y = pb.createAdvance(mUTF8 ? pb.createAnd(x, top.lengthAt(0, l)) : x, l);
+            moved = moved ? pb.createOr(moved, y) : y;
+        }
+        //  (Through the positions inserted after a match before it: at most the
+        //  largest expansion, by Advances so that the carries stay local.)
+        if (gap) {
+            const unsigned E = maxExpansion(plan, mUTF8);
+            PabloAST * through = moved;
+            for (unsigned g = 0; g < E; g++) {
+                through = pb.createAdvance(pb.createAnd(through, gap), 1);
+                moved = pb.createOr(moved, through);
+            }
+        }
+        return moved;
+    };
+    std::map<std::string, PabloAST *> befores;
+    auto itemKey = [&](const ldml::DivContextItem & item) {
+        return std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "") + std::to_string(item.external)
+               + Tests::key(item.set) + ";";
+    };
+    auto testAt = [&](const ldml::DivContextItem & item) -> PabloAST * {
+        return item.kind == ldml::DivContextItem::Kind::External ? ext[item.external] : top.pseudo(0, plan.pseudoTest(item.set), 0);
+    };
+    //  A before context, from its outermost item inward: where the outermost
+    //  holds for the character before a position (negated, also at the start of
+    //  the text; marking the end of a filtered run, also after a character
+    //  outside the mask), then each inner item for the character before that,
+    //  with the items beyond it holding for the character before it.
+    auto beforeOf = [&](const ldml::DivContext & context) -> PabloAST * {
+        if (!context.present()) return nullptr;
+        std::string key;
+        for (const ldml::DivContextItem & item : context.items) key += itemKey(item);
+        auto f = befores.find(key);
+        if (f != befores.end()) return f->second;
+        const ldml::DivContextItem & outer = context.items.back();
+        PabloAST * x = next(testAt(outer));
+        if (outer.negated) x = pb.createNot(x);
+        if (outer.runEnd && mask) x = pb.createOr(x, next(pb.createNot(mask)));
+        for (size_t j = context.items.size() - 1; j-- > 0; ) x = next(pb.createAnd(testAt(context.items[j]), x));
+        befores.emplace(key, x);
+        return x;
+    };
+    //  (Created at the top level before the hierarchy: not those of the
+    //  converted rules, matched against the converted text.)
+    if (mMode != Mode::Converted) {
+        for (const ldml::DivRule & d : plan.rules) if (!d.converted && d.family < 0) beforeOf(d.before);
+        for (const auto & sc : plan.subgroupContexts) beforeOf(sc.first);
+    }
+
+    //  The Vars of the changes, created before the hierarchy (in Converted mode,
+    //  those of the pass after the loop; the loop has its own).  The leaves
+    //  assign the Vars of target.
+    std::map<Key, Var *> vars;
+    for (size_t r = 0; r < plan.rules.size(); r++) {
+        if (!needed(r)) continue;
+        for (const Change & c : changesOf(r)) {
+            if (vars.count(c.key)) continue;
+            vars.emplace(c.key, pb.createVar("chg" + std::to_string(vars.size()), zeroes));
+        }
+    }
+    std::map<Key, Var *> * target = &vars;
+
+    const unsigned maxExp = maxExpansion(plan, mUTF8);
+    //  The pass of a rule: its stage (see ldml::DivRule::stage), the
+    //  single-character rules with the string rules of stage 1.  (Converted
+    //  mode: one pass of the converted rules.)
+    auto passOf = [&](size_t r) {return std::max(plan.rules[r].stage, 1u);};
+    unsigned passes = 1;
+    for (size_t r = 0; r < plan.rules.size(); r++) passes = std::max(passes, passOf(r));
+    auto inPass = [&](size_t r, unsigned pass) {return needed(r) && (mMode == Mode::Converted || passOf(r) == pass);};
+    //  In Converted mode, the before contexts of the converted rules: whether the
+    //  converted character before a position is in the set of each item (or,
+    //  negated, not), as resolved so far.
+    std::vector<PabloAST *> convertedBefore;
+    //  In Converted mode, where the converted rules apply (their dependent
+    //  positions) and where the rules of the families do (their matches).
+    PabloAST * convertedAt = nullptr, * familiesAt = nullptr;
+    //  A leaf: the rules of a pass anchored at code A, each applying only outside
+    //  the applied string matches of the passes before (cover, if any).
+    auto leaf = [&](PabloBuilder & b, unsigned A, PabloAST * leafCond, unsigned pass, PabloAST * cover) {
+        Tests t{b, U, code, s, k, mUTF8};
+        //  In the spread text: the gap positions at an offset, the gaps of
+        //  exactly g positions from an offset, and an after item at the first
+        //  position of the text (not inserted) from an offset, as in the text
+        //  before it was spread.
+        PabloAST * const spreadIn = mHasSpread ? getInputStreamSet("Spread")[0] : nullptr;
+        auto gapAt = [&](unsigned o) {return b.createAnd(t.at(inText, o), b.createNot(t.at(spreadIn, o)));};
+        auto gapOf = [&](unsigned o, unsigned g) {
+            PabloAST * x = b.createNot(gapAt(o + g));
+            for (unsigned i = o; i < o + g; i++) x = b.createAnd(x, gapAt(i));
+            return x;
+        };
+        auto afterItem = [&](const ldml::DivContext & item, unsigned o, size_t index) -> PabloAST * {
+            if (!mHasSpread) return itemTest(t, item, o, index);
+            PabloAST * x = nullptr;
+            for (unsigned g = 0; g <= maxExp; g++) {
+                PabloAST * const y = b.createAnd(gapOf(o, g), itemTest(t, item, o + g, index));
+                x = x ? b.createOr(x, y) : y;
+            }
+            return x;
+        };
+        const std::vector<size_t> & rules = plan.leaves[A - 1];
+        const unsigned LA = blockLength(A);
+        //  The matches of rules at their anchors, before their priorities and
+        //  covers: of the rules of the pass, and of the earlier rules they yield
+        //  to (of any pass), computed as needed.
+        //  (own: the match of the rule itself, which in the spread text requires
+        //  exactly its own gap, so its after item is at the exact offset past
+        //  it; otherwise, as an earlier rule another yields to, past any gap.  A
+        //  converted rule may have more positions reserved after it than its
+        //  own: past any gap too.)
+        std::map<std::pair<size_t, bool>, PabloAST *> raw;
+        auto rawOf = [&](size_t r, bool own = false) -> PabloAST * {
+            auto f = raw.find({r, own});
+            if (f != raw.end()) return f->second;
+            const ldml::DivRule & d = plan.rules[r];
+            const Units & u = mUnits[r];
+            PabloAST * M = b.createAnd(leafCond, t.lowBits(0, u.length[0], lowSet(d.text[0])));
+            for (size_t i = 1; i < d.length(); i++) {
+                M = b.createAnd(M, t.pseudo(u.offset[i], plan.pseudoSet(d.text[i]), u.length[i]));
+            }
+            if (mask) for (unsigned o : u.offset) M = b.createAnd(M, t.at(mask, o));
+            if (d.after.present()) {
+                M = b.createAnd(M, own && mHasSpread && !d.converted && d.family < 0 ? itemTest(t, d.after, u.N + u.expansion(), ruleItem[r])
+                                                                                     : afterItem(d.after, u.N, ruleItem[r]));
+            }
+            //  (A converted rule, or a rule of a family: its before context only in
+            //  Converted mode.)
+            if (d.converted || d.family >= 0) {
+                if (mMode == Mode::Converted && d.before.present()) M = b.createAnd(M, convertedBefore[convertedItem(d.before.items[0])]);
+            } else if (PabloAST * bf = beforeOf(d.before)) {
+                M = b.createAnd(M, bf);
+            }
+            raw.emplace(std::make_pair(r, own), M);
+            return M;
+        };
+        //  The matches assigned to each Var, ORed together and assigned once at the
+        //  end of the leaf: Or(v, x) for the same v and x twice (two rules with the
+        //  same match and change) would be built once, and the second assignment
+        //  would drop what was assigned to v in between.
+        std::map<Var *, PabloAST *> assigned;
+        std::vector<Var *> order;
+        for (size_t r : rules) {
+            if (!inPass(r, pass)) continue;
+            const ldml::DivRule & d = plan.rules[r];
+            PabloAST * M = rawOf(r, true);
+            if (mMode == Mode::Converted) M = b.createAnd(M, d.family >= 0 ? familiesAt : convertedAt);
+            //  (Converted mode: only at the dependent positions, where no other
+            //  rule applies but the earlier rules of the same family.)
+            {
+                //  The earlier rules it yields to, matching at its anchor.
+                PabloAST * earlier = nullptr;
+                for (const ldml::DivEarlier & e : d.yieldsTo) {
+                    PabloAST * x = nullptr;
+                    if (mMode == Mode::Converted) {
+                        for (size_t q : rules) {
+                            const ldml::DivRule & eq = plan.rules[q];
+                            if (d.family >= 0 && eq.stringRule == e.stringRule && eq.family == d.family) {
+                                x = x ? b.createOr(x, rawOf(q)) : rawOf(q);
+                            }
+                        }
+                    } else if (e.stringRule >= 0) {
+                        for (size_t q : rules) {
+                            if (plan.rules[q].stringRule == e.stringRule) x = x ? b.createOr(x, rawOf(q)) : rawOf(q);
+                        }
+                    } else if (e.subgroup >= 0) {
+                        const UCD::UnicodeSet chars = e.chars & UCD::UnicodeSet(plan.blocks[A - 1] << s, (plan.blocks[A - 1] << s) | low);
+                        if (!chars.empty()) {
+                            x = b.createAnd(leafCond, t.lowBits(0, LA, lowSet(chars)));
+                            if (mask) x = b.createAnd(x, mask);
+                            const auto & sc = plan.subgroupContexts[e.subgroup];
+                            if (sc.second.present()) x = b.createAnd(x, afterItem(sc.second, LA, subgroupItem[e.subgroup]));
+                            if (PabloAST * bf = beforeOf(sc.first)) x = b.createAnd(x, bf);
+                        }
+                    }
+                    if (x) earlier = earlier ? b.createOr(earlier, x) : x;
+                }
+                if (earlier) M = b.createAnd(M, b.createNot(earlier));
+            }
+            if (mMode != Mode::Converted) {
+                //  (Not beginning strictly within an applied match of a pass before.)
+                if (cover) M = b.createAnd(M, b.createNot(cover));
+                //  In the spread text, a rule applies only where the Count kernel
+                //  found it to: with exactly its expansion inserted after it (none,
+                //  if it does not expand).  (A converted rule: with the positions
+                //  reserved at its dependent position.)
+                //  (A rule of a family: with the positions reserved for the family.)
+                if (mHasSpread && !d.converted && d.family < 0) M = b.createAnd(M, gapOf(mUnits[r].N, mUnits[r].expansion()));
+            }
+            for (const Change & c : changesOf(r)) {
+                //  (In the loop, only the outcomes: not the bits of the output.)
+                auto f = target->find(c.key);
+                if (f == target->end()) continue;
+                Var * const v = f->second;
+                PabloAST * x = M;
+                if (c.flip >= 0) {
+                    PabloAST * bit = t.at(U[c.key.value], c.key.offset);
+                    x = b.createAnd(M, c.flip ? bit : b.createNot(bit));
+                }
+                auto g = assigned.find(v);
+                if (g == assigned.end()) {
+                    assigned.emplace(v, x);
+                    order.push_back(v);
+                } else {
+                    g->second = b.createOr(g->second, x);
+                }
+            }
+        }
+        for (Var * v : order) b.createAssign(v, b.createOr(v, assigned.at(v)));
+    };
+
+    //  The If-hierarchy on the code bits, from the highest: a subtree of the
+    //  codes with the bits above 'bit' given (prefix), entered where a code of
+    //  it with rules (other than 0) is, within cond if given.
+    unsigned pass = 1;
+    PabloAST * cover = nullptr;
+    auto hasRules = [&](unsigned lo, unsigned hi) {
+        for (unsigned c = std::max(lo, 1u); c <= std::min<unsigned>(hi, plan.blocks.size()); c++) {
+            for (size_t r : plan.leaves[c - 1]) {
+                if (inPass(r, pass)) return true;
+            }
+        }
+        return false;
+    };
+    std::function<void (PabloBuilder &, int, unsigned, PabloAST *)> subtree = [&](PabloBuilder & b, int bit, unsigned prefix, PabloAST * cond) {
+        if (bit < 0) {
+            leaf(b, prefix, cond, pass, cover);
+            return;
+        }
+        for (unsigned v : {1u, 0u}) {
+            const unsigned p = (prefix << 1) | v;
+            const unsigned lo = p << bit, hi = ((p + 1) << bit) - 1;
+            if (!hasRules(lo, hi)) continue;
+            PabloAST * c = v ? code[bit] : b.createNot(code[bit]);
+            if (cond) c = b.createAnd(cond, c);
+            if (p == 0) {
+                //  (Codes other than 0 below.)
+                PabloAST * any = zeroes;
+                for (int j = 0; j < bit; j++) any = b.createOr(any, code[j]);
+                c = b.createAnd(c, any);
+            }
+            PabloBuilder body = b.createScope();
+            b.createIf(c, body);
+            subtree(body, bit - 1, p, c);
+        }
+    };
+    //  The positions strictly within the applied matches of the string rules so
+    //  far (the Vars of their matches by their numbers of units).
+    unsigned maxUnits = 0;
+    for (const auto & v : vars) if (v.first.kind == 3) maxUnits = std::max(maxUnits, v.first.value);
+    auto coverBefore = [&](unsigned stage) {
+        PabloAST * covered = zeroes;
+        for (unsigned j = 1; j < maxUnits; j++) {
+            PabloAST * longer = zeroes;
+            for (const auto & v : vars) {
+                if (v.first.kind == 3 && v.first.offset < stage && v.first.value > j) longer = pb.createOr(longer, v.second);
+            }
+            covered = pb.createOr(covered, pb.createAdvance(longer, j));
+        }
+        return covered;
+    };
+    //  The passes, one If-hierarchy each (see ldml::DivRule::stage).
+    if (mMode != Mode::Converted) {
+        for (pass = 1; pass <= passes; pass++) {
+            cover = pass > 1 ? coverBefore(pass) : nullptr;
+            subtree(pb, static_cast<int>(k) - 1, 0, nullptr);
+        }
+    }
+
+    //  The changes, advanced to their offsets: of the string rules, and of the
+    //  single-character rules outside the matches of the string rules.
+    PabloAST * const covered = coverBefore(passes + 1);
+    PabloAST * const uncovered = pb.createNot(covered);
+    //  The positions after the characters (not inserted) beginning at x.
+    auto nextPlain = [&](PabloAST * x) {
+        x = pb.createAnd(x, starts);
+        PabloAST * moved = nullptr;
+        for (unsigned l = 1; l <= maxLen; l++) {
+            PabloAST * const y = pb.createAdvance(mUTF8 ? pb.createAnd(x, top.lengthAt(0, l)) : x, l);
+            moved = moved ? pb.createOr(moved, y) : y;
+        }
+        return moved;
+    };
+    //  The matches of the Vars of a kind, at their anchors.
+    auto anchored = [&](unsigned kind) {
+        PabloAST * x = zeroes;
+        for (const auto & v : vars) {
+            if (v.first.kind == kind) x = pb.createOr(x, v.first.single ? pb.createAnd(v.second, uncovered) : v.second);
+        }
+        return x;
+    };
+    //  The dependent positions (see the class comment): where a converted rule
+    //  matches, ignoring its before context, outside the string matches, and no
+    //  other single-character rule applies nor a string match begins.
+    PabloAST * dep = nullptr;
+    if (plan.dependent() && mMode != Mode::Converted) {
+        dep = plan.convertedRules == 0 ? zeroes : pb.createAnd(anchored(8), pb.createNot(pb.createOr(anchored(7), anchored(3))));
+    }
+    if (mMode == Mode::Count) {
+        //  The insertion counts, at the last positions of the matches.
+        std::vector<PabloAST *> count(getOutputStreamSet(0)->getNumElements(), zeroes);
+        for (const auto & v : vars) {
+            if (v.first.kind != 4) continue;
+            PabloAST * x = v.first.single ? pb.createAnd(v.second, uncovered) : v.second;
+            if (v.first.offset) x = pb.createAdvance(x, v.first.offset);
+            for (unsigned j = 0; j < count.size(); j++) {
+                if ((v.first.value >> j) & 1) count[j] = pb.createOr(count[j], x);
+            }
+        }
+        //  At the dependent positions (where no other match ends), the largest
+        //  expansion of the converted rules that match there: atLeast[e], where
+        //  one of at least e does.
+        //  (And at the matches of a family, the largest expansion of its rules
+        //  matching there, ignoring their before contexts.)
+        if (dep && maxExp > 0) {
+            std::vector<PabloAST *> atLeast(maxExp + 2, zeroes);
+            for (const auto & v : vars) {
+                if ((v.first.kind != 8 && v.first.kind != 11) || v.first.value == 0) continue;
+                PabloAST * x = v.first.kind == 8 ? pb.createAnd(v.second, dep) : static_cast<PabloAST *>(v.second);
+                if (v.first.offset) x = pb.createAdvance(x, v.first.offset);
+                for (unsigned e = 1; e <= v.first.value; e++) atLeast[e] = pb.createOr(atLeast[e], x);
+            }
+            for (unsigned e = 1; e <= maxExp; e++) {
+                PabloAST * const exactly = pb.createAnd(atLeast[e], pb.createNot(atLeast[e + 1]));
+                for (unsigned j = 0; j < count.size(); j++) if ((e >> j) & 1) count[j] = pb.createOr(count[j], exactly);
+            }
+        }
+        for (PabloAST *& c : count) c = pb.createInFile(c);
+        writeOutputStreamSet("InsertCount", count);
+        return;
+    }
+
+    //  Converted mode: what the converted character before each dependent
+    //  position is, then the converted rules applied there.
+    const size_t n = mConvertedItems.size();
+    std::vector<PabloAST *> base = U;
+    PabloAST * deletedBefore = zeroes;
+    PabloAST * surplus = zeroes;
+    if (mMode == Mode::Converted) {
+        base = getInputStreamSet("Prev");
+        deletedBefore = getInputStreamSet("PrevDeleted")[0];
+        //  (Dep: the dependent positions of the converted rules, and the matches
+        //  of the families whose outcomes are known (consumers) and not.)
+        const std::vector<PabloAST *> deps = getInputStreamSet("Dep");
+        PabloAST * const depIn = deps[0];
+        PabloAST * const depAll = pb.createOr(depIn, pb.createOr(deps[1], deps[2]));
+        convertedAt = depIn;
+        familiesAt = pb.createOr(deps[1], deps[2]);
+        const std::vector<PabloAST *> ends = getInputStreamSet("Ends");
+        PabloAST * const start = pb.createNot(pb.createAdvance(pb.createOnes(), 1));
+        //  (An item marking the end of a filtered run also holds after a
+        //  character outside the mask.)
+        PabloAST * const afterOutside = mask ? next(pb.createNot(mask)) : nullptr;
+        std::vector<PabloAST *> tests(n);
+        for (size_t i = 0; i < n; i++) tests[i] = testAt(mConvertedItems[i]);
+        //  The dependent positions whose characters propagate (see
+        //  ldml::DivCodePlan::propagating), and the others (consumers), whose
+        //  outcome the plan gives.
+        auto charsAt = [&](const UCD::UnicodeSet & set) -> PabloAST * {
+            return set.empty() ? zeroes : top.pseudo(0, plan.pseudoSet(set), 0);
+        };
+        PabloAST * const propagatingChars = pb.createAnd(depIn, charsAt(plan.propagating));
+        PabloAST * const consumers = pb.createAnd(depIn, pb.createNot(propagatingChars));
+        PabloAST * const propagating = pb.createOr(propagatingChars, deps[2]);
+        std::vector<PabloAST *> lengths;
+        for (unsigned l = 1; l <= maxLen; l++) lengths.push_back(mUTF8 ? top.lengthAt(0, l) : nullptr);
+        //  The positions after the characters beginning at x.
+        auto after = [&](PabloBuilder & b, PabloAST * x) {
+            PabloAST * moved = zeroes;
+            for (unsigned l = 1; l <= maxLen; l++) {
+                moved = b.createOr(moved, b.createAdvance(lengths[l - 1] ? b.createAnd(x, lengths[l - 1]) : x, l));
+            }
+            return moved;
+        };
+        //  The reserved positions not filled, from x on.
+        auto unfilled = [&](PabloBuilder & b, PabloAST * x) {
+            return gap ? b.createAnd(b.createMatchStar(x, gap), gap) : zeroes;
+        };
+        //  The outcomes of the converted rules' matches (Vars vs) and of the
+        //  dependent positions where none applies (unchanged): the positions
+        //  just after a converted character in each item's set and not in it,
+        //  and the positions deleted.
+        struct Outcome {std::vector<PabloAST *> in, out; PabloAST * del;};
+        auto outcomes = [&](PabloBuilder & b, const std::map<Key, Var *> & vs, PabloAST * unchanged) {
+            Outcome o{std::vector<PabloAST *>(n, zeroes), std::vector<PabloAST *>(n, zeroes), zeroes};
+            for (const auto & v : vs) {
+                const Key & key = v.first;
+                if (key.kind == 5) {
+                    PabloAST *& x = (key.value & 1) ? o.out[key.value / 2] : o.in[key.value / 2];
+                    x = b.createOr(x, b.createAdvance(v.second, key.offset));
+                } else if (key.kind == 2) {
+                    o.del = b.createOr(o.del, key.offset ? b.createAdvance(v.second, key.offset) : static_cast<PabloAST *>(v.second));
+                } else if (key.kind == 10) {
+                    o.del = b.createOr(o.del, unfilled(b, b.createAdvance(v.second, key.value)));
+                }
+            }
+            for (size_t i = 0; i < n; i++) {
+                o.in[i] = b.createOr(o.in[i], after(b, b.createAnd(unchanged, tests[i])));
+                o.out[i] = b.createOr(o.out[i], after(b, b.createAnd(unchanged, b.createNot(tests[i]))));
+            }
+            o.del = b.createOr(o.del, unfilled(b, after(b, unchanged)));
+            return o;
+        };
+        //  The outcomes of the consumers, for the items: the position after the
+        //  character (in the set of an item or not), or the character deleted;
+        //  the positions reserved after it are deleted, or filled (the converted
+        //  character before the next position is the same either way).
+        PabloAST * const consumersDeleted = pb.createAnd(consumers, charsAt(plan.consumerDeleted));
+        PabloAST * const consumersKept = pb.createAnd(consumers, pb.createNot(consumersDeleted));
+        //  (And the positions of the matches of the families whose results are
+        //  all deleted: Ends' last stream.)
+        PabloAST * knownDeleted = pb.createOr(pb.createOr(deletedBefore, ends[2 * n]), unfilled(pb, after(pb, consumers)));
+        for (unsigned l = 1; l <= maxLen; l++) {
+            PabloAST * const x = lengths[l - 1] ? pb.createAnd(consumersDeleted, lengths[l - 1]) : consumersDeleted;
+            for (unsigned j = 0; j < l; j++) knownDeleted = pb.createOr(knownDeleted, j ? pb.createAdvance(x, j) : x);
+        }
+        //  The characters of the repeated set of an item (§12 step 2), with the
+        //  positions their results fill: passed over (as the deleted positions),
+        //  and no end of a character there or just after counts for the item.
+        //  (Where they are in the text: no conversion moves a character into or
+        //  out of the set, see planDivCodeGroup.)
+        std::vector<PabloAST *> through(n, nullptr), afterThrough(n, nullptr);
+        for (size_t i = 0; i < n; i++) {
+            const ldml::DivContextItem & item = mConvertedItems[i];
+            if (!item.hasThrough()) continue;
+            ldml::DivContextItem t;
+            t.kind = item.throughKind;
+            t.set = item.through;
+            t.external = item.throughExternal;
+            PabloAST * chars = pb.createAnd(testAt(t), inText);
+            if (gap) {
+                chars = pb.createAnd(chars, pb.createNot(gap));
+                chars = pb.createOr(chars, pb.createAnd(pb.createMatchStar(pb.createAdvance(chars, 1), gap), gap));
+            }
+            through[i] = chars;
+            afterThrough[i] = pb.createAdvance(chars, 1);
+        }
+        std::vector<PabloAST *> endsIn(n), endsOut(n);
+        for (size_t i = 0; i < n; i++) {
+            PabloAST * const in = pb.createAnd(consumersKept, charsAt(plan.consumerIn[i]));
+            endsIn[i] = pb.createOr(ends[2 * i], after(pb, in));
+            endsOut[i] = pb.createOr(ends[2 * i + 1], after(pb, pb.createAnd(consumersKept, pb.createNot(in))));
+            if (through[i]) {
+                endsIn[i] = pb.createAnd(endsIn[i], pb.createNot(afterThrough[i]));
+                endsOut[i] = pb.createAnd(endsOut[i], pb.createNot(afterThrough[i]));
+            }
+        }
+        //  The items known: K1 (in the set) and K0 (not, or the start of the
+        //  text), from the ends of the converted characters through the deleted
+        //  positions.  The propagating positions are not known until evaluated.
+        //  (The initial values are kept: an expression over the Vars built before
+        //  the loop would be reused for the same expression in its body, with the
+        //  values from before the loop.)
+        std::vector<Var *> K1(n), K0(n);
+        std::vector<PabloAST *> k1(n), k0(n);
+        for (size_t i = 0; i < n; i++) {
+            PabloAST * const over = through[i] ? pb.createOr(knownDeleted, through[i]) : knownDeleted;
+            k1[i] = pb.createMatchStar(endsIn[i], over);
+            k0[i] = pb.createMatchStar(pb.createOr(endsOut[i], start), over);
+            K1[i] = pb.createVar("K1_" + std::to_string(i), k1[i]);
+            K0[i] = pb.createVar("K0_" + std::to_string(i), k0[i]);
+        }
+        auto contexts = [&](PabloBuilder & b) {
+            convertedBefore.clear();
+            for (size_t i = 0; i < n; i++) {
+                const ldml::DivContextItem & item = mConvertedItems[i];
+                PabloAST * x = item.negated ? K0[i] : K1[i];
+                if (item.runEnd && afterOutside) x = b.createOr(x, afterOutside);
+                convertedBefore.push_back(x);
+            }
+        };
+        //  The loop (doc/ldml-divcode-plan.md §10): its condition, the frontier,
+        //  is the propagating positions not yet evaluated whose items are known.
+        //  Each iteration evaluates the converted rules there, and adds their
+        //  outcomes to the known items, which then hold at later positions.
+        //  Every Var only gains bits (the loop's carries from the previous
+        //  block reach its first iteration only).
+        if (plan.propagates()) {
+            std::map<Key, Var *> loopVars;
+            for (const auto & v : vars) {
+                const unsigned kind = v.first.kind;
+                if (kind == 2 || kind == 5 || kind == 10) loopVars.emplace(v.first, pb.createVar("loop" + std::to_string(loopVars.size()), zeroes));
+            }
+            Var * const Del = pb.createVar("Del", knownDeleted);
+            Var * const Done = pb.createVar("Done", zeroes);
+            Var * const Unchanged = pb.createVar("Unchanged", zeroes);
+            Var * const Frontier = pb.createVar("Frontier", pb.createAnd(propagating, pb.createOr(k1[0], k0[0])));
+            PabloBuilder wb = pb.createScope();
+            contexts(wb);
+            target = &loopVars;
+            subtree(wb, static_cast<int>(k) - 1, 0, Frontier);
+            PabloAST * fired = zeroes;
+            for (const auto & v : loopVars) if (v.first.kind == 10) fired = wb.createOr(fired, v.second);
+            wb.createAssign(Unchanged, wb.createOr(Unchanged, wb.createAnd(Frontier, wb.createNot(fired))));
+            const Outcome o = outcomes(wb, loopVars, Unchanged);
+            PabloAST * const del = wb.createOr(Del, o.del);
+            wb.createAssign(Del, del);
+            for (size_t i = 0; i < n; i++) {
+                PabloAST * in = o.in[i], * out = o.out[i], * over = del;
+                if (through[i]) {
+                    in = wb.createAnd(in, wb.createNot(afterThrough[i]));
+                    out = wb.createAnd(out, wb.createNot(afterThrough[i]));
+                    over = wb.createOr(del, through[i]);
+                }
+                wb.createAssign(K1[i], wb.createOr(K1[i], wb.createMatchStar(wb.createOr(in, K1[i]), over)));
+                wb.createAssign(K0[i], wb.createOr(K0[i], wb.createMatchStar(wb.createOr(out, K0[i]), over)));
+            }
+            wb.createAssign(Done, wb.createOr(Done, Frontier));
+            wb.createAssign(Frontier, wb.createAnd(wb.createAnd(propagating, wb.createNot(Done)), wb.createOr(K1[0], K0[0])));
+            pb.createWhile(Frontier, wb);
+        }
+        //  The converted rules at every dependent position, with the items
+        //  resolved.
+        contexts(pb);
+        target = &vars;
+        subtree(pb, static_cast<int>(k) - 1, 0, depAll);
+        PabloAST * fired = zeroes;
+        for (const auto & v : vars) {
+            if (v.first.kind != 10) continue;
+            fired = pb.createOr(fired, v.second);
+            surplus = pb.createOr(surplus, unfilled(pb, pb.createAdvance(v.second, v.first.value)));
+        }
+        surplus = pb.createOr(surplus, unfilled(pb, after(pb, pb.createAnd(depAll, pb.createNot(fired)))));
+    }
+
+    std::vector<PabloAST *> out(W, nullptr);
+    PabloAST * deleted = zeroes;
+    for (bool single : {false, true}) {
+        std::map<unsigned, std::vector<PabloAST *>> bitsAt;    // offset: the changes of each bit
+        std::map<unsigned, PabloAST *> deletedAt;
+        for (const auto & v : vars) {
+            const Key & key = v.first;
+            if (key.single != single || key.kind > 2) continue;
+            if (key.kind == 2) {
+                deletedAt[key.offset] = deletedAt.count(key.offset) ? pb.createOr(deletedAt[key.offset], v.second) : v.second;
+                continue;
+            }
+            auto & bits = bitsAt[key.offset];
+            if (bits.empty()) bits.assign(W, zeroes);
+            if (key.kind == 0) {
+                for (unsigned b = s; b < W; b++) {
+                    if ((key.value >> (b - s)) & 1) bits[b] = pb.createOr(bits[b], v.second);
+                }
+            } else if (key.kind == 1) {
+                bits[key.value] = pb.createOr(bits[key.value], v.second);
+            }
+        }
+        //  (A single-character rule applies only at an anchor outside the
+        //  matches of the string rules: its changes at every offset.)
+        auto place = [&](PabloAST * x, unsigned offset) {
+            if (single) x = pb.createAnd(x, uncovered);
+            return offset ? pb.createAdvance(x, offset) : x;
+        };
+        for (auto & a : bitsAt) {
+            for (unsigned b = 0; b < W; b++) {
+                if (a.second[b] == zeroes) continue;
+                PabloAST * const x = place(a.second[b], a.first);
+                out[b] = out[b] ? pb.createOr(out[b], x) : x;
+            }
+        }
+        for (auto & d : deletedAt) deleted = pb.createOr(deleted, place(d.second, d.first));
+    }
+    std::vector<PabloAST *> result(W);
+    for (unsigned b = 0; b < W; b++) result[b] = out[b] ? pb.createXor(base[b], out[b]) : base[b];
+    writeOutputStreamSet("Out", result);
+    deleted = pb.createOr(pb.createOr(deleted, surplus), deletedBefore);
+    writeOutputStreamSet("Deleted", std::vector<PabloAST *>{pb.createInFile(deleted)});
+    if (!dep) return;
+    //  Translate mode with converted rules: the dependent positions, and the
+    //  positions just after each converted character, in the set of each item
+    //  or not: after the results of the applied matches, and after the
+    //  characters of the text that no applied match replaces (not dependent).
+    PabloAST * within = zeroes;
+    for (const auto & v : vars) {
+        if (v.first.kind != 6) continue;
+        PabloAST * const y = v.first.single ? pb.createAnd(v.second, uncovered) : v.second;
+        for (unsigned j = 0; j < v.first.value; j++) within = pb.createOr(within, j ? pb.createAdvance(y, j) : y);
+    }
+    PabloAST * const unchanged = pb.createAnd(starts, pb.createNot(pb.createOr(within, dep)));
+    std::vector<PabloAST *> ends(2 * n, zeroes);
+    for (const auto & v : vars) {
+        if (v.first.kind != 5) continue;
+        PabloAST * const y = v.first.single ? pb.createAnd(v.second, uncovered) : v.second;
+        ends[v.first.value] = pb.createOr(ends[v.first.value], pb.createAdvance(y, v.first.offset));
+    }
+    for (size_t i = 0; i < n; i++) {
+        PabloAST * const test = testAt(mConvertedItems[i]);
+        ends[2 * i] = pb.createOr(ends[2 * i], nextPlain(pb.createAnd(unchanged, test)));
+        ends[2 * i + 1] = pb.createOr(ends[2 * i + 1], nextPlain(pb.createAnd(unchanged, pb.createNot(test))));
+    }
+    //  The matches of the families (the anchors of their rules, which Converted
+    //  applies), known (consumers) or not; for the consumers, the outcome at
+    //  the first position after the match and the positions reserved after it
+    //  (the result's last character), or the positions of the match and those
+    //  reserved, deleted.
+    PabloAST * familyKnown = zeroes, * familyPropagating = zeroes, * familyDeleted = zeroes;
+    for (const auto & v : vars) {
+        if (v.first.kind != 11) continue;
+        const ldml::DivConvertedFamily & family = plan.convertedFamilies[v.first.value];
+        if (family.propagating) {
+            familyPropagating = pb.createOr(familyPropagating, v.second);
+            continue;
+        }
+        familyKnown = pb.createOr(familyKnown, v.second);
+        //  (The units of the text, then the reserved positions, to the first
+        //  position after them.)
+        PabloAST * span = zeroes;
+        for (unsigned j = 0; j < v.first.offset; j++) span = pb.createOr(span, j ? pb.createAdvance(v.second, j) : static_cast<PabloAST *>(v.second));
+        PabloAST * through = pb.createAdvance(v.second, v.first.offset);
+        PabloAST * end = gap ? pb.createAnd(through, pb.createNot(gap)) : through;
+        if (gap) {
+            for (unsigned g = 0; g < maxExp; g++) {
+                PabloAST * const inGap = pb.createAnd(through, gap);
+                span = pb.createOr(span, inGap);
+                through = pb.createAdvance(inGap, 1);
+                end = pb.createOr(end, pb.createAnd(through, pb.createNot(gap)));
+            }
+        }
+        if (family.deleted) {
+            familyDeleted = pb.createOr(familyDeleted, span);
+        } else {
+            for (size_t i = 0; i < n; i++) ends[2 * i + (family.in[i] ? 0 : 1)] = pb.createOr(ends[2 * i + (family.in[i] ? 0 : 1)], end);
+        }
+    }
+    ends.push_back(familyDeleted);
+    for (PabloAST *& e : ends) e = pb.createInFile(e);
+    writeOutputStreamSet("Dep", std::vector<PabloAST *>{pb.createInFile(dep), pb.createInFile(familyKnown), pb.createInFile(familyPropagating)});
+    writeOutputStreamSet("Ends", ends);
+}
+
+void DivCodeItems::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const ldml::DivCodePlan & plan = mPlan;
+    const unsigned s = plan.shift;
+    const std::vector<PabloAST *> U = getInputStreamSet("Basis");
+    const std::vector<PabloAST *> code = getInputStreamSet("Code");
+    const std::vector<PabloAST *> ext = mHasExternals ? getInputStreamSet("Externals") : std::vector<PabloAST *>{};
+    PabloAST * const inText = getInputStreamSet("InText")[0];
+    PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+    const unsigned k = static_cast<unsigned>(code.size());
+    auto at = [&](PabloAST * x, unsigned o) {return o ? pb.createLookahead(x, o) : x;};
+    //  The positions at an offset that begin a UTF-8 character of length L.
+    auto lengthAt = [&](unsigned o, unsigned L) -> PabloAST * {
+        PabloAST * const b7 = at(U[7], o), * const b6 = at(U[6], o), * const b5 = at(U[5], o), * const b4 = at(U[4], o);
+        if (L == 1) return pb.createNot(b7);
+        PabloAST * x = pb.createAnd(b7, b6);
+        if (L == 2) return pb.createAnd(x, pb.createNot(b5));
+        x = pb.createAnd(x, b5);
+        return L == 3 ? pb.createAnd(x, pb.createNot(b4)) : pb.createAnd(x, b4);
+    };
+    //  The test of an item's set at a character starting at an offset: on the
+    //  pseudo-basis there (its code, and the low bits of its last unit, in
+    //  UTF-8 by the length its first byte gives), within the text.
+    std::map<unsigned, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> compilers;
+    std::map<std::pair<unsigned, std::string>, PabloAST *> cache;
+    auto test = [&](const ldml::DivContextItem & item, unsigned o) -> PabloAST * {
+        std::string key = std::to_string(static_cast<int>(item.kind)) + "," + std::to_string(item.external) + ":";
+        for (const auto & r : item.set) key += std::to_string(r.first) + "-" + std::to_string(r.second) + ",";
+        auto f = cache.find({o, key});
+        if (f != cache.end()) return f->second;
+        PabloAST * x = nullptr;
+        if (item.kind == ldml::DivContextItem::Kind::External) {
+            x = at(ext[item.external], o);
+        } else {
+            auto & c = compilers[o];
+            if (!c) {
+                std::vector<PabloAST *> basis;
+                for (unsigned i = 0; i < s; i++) {
+                    if (!mUTF8) {
+                        basis.push_back(at(U[i], o));
+                        continue;
+                    }
+                    PabloAST * y = pb.createAnd(lengthAt(o, 1), at(U[i], o));
+                    for (unsigned l = 2; l <= 4; l++) y = pb.createOr(y, pb.createAnd(lengthAt(o, l), at(U[i], o + l - 1)));
+                    basis.push_back(y);
+                }
+                for (unsigned i = 0; i < k; i++) basis.push_back(at(code[i], o));
+                c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(basis);
+            }
+            x = c->compileCC(re::makeCC(plan.pseudoTest(item.set), &cc::Unicode), pb);
+        }
+        x = pb.createAnd(x, at(inText, o));
+        cache.emplace(std::make_pair(o, key), x);
+        return x;
+    };
+    //  Whether the items from j on hold, from the character starting at an
+    //  offset: its item's test and, for an inner item, the items after it from
+    //  the next character; the outermost, negated, also at the end of the text,
+    //  and (marking the end of a filtered run) outside the mask.
+    std::function<PabloAST * (const ldml::DivContext &, size_t, unsigned)> chain = [&](const ldml::DivContext & c, size_t j, unsigned o) -> PabloAST * {
+        const ldml::DivContextItem & item = c.items[j];
+        PabloAST * x = test(item, o);
+        if (j + 1 == c.items.size()) {
+            if (item.negated) x = pb.createNot(x);
+            if (item.runEnd && mask) x = pb.createOr(x, pb.createAnd(at(inText, o), pb.createNot(at(mask, o))));
+            return x;
+        }
+        PabloAST * rest = nullptr;
+        for (unsigned l = 1; l <= (mUTF8 ? 4u : 1u); l++) {
+            PabloAST * y = chain(c, j + 1, o + l);
+            if (mUTF8) y = pb.createAnd(lengthAt(o, l), y);
+            rest = rest ? pb.createOr(rest, y) : y;
+        }
+        return pb.createAnd(x, rest);
+    };
+    std::vector<PabloAST *> out;
+    //  (Only the contexts of several items: see divCodeChainedIndex.)
+    for (const ldml::DivContext * c : divCodeAfterContexts(plan)) {
+        if (c->items.size() > 1) out.push_back(pb.createInFile(chain(*c, 0, 0)));
+    }
+    writeOutputStreamSet("Items", out);
+}
+
+//  The after contexts of a plan (see DivCodeItems), or nullptr if none.
+static StreamSet * DivCodeItemsOf(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label, StreamSet * Basis,
+                                  StreamSet * Code, StreamSet * Externals, StreamSet * InText, StreamSet * Mask) {
+    const size_t n = divCodeChainedCount(plan);
+    if (n == 0) return nullptr;
+    StreamSet * const Items = P.CreateStreamSet(n);
+    P.CreateKernelCall<DivCodeItems>(plan, label, Basis, Code, Externals, InText, Mask, Items);
+    return Items;
+}
+
+//  A conversion group by its DivCode plan (eligible), on the 21-bit basis or
+//  on the basis bits of UTF-8 code units, within the active mask of Masks (the
+//  filter masks), with the positions inserted and deleted.
+static Staged DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
+                                   StreamSet * Basis, TransformMasks & Masks,
+                                   const std::vector<StreamSet *> & afterStreams) {
+    const bool utf8 = Basis->getNumElements() == 8;
+    StreamSet * Code = DivCodeOf(P, plan, Basis);
+    SHOW_BIXNUM(Code);
+    StreamSet * Externals = DivCodeExternalsOf(P, plan, Basis);
+    //  (The after contexts computed by the engine, after the external sets'
+    //  classes: see ldml::DivContextItem::Kind::Stream.)
+    if (!afterStreams.empty()) {
+        std::vector<std::pair<StreamSet *, std::vector<uint32_t>>> selections;
+        if (Externals) {
+            std::vector<uint32_t> all(Externals->getNumElements());
+            for (uint32_t i = 0; i < all.size(); i++) all[i] = i;
+            selections.emplace_back(Externals, all);
+        }
+        for (StreamSet * a : afterStreams) selections.emplace_back(a, std::vector<uint32_t>{0});
+        Externals = streamutils::Select(P, selections);
+    }
+    StreamSet * InText = P.CreateStreamSet(1);
+    P.CreateKernelCall<TextPositions>(Basis, InText);
+    StreamSet * const Mask = Masks.active();
+    PositionMap positions;
+    //  The after contexts, on the text before it is spread (see DivCodeItems).
+    StreamSet * Items = DivCodeItemsOf(P, plan, label, Basis, Code, Externals, InText, Mask);
+    //  With expansions: the positions inserted after the matches, counted by the
+    //  Count kernel, and the text (with its codes, classes and masks) spread.
+    const unsigned maxExpansion = DivCodeTranslate::maxExpansion(plan, utf8);
+    StreamSet * SpreadMask = nullptr;
+    if (maxExpansion > 0) {
+        unsigned bits = 0;
+        while ((maxExpansion >> bits) != 0) bits++;
+        StreamSet * const InsertCount = P.CreateStreamSet(bits);
+        P.CreateKernelCall<DivCodeTranslate>(plan, label, DivCodeTranslate::Mode::Count, Basis, Code, Externals, InText,
+                                             Mask, nullptr, Items, InsertCount, nullptr);
+        SHOW_BIXNUM(InsertCount);
+        SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertCount, SpreadMask, kernel::InsertPosition::After);
+        SHOW_STREAM(SpreadMask);
+        auto spread = [&](StreamSet * s) {
+            StreamSet * const spreadOut = P.CreateStreamSet(s->getNumElements());
+            SpreadByMask(P, SpreadMask, s, spreadOut);
+            return spreadOut;
+        };
+        Basis = spread(Basis);
+        Code = spread(Code);
+        if (Externals) Externals = spread(Externals);
+        if (Items) Items = spread(Items);
+        positions.insert(SpreadMask);
+        InText = P.CreateStreamSet(1);
+        P.CreateKernelCall<TextPositions>(Basis, InText);
+    }
+    StreamSet * Out = P.CreateStreamSet(Basis->getNumElements());
+    StreamSet * Deleted = P.CreateStreamSet(1);
+    //  With converted rules: their dependent positions, and the ends of the
+    //  converted characters by the sets of their items (see DivCodeTranslate).
+    const size_t convertedItems = DivCodeTranslate::convertedItemsOf(plan).size();
+    //  (Dep: of the converted rules, and of the families known and not; Ends:
+    //  by item, in the set and not, and the matches of families deleted.)
+    StreamSet * const Dep = plan.dependent() ? P.CreateStreamSet(3) : nullptr;
+    StreamSet * const Ends = plan.dependent() ? P.CreateStreamSet(2 * convertedItems + 1) : nullptr;
+    StreamSet * const SpreadTextMask = Mask ? Masks.mapped(Mask, positions) : nullptr;
+    P.CreateKernelCall<DivCodeTranslate>(plan, label, DivCodeTranslate::Mode::Translate, Basis, Code, Externals, InText,
+                                         SpreadTextMask, SpreadMask, Items, Out, Deleted, Dep, Ends);
+    SHOW_BIXNUM(Out);
+    SHOW_STREAM(Deleted);
+    if (Dep) {
+        SHOW_STREAM(Dep);
+        SHOW_BIXNUM(Ends);
+        StreamSet * const Converted = P.CreateStreamSet(Basis->getNumElements());
+        StreamSet * const ConvertedDeleted = P.CreateStreamSet(1);
+        P.CreateKernelCall<DivCodeTranslate>(plan, label, DivCodeTranslate::Mode::Converted, Basis, Code, Externals, InText,
+                                             SpreadTextMask, SpreadMask, Items, Converted, ConvertedDeleted, Dep, Ends, Out, Deleted);
+        Out = Converted;
+        Deleted = ConvertedDeleted;
+        SHOW_BIXNUM(Out);
+        SHOW_STREAM(Deleted);
+    }
+    if (!DivCodeTranslate::deletes(plan, utf8)) return Staged(Out, std::move(positions));
+    StreamSet * const keep = P.CreateStreamSet(1);
+    Invert(P, Deleted, keep);
+    StreamSet * const filtered = P.CreateStreamSet(Out->getNumElements());
+    FilterByMask(P, keep, Out, filtered);
+    positions.remove(keep);
+    return Staged(filtered, std::move(positions));
+}
+
+Staged RulePipelineBuilder::divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21) {
+    //  (The after contexts computed by the engine: the anchors, characters of
+    //  any kind, after which each matches.)
+    std::vector<StreamSet *> afterStreams;
+    for (re::RE * after : plan.afterStreams) {
+        afterStreams.push_back(matchPositions(nullptr, after, {UCD::UnicodeSet(0, 0x10FFFF)}, U21));
+    }
+    return DivCodeGroupPipeline(mP, plan, mGroupLabel, U21, mMasks, afterStreams);
+}
+
+//  For the smoke test (--divcode-codes): each character replaced by the
+//  codepoint 0x10000 | (externals << 10) | code, its code (of at most 10 bits)
+//  and the bits of the external classes (at most 6) it is in.
+class DivCodeDumpKernel final : public PabloKernel {
+public:
+    DivCodeDumpKernel(LLVMTypeSystemInterface & ts, StreamSet * Code, StreamSet * Externals, StreamSet * U21)
+    : PabloKernel(ts, "DivCodeDump_" + std::to_string(Code->getNumElements()) + "_"
+                  + std::to_string(Externals ? Externals->getNumElements() : 0),
+                  {Binding{"code", Code}}, {Binding{"U21", U21}}) {
+        if (Externals) mInputStreamSets.push_back(Binding{"externals", Externals});
+    }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> code = getInputStreamSet("code");
+        std::vector<PabloAST *> ext;
+        if (getNumOfInputs() > 1) ext = getInputStreamSet("externals");
+        PabloAST * const all = pb.createInFile(pb.createOnes());
+        for (unsigned b = 0; b < 21; b++) {
+            PabloAST * v = pb.createZeroes();
+            if (b < code.size() && b < 10) v = code[b];
+            if (b >= 10 && b < 16 && b - 10 < ext.size()) v = ext[b - 10];
+            if (b == 16) v = all;
+            pb.createAssign(pb.createExtract(getOutput(0), pb.getInteger(b)), pb.createAnd(v, all));
+        }
+    }
+};
+
+//  --divcode-codes=G: the smoke test of the DivCode kernels (see DivCodeDumpKernel).
+static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry, const std::string & inputFile) {
+    TransformAnalyzer analyzer(registry);
+    const TransformAnalysis & a = analyzer.analyze(entry);
+    size_t group = 0;
+    const ldml::TransformStep * step = nullptr;
+    for (const ldml::TransformStep & s : a.plan.steps) {
+        if (s.kind == ldml::TransformStep::Kind::Transform) continue;
+        if (++group == DivCodeCodes) step = &s;
+    }
+    if (step == nullptr) {
+        llvm::errs() << "Error: " << entry->canonicalName << " has no conversion group " << DivCodeCodes << "\n";
+        return 1;
+    }
+    ldml::DivCodeOptions options;
+    options.shift = DivCodeShift;
+    options.convertedBefore = convertedBeforeContext;
+    options.convertedRounds = ConvertedContextRounds;
+    const ldml::DivCodePlan plan = ldml::planDivCodeGroup(*step, options);
+    if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 6) {
+        llvm::errs() << "Error: the alphabet of group " << DivCodeCodes << " has " << plan.blocks.size() << " blocks and "
+                     << plan.externalSets.size() << " external sets (1 to 1023 blocks and at most 6 external sets are dumped)\n";
+        return 1;
+    }
+    //  The alphabet, for the test: shift, blocks, the ranges of the external sets.
+    std::string desc = "{\"shift\": " + std::to_string(plan.shift) + ", \"blocks\": [";
+    for (size_t i = 0; i < plan.blocks.size(); i++) desc += (i ? ", " : "") + std::to_string(plan.blocks[i]);
+    desc += "], \"externals\": [";
+    for (size_t i = 0; i < plan.externalSets.size(); i++) {
+        desc += i ? ", [" : "[";
+        bool first = true;
+        for (const auto & r : plan.externalSets[i]) {
+            desc += (first ? "[" : ", [") + std::to_string(r.first) + ", " + std::to_string(r.second) + "]";
+            first = false;
+        }
+        desc += "]";
+    }
+    //  (Samples of the texts of the rules, and of the explicit sets of their
+    //  contexts, for the text of tests.)
+    auto utf8 = [](const std::u32string & u) {
+        std::string r;
+        for (char32_t c : u) {
+            if (c < 0x80) {
+                r += static_cast<char>(c);
+            } else if (c < 0x800) {
+                r += static_cast<char>(0xC0 | (c >> 6)); r += static_cast<char>(0x80 | (c & 0x3F));
+            } else if (c < 0x10000) {
+                r += static_cast<char>(0xE0 | (c >> 12)); r += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+                r += static_cast<char>(0x80 | (c & 0x3F));
+            } else {
+                r += static_cast<char>(0xF0 | (c >> 18)); r += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+                r += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); r += static_cast<char>(0x80 | (c & 0x3F));
+            }
+        }
+        return r;
+    };
+    desc += "], \"samples\": [";
+    for (size_t i = 0; i < plan.rules.size() && i < 4000; i++) {
+        std::u32string t;
+        for (const UCD::UnicodeSet & p : plan.rules[i].text) t += static_cast<char32_t>(p.begin()->first);
+        desc += (i ? ", \"" : "\"") + jsonEscape(utf8(t)) + "\"";
+    }
+    desc += "], \"context_chars\": \"";
+    std::u32string contextChars;
+    for (const ldml::DivRule & d : plan.rules) {
+        std::vector<const ldml::DivContextItem *> contextItems;
+        for (const ldml::DivContext * c : {&d.before, &d.after}) for (const ldml::DivContextItem & i : c->items) contextItems.push_back(&i);
+        for (const ldml::DivContextItem * item : contextItems) {
+            if (item->kind != ldml::DivContextItem::Kind::Explicit || item->set.count() > 64) continue;
+            for (const auto & r : item->set) {
+                for (UCD::codepoint_t c = r.first; c <= r.second; c++) {
+                    if (contextChars.find(static_cast<char32_t>(c)) == std::u32string::npos) contextChars += static_cast<char32_t>(c);
+                }
+            }
+        }
+    }
+    desc += jsonEscape(utf8(contextChars)) + "\"";
+    desc += ", \"kernel\": \"" + DivCodeKernel::kernelName(plan.shift, plan.blocks, "U21") + "\"}";
+    llvm::errs() << desc << "\n";
+    if (!openInputAndOutput(inputFile)) return 1;
+    CPUDriver driver("tconv");
+    auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
+    StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+    StreamSet * const Code = DivCodeOf(P, plan, U21);
+    SHOW_BIXNUM(Code);
+    StreamSet * const Externals = DivCodeExternalsOf(P, plan, U21);
+    StreamSet * const Dump = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<DivCodeDumpKernel>(Code, Externals, Dump);
+    P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, UTF8_Of(P, Dump)));
+    TransformFunctionType fn = P.compile();
+    applyToInput(pipelineRunner(fn), MainInput.fd);
+    return finishOutput();
+}
+
 int main(int argc, char *argv[]) {
     const int status = run(argc, argv);
     return toolio::finishOutput() ? status : 1;
@@ -11138,8 +15132,10 @@ static int run(int argc, char *argv[]) {
         }
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis a = analyzer.analyzeRulesFile(parsed);
+        if (DivCodeReport) return printDivCodeReportOf(RulesFile, a);
         if (ShowPlan) {
             printPlan("rules file " + RulesFile, a);
+            if (Lines) printRegionScope(regionScope(registry, analyzer, a));
             return a.implementable ? 0 : 2;
         }
         //  Not implementable: applied by ICU (unless --use-ICU=0).
@@ -11190,8 +15186,26 @@ static int run(int argc, char *argv[]) {
             applyToInput(runner, MainInput.fd);
             return finishOutput();
         }
-        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
-        applyToInput(pipelineRunner(fn), MainInput.fd);
+        //  (With --lines, the lines as regions where every component supports it;
+        //  with contexts bounded by them, in Unicode mode.)
+        const RegionScope scope = regionScope(registry, analyzer, a);
+        const bool regions = Lines && LinesRegions && scope.supported();
+        const bool bounded = regions && scope.bounded;
+        //  (In UTF-8 mode, where its steps can be: see TransformAnalyzer::mode.)
+        if (UTF8Mode && analyzer.modeOf(a).utf8 && !bounded) {
+            auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
+            StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+            P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
+            UTF8PipelineBuilder builder(P, registry, analyzer);
+            StreamSet * const text = kernel::WellFormedUTF8(P, BasisOf(P, ByteStream));
+            if (regions) builder.pushRegions(text);
+            StreamSet * const Result = builder.applyAnalysis("rules", a, text);
+            P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
+            applyToInput(pipelineRunner(P.compile()), MainInput.fd, regions);
+            return finishOutput();
+        }
+        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a, regions, bounded);
+        applyToInput(pipelineRunner(fn), MainInput.fd, regions);
         return finishOutput();
     }
 
@@ -11211,6 +15225,17 @@ static int run(int argc, char *argv[]) {
         return 1;
     }
     if (KernelCounts) return printKernelCounts(registry, entry);
+    if (DivCodeCodes) {
+        if (entry->isBuiltIn()) {
+            llvm::errs() << "Error: " << entry->canonicalName << " is a built-in transform\n";
+            return 1;
+        }
+        return divCodeCodes(registry, entry, InputFile);
+    }
+    if (DivCodeReport) {
+        if (entry->isBuiltIn()) return 0;
+        return printDivCodeReport(registry, entry);
+    }
     if (RevisitReport) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);
@@ -11247,6 +15272,7 @@ static int run(int argc, char *argv[]) {
                         printShapeStep(step);
                     }
                 }
+                if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
                 return 0;
             }
             //  (The transforms invoked by their shape groups, within filters
@@ -11268,14 +15294,17 @@ static int run(int argc, char *argv[]) {
                 printPlan(label, a, &shapeChoice(registry, analyzer, entry), note);
                 if (!groups.applicable) toolio::out() << "  (not entirely by shape groups: " << groups.reason << ")\n";
                 printMode(analyzer, entry);
+                if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
                 return 0;
             }
             printPlan(label, a);
             toolio::out() << "  not by shape groups: " << groups.reason << "\n";
+            if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
             return 2;
         }
         printPlan(label, a);
         if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry);
+        if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
@@ -11359,9 +15388,14 @@ static int run(int argc, char *argv[]) {
                         && impl->second != Transform::HexC && impl->second != Transform::HexXML && impl->second != Transform::HexXML10
                         && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode
                         && impl->second != Transform::Remove;
-    TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
-                               : (UTF8Mode && analyzer.mode(entry).utf8) ? generateUTF8Pipeline(driver, registry, analyzer, entry)
-                               : generateRulePipeline(driver, registry, analyzer, entry);
-    applyToInput(pipelineRunner(fn), MainInput.fd);
+    //  (With --lines, the lines as regions where every component supports it,
+    //  by the rule pipeline.)
+    const RegionScope scope = regionScope(registry, analyzer, entry);
+    const bool regions = Lines && LinesRegions && scope.supported();
+    const bool bounded = regions && scope.bounded;
+    TransformFunctionType fn = direct && !regions ? generatePipeline(driver, impl->second)
+                               : (UTF8Mode && analyzer.mode(entry).utf8 && !bounded) ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
+                               : generateRulePipeline(driver, registry, analyzer, entry, regions, bounded);
+    applyToInput(pipelineRunner(fn), MainInput.fd, regions);
     return finishOutput();
 }

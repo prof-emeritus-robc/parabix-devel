@@ -69,14 +69,14 @@ llvm::StringRef UnicodePropertyKernelBuilder::getSignature() const {
 
 void UnicodePropertyKernelBuilder::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
-    UTF::UTF_Compiler unicodeCompiler(getInput(0), pb, mBitMovement);
     pablo::Var * propertyVar = pb.createVar(mPropertyExpr->getFullName(), pb.createZeroes());
-    if (mPropertyExpr->getKind() == re::PropertyExpression::Kind::Codepoint) {
-        re::CC * propertyCC = llvm::cast<re::CC>(mPropertyExpr->getResolvedRE());
-        unicodeCompiler.compile({propertyVar}, {propertyCC});
-    } else {
+    if (mPropertyExpr->getKind() != re::PropertyExpression::Kind::Codepoint) {
         llvm::report_fatal_error("UnicodePropertyKernelBuilder requires a non-boundary property expression");
     }
+    computeMasked(pb, *this, mHasMask, [&](PabloBuilder & body) {
+        UTF::UTF_Compiler unicodeCompiler(getInput(0), body, mBitMovement);
+        unicodeCompiler.compile({propertyVar}, {llvm::cast<re::CC>(mPropertyExpr->getResolvedRE())});
+    });
     assignMasked(pb, *this, {propertyVar}, "property_stream", mHasMask, mMaskKind);
 }
 

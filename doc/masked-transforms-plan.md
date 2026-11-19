@@ -337,6 +337,18 @@ transforms it can affect, and against ICU.
    mask), and narrower masks where the work is rare (case maps' expanding
    slots). This step is independent and can come earlier.
 
+   In progress (2026-11-19): the class and property kernels with a mask
+   (`CharClassesKernel`, `UnicodePropertyKernelBuilder`, tconv's
+   `PropertyClasses`) compute their streams within an If on the mask
+   (`kernel::computeMasked`; `-masked-block-skip`, default on, which the
+   kernel names encode as `+MaskZIf`/`+MaskPIf`). The normalization and tconv
+   tests pass. Remaining:
+   - measure against `-masked-block-skip=0` at several densities (a Greek
+     filter on Greek and on German text);
+   - the NFC stages and the masked case maps, whose masks are applied within
+     their own kernels;
+   - narrower masks for the case maps' expanding slots.
+
 ## Testing
 
 - **`--lines`:** the single-run output must equal the per-line output on the CLDR

@@ -12,6 +12,7 @@
 #include <re/adt/re_name.h>
 #include <ucd/utf/utf_compiler.h>
 #include <pablo/pablo.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
@@ -41,9 +42,24 @@ std::string makeSignature(const StreamSet * const basis, std::vector<re::CC *> &
     return tmp;
 }
 
+static llvm::cl::opt<bool> MaskedBlockSkip("masked-block-skip",
+    llvm::cl::desc("Compute the streams of the kernels with a mask (class and property kernels) within an If on the "
+                   "mask, skipping the blocks without mask bits (default on)"),
+    llvm::cl::init(true));
+
 std::string kernel::maskSuffix(const StreamMask & mask) {
     if (mask.mask == nullptr) return "";
-    return mask.kind == MaskKind::Zeroing ? "+MaskZ" : "+MaskP";
+    return std::string(mask.kind == MaskKind::Zeroing ? "+MaskZ" : "+MaskP") + (MaskedBlockSkip ? "If" : "");
+}
+
+void kernel::computeMasked(PabloBuilder & pb, PabloKernel & kernel, bool hasMask, const std::function<void (PabloBuilder &)> & compute) {
+    if (!hasMask || !MaskedBlockSkip) {
+        compute(pb);
+        return;
+    }
+    PabloBuilder body = pb.createScope();
+    pb.createIf(kernel.getInputStreamSet("mask")[0], body);
+    compute(body);
 }
 
 void kernel::addMaskInputs(const StreamMask & mask, Bindings & inputs) {
@@ -121,12 +137,14 @@ void CharClassesKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     unsigned n = mCCs.size();
 
-    UTF::UTF_Compiler unicodeCompiler(getInput(0), pb, mBitMovement);
     std::vector<Var *> mpx;
     for (unsigned i = 0; i < n; i++) {
         mpx.push_back(pb.createVar("mpx_basis" + std::to_string(i), pb.createZeroes()));
     }
-    unicodeCompiler.compile(mpx, mCCs);
+    computeMasked(pb, *this, mHasMask, [&](PabloBuilder & body) {
+        UTF::UTF_Compiler unicodeCompiler(getInput(0), body, mBitMovement);
+        unicodeCompiler.compile(mpx, mCCs);
+    });
     std::vector<PabloAST *> classes;
     for (unsigned i = 0; i < mpx.size(); i++) classes.push_back(pb.createInFile(mpx[i]));
     assignMasked(pb, *this, classes, "charclasses", mHasMask, mMaskKind);

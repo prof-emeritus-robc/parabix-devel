@@ -4957,28 +4957,34 @@ public:
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
     void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
-        cc::Parabix_CC_Compiler_Builder ccc(basis);
-        std::vector<PabloAST *> p;
-        for (size_t k = 0; k < mNumProps; k++) p.push_back(getInputStreamSet("P" + std::to_string(k))[0]);
-        std::map<uint32_t, PabloAST *> cellOf;
-        auto cell = [&](uint32_t mask) {
-            PabloAST *& c = cellOf[mask];
-            if (c) return c;
-            c = pb.createOnes();
-            for (size_t k = 0; k < mNumProps; k++) c = pb.createAnd(c, ((mask >> k) & 1) ? p[k] : pb.createNot(p[k]));
-            return c;
-        };
+        PabloBuilder entry(getEntryScope());
+        std::vector<Var *> vars;
+        for (size_t i = 0; i < mFormulas.size(); i++) vars.push_back(entry.createVar("class" + std::to_string(i), entry.createZeroes()));
+        //  (Within an If on the mask, with one; see kernel::computeMasked.)
         std::vector<PabloAST *> out;
-        for (const PropertyFormula & f : mFormulas) {
-            PabloAST * u = pb.createZeroes();
-            for (uint32_t mask : f.cells) u = pb.createOr(u, cell(mask));
-            if (!f.out.empty()) u = pb.createAnd(u, pb.createNot(ccc.compileCC(re::makeCC(f.out, &cc::Unicode), pb)));
-            if (!f.in.empty()) u = pb.createOr(u, ccc.compileCC(re::makeCC(f.in, &cc::Unicode), pb));
-            out.push_back(pb.createInFile(u));
-        }
-        assignMasked(pb, *this, out, "Classes", mHasMask, mMaskKind);
+        computeMasked(entry, *this, mHasMask, [&](PabloBuilder & pb) {
+            const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+            cc::Parabix_CC_Compiler_Builder ccc(basis);
+            std::vector<PabloAST *> p;
+            for (size_t k = 0; k < mNumProps; k++) p.push_back(getInputStreamSet("P" + std::to_string(k))[0]);
+            std::map<uint32_t, PabloAST *> cellOf;
+            auto cell = [&](uint32_t mask) {
+                PabloAST *& c = cellOf[mask];
+                if (c) return c;
+                c = pb.createOnes();
+                for (size_t k = 0; k < mNumProps; k++) c = pb.createAnd(c, ((mask >> k) & 1) ? p[k] : pb.createNot(p[k]));
+                return c;
+            };
+            for (const PropertyFormula & f : mFormulas) {
+                PabloAST * u = pb.createZeroes();
+                for (uint32_t mask : f.cells) u = pb.createOr(u, cell(mask));
+                if (!f.out.empty()) u = pb.createAnd(u, pb.createNot(ccc.compileCC(re::makeCC(f.out, &cc::Unicode), pb)));
+                if (!f.in.empty()) u = pb.createOr(u, ccc.compileCC(re::makeCC(f.in, &cc::Unicode), pb));
+                pb.createAssign(vars[out.size()], pb.createInFile(u));
+                out.push_back(vars[out.size()]);
+            }
+        });
+        assignMasked(entry, *this, out, "Classes", mHasMask, mMaskKind);
     }
 private:
     PropertyClasses(LLVMTypeSystemInterface & ts, std::string && sig, std::vector<PropertyFormula> && formulas,

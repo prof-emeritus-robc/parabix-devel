@@ -43,9 +43,9 @@ one pipeline run for `--lines`, and more kernels that can run in parallel.
 | Masks kept in step | stages return a `PositionMap`; `inStep` applies it (`InheritMask` for inherited positions) | after positions are inserted or deleted |
 | Barrier replacement | `barrierNormalization`, `UTF8PipelineBuilder::maskedNormalization` | characters outside the mask replaced by `BarrierMark` (a starter), normalized, then restored; replaced by the masked kernels (step 6), kept only for `--masked-normalization=0` |
 | Masked case maps | `maskedStringOverrides` | lc, uc or tc at masked positions, with its own spread |
-| Classes outside the mask | `OutsideMask` kernel | a class also holds outside the filter |
-| Run ends | `ldml::FilterRunEndMark` (U+FDD2), `marksFilterRunEnd` | an after context's boundary set matching at the end of a filter run |
-| Insertions under a filter | `mInsertAnywhere`, eligibility (`insertionsEligible`) | an insertion rule inserts only before a filtered character |
+| Classes with run ends | `WithRunEnds` kernel, from `TransformMasks::runEnds` (step 7) | a class also holds outside the filter |
+| Run ends | `ldml::FilterRunEndMark` (U+FDD2), `marksFilterRunEnd`; `TransformMasks::runEnds` (step 7) | an after context's boundary set matching at the end of a filter run |
+| Insertions under a filter | `TransformMask::insertBefore`, eligibility (`insertionsEligible`) (step 7) | an insertion rule inserts only before a filtered character |
 | Per-line runs | `applyToInput` | `--lines`: one pipeline run per line, for the transforms not supporting region scope (`regionScopeProblem`) |
 | Engine regions | `RE_Compiler` region start and follow streams | matches confined to regions: every class, `.` and external is intersected with the region span `SpanUpTo(starts, follows)`, so matches and lookaround bodies (lookbehinds too) stop at region boundaries; `^` and `$` are the region start and follow; the lookahead chain kernels and region reversal take the follows as barriers |
 | Kernel masks | `StreamMask` (Zeroing, PassThru) | class and property kernels (done) |
@@ -298,6 +298,36 @@ transforms it can affect, and against ICU.
 7. **Filters through the interface.** Fold `OutsideMask`, `FilterRunEndMark` and
    the insertion eligibility into text scope, and retire the special cases one at
    a time.
+
+   Done (2026-11-19) in tconv's Unicode mode:
+   - **Insertion eligibility** is a property of a mask of text scope,
+     `TransformMask::insertBefore`: an insertion within its runs is made only
+     before one of its positions (ICU's compound transforms under a filter).
+     The filter of a transform of one conversion group, its own or the one it
+     is invoked with, does not restrict them (`TransformMasks::insertAnywhere`).
+     `insertionsEligible` takes the innermost mask that restricts insertions
+     (`insertionMask`). This replaces `mInsertAnywhere`, a flag saved and
+     restored around each transform, and the index arithmetic on the stack.
+   - **Run ends** are a stream of the mask stack, `TransformMasks::runEnds`
+     (the positions outside the innermost mask, cached). The classes of the
+     sets with `FilterRunEndMark` are ORed with it (`WithRunEnds`, which
+     replaces `OutsideMask`, a kernel that complemented the mask itself), and
+     the engine's `tconvFilterRunEnd` external is the same stream instead of
+     a complement of its own.
+
+   `FilterRunEndMark` itself stays: it is how the rule analysis
+   (`ldml::MoveTextAnchors`) tells the pipeline that a set matches at the end
+   of a run, which the rules alone do not say.
+   Checks: the tconv tests (`tconv_filter_run_end_test`, the insertion and
+   DivCode tests) pass, and insertions under global filters, with one group
+   and with several, give the previous output.
+   Remaining:
+   - **UTF-8 mode** has no run ends: a group with single-character rules
+     whose contexts end a filtered run is applied in Unicode mode. Of the CLDR
+     transforms, only am_Ethi-d0_Morse uses run ends, and it is in Unicode mode
+     for its insertion rules.
+   - **DivCode** takes the mask and complements it within its kernels; it
+     could take the run ends instead.
 8. **Function calls by masks.** `&T($k)` on a captured character applies T at the
    marked position, in region scope with each argument a region (separated
    from its neighbours, see the open question on adjacent arguments), as the

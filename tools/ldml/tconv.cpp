@@ -1511,10 +1511,16 @@ enum class ContextScope {Text, Region};
 //  The positions where a transform applies (the 1 bits of apply, each run of
 //  them applied as a run), what a kernel with the mask produces outside them
 //  (see MaskKind), and the scope of their contexts.
+//  insertBefore (text scope): an insertion within the runs is made only before
+//  one of their positions, as ICU's compound transforms under a filter insert
+//  where the cursor stops in a run; not for the filter of a transform of one
+//  conversion group, which checks its filter only for the characters it
+//  replaces (see RulePipelineBuilder::insertionGroup).
 struct TransformMask {
     StreamSet * apply = nullptr;
     MaskKind kind = MaskKind::PassThru;
     ContextScope scope = ContextScope::Text;
+    bool insertBefore = true;
 };
 
 //  The changes a stage makes to the positions of a text, in order: positions
@@ -1562,6 +1568,13 @@ public:
         mMasks.push_back(TransformMask{apply, MaskKind::PassThru, scope});
     }
     void pop() {mMasks.pop_back();}
+    //  The innermost mask does not restrict insertions (see TransformMask::insertBefore).
+    void insertAnywhere() {mMasks.back().insertBefore = false;}
+    //  The innermost mask restricting insertions, or nullptr.
+    StreamSet * insertionMask() const {
+        for (auto m = mMasks.rbegin(); m != mMasks.rend(); ++m) if (m->insertBefore) return m->apply;
+        return nullptr;
+    }
     //  A mask outside all others (taken out by popOutermost).
     void pushOutermost(StreamSet * apply) {mMasks.insert(mMasks.begin(), TransformMask{apply});}
     StreamSet * popOutermost() {
@@ -1594,6 +1607,11 @@ public:
             m.apply = combined;
         }
     }
+    //  The run ends of the innermost mask (text scope): the positions outside it,
+    //  where an after context's set with the end of a run (ldml::FilterRunEndMark,
+    //  see ldml::MoveTextAnchors) matches, as ICU applies a compound transform to
+    //  each run of a filter; nullptr without a mask.
+    StreamSet * runEnds() {return mMasks.empty() ? nullptr : complement(mMasks.back().apply);}
     //  The complement of a stream of one bit per position (cached).
     StreamSet * complement(StreamSet * s) {
         StreamSet *& c = mCache[{s, nullptr, Complement}];
@@ -1840,24 +1858,25 @@ private:
     const WalkConfig mConfig;
 };
 
-//  The streams of Classes, those at the indices given ORed with the positions
-//  outside Mask (see ldml::FilterRunEndMark).
-class OutsideMask final : public pablo::PabloKernel {
+//  The streams of Classes, those at the indices given ORed with the run ends of
+//  a mask of text scope (RunEnds, see TransformMasks::runEnds and
+//  ldml::FilterRunEndMark).
+class WithRunEnds final : public pablo::PabloKernel {
 public:
-    OutsideMask(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * Mask, const std::vector<unsigned> & indices, StreamSet * Out)
-    : PabloKernel(ts, "OutsideMask" + std::to_string(Classes->getNumElements()) + [&] {
+    WithRunEnds(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * RunEnds, const std::vector<unsigned> & indices, StreamSet * Out)
+    : PabloKernel(ts, "WithRunEnds" + std::to_string(Classes->getNumElements()) + [&] {
                       std::string s;
                       for (unsigned i : indices) s += "_" + std::to_string(i);
                       return s;
                   }(),
-                  {Binding{"Classes", Classes}, Binding{"Mask", Mask}}, {Binding{"Out", Out}})
+                  {Binding{"Classes", Classes}, Binding{"RunEnds", RunEnds}}, {Binding{"Out", Out}})
     , mIndices(indices) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST *> classes = getInputStreamSet("Classes");
-        PabloAST * const outside = pb.createNot(getInputStreamSet("Mask")[0]);
-        for (unsigned i : mIndices) classes[i] = pb.createOr(classes[i], outside);
+        PabloAST * const ends = getInputStreamSet("RunEnds")[0];
+        for (unsigned i : mIndices) classes[i] = pb.createOr(classes[i], ends);
         writeOutputStreamSet("Out", classes);
     }
 private:
@@ -8442,11 +8461,7 @@ private:
     //  Likewise the characters followed by such a run (at the end of the text too).
     StreamSet * mDeletedRunAfter = nullptr;
     StreamSet * mNextDeletedRunAfter = nullptr;
-    //  Whether the transform applied is a single conversion group with its own
-    //  filter (or one where it is invoked), whose insertions the filter does
-    //  not restrict (see insertionGroup), and whether the transform about to be
-    //  applied is invoked with a filter.
-    bool mInsertAnywhere = false;
+    //  Whether the transform about to be applied is invoked with a filter.
     bool mInvokedWithFilter = false;
     unsigned mDepth = 0;
     std::vector<GroupCount> mGroupCounts;
@@ -9073,7 +9088,7 @@ static re::RE * possessiveBefore(re::RE * engineBefore) {
 
 //  The name of the positions outside the global filter (see
 //  ldml::FilterRunEndMark) in the patterns of the engine: an external of the
-//  engine, the positions outside the active mask.
+//  engine, the run ends of the active mask (TransformMasks::runEnds).
 static const std::string FilterRunEndName = "tconvFilterRunEnd";
 static const std::string DeletedRunEndName = "tconvDeletedRunEnd";
 static const std::string NotDeletedRunEndName = "tconvNotDeletedRunEnd";
@@ -9207,10 +9222,8 @@ RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pa
         context.matchStarts = edges.first;
         context.matchFollows = edges.second;
     }
-    if (StreamSet * const mask = activeMask(); mask && usesExternal(pattern, FilterRunEndName)) {
-        StreamSet * const outside = mP.CreateStreamSet(1);
-        Invert(mP, mask, outside);
-        context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, outside});
+    if (StreamSet * const ends = mMasks.runEnds(); ends && usesExternal(pattern, FilterRunEndName)) {
+        context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ends});
     }
     const bool deleted = usesExternal(pattern, DeletedRunEndName), notDeleted = usesExternal(pattern, NotDeletedRunEndName);
     if (usesExternal(pattern, DeletedRunAfterName)) {
@@ -9492,12 +9505,13 @@ static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
 //  of sets; the matches of the other rules are given to them by the regular
 //  expression engine.
 //  The positions after which the insertion rules of a group may insert, within
-//  filters (see insertionGroup), or nullptr (everywhere).
+//  filters (see insertionGroup and TransformMask::insertBefore), or nullptr
+//  (everywhere).
 StreamSet * RulePipelineBuilder::insertionsEligible() {
-    const size_t restricting = mMasks.size() - (mInsertAnywhere && !mMasks.empty() ? 1 : 0);
-    if (restricting == 0) return nullptr;
+    StreamSet * const mask = mMasks.insertionMask();
+    if (mask == nullptr) return nullptr;
     StreamSet * const eligible = mP.CreateStreamSet(1);
-    mP.CreateKernelCall<ShiftBack>(mMasks[restricting - 1].apply, eligible, 1);
+    mP.CreateKernelCall<ShiftBack>(mask, eligible, 1);
     return eligible;
 }
 
@@ -9886,7 +9900,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             if (!outside.empty()) {
                 //  (Their classes also hold the positions outside the filter.)
                 StreamSet * const marked = P.CreateStreamSet(ccs.size());
-                P.CreateKernelCall<OutsideMask>(classes, mask, outside, marked);
+                P.CreateKernelCall<WithRunEnds>(classes, mMasks.runEnds(), outside, marked);
                 classes = marked;
             }
             std::vector<UCD::UnicodeSet> of;
@@ -12535,8 +12549,6 @@ Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, Stre
 StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, StreamSet * U21) {
     const bool invokedWithFilter = mInvokedWithFilter;
     mInvokedWithFilter = false;
-    const bool insertAnywhere = mInsertAnywhere;
-    mInsertAnywhere = a.plan.steps.size() == 1 && (a.plan.filter || invokedWithFilter);
     const bool outermost = mDepth++ == 0;
     StreamSet * const deletedRunEnds = mDeletedRunEnds;
     StreamSet * const nextDeletedRunEnds = mNextDeletedRunEnds;
@@ -12545,6 +12557,12 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mNextDeletedRunEnds = nullptr;
     mNextDeletedRunAfter = nullptr;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
+    //  A transform of one conversion group inserts anywhere within its own filter,
+    //  or the one it is invoked with (see TransformMask::insertBefore).
+    if (a.plan.steps.size() == 1 && a.plan.steps[0].kind == ldml::TransformStep::Kind::Conversion
+        && (a.plan.filter || invokedWithFilter)) {
+        mMasks.insertAnywhere();
+    }
     //  The segments applied by their shape groups (see TransformAnalyzer::
     //  ShapeChoice): their shape groups in place of their conversion groups.
     const TransformAnalyzer::ShapeChoice * const choice = mShapeChoice;
@@ -12603,7 +12621,6 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mDeletedRunAfter = deletedRunAfter;
     mNextDeletedRunAfter = nextDeletedRunAfter;
     mDepth--;
-    mInsertAnywhere = insertAnywhere;
     return U21;
 }
 

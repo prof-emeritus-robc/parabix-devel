@@ -222,12 +222,18 @@ void LongComposablePipeline(PipelineBuilder & P,
 //  scripts/UCD/nfc_generator.py (-nfc-kernels=generated): the insertion amounts
 //  (NFC_Initial_Insertion), the excluded composites, the singletons, the short
 //  and long composables, and the candidate classes (NFC_CandidateClass).
+//  With a mask (the bytes of the characters within it; C++ kernels only), the
+//  stages change only the characters within it, and the compositions are of
+//  characters within one run of it (see NFC_Transform); the long composables'
+//  ccc_NR then also marks the bytes outside the mask, which block them.
 bool NFC_CxxKernels();
 void NFC_InitialInsertion(PipelineBuilder & P, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask = nullptr);
-void NFC_ExcludedComposites(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result);
-void NFC_Singletons(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result);
-void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * FinalBasis);
-void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc_NR, StreamSet * FinalBasis);
+void NFC_ExcludedComposites(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask = nullptr);
+void NFC_Singletons(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask = nullptr);
+void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * FinalBasis, StreamSet * Mask = nullptr);
+void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc_NR, StreamSet * FinalBasis, StreamSet * Mask = nullptr);
+//  The streams of In within the mask.
+StreamSet * NFC_MaskStreams(PipelineBuilder & P, StreamSet * In, StreamSet * Mask);
 void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates);
 //
 //  Compute a mask for final work placement, given
@@ -293,8 +299,14 @@ void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, Strea
 // U8_Basis with room inserted for decompositions; ValidWorkMask marks the positions
 // of the working space that remain in TransformedBasis.  Given a WorkMask, room is
 // inserted only within the work regions (for transforming a whole text).
+// Given a Mask (a stream over U8_Basis set on every byte of each character
+// within it; the C++ kernels only), each run of the mask is normalized by itself:
+// only its characters change, no character composes with or moves across one
+// outside it, and those are unchanged (as with barrier substitution).
+// OutputMask, if given, receives the mask over TransformedBasis.
 void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * TransformedBasis,
-                   StreamSet * ValidWorkMask, StreamSet * WorkMask = nullptr);
+                   StreamSet * ValidWorkMask, StreamSet * WorkMask = nullptr,
+                   StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr);
 
 // The placement of the transformed work regions in the output, given the
 // ValidWorkMask from NFC_Transform of the work regions.

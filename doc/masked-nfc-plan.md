@@ -461,6 +461,37 @@ on the CLDR transforms that use NFC.
    - a mark after an unmasked lower-ccc character;
    - overridable primaries;
    - singletons and excluded composites outside the mask.
+
+   Done (2026-11-19), unfocused. The C++ kernels take an optional `Mask` input
+   (`CharacterStage`, `SelfComposableStage`, `ShortComposableStage`,
+   `FindComposablesStage`; kernel names suffixed `+mask`). Their classes are
+   ANDed with the mask, and a class of the character ahead (the second of a
+   short composition, a self-composable's next) with the mask looked ahead
+   by as much.
+
+   `NFC_Transform` takes the mask over the text and threads it through:
+   - insertion room only within the mask;
+   - the working space's mask: the mask spread, with the inserted bytes in it;
+   - the long composables' blocking set: `ccc_NR` ∨ the bytes outside the mask;
+   - the Hangul composables: `NFC_MaskStreams`;
+   - the sort's runs: nonzero ccc ∧ the mask, in 21-bit space.
+
+   It returns the mask over its output (`OutputMask`). `nfc -NoFocus
+   -nfc-mask=<hex ranges>` normalizes within the characters of a set.
+
+   Checked against the reference NFC of each run of the set (the others
+   unchanged, as barrier substitution gives) for five masks:
+   - everything but the class-220 marks;
+   - everything but the Latin capitals;
+   - everything but the Hangul V jamo;
+   - a pseudo-random 60% of the code points;
+   - everything.
+
+   The inputs are the pairs and random texts, every code point and
+   NormalizationTest.txt; all match, also with `-thread-num=4 -segment-size=1`.
+   On these inputs the masks change the expected output on up to 21,144 lines.
+   Unmasked output is unchanged. `normalization_test` has two masked cases on
+   its focus text.
 4. **Masked focused and in-place transforms.** Add auxiliary streams to
    `FocusedTransform`, the masked focus (candidates ∧ mask, keeping the
    predecessors), the mask through the working space, and the output mask, and

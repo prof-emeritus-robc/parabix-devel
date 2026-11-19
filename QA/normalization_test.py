@@ -13,6 +13,9 @@
 #  - regression: the small cases in nfd/TestFiles and nfc/TestFiles, concatenated
 #    into one input per tool (each ends in a newline, so nothing composes across
 #    them), checked against the concatenated ExpectedOutput files;
+#  - masked: nfc with -nfc-mask (unfocused), each run of the characters of a set
+#    normalized by itself and the others unchanged, on the focus text, checked
+#    against unicodedata.normalize of each run;
 #  - focus: a generated text mixing sparse and dense work, run with a small
 #    --segment-size so that segment boundaries fall inside work regions, checked
 #    against Python's unicodedata.normalize.  The default focus mode runs for nfd
@@ -67,6 +70,26 @@ FOCUS_CASES = [
 
 FORM = {'nfd': 'NFD', 'nfc': 'NFC', 'nfkd': 'NFKD'}
 
+# (-nfc-mask ranges, the characters of the set): everything but the marks of
+# class 220 (U+0316..U+0333), or but the Latin capitals.
+MASK_CASES = [
+    ('0-315,334-10ffff', lambda c: not 0x316 <= ord(c) <= 0x333),
+    ('0-40,5b-10ffff', lambda c: not 0x41 <= ord(c) <= 0x5A),
+]
+
+
+def masked_nfc(text, within):
+    out = []
+    i = 0
+    while i < len(text):
+        j = i
+        inside = within(text[i])
+        while j < len(text) and within(text[j]) == inside:
+            j += 1
+        out.append(unicodedata.normalize('NFC', text[i:j]) if inside else text[i:j])
+        i = j
+    return ''.join(out)
+
 
 def read(path):
     with open(path, 'rb') as f:
@@ -96,6 +119,9 @@ def main():
         for tool, flags in FOCUS_CASES:
             expected = unicodedata.normalize(FORM[tool], text).encode('utf-8')
             cases.append((tool, FOCUS_COMMON + flags, focus_path, expected, 'focus text'))
+        for spec, within in MASK_CASES:
+            expected = masked_nfc(text, within).encode('utf-8')
+            cases.append(('nfc', ['-NoFocus', '-nfc-mask=' + spec], focus_path, expected, 'focus text, masked'))
         failures = []
         for tool, flags, path, expected, label in cases:
             result = subprocess.run([os.path.join(bin_dir, tool)] + flags + [path], stdout=subprocess.PIPE)

@@ -176,10 +176,10 @@ struct BitXfrms {
             specs.push_back(BitXfrmSpec{k, s.first.first, s.first.second});
         }
     }
-    void update(PabloBuilder & b, std::vector<Var *> & xfrm, PabloAST * marker, const std::vector<Var *> & vars) {
+    void update(PabloBuilder & b, std::vector<Var *> & xfrm, PabloAST * marker, const std::vector<PabloAST *> & cls) {
         if (specs.empty()) return;
         std::vector<PabloAST *> sets;
-        for (unsigned c : classIndex) sets.push_back(vars[c]);
+        for (unsigned c : classIndex) sets.push_back(cls[c]);
         UpdateBitXfrms(b, xfrm, marker, sets, specs);
     }
 };
@@ -204,6 +204,29 @@ void characterTranslation(PabloBuilder & b, codepoint_t cp1, codepoint_t cp2, Pa
             if ((x[i] >> j) & 1) xfrm[j] = b.createOr(xfrm[j], adv);
         }
     }
+}
+
+//  The classes of a scope, within the mask if any (at an offset ahead: the mask
+//  of the character the classes are of).
+std::vector<PabloAST *> withinMask(PabloBuilder & b, const std::vector<Var *> & vars, PabloAST * mask) {
+    std::vector<PabloAST *> cls(vars.begin(), vars.end());
+    if (mask) for (PabloAST *& c : cls) c = b.createAnd(c, mask);
+    return cls;
+}
+
+//  A kernel's mask input (see NFC_MaskedTransform): the bytes of the characters
+//  within the mask, looked ahead as far as its basis.
+struct MaskInput {
+    static void bind(Bindings & inputs, StreamSet * Mask, unsigned lookahead) {
+        if (Mask == nullptr) return;
+        if (lookahead) inputs.emplace_back("Mask", Mask, FixedRate(), LookAhead(lookahead)); else inputs.emplace_back("Mask", Mask);
+    }
+    static std::string suffix(StreamSet * Mask) {return Mask ? "+mask" : "";}
+};
+
+PabloAST * maskAt(PabloBuilder & b, PabloAST * mask, unsigned offset) {
+    if (mask == nullptr) return nullptr;
+    return offset ? b.createLookahead(mask, offset) : mask;
 }
 
 std::vector<Var *> xfrmVars(PabloBuilder & pb, unsigned n) {
@@ -265,10 +288,15 @@ private:
 class CharacterStage final : public PabloKernel {
 public:
     CharacterStage(LLVMTypeSystemInterface & ts, std::string name, std::map<codepoint_t, std::u32string> map,
-                   StreamSet * Basis, StreamSet * XfrmBasis)
-    : PabloKernel(ts, name + Basis->shapeString() + nameSuffix(),
-                  {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}}, {Binding{"XfrmBasis", XfrmBasis}}),
-      mMap(std::move(map)) {
+                   StreamSet * Basis, StreamSet * XfrmBasis, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, name + Basis->shapeString() + MaskInput::suffix(Mask) + nameSuffix(),
+                  [&] {
+                      Bindings b{Binding{"Basis", Basis, FixedRate(), LookAhead(3)}};
+                      MaskInput::bind(b, Mask, 0);
+                      return b;
+                  }(),
+                  {Binding{"XfrmBasis", XfrmBasis}}),
+      mMap(std::move(map)), mHasMask(Mask != nullptr) {
         addAttribute(kernel::LocalCarries());
     }
 protected:
@@ -279,6 +307,7 @@ protected:
         const std::vector<PabloAST *> Basis = getInputStreamSet("Basis");
         Var * const basisVar = getInputStreamVar("Basis");
         const bool needsDelete = !deletionSets(mMap).empty();
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
         Var * const DeleteVar = needsDelete ? pb.createVar("DeleteVar", zeroes) : nullptr;
         std::vector<Var *> XfrmVar = xfrmVars(pb, Basis.size());
         std::vector<codepoint_t> keys;
@@ -295,14 +324,14 @@ protected:
             const std::map<unsigned, UnicodeSet> del = deletionSets(sub);
             std::map<unsigned, unsigned> delClass;
             for (const auto & d : del) delClass[d.first] = classes.add(d.second);
-            const std::vector<Var *> vars = classes.compile(b, basisVar);
-            bits.update(b, XfrmVar, nullptr, vars);
+            const std::vector<PabloAST *> cls = withinMask(b, classes.compile(b, basisVar), mask);
+            bits.update(b, XfrmVar, nullptr, cls);
             if (needsDelete && !del.empty()) {
                 const unsigned cpLen = pfxLength(pfx);
                 PabloAST * d = zeroes;
                 for (const auto & dc : delClass) {
                     for (unsigned offset = cpLen - dc.first; offset < cpLen; offset++) {
-                        PabloAST * const v = vars[dc.second];
+                        PabloAST * const v = cls[dc.second];
                         d = b.createOr(d, offset == 0 ? v : b.createAdvance(v, offset));
                     }
                 }
@@ -319,6 +348,7 @@ protected:
     }
 private:
     const std::map<codepoint_t, std::u32string> mMap;
+    const bool mHasMask;
 };
 
 std::map<codepoint_t, std::u32string> singletonStrings() {
@@ -330,9 +360,14 @@ std::map<codepoint_t, std::u32string> singletonStrings() {
 //  The self-composables (generate_self_composable_stage).
 class SelfComposableStage final : public PabloKernel {
 public:
-    SelfComposableStage(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmedBasis)
-    : PabloKernel(ts, "NFC_SelfComposable" + Basis->shapeString() + nameSuffix(),
-                  {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}}, {Binding{"XfrmedBasis", XfrmedBasis}}) {}
+    SelfComposableStage(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmedBasis, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "NFC_SelfComposable" + Basis->shapeString() + MaskInput::suffix(Mask) + nameSuffix(),
+                  [&] {
+                      Bindings b{Binding{"Basis", Basis, FixedRate(), LookAhead(7)}};
+                      MaskInput::bind(b, Mask, 7);
+                      return b;
+                  }(),
+                  {Binding{"XfrmedBasis", XfrmedBasis}}), mHasMask(Mask != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -347,7 +382,8 @@ protected:
             top.add(UnicodeSet(s.first));
             top.add(UnicodeSet(s.second));
         }
-        const std::vector<Var *> topVars = top.compile(pb, basisVar);
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
+        const std::vector<PabloAST *> topVars = withinMask(pb, top.compile(pb, basisVar), mask);
         for (const auto & s : selfc) {
             const codepoint_t A = s.first, AA = s.second;
             PabloAST * const A_v = topVars[top.add(UnicodeSet(A))];
@@ -361,7 +397,8 @@ protected:
             for (const auto & l : byLength) {
                 ScopeClasses la;
                 for (codepoint_t cp : l.second) la.add(UnicodeSet(cp));
-                const std::vector<Var *> v = la.compile(b, basisVar, BitMovementMode::LookAhead, l.first);
+                const std::vector<PabloAST *> v = withinMask(b, la.compile(b, basisVar, BitMovementMode::LookAhead, l.first),
+                                                             maskAt(b, mask, l.first));
                 for (codepoint_t cp : l.second) ahead[cp] = v[la.add(UnicodeSet(cp))];
             }
             const SCResults r = SelfComposableLogic(b, Basis, u8_encoded_length(A), u8_encoded_length(AA), A_v, AA_v, ahead[A], ahead[AA]);
@@ -371,7 +408,7 @@ protected:
             BitXfrms bits;
             bits.add(classes, {{A, std::u32string(1, static_cast<char32_t>(AA))}, {AA, std::u32string(1, static_cast<char32_t>(A))}});
             const std::vector<Var *> vars = classes.compile(b, basisVar);
-            bits.update(b, XfrmVar, xfrm, vars);
+            bits.update(b, XfrmVar, xfrm, withinMask(b, vars, nullptr));
         }
         PabloAST * const select = pb.createNot(DelVar);
         Var * const out = getOutputStreamVar("XfrmedBasis");
@@ -379,6 +416,8 @@ protected:
             pb.createAssign(pb.createExtract(out, pb.getInteger(i)), pb.createAnd(select, pb.createXor(XfrmVar[i], Basis[i])));
         }
     }
+private:
+    const bool mHasMask;
 };
 
 //  A pass of the short composables (generate_short_composable_stage): pairs of
@@ -386,10 +425,15 @@ protected:
 //  a recomposition) and the first deleted.
 class ShortComposableStage final : public PabloKernel {
 public:
-    ShortComposableStage(LLVMTypeSystemInterface & ts, unsigned pass, StreamSet * Basis, StreamSet * OutputBasis)
-    : PabloKernel(ts, "NFC_ShortComposable" + std::to_string(pass) + "_" + Basis->shapeString() + nameSuffix(),
-                  {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}}, {Binding{"OutputBasis", OutputBasis}}),
-      mPass(pass) {
+    ShortComposableStage(LLVMTypeSystemInterface & ts, unsigned pass, StreamSet * Basis, StreamSet * OutputBasis, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "NFC_ShortComposable" + std::to_string(pass) + "_" + Basis->shapeString() + MaskInput::suffix(Mask) + nameSuffix(),
+                  [&] {
+                      Bindings b{Binding{"Basis", Basis, FixedRate(), LookAhead(7)}};
+                      MaskInput::bind(b, Mask, 7);
+                      return b;
+                  }(),
+                  {Binding{"OutputBasis", OutputBasis}}),
+      mPass(pass), mHasMask(Mask != nullptr) {
         addAttribute(kernel::LocalCarries());
     }
 protected:
@@ -401,6 +445,7 @@ protected:
         Var * const basisVar = getInputStreamVar("Basis");
         Var * const DeleteVar = pb.createVar("DeleteVar", zeroes);
         std::vector<Var *> XfrmVar = xfrmVars(pb, Basis.size());
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
         const auto & rules = tables().short_pass_map.at(mPass);
         std::vector<codepoint_t> keys;
         for (const auto & r : rules) keys.push_back(r.first);
@@ -420,9 +465,17 @@ protected:
             ScopeClasses firstClasses;
             for (codepoint_t cp1 : cp1_list) firstClasses.add(UnicodeSet(cp1));
             const std::vector<Var *> firstVars = firstClasses.compile(b, basisVar);
+            //  (Within the mask: the first character, and the second, ahead.)
             std::map<codepoint_t, Var *> generated;
-            for (codepoint_t cp1 : cp1_list) generated[cp1] = firstVars[firstClasses.add(UnicodeSet(cp1))];
-            auto second = [&](codepoint_t cp2) -> PabloAST * {return secondVars[secondClasses.add(UnicodeSet(cp2))];};
+            for (codepoint_t cp1 : cp1_list) {
+                Var * const v = firstVars[firstClasses.add(UnicodeSet(cp1))];
+                generated[cp1] = mask ? b.createVar("first", b.createAnd(v, mask)) : v;
+            }
+            PabloAST * const secondMask = maskAt(b, mask, pfxLength(pfx));
+            auto second = [&](codepoint_t cp2) -> PabloAST * {
+                PabloAST * const v = secondVars[secondClasses.add(UnicodeSet(cp2))];
+                return secondMask ? b.createAnd(v, secondMask) : v;
+            };
             std::map<codepoint_t, PabloAST *> precomposedGenerated;
             auto emitCases = [&](codepoint_t cp1) {
                 for (const auto & y : rules.at(cp1)) {
@@ -480,6 +533,7 @@ protected:
     }
 private:
     const unsigned mPass;
+    const bool mHasMask;
 };
 
 //  The marks of a long-composition pass by prefix code of their starters:
@@ -511,11 +565,16 @@ unsigned markCode(unsigned pass, unsigned pfx, codepoint_t mark) {
 //  follow, unblocked, coded at the marks (generate_nfc_stage).
 class FindComposablesStage final : public PabloKernel {
 public:
+    //  With a mask, ccc_NR also marks the positions outside it, where a scan stops.
     FindComposablesStage(LLVMTypeSystemInterface & ts, unsigned pass, StreamSet * Basis, StreamSet * ccc_NR,
-                         StreamSet * MarkCode, StreamSet * Index)
-    : PabloKernel(ts, "NFC_FindComposables" + std::to_string(pass) + "_" + Basis->shapeString() + nameSuffix(),
-                  {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"ccc_NR", ccc_NR}},
-                  {Binding{"MarkCode", MarkCode}, Binding{"Index_ccc_NR_or_MarksFound", Index}}), mPass(pass) {}
+                         StreamSet * MarkCode, StreamSet * Index, StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "NFC_FindComposables" + std::to_string(pass) + "_" + Basis->shapeString() + MaskInput::suffix(Mask) + nameSuffix(),
+                  [&] {
+                      Bindings b{Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"ccc_NR", ccc_NR}};
+                      MaskInput::bind(b, Mask, 0);
+                      return b;
+                  }(),
+                  {Binding{"MarkCode", MarkCode}, Binding{"Index_ccc_NR_or_MarksFound", Index}}), mPass(pass), mHasMask(Mask != nullptr) {}
 protected:
     void generatePabloMethod() override {
         auto * cccObj = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
@@ -525,6 +584,7 @@ protected:
         const std::vector<PabloAST *> Basis = getInputStreamSet("Basis");
         Var * const basisVar = getInputStreamVar("Basis");
         PabloAST * const ccc_NR = getInputStreamSet("ccc_NR")[0];
+        PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
         const unsigned markCodeBits = tables().max_conditional_code_bits.at(mPass);
         std::vector<Var *> markCodeVar(markCodeBits);
         for (unsigned i = 0; i < markCodeBits; i++) markCodeVar[i] = pb.createVar("markCode" + std::to_string(i), zeroes);
@@ -540,11 +600,18 @@ protected:
                 const unsigned cccEnum = cccObj->GetEnumerationValue(m.first);
                 idx[m.first] = {classes.add(starters), classes.add(UnicodeSet(m.first)), classes.add(cccObj->GetCodepointSet(cccEnum))};
             }
-            const std::vector<Var *> vars = classes.compile(b, basisVar);
+            //  (The starters and the marks within the mask.)
+            const std::vector<Var *> cv = classes.compile(b, basisVar);
+            std::vector<PabloAST *> vars(cv.begin(), cv.end());
+            if (mask) {
+                for (const auto & m : d.second) {
+                    for (unsigned k : {0, 1}) vars[idx[m.first][k]] = b.createAnd(cv[idx[m.first][k]], mask);
+                }
+            }
             std::map<unsigned, PabloAST *> cccOrNR;
             for (const auto & m : d.second) {
                 const unsigned c = idx[m.first][2];
-                if (!cccOrNR.count(c)) cccOrNR[c] = b.createOr(vars[c], ccc_NR);
+                if (!cccOrNR.count(c)) cccOrNR[c] = b.createOr(cv[c], ccc_NR);
             }
             for (const auto & m : d.second) {
                 const auto & ix = idx[m.first];
@@ -565,6 +632,7 @@ protected:
     }
 private:
     const unsigned mPass;
+    const bool mHasMask;
 };
 
 //  The bytes a long composition writes at its starter P: the composite; or, for
@@ -623,7 +691,7 @@ protected:
                 for (codepoint_t s : m.second) xlate[s] = compositionTarget(s, T.long_composable_map.at(m.first).at(s));
                 bits[m.first].add(classes, xlate);
             }
-            const std::vector<Var *> vars = classes.compile(b, basisVar);
+            const std::vector<PabloAST *> vars = withinMask(b, classes.compile(b, basisVar), nullptr);
             for (const auto & m : d.second) {
                 PabloAST * const foundMark = b_bnc.EQ(markCodeAtStarter, markCode(mPass, pfx, m.first));
                 bits[m.first].update(b, XfrmVar, foundMark, vars);
@@ -637,6 +705,22 @@ protected:
     }
 private:
     const unsigned mPass;
+};
+
+//  The streams of a set within a mask.
+class MaskStreams final : public PabloKernel {
+public:
+    MaskStreams(LLVMTypeSystemInterface & ts, StreamSet * In, StreamSet * Mask, StreamSet * Out)
+    : PabloKernel(ts, "NFC_MaskStreams" + std::to_string(In->getNumElements()),
+                  {Binding{"In", In}, Binding{"Mask", Mask}}, {Binding{"Out", Out}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> in = getInputStreamSet("In");
+        PabloAST * const mask = getInputStreamSet("Mask")[0];
+        for (PabloAST *& x : in) x = pb.createAnd(x, mask);
+        writeOutputStreamSet("Out", in);
+    }
 };
 
 //  The candidates of NFC, and the characters that need expansion (NFC_CandidateClass).
@@ -669,23 +753,37 @@ void NFC_InitialInsertion(PipelineBuilder & P, StreamSet * Basis, StreamSet * In
     }
 }
 
-void NFC_ExcludedComposites(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result) {
+//  (The generated kernels have no mask.)
+static void requireCxxForMask(StreamSet * Mask) {
+    if (Mask && !NFC_CxxKernels()) report_fatal_error("NFC: a mask requires the C++ kernels (-nfc-kernels=cxx)");
+}
+
+void NFC_ExcludedComposites(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask) {
+    requireCxxForMask(Mask);
     if (NFC_CxxKernels()) {
-        P.CreateKernelCall<CharacterStage>("NFC_ExcludedComposites", tables().excluded_composite_map, Basis, Result);
+        P.CreateKernelCall<CharacterStage>("NFC_ExcludedComposites", tables().excluded_composite_map, Basis, Result, Mask);
     } else {
         P.CreateKernelCall<ExcludedCompositeStage>(Basis, Result);
     }
 }
 
-void NFC_Singletons(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result) {
+void NFC_Singletons(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask) {
+    requireCxxForMask(Mask);
     if (NFC_CxxKernels()) {
-        P.CreateKernelCall<CharacterStage>("NFC_Singletons", singletonStrings(), Basis, Result);
+        P.CreateKernelCall<CharacterStage>("NFC_Singletons", singletonStrings(), Basis, Result, Mask);
     } else {
         P.CreateKernelCall<SingletonCanonicalization>(Basis, Result);
     }
 }
 
-void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * FinalBasis) {
+StreamSet * NFC_MaskStreams(PipelineBuilder & P, StreamSet * In, StreamSet * Mask) {
+    StreamSet * const Out = P.CreateStreamSet(In->getNumElements(), 1);
+    P.CreateKernelCall<MaskStreams>(In, Mask, Out);
+    return Out;
+}
+
+void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * FinalBasis, StreamSet * Mask) {
+    requireCxxForMask(Mask);
     if (!NFC_CxxKernels()) {
         ShortComposablePipeline(P, Basis, FinalBasis);
         return;
@@ -695,16 +793,17 @@ void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * Fi
     for (unsigned pass = 0; pass < T.short_pass_count; pass++) {
         StreamSet * const output = pass + 1 == T.short_pass_count ? FinalBasis : P.CreateStreamSet(8, 1);
         if (static_cast<int>(pass) == T.self_composable_pass_no) {
-            P.CreateKernelCall<SelfComposableStage>(input, output);
+            P.CreateKernelCall<SelfComposableStage>(input, output, Mask);
         } else {
-            P.CreateKernelCall<ShortComposableStage>(pass, input, output);
+            P.CreateKernelCall<ShortComposableStage>(pass, input, output, Mask);
         }
         SHOW_BIXNUM(output);
         input = output;
     }
 }
 
-void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc_NR, StreamSet * FinalBasis) {
+void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc_NR, StreamSet * FinalBasis, StreamSet * Mask) {
+    requireCxxForMask(Mask);
     if (!NFC_CxxKernels()) {
         LongComposablePipeline(P, Basis, ccc_NR, FinalBasis);
         return;
@@ -718,7 +817,7 @@ void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc
             StreamSet * const output = last ? FinalBasis : P.CreateStreamSet(8, 1);
             StreamSet * const MarkCode = P.CreateStreamSet(bits);
             StreamSet * const Index = P.CreateStreamSet(1, 1);
-            P.CreateKernelCall<FindComposablesStage>(pass, input, ccc_NR, MarkCode, Index);
+            P.CreateKernelCall<FindComposablesStage>(pass, input, ccc_NR, MarkCode, Index, Mask);
             SHOW_BIXNUM(MarkCode);
             SHOW_STREAM(Index);
             StreamSet * const MarkCodeAtStarter = P.CreateStreamSet(bits, 1);

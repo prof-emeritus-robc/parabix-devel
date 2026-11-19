@@ -1,10 +1,12 @@
 # Plan: masked NFC, with the NFC generator rewritten in C++
 
-Status (2026-11-19): plan. Part of step 6 of `doc/masked-transforms-plan.md`
-(normalization with a mask). Masked NFD and NFKD are done in Unicode mode
-(`NFD_U21_Pipeline` with a mask, commit ff6c907b2). NFC, NFKC and FCC still use
-barrier substitution (`RulePipelineBuilder::barrierNormalization`,
-`UTF8PipelineBuilder::maskedNormalization`).
+Status (2026-11-19): steps 1 to 6 done; step 7 (retiring the generator) open.
+Part of step 6 of `doc/masked-transforms-plan.md` (normalization with a mask).
+tconv normalizes within a filter by the masked kernels in both modes (NFD,
+NFKD, NFC, NFKC, FCC and FCD); barrier substitution
+(`RulePipelineBuilder::barrierNormalization`, the barrier branch of
+`UTF8PipelineBuilder::maskedNormalization`) remains only behind
+`--masked-normalization=0`.
 
 ## Goal
 
@@ -677,8 +679,11 @@ on the CLDR transforms that use NFC.
    0.23 / 0.22 s, ja-t-it 0.27 / 0.26 s, ko-t-ja-Latn 0.47 / 0.47 s (Unicode
    mode); be-Latn-t-be-m0-bgn 0.08 / 0.08 s, ja-Latn-t-ja-hrkt-m0-bgn 0.13 /
    0.13 s (UTF-8 mode). The normalizations are a small part of these
-   transforms.7. **Retire the generator.** Delete `nfc_generator.py` and
-   `normalization-generated.cpp`, together with the transitional option.
+   transforms.
+7. **Retire the generator.** Delete `nfc_generator.py` and
+   `normalization-generated.cpp`, together with the transitional option
+   (`-nfc-kernels`), and the barrier substitution in tconv with
+   `--masked-normalization` and `--u21-nfc`.
 
 Step 1 can be checked on its own and is the cheapest test of whether the port
 is sound. Steps 3 and 4 could instead be done in the Python templates
@@ -766,8 +771,10 @@ nothing measurable.
   4 bytes per mark). Measure the byte sort, with its number of parallel steps
   (see Canonical ordering), against the decode, sort and encode it replaces,
   in the working space and on mark-heavy text.
-- **UTF-8 mode NFD.** The same auxiliary-stream focus would give a masked
-  focused NFD in UTF-8 mode, which is the other remaining part of step 6.
+- **An auxiliary-stream facility.** `NFC_Masked` and `NFD_Masked` each carry
+  the mask beside the basis themselves. A generic facility of
+  `FocusedTransform` (streams filtered, transformed and reintegrated with the
+  basis) could replace both.
 - **Lookahead of the mask binding.** Each kernel's `Basis` lookahead (up to 7
   for short composables) applies to the mask as well, because classes compiled
   in `LookAhead` mode test it at the same offsets.

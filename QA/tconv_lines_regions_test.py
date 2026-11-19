@@ -62,7 +62,8 @@ CASES = [
     ("Any-NFC", "e\u0301\n\u0301x\ne\n\u0301", ONE),
     ("Any-NFD", "\u00e9\n\u0301\u00e9", ONE),
     ("Any-Remove", "ab\n\nc", ONE),
-    ("Any-FCD", "a\u0301\nb", PER_LINE),
+    ("Any-FCD", "a\u0301\nb\u0323\u0301\n\u0301\u0323\n\u0344\u0323", ONE),
+    ("Any-FCC", "a\u0301\n\u0301\ne\u0323\u0302\n\u0302\u0323", ONE),
 ]
 
 

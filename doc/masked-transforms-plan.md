@@ -10,6 +10,9 @@ the transforms whose components support region scope, is done
 (`regionScope`, `pushRegions`, `--lines-regions`). Step 4, contexts bounded by
 the regions in the fused kernels (correction kernels included) and the engine,
 is done (`boundRegions`, `FusedRulesConfig::region`, `--bound-regions`).
+Step 5, engine regions, is done for regions that are not adjacent. Step 6,
+normalization with a mask, is done for every form in both modes
+(`--masked-normalization`, `--u21-nfc`; doc/masked-nfc-plan.md).
 
 ## Goal
 
@@ -38,7 +41,7 @@ one pipeline run for `--lines`, and more kernels that can run in parallel.
 |---|---|---|
 | Mask stack | `TransformMasks` (`pushFilter`, `activeMask`, `popFilter`) | the filter's characters, intersected with the outer filters |
 | Masks kept in step | stages return a `PositionMap`; `inStep` applies it (`InheritMask` for inherited positions) | after positions are inserted or deleted |
-| Barrier replacement | `barrierNormalization`, `maskedNormalization`, `fcd` | characters outside the mask replaced by `BarrierMark` (a starter), normalized, then restored |
+| Barrier replacement | `barrierNormalization`, `UTF8PipelineBuilder::maskedNormalization` | characters outside the mask replaced by `BarrierMark` (a starter), normalized, then restored; replaced by the masked kernels (step 6), kept only for `--masked-normalization=0` |
 | Masked case maps | `maskedStringOverrides` | lc, uc or tc at masked positions, with its own spread |
 | Classes outside the mask | `OutsideMask` kernel | a class also holds outside the filter |
 | Run ends | `ldml::FilterRunEndMark` (U+FDD2), `marksFilterRunEnd` | an after context's boundary set matching at the end of a filter run |
@@ -262,15 +265,35 @@ transforms it can affect, and against ICU.
    too. On the CLDR test data of the 112 transforms with NFD, NFKD or FCD under a
    filter, the output equals the barrier substitution's (also multithreaded and
    with `--lines`); el-Latn-t-el-m0-bgn: 83 to 75 kernels.
-   Remaining:
-   - **UTF-8 mode** (95 of those 112 transforms) still substitutes barriers
-     (`UTF8PipelineBuilder::maskedNormalization`). A mask on the byte-level
-     focused NFD needs work regions within the runs of the mask, with no
-     reordering across the seams of the focused stream.
-   - **NFC, NFKC and FCC** still substitute barriers. Their composition kernels
-     are generated (`scripts/UCD/nfc_generator.py`); a mask needs the pairs
-     composed only within a run (the pair finding, long composition and Hangul
-     composition).
+   NFC, NFKC and FCC followed (2026-11-19, doc/masked-nfc-plan.md), with the
+   NFC kernels rebuilt in C++ from the UCD (`NFC_Tables`, `nfc_kernels.cpp`)
+   and a mask input, focused or in place, in UTF-8 and 21-bit modes, with an
+   output mask:
+   - **Unicode mode:** NFD and NFKD by `NFD_U21`, NFC by `NFC_U21` (no
+     conversion through UTF-8), NFKC as the masked NFKD then the masked NFC,
+     FCC as the masked NFD then its passes' masked NFC. The position map is
+     the selection deleted and the output mask inserted.
+   - **UTF-8 mode:** NFD and NFKD by `NFD_Masked`, NFC by `NFC_Masked`, NFKC by
+     both, on the bytes, with the output byte mask for the position map.
+   - **FCD:** its regions are found under the mask (`FCD_RegionMask` with a
+     mask: lccc = tccc = 0 outside it, as for a barrier), then decomposed by the
+     masked NFD.
+   - **`--lines`:** FCD and FCC now support region scope as well, so every
+     normalization form is applied in one run (none of the CLDR transforms
+     uses them).
+
+   Barrier substitution (`barrierNormalization`, `BarrierMark`,
+   `ReplaceUnmasked`, `UTF8_ReplaceUnselected`) is left only behind
+   `--masked-normalization=0` (and `--u21-nfc=0`) for comparison, and can be
+   removed with the generated NFC kernels (masked NFC plan, step 7).
+
+   Checks: the CLDR test data of the transforms with NFC, NFKC, NFD, NFKD or
+   FCC under a filter give the previous route's output, also multithreaded and
+   with `--lines` (see doc/masked-nfc-plan.md, step 6 and NFD and NFKD,
+   aligned). FCD and FCC under global and step filters cutting mark
+   sequences, on 4,000 random lines: the masked route, the barrier route, ICU
+   (FCD), per-line runs and one run with `--lines` all agree, also with
+   `-thread-num=4 -segment-size=1`.
 7. **Filters through the interface.** Fold `OutsideMask`, `FilterRunEndMark` and
    the insertion eligibility into text scope, and retire the special cases one at
    a time.

@@ -291,9 +291,12 @@ void UpdateBitXfrms(pablo::PabloBuilder & pb,
 //  at the last character before it with lccc = 0, or after the last one with
 //  tccc <= 1 if later, and ends before the next character with lccc = 0.
 //  FCD_RegionMask marks the regions of a U21-indexed text; the regions,
-//  decomposed with NFD (with the other characters as barriers), give the FCD.
+//  decomposed with NFD within them (NFD_U21 with the regions as its mask), give
+//  the FCD.  With a Mask, each run of it is tested by itself: the characters
+//  outside it have lccc = tccc = 0, so no region extends across them (regions
+//  may still begin on one; intersect them with the mask).
 //
-void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions);
+void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions, StreamSet * Mask = nullptr);
 
 // NFC Support
 //

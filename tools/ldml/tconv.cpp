@@ -8624,7 +8624,9 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
 }
 
 //  A normalization within a filter.  As in ICU, each run of the characters of
-//  the filter is normalized by itself: the characters outside it are replaced by
+//  the filter is normalized by itself, by the masked kernels (NFD_U21, NFC_U21,
+//  see maskedNFC and fcc).  With --masked-normalization=0 (barrierNormalization),
+//  the characters outside it are replaced by
 //  the barrier codepoint, which is neither reordered nor composed, so that no
 //  character moves or composes across them; after the normalization, which keeps
 //  the barriers in order, they are replaced by the characters again.  The
@@ -8713,17 +8715,19 @@ Staged RulePipelineBuilder::barrierNormalization(const std::string & name, Strea
 //  Any-FCD (see FCD_RegionMask): the regions where the text fails the FCD test
 //  are decomposed, as NFD within a mask, the rest is left as it is.  Within a
 //  filter, as in ICU, each run of the filtered characters is taken by itself:
-//  the regions are found with the other characters replaced by the barrier
-//  codepoint (lccc = tccc = 0), and kept within the filter.
+//  the regions are found under the filter's mask (the other characters with
+//  lccc = tccc = 0; with --masked-normalization=0, replaced by the barrier
+//  codepoint), and kept within the filter.
 Staged RulePipelineBuilder::fcd(StreamSet * U21) {
     PipelineBuilder & P = mP;
     StreamSet * text = U21;
-    if (StreamSet * const mask = activeMask()) {
+    StreamSet * const mask = activeMask();
+    if (mask && !MaskedNormalization) {
         text = P.CreateStreamSet(21);
         P.CreateKernelCall<ReplaceUnmasked>(U21, mask, text);
     }
     StreamSet * const Regions = P.CreateStreamSet(1);
-    FCD_RegionMask(P, text, Regions);
+    FCD_RegionMask(P, text, Regions, MaskedNormalization ? mask : nullptr);
     SHOW_STREAM(Regions);
     return maskedNormalization("Any-NFD", U21, Regions);
 }
@@ -11704,10 +11708,11 @@ void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet *
 }
 
 //  A normalization within a filter, as in Unicode mode (see RulePipelineBuilder::
-//  barrierNormalization): each run of the characters of the filter normalized by
-//  itself, the characters outside it (and any barrier in the text) replaced in
-//  place by the barriers of their lengths, and restored after the normalization,
-//  which keeps the barriers in order; the masks are kept in step.
+//  maskedNormalization): each run of the characters of the filter normalized by
+//  itself, by the masked kernels; the masks are kept in step.  With
+//  --masked-normalization=0, the characters outside it (and any barrier in the
+//  text) are replaced in place by the barriers of their lengths, and restored
+//  after the normalization, which keeps the barriers in order.
 Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, StreamSet * Basis) {
     PipelineBuilder & P = mP;
     //  By the masked kernels of the bytes (NFD_Masked, NFC_Masked; focused unless
@@ -12903,8 +12908,8 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 //  uses must keep to the region of each position, seeing nothing outside it.
 //  The components supported are the class kernels; the case maps (Any-Upper,
 //  Any-Lower and Any-Title: neither the Final_Sigma context nor a word crosses
-//  a line feed); the normalization forms other than FCD and FCC (each run of a
-//  mask normalized by itself, see barrierNormalization); Any-Hex (and its
+//  a line feed); the normalization forms, FCD and FCC included (each run of a
+//  mask normalized by itself, see maskedNormalization); Any-Hex (and its
 //  forms), Any-Remove and Any-Null; and conversion groups without revisits
 //  whose rules have line-bound contexts, if any.  The n characters of a match
 //  are all within the mask, and a context is line-bound if it has no anchors
@@ -12976,7 +12981,7 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
     if (entry->isBuiltIn()) {
         static const std::vector<std::string> supported = {
             "Any-Null", "Any-Upper", "Any-Lower", "Any-Title", "Any-NFD", "Any-NFKD", "Any-NFC", "Any-NFKC",
-            "Any-Remove", "Any-Hex", "Any-Hex/Java", "Any-Hex/Unicode", "Any-Hex/C", "Any-Hex/XML", "Any-Hex/XML10",
+            "Any-FCD", "Any-FCC", "Any-Remove", "Any-Hex", "Any-Hex/Java", "Any-Hex/Unicode", "Any-Hex/C", "Any-Hex/XML", "Any-Hex/XML10",
             "Any-Hex/Perl"};
         if (std::find(supported.begin(), supported.end(), entry->canonicalName) != supported.end()) return RegionScope();
         RegionScope s;

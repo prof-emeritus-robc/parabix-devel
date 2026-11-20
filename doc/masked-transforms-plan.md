@@ -12,7 +12,15 @@ the regions in the fused kernels (correction kernels included) and the engine,
 is done (`boundRegions`, `FusedRulesConfig::region`, `--bound-regions`).
 Step 5, engine regions, is done for regions that are not adjacent. Step 6,
 normalization with a mask, is done for every form in both modes
-(`--masked-normalization`, `--u21-nfc`; doc/masked-nfc-plan.md).
+(`--masked-normalization`, `--u21-nfc`; doc/masked-nfc-plan.md). Step 7 is
+done in Unicode mode, and step 9 for the class and property kernels. Since
+step 4, capture replacements are applied in region scope too (229fb48c0).
+
+**Next (2026-11-20): every transform masked in both modes, and one run for
+`--lines`.** See [Completing the interface](#completing-the-interface-both-modes-one-run-for---lines):
+the per-line runs are to be removed, and the UTF-8 mode is to apply every
+component that can be applied in it, switching to Unicode mode only where a
+component needs it, and back as early as possible.
 
 ## Goal
 
@@ -46,7 +54,7 @@ one pipeline run for `--lines`, and more kernels that can run in parallel.
 | Classes with run ends | `WithRunEnds` kernel, from `TransformMasks::runEnds` (step 7) | a class also holds outside the filter |
 | Run ends | `ldml::FilterRunEndMark` (U+FDD2), `marksFilterRunEnd`; `TransformMasks::runEnds` (step 7) | an after context's boundary set matching at the end of a filter run |
 | Insertions under a filter | `TransformMask::insertBefore`, eligibility (`insertionsEligible`) (step 7) | an insertion rule inserts only before a filtered character |
-| Per-line runs | `applyToInput` | `--lines`: one pipeline run per line, for the transforms not supporting region scope (`regionScopeProblem`) |
+| Per-line runs | `applyToInput` | `--lines`: one pipeline run per line, for the transforms not supporting region scope (`regionScope`); to be removed (step 12) |
 | Engine regions | `RE_Compiler` region start and follow streams | matches confined to regions: every class, `.` and external is intersected with the region span `SpanUpTo(starts, follows)`, so matches and lookaround bodies (lookbehinds too) stop at region boundaries; `^` and `$` are the region start and follow; the lookahead chain kernels and region reversal take the follows as barriers |
 | Kernel masks | `StreamMask` (Zeroing, PassThru) | class and property kernels (done) |
 
@@ -362,6 +370,160 @@ transforms it can affect, and against ICU.
    - the NFC stages and the masked case maps, whose masks are applied within
      their own kernels;
    - narrower masks for the case maps' expanding slots.
+
+## Completing the interface: both modes, one run for `--lines`
+
+Goals (2026-11-20):
+
+- **One run for `--lines`, always.** Every transform is applied to all the
+  lines in one run, each line a region. The per-line runs (`applyToInput`'s
+  loop, a pipeline invocation per line through a pipe, and
+  `--lines-regions=0`) are removed.
+- **Both modes, mixed.** A transform is no longer in UTF-8 mode or Unicode
+  mode as a whole. Each component is applied in UTF-8 mode if it can be, and
+  the pipeline switches to Unicode mode only at the first component that needs
+  it, and back to UTF-8 mode as early as possible. Leading and trailing
+  normalizations, case maps and UTF-8-capable conversion groups stay on the
+  bytes.
+- **Masks in both modes.** Every component honours the text scope of filters
+  and the region scope of `--lines` in the mode it runs in, and the masks
+  (with their run ends, insertion eligibility and regions) cross each switch.
+
+### Survey (2026-11-20, `tconv --plan` and `--plan --lines` for all 453 names)
+
+Of the 424 implementable transforms defined by rules, 183 are in UTF-8 mode
+and 241 in Unicode mode: 111 for a component of their own, 130 only because
+a transform they invoke is. The first reason, followed through the invoked
+transforms to its root:
+
+| Reason for Unicode mode | Transforms |
+|---|--:|
+| a conversion group with string rules that DivCode cannot plan for UTF-8 | 186 |
+| insertion rules | 14 |
+| prefix runs | 13 |
+| single-character rules with before contexts that are not sequences of sets | 8 |
+| characters of several subgroups | 7 |
+| rules with captures | 7 |
+| mark run edits | 3 |
+| before contexts matched against the converted text (single-character rules) | 1 |
+| the built-ins Any-BreakInternal, Any-Title | 2 |
+
+The DivCode problems of the string-rule groups of the 70 transforms where they
+are the direct reason (127 groups, 101 ineligible): string rule overlaps,
+two-way or self (54 groups); string rules with runs (23); a converted before
+context that may begin within a string match (22); string rules keeping
+characters of their texts (21); rules with captures (20); converted before
+contexts of string rules (14); contexts that are not fixed sequences of sets
+(14); self-overlapping string rules (14); and a few others. The fused kernels
+handle all of these, but only in Unicode mode.
+
+With `--lines`:
+
+| Mode | One run | One run, contexts bounded | Per-line runs |
+|---|--:|--:|--:|
+| UTF-8 | 139 | 44 (then applied in Unicode mode) | 0 |
+| Unicode | 33 | 165 | 43 |
+
+The 43 per-line runs (counting the transforms invoking the component): prefix
+runs 19, insertion rules 16, deferred rules 4, mark run edits 3. The built-ins
+without region scope: Any-BreakInternal, Any-CaseFold, Any-Name, Name-Any and
+the seven forms of Hex-Any. Revisits, chain revisits and front-letter
+revisits, which also force per-line runs, are in no CLDR transform's
+`--lines` path at present, but rules files may have them. Transforms applied
+by ICU (`--use-ICU`, whole or as stages through `stagedTransformRunner`) are
+also run line by line through `applyToInput`.
+
+### Steps
+
+10. **Region scope for the remaining components, in Unicode mode.** Each is
+    checked as steps 3 and 4 were: one run against the per-line runs on the
+    CLDR test data of the transforms it enables (also `-thread-num=4
+    -segment-size=1`), and rules files reaching across lines at both edges.
+    - **Insertion rules** (16): an insertion at the start of a region needs no
+      position before it in the region; eligibility (`insertionsEligible`)
+      within the region; the correction kernel's insertions are already
+      bounded with the region.
+    - **Prefix runs** (19): a run stops at the region's follow; the blocking
+      marks (`DeletedRunBlockMark`) and the streams of deleted runs restart
+      at each region start.
+    - **Deferred rules** (4): the rounds' compaction to the live positions and
+      `DeferredPlan` keep the region mask mapped (as they keep the active
+      mask), and a copied capture never reaches across a region.
+    - **Mark run edits** (3), revisits, chain revisits and front-letter
+      revisits: their runs and walks bounded by the regions.
+    - **Built-ins**: Hex-Any and Name-Any parse within a line (their syntax
+      has no line feed), Any-Name and Any-CaseFold are per character, so they
+      need only to be checked and listed (`regionScope`); Any-BreakInternal
+      needs its break kernel bounded by the regions.
+11. **ICU under `--lines`.** ICU's `uconv -x` already gives `--lines`
+    semantics in one process: it transliterates each line as a text (checked
+    with ICU 78.3's `uconv`, the version tconv links,
+    `/opt/homebrew/opt/icu4c@78/bin/uconv`: `[a\u000A] { b > X ;` leaves the
+    `b` after a line feed, and `[$] { b > X ;` matches at the start of each
+    line). So a transform applied by ICU as a whole is applied by one
+    `uconv -f utf-8 -t utf-8 -x <rules>` over the input. `-x` takes a
+    transform ID, which uses ICU's own CLDR data rather than the checkout's
+    rules (which carry local fixes), or rule text applied forward, so a
+    backward transform of an XML file cannot be passed to it as it is. Such a
+    transform, and any where `uconv` is not available, is applied by tconv's
+    own `ICUTransform` (the same transliterator) line by line in the process,
+    without the pipe and thread of `applyToInput`. A transform with ICU stages
+    (`stagedTransformRunner`) runs each tconv stage once over all the lines,
+    in region scope, and each ICU stage likewise on the intermediate text.
+12. **Remove the per-line runs.** When steps 10 and 11 are done, one run gives
+    the per-line output on the CLDR test data of every transform, in both
+    modes and with four threads. Then `applyToInput`'s per-line loop and
+    `--lines-regions` are removed, `regionScope` becomes a check that must
+    succeed (a component without region scope is an error in `--plan
+    --lines` and in the tests), and the tests that compared one run with
+    per-line runs (`tconv_lines_regions_test`) compare with expected
+    outputs (from ICU, or from the last per-line build).
+13. **Mixed modes.** The plan of a transform becomes a sequence of segments,
+    each in UTF-8 or Unicode mode, through the transforms it invokes:
+    - **Choice.** A component is in UTF-8 mode if it can be (the built-ins of
+      `utf8BuiltIn`, `utf8CharMap` groups, DivCode groups for UTF-8), unless
+      a Unicode segment on both sides makes it cheaper to stay (each switch
+      costs a decode and an encode: compare kernels, then measure). `--plan`
+      lists the segments, their modes and the reason for each Unicode
+      segment, instead of one mode line.
+    - **Switches.** UTF-8 to Unicode: the 21-bit basis decoded from the
+      bytes; Unicode to UTF-8: encoded. These are stages with position maps
+      (a character's code units to one position, and back).
+    - **Masks across a switch.** The mask stack (`TransformMasks`) is mapped
+      with the text: on decoding, a character's mask bit is that of its code
+      units (which agree; see step 14); on encoding, a position's bit is
+      spread to each of its code units. Run ends, insertion eligibility and
+      the regions of `--lines` are properties of the masks, so they follow.
+      The builders share one mask stack type and one pass over the plan.
+    - **Checks.** Every transform in mixed mode against Unicode mode
+      (`--utf8-mode=0`) on the CLDR test data, with and without `--lines`,
+      and against ICU on random text for the transforms whose segments
+      change.
+14. **UTF-8 mask conventions** (the open question below). A mask covers every
+    code unit of a character, and a region starts at a character's first code
+    unit and follows its last. Checked against the UTF-8 class compilers'
+    marking (Advance marks the last unit, LookAhead the first), the UTF-8
+    character maps and DivCode on bytes, so that a mask decoded in step 13 is
+    exact.
+15. **UTF-8 components with masks of both scopes.** So that fewer components
+    need Unicode segments:
+    - **Run ends in UTF-8 mode** (step 7's remaining item), for single-character
+      rules whose contexts end a filtered run.
+    - **Bounded contexts in UTF-8 mode and in DivCode** (step 4 kept both out):
+      the 44 UTF-8-mode transforms whose contexts must be bounded by the lines
+      now switch wholly to Unicode mode; with region bounds in the UTF-8
+      character maps' contextual groups and in DivCode (both modes), they stay
+      in UTF-8 mode.
+16. **More components in UTF-8 mode** (optional, by measurement). The string-rule
+    groups that DivCode cannot plan (186 transforms through them) run in a
+    Unicode segment after step 13. Reducing that set means either DivCode
+    support for their problems (overlaps, runs, kept characters, captures) or
+    the fused kernels on UTF-8 code units. Worth it only where the switches
+    cost more than the segment.
+
+Order: steps 10 to 12 first (the per-line runs removed, in Unicode mode, which
+every component already has); then 14 and 13 (mixed modes); then 15 and 16,
+which move work from Unicode segments to UTF-8 segments.
 
 ## Testing
 

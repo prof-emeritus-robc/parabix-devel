@@ -98,6 +98,7 @@
 #include <ldml/transform_registry.h>
 #include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
+#include <re/printer/re_printer.h>
 #include <re/transforms/resolve_possessive.h>
 #include <re/analysis/re_analysis.h>
 #include <re/analysis/nullable.h>
@@ -8770,6 +8771,11 @@ private:
     //  this step (see ldml::DeletedRunBlockMark); and those of this step's
     //  prefix runs, for the next (past :: Null ;).
     StreamSet * mDeletedRunEnds = nullptr;
+    //  The engine's matches made so far, by engineMatchKey: an identical
+    //  match on the same text, in the same scope, is made once (as the rules
+    //  a group yields to, and the deferred rules of a round, ask for again).
+    std::map<std::string, std::pair<StreamSet *, StreamSet *>> mEngineMatches;
+    std::string engineMatchKey(char mode, StreamSet * U21, const re::RE * pattern) const;
     StreamSet * mNextDeletedRunEnds = nullptr;
     //  Likewise the characters followed by such a run (at the end of the text too).
     StreamSet * mDeletedRunAfter = nullptr;
@@ -9562,9 +9568,29 @@ RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pa
     return context;
 }
 
+//  The key of a match of the engine: its mode, the text, everything its
+//  context (engineContext) may take (the regions, the active mask, of which
+//  the run ends are made, and the streams of the deleted runs), and the
+//  pattern (its variables printed with their definitions, the externals by
+//  name, their streams given by the rest of the key).
+std::string RulePipelineBuilder::engineMatchKey(char mode, StreamSet * U21, const re::RE * pattern) const {
+    std::string key(1, mode);
+    for (const void * p : {static_cast<const void *>(U21), static_cast<const void *>(boundedRegions()),
+                           static_cast<const void *>(activeMask()), static_cast<const void *>(mDeletedRunEnds),
+                           static_cast<const void *>(mDeletedRunAfter)}) {
+        key += std::to_string(reinterpret_cast<uintptr_t>(p)) + ",";
+    }
+    return key + Printer_RE::PrintRE(pattern);
+}
+
 StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                               StreamSet * U21, StreamSet ** spans) {
     re::RE * const pattern = contextPattern(engineBefore, engineAfter, text);
+    const std::string key = engineMatchKey(spans ? 'S' : 'M', U21, pattern);
+    if (auto f = mEngineMatches.find(key); f != mEngineMatches.end()) {
+        if (spans) *spans = f->second.second;
+        return f->second.first;
+    }
     //  The engine marks a match at an offset after its last character (e.g. 1
     //  for a pattern ending with a zero-width lookahead): shift the marks back.
     const PreparedRE prepared = prepareRE(pattern, engineOptions());
@@ -9581,6 +9607,7 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
         mP.CreateKernelCall<ShiftBack>(matches, shifted, offset);
         matches = shifted;
     }
+    mEngineMatches.emplace(key, std::make_pair(matches, spans ? *spans : nullptr));
     return matches;
 }
 
@@ -9593,7 +9620,10 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
 //  the position it begins).
 StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                              StreamSet * U21) {
+    const std::string key = engineMatchKey('T', U21, startsPattern(engineBefore, engineAfter, text, false));
+    if (auto f = mEngineMatches.find(key); f != mEngineMatches.end()) return f->second.first;
     StreamSet * const starts = mP.CreateStreamSet(1);
+    mEngineMatches.emplace(key, std::make_pair(starts, nullptr));
     RE_PipelineBuilder engine(mP, engineContext(U21, startsPattern(engineBefore, engineAfter, text, false)));
     const PreparedRE prepared = prepareRE(startsPattern(engineBefore, engineAfter, text, false), startsOptions());
     if (checkPreconditions(prepared, &cc::Unicode).empty()) {

@@ -195,6 +195,11 @@ static cl::opt<bool> CaptureStrings("capture-strings",
              "(ldml::StringRule::kept), matched in the fused kernels with the other string rules, rather than one regular "
              "expression pipeline for each set (default on)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> AfterStreams("after-streams",
+    cl::desc("Match a string rule whose after context the fused kernels cannot match, but whose before context they can, in "
+             "the fused kernels, with its after context found by the engine (one stream for each distinct after context; "
+             "FusedStringRule::afterMatch), rather than the whole rule by the engine (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
     cl::desc("Rounds of applying the rules deferred after the BeforeCaptureCopy rules of a group, to the converted text "
              "(exact for chains of up to this many triggers whose before contexts reach back to each other)"),
@@ -4001,6 +4006,11 @@ struct FusedStringRule {
     std::u32string replacement;
     FusedContexts before{FusedContext()}, after{FusedContext()};
     int match = -1;
+    //  If afterMatch >= 0 (an index in FusedRulesConfig::sources, after then
+    //  empty): the positions after which its after context holds (as the
+    //  engine finds it, for a context the kernels cannot match), read at the
+    //  last position of its text.
+    int afterMatch = -1;
     std::vector<FusedYield> yields;
     bool converted = false;     // in a correction kernel: its before context is matched against the converted text
     UCD::UnicodeSet run;        // the set of the run following the text, deleted (see ldml::StringRule::run)
@@ -4363,6 +4373,7 @@ struct FusedLayout {
     unsigned changePositions = 0;   // the positions i of the replacements, with outputs
     std::set<unsigned> insertCounts;
     std::vector<StreamSet *> sourceSets;
+    std::vector<unsigned> sourceLookahead;  // of each of sourceSets (see FusedStringRule::afterMatch)
     std::set<unsigned> marks;               // the case mappings marked (given, or by its subgroups)
     FusedLayout(const FusedRulesConfig & c, const FusedState & in) {
         //  (The lookaheads of the earlier rules yielded to.)
@@ -4422,6 +4433,12 @@ struct FusedLayout {
         }
         for (const FusedMatchSource & s : c.sources) {
             if (std::find(sourceSets.begin(), sourceSets.end(), s.streamSet) == sourceSets.end()) sourceSets.push_back(s.streamSet);
+        }
+        sourceLookahead.assign(sourceSets.size(), 0);
+        for (const FusedStringRule & r : c.strings) {
+            if (r.match >= 0 || r.afterMatch < 0) continue;
+            const size_t k = std::find(sourceSets.begin(), sourceSets.end(), c.sources[r.afterMatch].streamSet) - sourceSets.begin();
+            sourceLookahead[k] = std::max<unsigned>(sourceLookahead[k], static_cast<unsigned>(r.text.size()) - 1);
         }
     }
 };
@@ -5213,7 +5230,13 @@ private:
             else b.emplace_back("Mask", Mask);
         }
         if (Allowed) b.emplace_back("Allowed", Allowed);
-        for (size_t i = 0; i < l.sourceSets.size(); i++) b.emplace_back("Source" + std::to_string(i), l.sourceSets[i]);
+        for (size_t i = 0; i < l.sourceSets.size(); i++) {
+            if (l.sourceLookahead[i] > 0) {
+                b.emplace_back("Source" + std::to_string(i), l.sourceSets[i], FixedRate(1), LookAhead(l.sourceLookahead[i]));
+            } else {
+                b.emplace_back("Source" + std::to_string(i), l.sourceSets[i]);
+            }
+        }
         if (!c.matchOnly || c.staged) {
             for (size_t i = 0; i < in.changes.size(); i++) {
                 if (in.changes[i]) b.emplace_back("ChangesIn" + std::to_string(i), in.changes[i]);
@@ -5298,7 +5321,9 @@ private:
         if (Mask) s += "K" + std::to_string(l.maskLookahead);
         if (Allowed) s += "A";
         s += "L" + std::to_string(l.lookahead) + "S";
-        for (StreamSet * ss : l.sourceSets) s += std::to_string(ss->getNumElements()) + ",";
+        for (size_t i = 0; i < l.sourceSets.size(); i++) {
+            s += std::to_string(l.sourceSets[i]->getNumElements()) + (l.sourceLookahead[i] ? "+" + std::to_string(l.sourceLookahead[i]) : "") + ",";
+        }
         s += "I";
         for (StreamSet * ss : in.changes) s += ss ? "1" : "0";
         s += "/";
@@ -5333,6 +5358,7 @@ private:
             } else {
                 appendContext(s, r.before);
                 appendContext(s, r.after);
+                if (r.afterMatch >= 0) s += "a" + source(r.afterMatch);
                 appendYields(s, r.yields);
             }
             if (r.converted) s += "c";
@@ -5502,6 +5528,10 @@ void FusedRules::generatePabloMethod() {
         for (unsigned j = 0; j < n; j++) {
             m = pb.createAnd(m, classAt(j, r.text[j]));
             if (mask) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
+        }
+        if (r.afterMatch >= 0) {
+            PabloAST * const a = source(r.afterMatch);
+            m = pb.createAnd(m, n > 1 ? pb.createLookahead(a, n - 1) : a);
         }
         if (PabloAST * const free = notYielded(r.yields)) m = pb.createAnd(m, free);
         starts.push_back(m);
@@ -10055,6 +10085,27 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         fusedMatch[r] = !texts[r].empty() && fusedContexts(rule.engineAfter, false, afters[r])
                    && fusedContexts(rule.engineBefore, true, befores[r]);
     }
+    //  The string rules whose after contexts the fused kernels cannot match, but
+    //  whose before contexts they can: matched in them, with the positions after
+    //  which the after context holds found by the engine (--after-streams; see
+    //  FusedStringRule::afterMatch), one stream for each distinct after context.
+    std::vector<StreamSet *> afterStreams(numStringRules, nullptr);
+    std::vector<bool> afterStreamed(numStringRules, false);
+    for (size_t r = 0; r < numStringRules && AfterStreams; r++) {
+        const ldml::StringRule & rule = step.stringRules[r];
+        if (fusedMatch[r] || texts[r].empty() || rule.engineAfter == nullptr) continue;
+        FusedContexts before;
+        if (!fusedContexts(rule.engineBefore, true, before)) continue;
+        befores[r] = before;
+        afters[r] = {FusedContext()};
+        afterStreamed[r] = fusedMatch[r] = true;
+    }
+    auto afterStream = [&](size_t r) {
+        if (afterStreams[r] == nullptr) {
+            afterStreams[r] = matchPositions(nullptr, step.stringRules[r].engineAfter, {UCD::UnicodeSet(0, 0x10FFFF)}, U21);
+        }
+        return afterStreams[r];
+    };
     //  The rules whose before contexts the conversions of the group may make match
     //  differently in the converted text: matched against it by a correction
     //  kernel (FusedRules with rounds), after the other rules; or, if such string
@@ -10186,8 +10237,12 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         Invert(P, earlier, notEarlier);
         return combine(firsts, notEarlier, false);
     };
-    auto fusedRule = [&](size_t r) {
+    auto fusedRule = [&](size_t r, FusedRulesConfig & c) {
         FusedStringRule fr;
+        if (afterStreamed[r]) {
+            fr.afterMatch = static_cast<int>(c.sources.size());
+            c.sources.push_back(FusedMatchSource{afterStream(r), 0});
+        }
         fr.text = texts[r];
         fr.run = step.stringRules[r].run;
         fr.runSingles = step.stringRules[r].runSingles;
@@ -10993,7 +11048,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         std::vector<size_t> index(numStringRules, SIZE_MAX);
         for (size_t i = 0; i < order.size(); i++) index[order[i]] = i;
         for (size_t r : order) {
-            FusedStringRule fr = fusedRule(r);
+            FusedStringRule fr = fusedRule(r, config);
             if (convertible[r]) {
                 fr.before = convertedBefores[r];
                 fr.converted = true;
@@ -11153,7 +11208,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 FusedRulesConfig config;
                 config.matchOnly = true;
                 for (size_t r : chunk) {
-                    config.strings.push_back(fusedRule(r));
+                    config.strings.push_back(fusedRule(r, config));
                     const MatchClass k = classOf(r);
                     if (std::find(config.startsByLength.begin(), config.startsByLength.end(), k) == config.startsByLength.end()) {
                         config.startsByLength.push_back(k);
@@ -11263,7 +11318,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             for (const std::vector<size_t> & chunk : fusedStringChunks(lengths, fusedRules)) {
                 FusedRulesConfig config;
                 config.matchOnly = true;
-                for (size_t r : chunk) config.strings.push_back(fusedRule(r));
+                for (size_t r : chunk) config.strings.push_back(fusedRule(r, config));
                 StreamSet * const matches = P.CreateStreamSet(chunk.size());
                 const FusedState none;
                 StreamSet * const classes = fusedClasses(config);
@@ -11320,7 +11375,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                     config.sources.push_back(FusedMatchSource{selected, 0});
                 }
                 for (size_t i : chunk) {
-                    FusedStringRule fr = fusedRule(applying[i]);
+                    FusedStringRule fr = fusedRule(applying[i], config);
                     if (applied[i].streamSet) {
                         fr.match = static_cast<int>(config.sources.size());
                         config.sources.push_back(applied[i]);
@@ -11419,7 +11474,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         }
         for (size_t r = 0; r < numStringRules; r++) {
             if (correctedString[r]) {
-                FusedStringRule fr = fusedRule(r);
+                FusedStringRule fr = fusedRule(r, correction);
                 fr.before = convertedBefores[r];
                 fr.converted = true;
                 correction.strings.push_back(std::move(fr));

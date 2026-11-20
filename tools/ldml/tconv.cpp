@@ -13333,7 +13333,9 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 //  FusedRulesConfig::region; also the before contexts matched against the
 //  converted text, in rounds or by the While loop) and by the engine (region
 //  starts and follows), and it is not applied by DivCode, shape groups or in
-//  UTF-8 mode.
+//  UTF-8 mode.  So is a group with MultipleCaptureMultipleReplacement rules,
+//  which the engine matches, bounded likewise (before, each line was a run of
+//  its own: am_FONIPA-am took 110 s on 2.9 MB of 200,000 lines, now 0.6 s).
 struct RegionScope {
     std::string problem;
     bool bounded = false;
@@ -13371,7 +13373,12 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
         if (!step.prefixRuns.empty()) return fail("prefix runs");
         if (!step.chainRevisitRules.empty()) return fail("chain revisits");
         if (!step.markRunEditRules.empty()) return fail("mark run edits");
-        if (!step.captureReplacements.empty()) return fail("capture replacements");
+        //  (The capture replacements are matched by the engine, bounded by the
+        //  regions: see RulePipelineBuilder::boundRegions.)
+        if (!step.captureReplacements.empty()) {
+            if (!BoundRegions) return fail("capture replacements");
+            scope.bounded = true;
+        }
         if (step.hasFrontLetters || step.frontLettersEnd) return fail("front-letter revisits");
         for (const ldml::ConversionRule * r : step.rules) {
             if (revisits(r->getRightSide())) return fail("a rule with a revisit");

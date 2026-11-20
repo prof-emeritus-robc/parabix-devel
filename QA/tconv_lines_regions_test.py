@@ -8,7 +8,8 @@
 #  region of a mask, and must give the output of one run per line
 #  (--lines-regions=0).  Contexts that are not line-bound are bounded by the
 #  lines (step 4), in the fused kernels (also the before contexts matched
-#  against the converted text, by the correction kernels) and by the engine.
+#  against the converted text, by the correction kernels) and by the engine,
+#  which also matches the capture replacements, bounded by the lines.
 #  Each case checks the plan's verdict (--plan --lines) and, either way, the
 #  equality of the two outputs, on inputs with contexts reaching for a
 #  neighbouring line at both edges, empty lines and a last line without a line
@@ -52,6 +53,11 @@ CASES = [
     ("x \u2192 a ;\n[^a]* c { b \u2192 B ;\n", "xcb\nc\nb\nab\ncb\nc\nxb", BOUNDED),
     # Contexts seen by the engine (an unbounded repetition), bounded
     ("a } [^x]* y \u2192 Q ;\n", "a\ny\nay\naxy\na b\ny", BOUNDED),
+    # Capture replacements, matched by the engine, bounded: a capture whose set
+    # has the line feed, and one of variable length that stays one (not a
+    # string rule, --capture-strings)
+    ("(a [c\\u000A]*) b \u2192 $1 B ;\n", "a\ncb\nacb\nab\na\nb", BOUNDED),
+    ("(a b*) c \u2192 $1 C ;\n", "ab\nbc\nabbc\na\nc\nabc", BOUNDED),
     # Insertions keep the per-line runs
     ("b { } d \u2192 I ;\n", LINES, PER_LINE),
     # Built-ins

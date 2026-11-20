@@ -4,9 +4,9 @@
 #
 #  tconv: before contexts matched against the converted text, resolved in the
 #  regular plan's correction kernel by a While loop (doc/round-replacement.md
-#  §1, --converted-context-while) instead of rounds: single-character rules
+#  §1; the rounds it replaced were removed in step 7): single-character rules
 #  whose before contexts have two or three items, in chains longer than the
-#  default 8 rounds; a deletion seen through, and the first character of an
+#  8 rounds the loop replaced; a deletion seen through, and the first character of an
 #  expansion seen at distance 2; negated sets at the start of the text, and
 #  the rules of one character made exclusive by order disambiguation.  Then a
 #  repeated set in the before context (X T*): chains through it, conversions

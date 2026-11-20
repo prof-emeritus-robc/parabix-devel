@@ -330,7 +330,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
 
     //  A context, its items classified (the alphabet completed later).
     //  (converted: whether the before context is matched against the converted
-    //  text, in rounds; allowed only for single-character rules, phase 1.)
+    //  text; allowed only for single-character rules, phase 1.)
     auto classify = [&](RE * re, RE * engineBefore, bool before, DivContext & context, bool * converted = nullptr,
                         bool single = false) {
         std::vector<std::pair<UCD::UnicodeSet, bool>> items;
@@ -344,7 +344,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         if (before) {
             if (!options.convertedBefore) {
                 problem("before contexts (no check of the converted text)");
-            } else if (options.convertedBefore(step, engineBefore) && options.convertedRounds > 0) {
+            } else if (options.convertedBefore(step, engineBefore) && options.convertedContexts) {
                 if (!single && !converted) {
                     problem("string rules with before contexts matched against the converted text");
                 } else if (items.size() > 1) {

@@ -151,23 +151,14 @@ static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML trans
 static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known transform names and exit"),
                                     cl::init(false), cl::cat(TconvOptions));
 static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
-    cl::desc("Rounds of matching before contexts against the converted text, which the conversions of a group may change "
-             "(exact for chains of up to this many such rules; 0 matches them against the text itself)"),
+    cl::desc("Before contexts that the conversions of a group may change: matched against the converted text (resolved by "
+             "the correction kernel's While loop, exact at any chain length) if nonzero, against the text itself if 0.  Also "
+             "the rounds of the staged sequential selection of string rules with runs (exact for chains of up to this many)"),
     cl::init(8), cl::cat(TconvOptions));
-static cl::opt<bool> ConvertedContextWhile("converted-context-while",
-    cl::desc("Resolve the before contexts matched against the converted text in a correction kernel of single-character rules "
-             "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
-             "§1; default on, --converted-context-while=0 for the rounds)"),
-    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> SequentialWhile("sequential-while",
-    cl::desc("With --converted-string-while, select the string matches of a whole group selected sequentially (two-way or cyclic "
-             "overlaps) in the correction kernel's While loop, instead of in --converted-context-rounds staged rounds of "
-             "matching, LeftmostMatches and applying kernels (doc/round-replacement.md step 6; default on)"),
-    cl::init(true), cl::cat(TconvOptions));
-static cl::opt<bool> ConvertedStringWhile("converted-string-while",
-    cl::desc("With --converted-context-while, also resolve by the While loop the string rules whose before contexts are matched "
-             "against the converted text, with the string rules whose selection depends on them (doc/round-replacement.md "
-             "step 3; default on, --converted-string-while=0 for the rounds)"),
+    cl::desc("Select the string matches of a whole group selected sequentially (two-way or cyclic overlaps) in the correction "
+             "kernel's While loop, where it can decide all the string rules, instead of in --converted-context-rounds staged "
+             "rounds of matching, LeftmostMatches and applying kernels (doc/round-replacement.md step 6; default on)"),
     cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
@@ -3898,7 +3889,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         //  (In the While loop where every string rule can be decided there: no runs, and
         //  results fixed at each position of their texts; see FusedRulesConfig::sequential.)
         toolio::out() << "    string matches selected sequentially "
-                     << (SequentialWhile && ConvertedStringWhile && ConvertedContextWhile
+                     << (SequentialWhile
                          ? "in the correction kernel's While loop if its rules allow, otherwise " : "")
                      << "between the " << ConvertedContextRounds + 1
                      << " rounds of matching before contexts against the converted text\n";
@@ -4606,7 +4597,6 @@ struct FusedSubgroupPlan {
 //  a fixed string as its result at each position of its text (no run; a
 //  character kept is the position's own, one deleted has none), and there are
 //  no insertion rules.
-//  (--converted-string-while.)
 //  Whether a match of rule r may begin at offset o of a match of rule p.
 static bool mayBeginWithin(const FusedRulesConfig & c, size_t r, size_t p, unsigned o) {
     if (o == 0 || o >= c.strings[p].text.size()) return false;
@@ -4643,7 +4633,7 @@ static std::vector<bool> loopStringRules(const FusedRulesConfig & c) {
 
 static bool loopStringResolvable(const FusedRulesConfig & c, size_t r) {
     const FusedStringRule & s = c.strings[r];
-    if (!ConvertedStringWhile || !c.insertions.empty() || !s.run.empty() || !s.runStrings.empty() || s.keep >= 0) return false;
+    if (!c.insertions.empty() || !s.run.empty() || !s.runStrings.empty() || s.keep >= 0) return false;
     if (s.converted && s.match >= 0) return false;
     //  (A character kept, or deleted: at a position of the text, the first of its
     //  result.)
@@ -4654,8 +4644,12 @@ static bool loopStringResolvable(const FusedRulesConfig & c, size_t r) {
     return true;
 }
 
-static bool resolvableByWhile(const FusedRulesConfig & c) {
-    if (!ConvertedContextWhile || c.rounds == 0 || c.staged || c.matchOnly) return false;
+static bool resolvableByWhile(const FusedRulesConfig & c, std::string * why = nullptr) {
+    if (c.rounds == 0 || c.staged || c.matchOnly) return false;
+    auto no = [&](const std::string & reason) {
+        if (why) *why = reason;
+        return false;
+    };
     auto starsOk = [](const FusedContexts & before) {
         for (const FusedContext & alt : before) {
             for (size_t k = 0; k < alt.size(); k++) {
@@ -4665,22 +4659,27 @@ static bool resolvableByWhile(const FusedRulesConfig & c) {
         }
         return true;
     };
+    static const std::string stars = "a before context with a repeated set that is not the last item of an X T* pair";
     for (const FusedInsertion & ins : c.insertions) {
-        if (!starsOk(ins.before)) return false;
+        if (!starsOk(ins.before)) return no("an insertion rule with " + stars);
     }
     bool any = false;
     const std::vector<bool> loop = loopStringRules(c);
     for (size_t r = 0; r < c.strings.size(); r++) {
         if (!loop[r]) continue;
-        if (!loopStringResolvable(c, r) || (c.strings[r].converted && !starsOk(c.strings[r].before))) return false;
+        if (!loopStringResolvable(c, r)) {
+            return no("a string rule decided in the loop with a run, a kept capture, a match by the engine, a kept or "
+                      "deleted character beyond its text, or insertion rules in its group");
+        }
+        if (c.strings[r].converted && !starsOk(c.strings[r].before)) return no("a string rule with " + stars);
         any = true;
     }
     for (const FusedSubgroup & g : c.subgroups) {
         if (!g.converted) continue;
         any = true;
-        if (!starsOk(g.before)) return false;
+        if (!starsOk(g.before)) return no("a single-character rule with " + stars);
     }
-    return any || !c.insertions.empty();
+    return any || !c.insertions.empty() || no("no rule matched against the converted text");
 }
 
 //  An item of the before contexts resolved by the While loop, and the greatest
@@ -6850,21 +6849,8 @@ void FusedRules::generatePabloMethod() {
                 noneBefore = pb.createAnd(noneBefore, insKnown(pb, i, false, finalC));
             }
         } else {
-            //  Round 0: the before contexts matched against the text itself.
-            matchConverted(none, none);
-            settle();
-            //  Each further round: the converted text from the results so far (with the
-            //  texts inserted), and the before contexts matched against it.  (A rule
-            //  whose before context sees the result of another such rule is right after
-            //  as many rounds as such rules precede it in a chain.)
-            for (unsigned round = 1; round <= mConfig.rounds; round++) {
-                Results base = stateIn();
-                addResults(base, firstOf, atOf);
-                Results res = base;
-                addInsertions(res, insAt);
-                matchConverted(res, base);
-                settle();
-            }
+            //  (Not built: see applyFused.)
+            llvm::report_fatal_error("tconv: a correction kernel neither staged nor resolved by the While loop");
         }
     }
 
@@ -9921,7 +9907,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         ldml::DivCodeOptions options;
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
-        options.convertedRounds = ConvertedContextRounds;
+        options.convertedContexts = ConvertedContextRounds > 0;
         const ldml::DivCodePlan plan = ldml::planDivCodeGroup(step, options);
         if (divCodeApplies(plan)) return divCodeGroup(plan, U21);
     }
@@ -10387,7 +10373,15 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         if (caseMapGroup) {
             for (FusedSubgroup & fg : config.subgroups) fg.caseMaps = true;
         }
-        config.resolve = resolvableByWhile(config);
+        //  (A correction kernel resolves its before contexts by the While loop:
+        //  doc/round-replacement.md step 7 removed the rounds.)
+        std::string why;
+        config.resolve = resolvableByWhile(config, &why);
+        if (config.rounds > 0 && !config.staged && !config.matchOnly && !config.resolve) {
+            llvm::report_fatal_error(llvm::StringRef("tconv: before contexts matched against the converted text that the "
+                                                     "correction kernel's While loop cannot resolve (" + why + "); "
+                                                     "--converted-context-rounds=0 matches them against the text itself"));
+        }
         const FusedLayout layout(config, state);
         config.marks = layout.marks;
         FusedState out;
@@ -11016,7 +11010,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  correction kernel, where it can decide all the string rules (see
         //  FusedRulesConfig::sequential); otherwise in staged rounds.
         bool sequentialLoop = false;
-        if (step.sequentialSelection && SequentialWhile && ConvertedStringWhile) {
+        if (step.sequentialSelection && SequentialWhile) {
             FusedRulesConfig trial = config;
             trial.selection.clear();
             trial.sequential = true;
@@ -11822,7 +11816,7 @@ static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
     ldml::DivCodeOptions options;
     options.shift = DivCodeShift;
     options.convertedBefore = convertedBeforeContext;
-    options.convertedRounds = ConvertedContextRounds;
+    options.convertedContexts = ConvertedContextRounds > 0;
     options.utf8 = true;
     return ldml::planDivCodeGroup(step, options);
 }
@@ -13113,7 +13107,7 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
         group++;
         ldml::DivCodeOptions options;
         options.convertedBefore = convertedBeforeContext;
-        options.convertedRounds = ConvertedContextRounds;
+        options.convertedContexts = ConvertedContextRounds > 0;
         options.shift = 5;
         const ldml::DivCodePlan p32 = ldml::planDivCodeGroup(step, options);
         //  (A group without string rules: only with rules whose before contexts
@@ -15386,7 +15380,7 @@ static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::Tr
     ldml::DivCodeOptions options;
     options.shift = DivCodeShift;
     options.convertedBefore = convertedBeforeContext;
-    options.convertedRounds = ConvertedContextRounds;
+    options.convertedContexts = ConvertedContextRounds > 0;
     const ldml::DivCodePlan plan = ldml::planDivCodeGroup(*step, options);
     if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 6) {
         llvm::errs() << "Error: the alphabet of group " << DivCodeCodes << " has " << plan.blocks.size() << " blocks and "

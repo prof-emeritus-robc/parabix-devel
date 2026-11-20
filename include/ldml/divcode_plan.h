@@ -60,10 +60,11 @@ struct DivCodeOptions {
     // At most this many stages of string rules with one-way overlaps (see
     // DivRule::stage).
     unsigned maxStages = 8;
-    // The rounds of matching the before contexts that ICU matches against the
-    // converted text (see DivRule::converted); 0: matched against the text
-    // itself, as with tconv --converted-context-rounds=0.
-    unsigned convertedRounds = 8;
+    // Whether the before contexts that ICU matches against the converted text
+    // (see DivRule::converted) are matched against it, resolved by the
+    // Converted kernel's While loop (doc/ldml-divcode-plan.md §10); if not,
+    // against the text itself, as with tconv --converted-context-rounds=0.
+    bool convertedContexts = true;
     // Whether a before context (as given for the regular expression engine)
     // may match differently in the text as converted by the group, against
     // which ICU matches it (or is not known not to).  If not given, no before
@@ -157,10 +158,9 @@ struct DivRule {
     unsigned stage = 0;
     // A rule whose before context ICU matches against the converted text (it
     // may match differently there: see convertedContextMatters in tconv):
-    // matched against the text itself first, then again in rounds against the
-    // converted text that the matches of the round before give.  (Phase 1: a
-    // single-character rule, with a before context of one item, that no rule
-    // yields to.)
+    // resolved against the converted text by the Converted kernel's While loop
+    // (doc/ldml-divcode-plan.md §10).  (Phase 1: a single-character rule, with
+    // a before context of one item, that no rule yields to.)
     bool converted = false;
     // A rule of a covering family (DivCodePlan::convertedFamilies, phase 2): its
     // index, or -1.  The family's match is certain; which of its rules applies

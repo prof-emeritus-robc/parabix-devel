@@ -4,8 +4,8 @@
 #
 #  tconv: string rules whose before contexts are matched against the converted
 #  text, resolved in the regular plan's correction kernel by the While loop
-#  (doc/round-replacement.md step 3, --converted-string-while) instead of
-#  rounds, with the rules whose selection depends on them.  The loop decides
+#  (doc/round-replacement.md step 3; the rounds it replaced were removed in
+#  step 7), with the rules whose selection depends on them.  The loop decides
 #  such a rule at the first position of each match, from its before context and
 #  the matches that may cover that position; the positions of its text then
 #  have the outcomes of its result, or their own where it does not apply.
@@ -21,8 +21,7 @@
 #  rules shaped as es-es_FONIPA's, zu-zu_FONIPA's and ja_Latn-ru's; characters
 #  kept and deleted, as blt-blt_FONIPA's rules have them; and a match beginning
 #  at the last position of an applied match, which the overlap order does not
-#  have.  Most chains are longer than the default 8 rounds, which miss them
-#  (--converted-string-while=0).  Then chains over 1,000 characters, across
+#  have.  Most chains are longer than the 8 rounds the loop replaced.  Then chains over 1,000 characters, across
 #  blocks, also with one thread and with four threads and segments of one
 #  stride (all with --extended-testing; otherwise the first only).  The
 #  expected results are ICU's (createFromRules, each line a text).

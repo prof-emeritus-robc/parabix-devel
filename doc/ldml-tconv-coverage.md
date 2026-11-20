@@ -799,43 +799,67 @@ converted text if some conversion of its group:
 This is `convertedContextMatters` in `tools/ldml/tconv.cpp`. `tconv --plan` lists
 these contexts ("before context matched against the converted text").
 
-**How.** These rules are applied by a correction kernel (`FusedRules` with
-rounds), after all the other rules of the group, given their results:
+**How.** These rules are applied by a correction kernel (`FusedRules`), after
+all the other rules of the group, given their results. A Pablo `While` loop
+decides them from left to right (doc/round-replacement.md §1, in the form of
+doc/ldml-divcode-plan.md §10):
 
-1. Round 0 matches the before contexts against the input.
-2. Each further round rebuilds the converted text at each position from all the
-   results so far: its length (0 if deleted, or 1 plus the positions inserted
-   after it) and its characters.
-3. From that, it computes whether the j-th last converted character before each
-   position is in a set. This uses `Advance`, looks through deleted positions
-   (`MatchStar`), and handles the start of the text. Only the set's intersection
-   with the group's replacement characters is compiled on computed bits.
-4. It then matches the before contexts again.
+1. The state only accumulates: for each item of the before contexts, the
+   positions where the j-th last converted character before the position is
+   known to be in its set, and those where it is known not to be; for each
+   rule, the positions where it is known to apply, and those where it is known
+   not to.
+2. The converted text at a position is known once the rules there are decided:
+   its length (0 if deleted, or 1 plus the positions inserted after it) and its
+   characters. Going back from a position uses `Advance`, looks through deleted
+   positions (`MatchStar`), and handles the start of the text. Only a set's
+   intersection with the group's replacement characters is compiled on
+   computed bits.
+3. A single-character or insertion rule is decided at its position from its
+   before context. A string rule whose before context is matched against the
+   converted text, or whose selection depends on such a rule, is decided at the
+   first position of each match, also from the matches that may cover that
+   position (`loopStringRules`, `mayBeginWithin`).
+4. Each iteration decides the positions whose items have become known (the
+   frontier). The loop is exact at any chain length, iterates as long as the
+   longest chain within a block, and not at all in blocks without one.
 
-A rule is right after as many rounds as rules of this kind precede it in a chain.
-`--converted-context-rounds` sets the number of rounds (default 8; 0 turns the
-correction off). Pablo `While` loops cannot be used for this fixpoint, because an
-`Advance` inside a loop takes the previous block's carry only in the first
-iteration.
+A `While` loop can be used because the state only accumulates: an `Advance`
+inside the loop takes the previous block's carry only in the first iteration,
+so the values carried across blocks are kept in Vars that the iterations only
+add to. `--converted-context-rounds=0` turns the correction off (the before
+contexts are matched against the text itself). A group that the loop cannot
+resolve (a repeated set in a before context that is not of the form `X T*`;
+string rules decided in the loop with runs, kept captures, matches found by the
+regular expression engine, or insertion rules beside them) is reported as an
+error. Until 2026-11, these rules were applied
+in fixed rounds instead (`--converted-context-rounds`, default 8), exact only
+for chains of up to that many rules (doc/round-replacement.md step 7).
 
 **Cost.** It is small:
 
 - 2 kernels per group (the correction kernel and its classes);
-- cold starts within noise (Deva-Latn 3.1–3.4 s at 1 to 8 rounds, 3.6 s at 16);
+- cold starts within noise (measured with the rounds: Deva-Latn 3.1–3.4 s at
+  1 to 8 rounds; the loop has one copy of the body where the rounds had nine);
 - no measurable run-time cost.
 
 **Whole groups.** Where such string rules must be selected (their matches
 overlap), or other rules need their coverage, the correction kernel takes all
-the rules of the group: in each round it also selects the string-rule matches
-that apply (as `SelectStringMatches`) and computes where the single-character
-rules may apply. (Groups of more than 256 string rules or subgroups keep their
+the rules of the group: it also selects the string-rule matches that apply (as
+`SelectStringMatches`) and computes where the single-character rules may apply.
+Where the matches must be selected sequentially (two-way or cyclic overlaps),
+they are selected in the loop if it can decide every string rule of the group;
+otherwise (string rules with runs: InterIndic-Arabic, Latin-ASCII,
+ro-ro_FONIPA, xh-xh_FONIPA) in staged rounds, each a matching kernel,
+`LeftmostMatches` and an applying kernel (§4.2), exact for chains of up to
+`--converted-context-rounds` (default 8). (Groups of more than 256 string rules or subgroups keep their
 before contexts matched against the text.) For example, pl-pl_FONIPA's
 `$voiceless { rz → ʂ` sees `W` converted to the voiceless `f` (`Wrz` gives `fʂ`).
 A before context matched against the converted text may also let a string rule
 match within a match that applies, where ICU applies no rule (`c { c → A ; cc → Y`
 on `ccc`, where `DisambiguateOrder` gives the string rule the context `[^c]`,
-which the `Y` then satisfies). Each round drops the matches starting within the
-matches applied in the previous round.
+which the `Y` then satisfies). Such matches are dropped: a match starting within
+an applied match does not apply.
 
 Two more cases were found by the W3 fuzzing and fixed:
 
@@ -887,7 +911,7 @@ Parabix pipeline framework on which it runs):
 - **Jpan-Latn compiles slowly.** Its pipeline, with the deferred rules of
   Kana-Latn twice (also through Hira-Latn), compiles only since the positions
   of the deferred rules are inserted once (`edbf0b88f`) and its planning no
-  longer takes gigabytes (`2f882cba6`): with the default of 4 rounds, on an
+  longer takes gigabytes (`2f882cba6`): with 4 deferred rounds (the default then), on an
   8 GB machine, the first compilation takes 228 s (300 s of CPU) and 1.5 GB,
   and runs from the object cache 3 s and 274 MB. It is identical to ICU 78.3's
   `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 509
@@ -896,9 +920,9 @@ Parabix pipeline framework on which it runs):
   Consecutive runs of iteration marks that reach back to each other may need
   more rounds than the default, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
   ("failed to allocate virtual address space", or a Z3 error at the default
-  of 4), and its analysis exceeded 13 GB.
+  of 4 then), and its analysis exceeded 13 GB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
-  (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
+  (`--deferred-rule-rounds`, default 8): a chain of more triggers whose before
   contexts reach back to each other leaves the last ones unchanged, unless it is
   a run of a self-reproducing rule (`カヽヽヽヽヽ`, `ナヾヾヾヾヾ`, any length,
   see `DeferredRuns`), and of rules known to reproduce the same block: a
@@ -916,7 +940,7 @@ Parabix pipeline framework on which it runs):
   rounds and `DeferredRuns` work within them, so that the bounds of the
   pipeline's buffers no longer grow with the number of rounds. (Inserting
   positions in each round had them grow to the power of the rounds: on an 8 GB
-  machine, Kana-Latn itself failed to compile with the default of 4, "failed to
+  machine, Kana-Latn itself failed to compile with 4 rounds, "failed to
   allocate virtual address space".) The runs of the repeated set of a capture
   copied are counted up to 16 characters, which bounds the positions reserved;
   a rule copying a longer run does not apply.
@@ -1013,8 +1037,10 @@ the filtered characters (`localCharacterMapping`).
      kernels then apply the rules where selected. As no two string rules of a
      group match at the same position (`DisambiguateOrder`), this is exactly
      the order in which ICU applies them. In a group whose before contexts are
-     matched against the converted text (§3.1), each round of that matching is
-     a kernel of its own, and the matches of each round are selected this way.
+     matched against the converted text (§3.1), the selection is made in the
+     correction kernel's While loop, or, for string rules with runs, in staged
+     rounds: each round's matching is a kernel of its own, and its matches are
+     selected this way.
 
    Single-character rules apply only outside the applied matches of string rules
    (W2a), and within the filter mask.
@@ -1033,7 +1059,7 @@ the filtered characters (`localCharacterMapping`).
    rule before it in the group may apply there (checked by the planner). A group
    of insertion rules alone, with before contexts of one character, is matched by
    the regular expression engine. Otherwise the insertions are made in the
-   correction kernel (§3.1): in each round, the text inserted is added after the
+   correction kernel (§3.1): once decided, the text inserted is added after the
    converted text of its character (or replaces the deletion mark of a deleted
    one), and the before contexts of the rules of the group see it. An insertion's
    own before context is matched without its own text, and may have repetitions.

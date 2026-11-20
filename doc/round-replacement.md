@@ -15,7 +15,7 @@ Since the survey: the correction kernel's While loop (section 1, three increment
 | 3. Deferred-rule rounds | Kana-Latn, fa-fa_FONIPA | unchanged; Kana-Latn #1 946 kernels at 8 rounds, 162 at 1 (Jpan-Latn 3,084 in all) | all |
 | 4. DeferredPlan blocking depth | 9 unrolled steps | While loop, committed (5a372fd94) | checks, see section 4 |
 | 5. Any-FCC passes | 422 kernels | 318 kernels (Any-NFC 75): each pass is now a masked NFC on the 21-bit basis | not a candidate |
-| 6. Stale text | | still stale (`include/ldml/divcode_plan.h` 63–66, 155–156; doc/ldml-tconv-coverage.md §3.1, §3.2) | edit |
+| 6. Stale text | | still stale (`include/ldml/divcode_plan.h` 63–66, 155–156; doc/ldml-tconv-coverage.md §3.1, §3.2) | edited (2026-11-20) |
 
 **The correction kernels still on rounds.** Every one has string rules whose before contexts are matched against the converted text; none is held back by its contexts' form (no repetition that `ContextExpansion` cannot give as `X T*`). Converted string rules are therefore the one remaining blocker of section 1.
 
@@ -280,7 +280,7 @@ Checks (all closed on 2026-11-19):
 
 ## 6. Already replaced, and stale text
 
-(Rechecked at `d7854835d`: all three items below are still as described.)
+(Rechecked at `d7854835d`: all three items below were still as described. The two stale items were edited on 2026-11-20, step 7 and step 9: the comments of `include/ldml/divcode_plan.h` and `lib/ldml/divcode_plan.cpp` now describe the While loop, and doc/ldml-tconv-coverage.md §3.1 describes the correction kernel's While loop and §3.2 gives the deferred-rule default as 8.)
 
 - DivCode applies 55 groups (by kernel counts with `--divcode-groups=0`), including all 42 eligible converted-context groups except ja_Latn-ko #2 and ro_FONIPA-ja #2.
 - `include/ldml/divcode_plan.h`: `convertedRounds = 8` is now only an on/off switch for converted contexts, and its comments (lines 63–66, 155–156) and `lib/ldml/divcode_plan.cpp:328` still describe rounds.
@@ -318,6 +318,10 @@ Next steps (2026-11-19):
    - Eight groups move to the loop, 26 kernels fewer each: Any-Publishing (37 to 11), Latin-ConjoiningJamo (49 to 23), es_FONIPA-zh, fa-fa_FONIPA, si-si_FONIPA (one of its two groups), ta-ta_FONIPA, und_FONIPA-fa and zh_Latn_PINYIN-ru. InterIndic-Arabic, Latin-ASCII, ro-ro_FONIPA and xh-xh_FONIPA keep the staged rounds: their string rules have runs, which the loop does not decide (`loopStringResolvable`).
    - Checks: 3,000 random words over each of the eight transforms' scripts: the loop's output equals ICU's, also with four threads and one-stride segments; the staged rounds differ from ICU on one Latin-ConjoiningJamo word (`dbpktbkmgq`, a chain longer than the rounds). `QA/tconv_sequential_while_test.py` (a two-way and a cyclic rule set, chains to 1,400 characters) passes, and fails 14 cases with `--sequential-while=0`. All 42 tconv tests pass. On the CLDR test data (the source column of each of the 290 files, `--lines`), the staged rounds (`--sequential-while=0`) and the loop give identical output for every file. Six files exit with status 1 in both, as tconv does not know their transforms (`d0-morse-t-am-Ethi`, `byn-Latn-t-byn-ethi-m0-tekie-alibekit` and four `und-Latn-t-und-ethi-m0-*` variants). The test data has no chains longer than the rounds, so this checks that the move loses nothing, not the loop's exactness, which the random words and the test above check. Cold compile times are still to be measured.
 7. **After 3 to 6:** `--converted-context-rounds` is left only as a switch, like DivCode's `convertedRounds`. Remove the round bodies of `FusedRules` (round 0 is still needed) and the staged loop, then update the stale text of section 6.
+   - **Done (2026-11-20), except the staged loop.** A trace of the `FusedRules` kernels built for all 453 transform names (`--kernel-counts`) and all 42 tconv tests found no correction kernel on rounds; 28 transforms still use the staged loop, for the groups with runs that step 6 left there (InterIndic-Arabic, Latin-ASCII, ro-ro_FONIPA, xh-xh_FONIPA), so it stays, and `--converted-context-rounds` still sets its rounds as well as switching the correction on and off.
+   - Removed: the round body of `FusedRules` (round 0, then rounds 1 to N, used when the While loop could not resolve a group), and `--converted-context-while` and `--converted-string-while`, whose only use was to force it. A correction kernel that the loop cannot resolve is now an error, naming the reason (`resolvableByWhile`), with `--converted-context-rounds=0` to match the before contexts against the text itself instead. No rule set tried reaches it: the forms the loop rejects are either refused by the planner or go to the staged loop. The While loop's own `settle` passes and the staged rounds still read `FusedRulesConfig::rounds`.
+   - DivCode's `convertedRounds` is now `bool convertedContexts`, as it was only tested for nonzero.
+   - Checks: all 42 tconv tests pass; seven CLDR test files with converted contexts (el, hy, ja-hrkt BGN, ko-t-ja-Latn, ru-t-ja-Latn, und-Latn-t-und-beng and -deva, the last two by DivCode) give the previous output and their expected results; with `--converted-context-rounds=0`, hy-Latn-t-hy-m0-bgn differs from its expected results on 6 lines, as before.
 8. **Section 3, deferred rounds:** still only after measuring against real Japanese and Persian text. As a cheap interim step, measure whether `--deferred-rule-rounds=4` loses anything on real text. On random Katakana it is identical to 8, and it saves about 440 s of Kana-Latn's cold compile.
    - **Measured (2026-11-19).** Real text from the Wikibooks dumps, 1 MB each, in one run per transform, at `--deferred-rule-rounds` 4, 8 (the default) and 16:
      - Kana-Latn on the 5,349 lines of jawikibooks with Katakana: the three outputs are identical, and equal ICU's.
@@ -329,4 +333,4 @@ Next steps (2026-11-19):
    - Make `-CheckWhileProgress` usable on the correction kernels: skip the first iteration, or start `Progress` from the first iteration's new bits (see 1C).
    - Measure Zawgyi-my (While against rounds, and its Pablo size).
    - Recover the 1–8% execution-cycle regression of the Title transforms under case-map marks (1D).
-   - Edit the stale comments and doc text listed in section 6.
+   - **Done (2026-11-20):** the stale comments and doc text listed in section 6.

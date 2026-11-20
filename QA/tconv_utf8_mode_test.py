@@ -86,9 +86,11 @@ def main():
                           % (name, errors, i + 1, a[i] if i < len(a) else None, b[i] if i < len(b) else None))
         for name in UNICODE:
             plan = subprocess.run([tconv, "--plan", name], capture_output=True).stdout
-            if b"  mode: Unicode" not in plan:
+            #  (Not wholly in UTF-8 mode: in Unicode mode, or, with mixed modes,
+            #  in Unicode segments where needed, see --mixed-modes.)
+            if b"  mode: Unicode" not in plan and b"  mode: mixed" not in plan:
                 failures += 1
-                print("FAIL %s: not in Unicode mode" % name)
+                print("FAIL %s: in UTF-8 mode, not Unicode or mixed" % name)
     if failures:
         sys.exit(1)
     print("tconv_utf8_mode_test: all tests passed")

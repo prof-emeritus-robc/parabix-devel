@@ -563,6 +563,41 @@ contexts see the characters outside the runs.
       (`--utf8-mode=0`) on the CLDR test data, with and without `--lines`,
       and against ICU on random text for the transforms whose segments
       change.
+    **Implemented (2026-11-20), being checked.** `--mixed-modes` (default on):
+    the UTF-8 builder applies each step in UTF-8 mode where it can
+    (`utf8StepProblem`, shared with `--plan`), and the steps that need
+    Unicode mode in segments (`UTF8PipelineBuilder::unicodeSegment`): the
+    text decoded (`U21_Of`), the mask stack mapped to one position per
+    character (each character's bit at its final byte, `UTF8_index`), the
+    steps applied by one `RulePipelineBuilder` of the pipeline
+    (`applySegment`, its label numbered by segment for the names of its
+    kernels), then the text encoded and the masks spread back over the
+    bytes of each character (`U8Spans`, LookAhead mode, which takes marks at
+    final bytes). A segment is extended over the steps that read the state
+    its steps leave: the step after prefix runs (past `:: Null ;`), and the
+    front-letter revisits to their end. A built-in of Unicode mode, and a
+    transform applied by its shape groups or not by the regular plan, is a
+    segment of its own. With `--lines`, the groups whose contexts are bounded
+    by the lines are Unicode segments, so that the transform stays in UTF-8
+    mode elsewhere. `--plan` gives the segments (`mode: mixed: step 1 UTF-8;
+    step 2 Unicode (a conversion group with string rules); steps 3-4 UTF-8`).
+    Found on the way, older than this work: in UTF-8 mode, a subgroup with
+    contexts whose characters map to themselves (`\+ { g → g ;`, from
+    prefix-run triggers) gave its matches to another subgroup's mapping of
+    the character (`g → RR`); `utf8Applies` now matches only the characters
+    a subgroup changes. Also older: the regular expression engine's
+    `FixedMatchSpansKernel` declared a lookahead of a whole block
+    (`round_up_to_blocksize(length)`, 128 on this machine), and in some
+    pipelines it lost the spans of the final partial stride (positions
+    128 and after, with the input marks complete). Mixed mode exposed it with
+    `--lines am-am_FONIPA` (15 of 607 lines of `am-fonipa-t-am`, the ፞/፟
+    gemination rules not applied near the end): a mask decoded from UTF-8 has
+    its region bounds and its positions as two streams (equal, but separate),
+    and the region edges made from the bounds changed the pipeline's layout
+    (the same loss in Unicode mode with the bounds copied). The kernel now
+    declares its actual lookahead, `length + offset - 1` (the old one also
+    ignored the offset). The pipeline's handling of a block-sized lookahead
+    at the final stride is still to be investigated.
 14. **UTF-8 mask conventions** (the open question below). All the bytes of a
     character outside a region (or a filter) are 0 in the mask. A mask
     computed from a character class is made from the characters outside it:

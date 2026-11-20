@@ -250,6 +250,11 @@ static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input a
                                              "data), in one run over the whole input, each line a region of a mask (region "
                                              "scope: see --plan --lines); the steps ICU applies, line by line"),
                            cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> MixedModes("mixed-modes",
+    cl::desc("In UTF-8 mode (--utf8-mode), apply the steps that need Unicode mode in segments of it, switching to it at the "
+             "first such step and back to UTF-8 after the last of a run of them (doc/masked-transforms-plan.md step 13; "
+             "default on; off: a transform with any such step wholly in Unicode mode)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<std::string> RegionSeparators("region-separators",
     cl::desc("With --lines, for testing that region scope relies only on the masks: the characters outside the regions, as "
              "hexadecimal code points separated by commas (default 0A, the line feed)"),
@@ -496,6 +501,7 @@ struct TransformAnalysis {
 class TransformAnalyzer {
 public:
     explicit TransformAnalyzer(const ldml::TransformRegistry & registry) : mRegistry(registry) {}
+    const ldml::TransformRegistry & registry() const {return mRegistry;}
     const TransformAnalysis & analyze(const ldml::TransformEntry * entry);
     //  Analyze rules not tied to a registry entry (e.g. from --rules-file), as
     //  the forward rules of an ad hoc transform.
@@ -8754,6 +8760,26 @@ public:
         size_t kernels;
     };
     const std::vector<GroupCount> & groupCounts() const {return mGroupCounts;}
+    //  Mixed modes (see UTF8PipelineBuilder::unicodeSegment): the steps of a
+    //  segment of a transform (a plan of those steps), or a whole transform,
+    //  applied in Unicode mode with the masks given (converted from UTF-8
+    //  mode), which are returned kept in step; label names its kernels.
+    StreamSet * applySegment(const std::string & label, const TransformAnalysis & part, StreamSet * U21,
+                             std::vector<TransformMask> & masks) {
+        mMasks.restore(std::move(masks));
+        const std::string saved = mTransformLabel;
+        mTransformLabel = label;
+        U21 = applyAnalysis(part, U21);
+        mTransformLabel = saved;
+        masks = mMasks.release();
+        return U21;
+    }
+    StreamSet * transformSegment(const ldml::TransformEntry * entry, StreamSet * U21, std::vector<TransformMask> & masks) {
+        mMasks.restore(std::move(masks));
+        U21 = transform(entry, U21);
+        masks = mMasks.release();
+        return U21;
+    }
     //  The built-in transforms applied by ICU (see isICUBuiltIn) left out, as
     //  stages of no kernels (for --kernel-counts: a transform that invokes them
     //  runs them as ICU stages, outside its pipelines).
@@ -11982,8 +12008,17 @@ static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap &
 static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml::CharMapSubgroup *> & contextual, StreamSet * Basis) {
     StreamSet * applies = nullptr;
     for (const ldml::CharMapSubgroup * g : contextual) {
+        //  (The characters the subgroup changes, as in the map: a character it
+        //  leaves unchanged, as \+ { g → g ;, is in no other subgroup's map at
+        //  its matches, which the union of the matches would otherwise give
+        //  another subgroup's mapping of the character, as g → RR ;.)
         UCD::UnicodeSet chars;
-        for (const ldml::CharMapping & m : g->mappings) chars = chars + m.chars;
+        for (const ldml::CharMapping & m : g->mappings) {
+            UCD::UnicodeSet c = m.chars - UCD::UnicodeSet(DeletionMark);
+            if (m.replacement.size() == 1) c = c - UCD::UnicodeSet(m.replacement[0]);
+            chars = chars + c;
+        }
+        if (chars.empty()) continue;
         const PreparedRE prepared = prepareRE(contextPattern(g->engineBefore, g->engineAfter, {re::makeCC(chars, &cc::Unicode)}),
                                               engineOptions());
         StreamSet * matches = P.CreateStreamSet(1);
@@ -12108,7 +12143,39 @@ public:
     }
     //  The steps of an analysis (of a transform named name, or a rules file).
     StreamSet * applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis);
+    //  With --lines, the contexts of the groups that are not line-bound bounded
+    //  by the lines: those groups in Unicode segments (see unicodeSegment).
+    void boundRegions() {mBounded = true;}
 private:
+    //  Mixed modes (--mixed-modes, step 13).  Whether a step is applied in UTF-8
+    //  mode: a conversion group by a UTF-8 character map or DivCode on the bytes
+    //  (and line-bound, with bounded regions); a built-in of UTF-8 mode; another
+    //  transform (in mixed modes itself, unless applied by its shape groups).
+    bool utf8Step(const ldml::TransformStep & step);
+    //  The end of the Unicode segment from step i: the steps that need Unicode
+    //  mode, with those that read the state the segment's steps leave (the step
+    //  after prefix runs, past :: Null ;, reads the runs they deleted; the
+    //  front-letter revisits end in a later step).
+    size_t segmentEnd(const TransformAnalysis & a, size_t i);
+    //  Steps [i, j) of an analysis (or a whole transform) in Unicode mode: the
+    //  text decoded, the masks mapped to one position per character (each
+    //  character's bit at its final byte) and back (spread over its bytes), as
+    //  the text is encoded again.
+    StreamSet * unicodeSegment(const std::string & label, const TransformAnalysis & a, size_t i, size_t j, StreamSet * Basis);
+    StreamSet * unicodeTransform(const ldml::TransformEntry * entry, StreamSet * Basis);
+    std::vector<TransformMask> unicodeMasks(StreamSet * Basis);
+    void utf8Masks(std::vector<TransformMask> && masks, StreamSet * Basis);
+    RulePipelineBuilder & unicode() {
+        if (!mUnicode) {
+            mUnicode = std::make_unique<RulePipelineBuilder>(mP, mRegistry, mAnalyzer);
+            if (mBounded) mUnicode->boundRegions();
+        }
+        return *mUnicode;
+    }
+    std::unique_ptr<RulePipelineBuilder> mUnicode;
+    bool mBounded = false;
+    bool mInvokedWithFilter = false;
+    unsigned mSegments = 0;
     StreamSet * builtIn(const std::string & name, StreamSet * Basis);
     StreamSet * normalization(const std::string & name, StreamSet * Basis);
     Staged maskedNormalization(const std::string & name, StreamSet * Basis);
@@ -12148,24 +12215,177 @@ private:
     unsigned mDepth = 0;
 };
 
+//  Mixed modes: why a step of a transform needs Unicode mode, or "" if it is
+//  applied in UTF-8 mode (a transform it invokes is, in mixed modes itself,
+//  unless it is a built-in of Unicode mode, applied by its shape groups, or not
+//  by the regular plan).  With bounded, the groups that are not line-bound too.
+static std::string utf8StepProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                   const ldml::TransformStep & step, bool bounded) {
+    if (step.kind == ldml::TransformStep::Kind::Transform) {
+        const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
+        if (used == nullptr) return "an unknown transform " + step.transform.getText();
+        if (used->isBuiltIn()) return utf8BuiltIn(used->canonicalName) ? "" : "the built-in " + used->canonicalName;
+        if (!analyzer.analyze(used).implementable) return used->canonicalName + " not by the regular plan";
+        if (ApplyShapeGroups && shapeChoice(registry, analyzer, used).any()) return used->canonicalName + " by its shape groups";
+        return "";
+    }
+    if (bounded && !groupLineBound(step)) return "a group whose contexts are bounded by the lines";
+    if (!step.prefixRuns.empty()) return "prefix runs";
+    if (!step.deferred.empty() || !step.copyCaptures.empty()) return "deferred rules";
+    if (!step.chainRevisitRules.empty()) return "chain revisits";
+    if (!step.markRunEditRules.empty()) return "mark run edits";
+    if (step.hasFrontLetters || step.frontLettersEnd) return "front-letter revisits";
+    kernel::UTF8_CharMap map;
+    std::string why;
+    if (utf8CharMap(step, map, why) || (DivCodeGroups && divCodeApplies(utf8DivCodePlan(step)))) return "";
+    return "a conversion group with " + why;
+}
+
 StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * Basis) {
-    if (entry->isBuiltIn()) return builtIn(entry->canonicalName, Basis);
+    if (entry->isBuiltIn()) {
+        if (MixedModes && !utf8BuiltIn(entry->canonicalName)) return unicodeTransform(entry, Basis);
+        return builtIn(entry->canonicalName, Basis);
+    }
+    //  (A transform applied by its shape groups, or not by the regular plan, in
+    //  Unicode mode as a whole.)
+    if (MixedModes && (!mAnalyzer.analyze(entry).implementable
+                       || (ApplyShapeGroups && shapeChoice(mRegistry, mAnalyzer, entry).any()))) {
+        return unicodeTransform(entry, Basis);
+    }
     return applyAnalysis(entry->canonicalName, mAnalyzer.analyze(entry), Basis);
+}
+
+bool UTF8PipelineBuilder::utf8Step(const ldml::TransformStep & step) {
+    return utf8StepProblem(mRegistry, mAnalyzer, step, mBounded).empty();
+}
+
+size_t UTF8PipelineBuilder::segmentEnd(const TransformAnalysis & a, size_t i) {
+    const std::vector<ldml::TransformStep> & steps = a.plan.steps;
+    size_t j = i + 1;
+    while (j < steps.size() && !utf8Step(steps[j])) j++;
+    auto isNull = [&](const ldml::TransformStep & s) {
+        if (s.kind != ldml::TransformStep::Kind::Transform || s.filter) return false;
+        const ldml::TransformEntry * const e = mRegistry.lookup(s.transform.getText());
+        return e && e->canonicalName == "Any-Null";
+    };
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t k = i; k < j; k++) {
+            size_t need = j;
+            if (!steps[k].prefixRuns.empty()) {
+                size_t m = k + 1;
+                while (m < steps.size() && isNull(steps[m])) m++;
+                if (m < steps.size()) need = std::max(need, m + 1);
+            }
+            if (steps[k].hasFrontLetters) {
+                size_t m = k;
+                while (m < steps.size() && !steps[m].frontLettersEnd) m++;
+                need = std::max(need, std::min(m + 1, steps.size()));
+            }
+            if (need > j) {
+                j = need;
+                changed = true;
+            }
+        }
+    }
+    return j;
+}
+
+std::vector<TransformMask> UTF8PipelineBuilder::unicodeMasks(StreamSet * Basis) {
+    std::vector<TransformMask> masks = mMasks.release();
+    if (masks.empty()) return masks;
+    StreamSet * const index = mP.CreateStreamSet(1);
+    mP.CreateKernelCall<UTF8_index>(Basis, index);
+    auto filter = [&](StreamSet * mask) {
+        StreamSet * const out = mP.CreateStreamSet(1);
+        FilterByMask(mP, index, mask, out);
+        return out;
+    };
+    for (TransformMask & m : masks) {
+        m.apply = filter(m.apply);
+        if (m.bounds) m.bounds = filter(m.bounds);
+    }
+    return masks;
+}
+
+void UTF8PipelineBuilder::utf8Masks(std::vector<TransformMask> && masks, StreamSet * Basis) {
+    if (!masks.empty()) {
+        StreamSet * const index = mP.CreateStreamSet(1);
+        mP.CreateKernelCall<UTF8_index>(Basis, index);
+        //  (A character's bit at its final byte, spread back over its bytes:
+        //  U8Spans's LookAhead mode takes marks at final bytes.)
+        auto spread = [&](StreamSet * mask) {
+            StreamSet * const finals = mP.CreateStreamSet(1);
+            SpreadByMask(mP, index, mask, finals);
+            StreamSet * const spans = mP.CreateStreamSet(1);
+            mP.CreateKernelCall<U8Spans>(finals, index, spans, pablo::BitMovementMode::LookAhead);
+            return spans;
+        };
+        for (TransformMask & m : masks) {
+            m.apply = spread(m.apply);
+            if (m.bounds) m.bounds = spread(m.bounds);
+        }
+    }
+    mMasks.restore(std::move(masks));
+}
+
+StreamSet * UTF8PipelineBuilder::unicodeSegment(const std::string & label, const TransformAnalysis & a, size_t i, size_t j,
+                                                StreamSet * Basis) {
+    std::vector<TransformMask> masks = unicodeMasks(Basis);
+    StreamSet * U21 = U21_Of(mP, Basis);
+    TransformAnalysis part = a;
+    part.plan.steps.assign(a.plan.steps.begin() + static_cast<std::ptrdiff_t>(i), a.plan.steps.begin() + static_cast<std::ptrdiff_t>(j));
+    part.plan.filter = nullptr;
+    part.problems.clear();
+    part.plan.problems.clear();
+    part.implementable = true;
+    U21 = unicode().applySegment(label, part, U21, masks);
+    Basis = UTF8_Of(mP, U21);
+    utf8Masks(std::move(masks), Basis);
+    return Basis;
+}
+
+StreamSet * UTF8PipelineBuilder::unicodeTransform(const ldml::TransformEntry * entry, StreamSet * Basis) {
+    std::vector<TransformMask> masks = unicodeMasks(Basis);
+    StreamSet * U21 = U21_Of(mP, Basis);
+    U21 = unicode().transformSegment(entry, U21, masks);
+    Basis = UTF8_Of(mP, U21);
+    utf8Masks(std::move(masks), Basis);
+    return Basis;
 }
 
 StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis) {
     const bool outermost = mDepth++ == 0;
+    const bool invokedWithFilter = mInvokedWithFilter;
+    mInvokedWithFilter = false;
     if (a.plan.filter) pushFilter(a.plan.filterSet, Basis);
+    //  A transform of one conversion group inserts anywhere within its own filter,
+    //  or the one it is invoked with (see TransformMask::insertBefore; its
+    //  insertion rules are applied in a Unicode segment).
+    if (a.plan.steps.size() == 1 && a.plan.steps[0].kind == ldml::TransformStep::Kind::Conversion
+        && (a.plan.filter || invokedWithFilter) && !mMasks.empty()) {
+        mMasks.insertAnywhere();
+    }
     size_t group = 0;
-    for (const ldml::TransformStep & step : a.plan.steps) {
+    for (size_t i = 0; i < a.plan.steps.size(); ) {
+        const ldml::TransformStep & step = a.plan.steps[i];
+        if (MixedModes && !utf8Step(step)) {
+            const size_t j = segmentEnd(a, i);
+            Basis = unicodeSegment(name + "U" + std::to_string(++mSegments), a, i, j, Basis);
+            i = j;
+            continue;
+        }
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, Basis);
+            mInvokedWithFilter = step.filter != nullptr;
             Basis = transform(mRegistry.lookup(step.transform.getText()), Basis);
+            mInvokedWithFilter = false;
             if (step.filter) popFilter();
         } else {
             mGroupLabel = name + "G" + std::to_string(++group);
             Basis = conversionGroup(step, Basis, outermost);
         }
+        i++;
     }
     if (a.plan.filter) popFilter();
     mDepth--;
@@ -12443,20 +12663,22 @@ StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet
 //  kernel::WellFormedUTF8 and codegen::UTF8Errors).
 static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                      const ldml::TransformEntry * entry, StreamSet * Basis,
-                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr, bool regions = false) {
+                                     std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr, bool regions = false,
+                                     bool bounded = false) {
     UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
     StreamSet * const text = kernel::WellFormedUTF8(P, Basis);
     if (regions) builder.pushRegions(text);
+    if (bounded) builder.boundRegions();
     return builder.transform(entry, text);
 }
 
 static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
                                                   TransformAnalyzer & analyzer, const ldml::TransformEntry * entry,
-                                                  bool regions = false) {
+                                                  bool regions = false, bool bounded = false) {
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
-    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream), nullptr, regions);
+    StreamSet * const Result = utf8TransformText(P, registry, analyzer, entry, BasisOf(P, ByteStream), nullptr, regions, bounded);
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
     return P.compile();
 }
@@ -14012,6 +14234,22 @@ static int run(int argc, char *argv[]);
 //  The mode of a transform (see TransformAnalyzer::mode), for --plan.
 static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
     const TransformAnalyzer::Mode & m = analyzer.mode(entry);
+    //  Mixed modes (step 13): the steps of the transform's own plan in UTF-8
+    //  mode, and the segments in Unicode mode with the reason of their first step.
+    if (UTF8Mode && MixedModes && !m.utf8 && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
+        const std::vector<ldml::TransformStep> & steps = analyzer.analyze(entry).plan.steps;
+        toolio::out() << "  mode: mixed:";
+        for (size_t i = 0; i < steps.size(); ) {
+            const std::string problem = utf8StepProblem(analyzer.registry(), analyzer, steps[i], false);
+            size_t j = i + 1;
+            while (j < steps.size() && utf8StepProblem(analyzer.registry(), analyzer, steps[j], false).empty() == problem.empty()) j++;
+            toolio::out() << (i ? ";" : "") << (j > i + 1 ? " steps " : " step ") << (i + 1) << (j > i + 1 ? "-" + std::to_string(j) : "")
+                         << (problem.empty() ? " UTF-8" : " Unicode (" + problem + ")");
+            i = j;
+        }
+        toolio::out() << "\n";
+        return;
+    }
     if (m.utf8) {
         toolio::out() << "  mode: UTF-8" << (UTF8Mode ? "" : " (not used: --utf8-mode=0)") << "\n";
         //  (The single-character rules with contexts of its own groups, and
@@ -15855,13 +16093,15 @@ static int run(int argc, char *argv[]) {
         const bool regions = Lines;
         const bool bounded = regions && scope.bounded;
         //  (In UTF-8 mode, where its steps can be: see TransformAnalyzer::mode.)
-        if (UTF8Mode && analyzer.modeOf(a).utf8 && !bounded && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A))) {
+        //  (Mixed modes: in UTF-8 mode, with Unicode segments where needed.)
+        if (UTF8Mode && (MixedModes || (analyzer.modeOf(a).utf8 && !bounded)) && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A))) {
             auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
             StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
             P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
             UTF8PipelineBuilder builder(P, registry, analyzer);
             StreamSet * const text = kernel::WellFormedUTF8(P, BasisOf(P, ByteStream));
             if (regions) builder.pushRegions(text);
+            if (bounded) builder.boundRegions();
             StreamSet * const Result = builder.applyAnalysis("rules", a, text);
             P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
             applyToInput(pipelineRunner(P.compile()), MainInput.fd);
@@ -16061,8 +16301,9 @@ static int run(int argc, char *argv[]) {
     const bool regions = Lines;
     const bool bounded = regions && scope.bounded;
     TransformFunctionType fn = direct && !regions ? generatePipeline(driver, impl->second)
-                               : (UTF8Mode && analyzer.mode(entry).utf8 && !bounded && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A)))
-                                 ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
+                               : (UTF8Mode && (MixedModes || (analyzer.mode(entry).utf8 && !bounded))
+                                  && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A)))
+                                 ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions, bounded)
                                : generateRulePipeline(driver, registry, analyzer, entry, regions, bounded);
     applyToInput(pipelineRunner(fn), MainInput.fd);
     return finishOutput();

@@ -248,6 +248,10 @@ RULES = {
     "conv-after-engine": "x > ; a { b } c* d > B ; a { q } [{zz} p] > Q ;",
     "conv-family-complete": "x > j ; [^jw] { ao > AO ;",
     "conv-family-complete-split": "\\- > ; ' ' { tz } [^ju] > Q ; [^' '$] { t } z > T ; z } [^z] > Z ; z } z > S ;",
+    # a group after prefix runs that delete (ü after q), without blocking
+    # marks: by DivCode, as ro_FONIPA-ja and sk_FONIPA-ja
+    # (doc/round-replacement.md, step 5)
+    "after-prefix-runs": "q ü > | q ; :: Null ; ab > X ; qa > Y ; b > Z ; [éè] { a > A ;",
 }
 RULES_ALPHABET = "abcdefghijkmnqxyzäAB \n.-éèüΩΑΒ中文😀"
 #  (A narrower alphabet for the contexts of several items, which random text
@@ -267,7 +271,7 @@ TRACE = ["-enable-object-cache", "-trace-object-cache"]
 #  The default selection (all of them with --extended-testing).
 DEFAULT_GROUPS = [("tk_Cyrl-tk/BGN", 1, 5)]
 DEFAULT_TRANSLATE = []
-DEFAULT_RULES = ["expansion-before", "stages-chain", "conv-sparse", "conv-family"]
+DEFAULT_RULES = ["expansion-before", "stages-chain", "conv-sparse", "conv-family", "after-prefix-runs"]
 #  (The configurations of the converted-context cases.)
 CONV_CONFIGS = [["-thread-num=1"], ["-thread-num=4", "-segment-size=1"]]
 DEFAULT_CONV_CONFIGS = [["-thread-num=4", "-segment-size=1"]]

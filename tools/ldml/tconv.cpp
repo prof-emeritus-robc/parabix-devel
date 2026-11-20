@@ -9677,6 +9677,17 @@ static bool hasBlockingMark(const re::RE * re) {
     return false;
 }
 
+//  Whether the rules of a step have blocking marks (in their texts or after
+//  contexts, see blockingMarkProblems), which need the runs deleted by the
+//  prefix runs before it (mDeletedRunEnds, mDeletedRunAfter).
+static bool hasBlockingMarks(const ldml::TransformStep & step) {
+    for (const ldml::ConversionRule * r : step.rules) {
+        const ldml::RuleSide * source = r->getSourceSide(ldml::Direction::Forward);
+        if (hasBlockingMark(source->getText()) || hasBlockingMark(source->getAfterContext())) return true;
+    }
+    return false;
+}
+
 //  The blocking marks (see ldml::DeletedRunBlockMark) must be in the rules of
 //  the conversion group right after prefix runs that only delete (past
 //  :: Null ;), whose deleted runs the pipeline gives them.
@@ -9871,8 +9882,11 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     //  (FusedRulesConfig::region), and it is not applied by DivCode.
     StreamSet * const regions = groupLineBound(step) ? nullptr : boundedRegions();
     //  (A group without string rules: eligible only with rules whose before
-    //  contexts are matched against the converted text, see planDivCodeGroup.)
-    if (DivCodeGroups && !mDeletedRunEnds && !mDeletedRunAfter && !regions) {
+    //  contexts are matched against the converted text, see planDivCodeGroup.
+    //  After prefix runs that delete, only without blocking marks, which DivCode
+    //  does not match: the runs deleted matter to no other rule.)
+    const bool deletedRuns = mDeletedRunEnds || mDeletedRunAfter;
+    if (DivCodeGroups && (!deletedRuns || !hasBlockingMarks(step)) && !regions) {
         ldml::DivCodeOptions options;
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;

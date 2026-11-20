@@ -24,7 +24,11 @@ import tempfile
 
 from tconv_test_mode import EXTENDED
 
-# (rules, [(line, expected result)])
+# The implementations of a group whose rules match characters outside the
+# filter only: the default, UTF-8 mode, without DivCode, and in four threads.
+OUTSIDE = [[], ["--utf8-mode"], ["--divcode-groups=0"], ["-thread-num=4", "-segment-size=1"]]
+
+# (rules, [(line, expected result)], [configurations])
 GROUPS = [
     # Filtered runs before a Null stage: [$] at the end of a run
     (":: [a-z] ;\n:: Null ;\nb a [$] \u2192 X ;\n",
@@ -51,33 +55,54 @@ GROUPS = [
     # An earlier rule's after context sees beyond the run: not at its end
     (":: [ab] ;\n:: Lower ;\nab } c → X ;\na → A ;\nb → B ;\n",
      [('abc', 'Xc'), ('ab', 'AB'), ('abd', 'ABd'), ('xabcx', 'xXcx')]),
+    # A later rule whose after context sees a character outside the filter
+    # that only an earlier rule's text has: there, beyond the run, the
+    # earlier rule fails (a } [c outside the filter])
+    (":: [ab] ;\n:: Lower ;\nac \u2192 X ;\na } c \u2192 Y ;\na \u2192 A ;\n",
+     [('ac', 'Yc'), ('ad', 'Ad'), ('a', 'A'), ('bac', 'bYc'), ('acc', 'Ycc'), ('aC', 'AC'), ('Ac', 'Ac')], OUTSIDE),
+    # The same, a string rule (ab } [c outside the filter])
+    (":: [ab] ;\n:: Lower ;\nabc \u2192 X ;\nab } c \u2192 Y ;\nab \u2192 Z ;\n",
+     [('abc', 'Yc'), ('abd', 'Zd'), ('ab', 'Z'), ('xabcx', 'xYcx'), ('abcc', 'Ycc'), ('abab', 'ZZ')], OUTSIDE),
     # As am_Ethi-d0_Morse: a space before the end of a run deleted
     (":: [a-z\\u0020\\-] ;\n:: Null ;\na \u2192 a ;\n:: Null ;\n([b\\-]) \\u0020 [$] \u2192 $1 ;\n",
      [('b ', 'b'), ('b 1', 'b1'), ('b b', 'b b'), ('- 1x', '-1x'), ('b', 'b'), ('- ', '-'), ('b  1', 'b  1')]),
 ]
+if EXTENDED:
+    GROUPS += [
+        # As Hira-Latn: ビ } $small_y → b | '~' ; with the small vowel outside
+        # the filter, where ~ュ → yu (composed: ビュ → byu) does not apply
+        (":: [\u30D3\u30C7\u30B8] ;\n:: Katakana-Latin ;\n",
+         [('\u30D3\u30E5', 'b~\u30E5'), ('\u30C7\u30A3', 'de\u30A3'), ('\u30B8\u30A7', 'ji\u30A7'), ('\u30D3', 'bi'),
+          ('\u30D3\u30E5\u30D3\u30E5', 'b~\u30E5b~\u30E5'), ('a\u30D3\u30E3b', 'ab~\u30E3b'), ('\u30D3\u30B9', 'bi\u30B9')]),
+    ]
 
 
 def main():
     tconv = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
-        for rules_text, cases in GROUPS:
+        for group in GROUPS:
+            rules_text, cases = group[0], group[1]
+            configs = group[2] if len(group) > 2 else [[]]
             rules = os.path.join(tmp, "rules.txt")
             with open(rules, "w", encoding="utf-8") as f:
                 f.write(rules_text)
             input = os.path.join(tmp, "input.txt")
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
-            run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
-            if run.returncode != 0:
-                failures += 1
-                print("FAIL %r: exit status %d\n%s" % (rules_text, run.returncode, run.stderr.decode("utf-8", "replace")))
-                continue
-            got = run.stdout.decode("utf-8", "replace").split("\n")
-            for i, (line, want) in enumerate(cases):
-                if i >= len(got) or got[i] != want:
+            for config in configs:
+                run = subprocess.run([tconv, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input], capture_output=True)
+                if run.returncode != 0:
                     failures += 1
-                    print("FAIL %r with %r:\n  want %r\n  got  %r" % (line, rules_text, want, got[i] if i < len(got) else None))
+                    print("FAIL %r %s: exit status %d\n%s" % (rules_text, " ".join(config), run.returncode,
+                                                              run.stderr.decode("utf-8", "replace")))
+                    continue
+                got = run.stdout.decode("utf-8", "replace").split("\n")
+                for i, (line, want) in enumerate(cases):
+                    if i >= len(got) or got[i] != want:
+                        failures += 1
+                        print("FAIL %r with %r %s:\n  want %r\n  got  %r" % (line, rules_text, " ".join(config), want,
+                                                                           got[i] if i < len(got) else None))
     print("%d failures" % failures)
     return 1 if failures else 0
 

@@ -515,7 +515,9 @@ std::vector<Rule *> MutuallyExclusivePartitioning(const std::vector<Rule *> & ru
 //  against the source side (the left side of forward rules).
 //
 //  Patterns are analyzed as regular expressions with Unicode properties
-//  resolved.  The analysis is conservative: as possessive quantification is
+//  resolved.  A set of an after context with FilterRunOutsideMark, which
+//  matches outside a global filter only, never matches where an item of a
+//  text to replace does (within a run of the filter).  The analysis is conservative: as possessive quantification is
 //  not modelled, rules may be reported as overlapping when they do not, but
 //  rules reported as not overlapping never match at the same position.
 class RuleOverlapAnalysis {
@@ -597,7 +599,12 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  ends with the run but its after context does not: a negated set beyond
 //  L where the earlier rules still matching have no after contexts (E = abc
 //  and L = a: a } b [^c]) also matches at the end of a run (it is marked
-//  with FilterRunEndMark).  Earlier
+//  with FilterRunEndMark).  Likewise, where only such earlier rules continue
+//  on the characters C of an item of L's after context, L also matches C
+//  beyond the run, as its after context sees them there and the texts of
+//  the earlier rules end: E = ac and L = a } c (masked otherwise) give
+//  a } [c] → result with the set marked FilterRunOutsideMark (as for
+//  Hira-Latn's ビ } $small_y → b | '~' ; after ビュ → byu ;).  Earlier
 //  rules with items before the position contribute before contexts.  An L
 //  masked by its earlier rules is removed.
 //
@@ -899,6 +906,22 @@ constexpr UCD::codepoint_t FilterRunEndMark = 0xFDD2;
 //  set complemented, as [^c], contains both, and does not).
 inline bool marksFilterRunEnd(const UCD::UnicodeSet & set) {
     return set.contains(FilterRunEndMark) && !set.contains(FilterRunEndMark + 1);
+}
+//  In a set of an after context, its characters only at the positions outside
+//  the global filter (a noncharacter, not in the text): where the text of an
+//  earlier rule, ending with the run, fails, but an after context sees the
+//  character beyond the run (see DisambiguateOrder).  The pipeline gives the
+//  class of such a set its characters at the positions outside the filter's
+//  mask only (none without a mask).  The next noncharacter is absent from
+//  such a set (a complement, which contains both, has no mark).
+constexpr UCD::codepoint_t FilterRunOutsideMark = 0xFDD6;
+inline bool marksFilterRunOutside(const UCD::UnicodeSet & set) {
+    return set.contains(FilterRunOutsideMark) && !set.contains(FilterRunOutsideMark + 1);
+}
+inline UCD::UnicodeSet withFilterRunOutside(const UCD::UnicodeSet & set) {
+    UCD::UnicodeSet marked = set;
+    marked.insert(FilterRunOutsideMark);
+    return marked - UCD::UnicodeSet(FilterRunOutsideMark + 1);
 }
 //  In a set of the text or the after context of a rule of the group after
 //  prefix runs that only delete (see ComposeRevisits), a position that does

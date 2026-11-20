@@ -1582,6 +1582,12 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
     std::vector<Step> steps;
     std::vector<std::set<State>> nexts;
     std::vector<LState> lNexts;
+    //  At the end of a filtered run (see mRuns), the texts of the earlier rules
+    //  end, but L's after context sees the character beyond the run: where
+    //  only earlier rules without after contexts continue on the characters of
+    //  an item of L's after context, L also matches them outside the filter
+    //  (FilterRunOutsideMark), and its following items as they are.
+    std::vector<std::pair<Step, LState>> outside;
 
     for (const UCD::UnicodeSet & part : parts) {
         int item = -1;
@@ -1602,9 +1608,11 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         };
         const auto lMarks = item >= 0 ? marks(lItems[item].set) : std::make_pair(false, false);
         std::set<State> next;
+        bool keysOnly = mRuns && after && item >= static_cast<int>(mKeyLength) && !lMarks.first && !lMarks.second;
         for (const State & s : active) {
             for (const NFA::Edge & e : automaton(rules[s.first], after).out[s.second]) {
                 if (e.kind != NFA::Kind::Chars || !e.chars.intersects(part)) continue;
+                keysOnly &= !rules[s.first].rule->getLeftSide()->hasAfterContext() && !marks(e.set).first;
                 next.insert(State{s.first, e.to});
                 const auto eMarks = marks(e.set);
                 if (lMarks.second || eMarks.second || (item >= 0 && eMarks.first && !lMarks.first)) {
@@ -1615,6 +1623,7 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         }
         closure(rules, after, next);
         if (lMarks.first && !marks(cls).first) cls = makeCC(withDeletedRunBlock(part));
+        if (keysOnly && !next.empty()) outside.emplace_back(Step{makeCC(withFilterRunOutside(part)), item}, lNext);
         steps.push_back(Step{cls, item});
         nexts.push_back(next);
         lNexts.push_back(lNext);
@@ -1745,6 +1754,11 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         std::vector<Step> p = path;
         p.push_back(steps[i]);
         if (!explore(rules, after, nexts[i], lNexts[i], p, pending, false, seen, out)) return false;
+    }
+    for (const auto & o : outside) {
+        std::vector<Step> p = path;
+        p.push_back(o.first);
+        if (!explore(rules, after, {}, o.second, p, pending, false, seen, out)) return false;
     }
     return true;
 }
@@ -1964,8 +1978,20 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     pieces.erase(std::remove_if(pieces.begin(), pieces.end(), [&](Rule * piece) {
         return !printed.insert(printRule(piece)).second;
     }), pieces.end());
-    // Verify that no piece overlaps a resolved rule.
+    // Verify that no piece overlaps a resolved rule.  (A piece matching outside
+    // the filter, FilterRunOutsideMark, overlaps the rules whose texts end with
+    // the run, as their characters, but not where it matches.)
+    auto outsideFilter = [&](const ConversionRule * r) {
+        const RE * const ctx = r->getLeftSide()->getAfterContext();
+        if (ctx == nullptr) return false;
+        std::vector<const RE *> items;
+        if (const Seq * seq = dyn_cast<Seq>(ctx)) items.assign(seq->begin(), seq->end()); else items.push_back(ctx);
+        return std::any_of(items.begin(), items.end(), [&](const RE * item) {
+            return CharSetAnalysis::isSet(item) && marksFilterRunOutside(mAnalysis.setOf(const_cast<RE *>(item), false));
+        });
+    };
     for (Rule * piece : pieces) {
+        if (outsideFilter(cast<ConversionRule>(piece))) continue;
         for (const Earlier & e : rules) {
             const ConversionRule * r = cast<ConversionRule>(piece);
             if (e.possessive || possessiveL ? mayOverlapPossessive(e, r) : mOverlaps.mayOverlap(e.rule, r)) {

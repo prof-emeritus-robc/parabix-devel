@@ -1870,27 +1870,32 @@ private:
 
 //  The streams of Classes, those at the indices given ORed with the run ends of
 //  a mask of text scope (RunEnds, see TransformMasks::runEnds and
-//  ldml::FilterRunEndMark).
+//  ldml::FilterRunEndMark), and those at the indices Within ANDed with them
+//  (ldml::FilterRunOutsideMark).
 class WithRunEnds final : public pablo::PabloKernel {
 public:
-    WithRunEnds(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * RunEnds, const std::vector<unsigned> & indices, StreamSet * Out)
+    WithRunEnds(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * RunEnds, const std::vector<unsigned> & indices,
+                const std::vector<unsigned> & within, StreamSet * Out)
     : PabloKernel(ts, "WithRunEnds" + std::to_string(Classes->getNumElements()) + [&] {
                       std::string s;
                       for (unsigned i : indices) s += "_" + std::to_string(i);
+                      for (unsigned i : within) s += "_w" + std::to_string(i);
                       return s;
                   }(),
                   {Binding{"Classes", Classes}, Binding{"RunEnds", RunEnds}}, {Binding{"Out", Out}})
-    , mIndices(indices) {}
+    , mIndices(indices), mWithin(within) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST *> classes = getInputStreamSet("Classes");
         PabloAST * const ends = getInputStreamSet("RunEnds")[0];
         for (unsigned i : mIndices) classes[i] = pb.createOr(classes[i], ends);
+        for (unsigned i : mWithin) classes[i] = pb.createAnd(classes[i], ends);
         writeOutputStreamSet("Out", classes);
     }
 private:
     const std::vector<unsigned> mIndices;
+    const std::vector<unsigned> mWithin;
 };
 
 //  The streams of Classes, those at the indices given without the positions
@@ -9432,8 +9437,13 @@ protected:
         const bool runEnd = ldml::marksFilterRunEnd(*cc);
         const bool blocked = ldml::marksDeletedRunBlock(*cc);
         const bool allowed = ldml::marksDeletedRunAllow(*cc);
-        if (!runEnd && !blocked && !allowed) return cc;
         static re::Name * const outside = re::makeName(FilterRunEndName, re::makeCC(ldml::FilterRunEndMark, &cc::Unicode));
+        //  (Its characters outside the filter only.)
+        if (ldml::marksFilterRunOutside(*cc)) {
+            re::CC * const chars = re::subtractCC(cc, re::makeCC(ldml::FilterRunOutsideMark, &cc::Unicode));
+            return re::Intersect::Create(chars, outside);
+        }
+        if (!runEnd && !blocked && !allowed) return cc;
         //  (Defined as code unit CCs, of length 1, which no simplification
         //  combines with the Unicode CCs of the sets.)
         static re::Name * const deleted = re::makeName(DeletedRunEndName, re::makeCC(0xD4, 0xD4, &cc::Byte));
@@ -10219,8 +10229,15 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         auto kernelOf = [&](const std::vector<size_t> & indices, bool properties) {
             std::vector<re::CC *> ccs;
             std::vector<unsigned> outside;      // the sets with ldml::FilterRunEndMark
+            std::vector<unsigned> within;       // the sets with ldml::FilterRunOutsideMark
             for (size_t i : indices) {
                 if (mask && ldml::marksFilterRunEnd(sets[i])) outside.push_back(static_cast<unsigned>(ccs.size()));
+                if (ldml::marksFilterRunOutside(sets[i])) {
+                    //  (Without a mask, no position is outside the filter.)
+                    if (mask) within.push_back(static_cast<unsigned>(ccs.size()));
+                    ccs.push_back(re::makeCC(mask ? sets[i] : UCD::UnicodeSet(), &cc::Unicode));
+                    continue;
+                }
                 ccs.push_back(re::makeCC(sets[i], &cc::Unicode));
             }
             StreamSet * classes = P.CreateStreamSet(ccs.size());
@@ -10238,10 +10255,11 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             } else {
                 P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
             }
-            if (!outside.empty()) {
-                //  (Their classes also hold the positions outside the filter.)
+            if (!outside.empty() || !within.empty()) {
+                //  (Their classes also hold the positions outside the filter, or
+                //  only those.)
                 StreamSet * const marked = P.CreateStreamSet(ccs.size());
-                P.CreateKernelCall<WithRunEnds>(classes, mMasks.runEnds(), outside, marked);
+                P.CreateKernelCall<WithRunEnds>(classes, mMasks.runEnds(), outside, within, marked);
                 classes = marked;
             }
             std::vector<UCD::UnicodeSet> of;
@@ -11723,7 +11741,9 @@ static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap &
             //  the class of the positions outside the mask in Unicode mode only.)
             auto marksRunEnd = [](const FusedContexts & alts) {
                 for (const FusedContext & alt : alts) {
-                    for (const FusedItem & item : alt) if (ldml::marksFilterRunEnd(item.chars)) return true;
+                    for (const FusedItem & item : alt) {
+                        if (ldml::marksFilterRunEnd(item.chars) || ldml::marksFilterRunOutside(item.chars)) return true;
+                    }
                 }
                 return false;
             };
@@ -13808,7 +13828,8 @@ static std::vector<const ldml::DivContext *> divCodeAfterContexts(const ldml::Di
     auto key = [](const ldml::DivContext & context) {
         std::string r;
         for (const ldml::DivContextItem & item : context.items) {
-            r += std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "") + ","
+            r += std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "")
+                 + (item.outside ? "o" : "") + ","
                  + std::to_string(item.external) + ":";
             for (const auto & range : item.set) r += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
             r += ";";
@@ -14103,7 +14124,7 @@ private:
     size_t convertedItem(const ldml::DivContextItem & item) const {
         for (size_t i = 0; i < mConvertedItems.size(); i++) {
             const ldml::DivContextItem & c = mConvertedItems[i];
-            if (c.kind == item.kind && c.set == item.set && c.negated == item.negated && c.runEnd == item.runEnd && c.external == item.external
+            if (c.kind == item.kind && c.set == item.set && c.negated == item.negated && c.runEnd == item.runEnd && c.outside == item.outside && c.external == item.external
                     && c.throughKind == item.throughKind && c.through == item.through) return i;
         }
         return SIZE_MAX;
@@ -14308,11 +14329,12 @@ void DivCodeTranslate::generatePabloMethod() {
         return t.b.createAnd(x, t.at(inText, offset));
     };
     //  (Negated, not in the set; marking the end of a filtered run, also a
-    //  position of the text outside the mask.)
+    //  position of the text outside the mask; outside the filter, only there.)
     auto finishTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset, PabloAST * x) -> PabloAST * {
         const ldml::DivContextItem & item = context.items[0];
         x = item.negated ? t.b.createNot(x) : x;
         if (item.runEnd && mask) x = t.b.createOr(x, t.b.createAnd(t.at(inText, offset), t.b.createNot(t.at(mask, offset))));
+        if (item.outside) x = mask ? t.b.createAnd(x, t.b.createNot(t.at(mask, offset))) : static_cast<PabloAST *>(t.b.createZeroes());
         return x;
     };
     auto singleTest = [&](Tests & t, const ldml::DivContext & context, unsigned offset) -> PabloAST * {
@@ -14510,7 +14532,8 @@ void DivCodeTranslate::generatePabloMethod() {
     };
     std::map<std::string, PabloAST *> befores;
     auto itemKey = [&](const ldml::DivContextItem & item) {
-        return std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "") + std::to_string(item.external)
+        return std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.runEnd ? "r" : "") + (item.outside ? "o" : "")
+               + std::to_string(item.external)
                + Tests::key(item.set) + ";";
     };
     auto testAt = [&](const ldml::DivContextItem & item) -> PabloAST * {
@@ -15185,6 +15208,8 @@ void DivCodeItems::generatePabloMethod() {
     std::function<PabloAST * (const ldml::DivContext &, size_t, unsigned)> chain = [&](const ldml::DivContext & c, size_t j, unsigned o) -> PabloAST * {
         const ldml::DivContextItem & item = c.items[j];
         PabloAST * x = test(item, o);
+        //  (Outside the filter: only there.)
+        if (item.outside) x = mask ? pb.createAnd(x, pb.createNot(at(mask, o))) : static_cast<PabloAST *>(pb.createZeroes());
         if (j + 1 == c.items.size()) {
             if (item.negated) x = pb.createNot(x);
             if (item.runEnd && mask) x = pb.createOr(x, pb.createAnd(at(inText, o), pb.createNot(at(mask, o))));

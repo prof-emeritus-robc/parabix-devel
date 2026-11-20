@@ -171,7 +171,7 @@ UCD::UnicodeSet DivCodePlan::pseudoTest(const UCD::UnicodeSet & set) const {
 //  propagate (see DivCodePlan::propagating).
 static void classifyConverted(DivCodePlan & plan) {
     auto sameItem = [](const DivContextItem & a, const DivContextItem & b) {
-        return a.kind == b.kind && a.set == b.set && a.negated == b.negated && a.runEnd == b.runEnd && a.external == b.external
+        return a.kind == b.kind && a.set == b.set && a.negated == b.negated && a.runEnd == b.runEnd && a.outside == b.outside && a.external == b.external
                && a.guardEnd == b.guardEnd && a.throughKind == b.throughKind && a.through == b.through;
     };
     auto sameContext = [&](const DivContext & a, const DivContext & b) {
@@ -304,9 +304,12 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     //  An item of a context: its set and whether it holds at the text boundary.
     auto classifyItem = [&](const UCD::UnicodeSet & set, bool boundary, bool before, DivContextItem & item) {
         item.runEnd = marksFilterRunEnd(set);
+        item.outside = marksFilterRunOutside(set);
+        if (item.outside && (before || boundary)) problem("before contexts of characters outside the filter");
+        const UCD::UnicodeSet chars = item.outside ? set - UCD::UnicodeSet(FilterRunOutsideMark) : set;
         //  With the text boundary: tested as the negation of the complement.
         item.negated = boundary;
-        item.set = boundary ? ~set : set;
+        item.set = boundary ? ~chars : chars;
         const size_t direct = blockCount(item.set, s), complement = blockCount(~item.set, s);
         if (std::min(direct, complement) <= options.maxSetBlocks) {
             //  A set given by its complement includes the characters of code 0,
@@ -1087,7 +1090,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     for (const std::string & k : plan.afterStreamKeys) content += "{" + k + "}";
     auto appendOne = [&](const DivContextItem & item) {
         content += "|" + std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.guardEnd ? "g" : "")
-                   + (item.runEnd ? "r" : "");
+                   + (item.runEnd ? "r" : "") + (item.outside ? "o" : "");
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
         else if (item.kind == DivContextItem::Kind::Stream) content += "s" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);

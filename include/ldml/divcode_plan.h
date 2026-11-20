@@ -91,6 +91,11 @@ struct DivContextItem {
     // marksFilterRunEnd): the item also holds at the positions outside the
     // filter's mask.
     bool runEnd = false;
+    // An after item whose set has its characters outside the global filter
+    // only (see marksFilterRunOutside, the mark removed from set): the item
+    // holds at the positions outside the filter's mask only (none without a
+    // mask).
+    bool outside = false;
     // A before item of a context matched against the converted text, S T*
     // (doc/ldml-divcode-plan.md §12 step 2): the characters of through (T,
     // possessively repeated) next to the text are passed over, and the item

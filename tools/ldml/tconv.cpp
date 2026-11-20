@@ -255,6 +255,10 @@ static cl::opt<bool> MixedModes("mixed-modes",
              "first such step and back to UTF-8 after the last of a run of them (doc/masked-transforms-plan.md step 13; "
              "default on; off: a transform with any such step wholly in Unicode mode)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> CheckUTF8Masks("check-utf8-masks",
+    cl::desc("In UTF-8 mode, check that every mask gives all the bytes of a character the same bit (doc/masked-transforms-plan.md "
+             "step 14) after each filter and each step, and report each mask that does not (exit status 3)"),
+    cl::init(false), cl::Hidden, cl::cat(TconvOptions));
 static cl::opt<std::string> RegionSeparators("region-separators",
     cl::desc("With --lines, for testing that region scope relies only on the masks: the characters outside the regions, as "
              "hexadecimal code points separated by commas (default 0A, the line feed)"),
@@ -12127,6 +12131,44 @@ TransformAnalyzer::Mode TransformAnalyzer::modeOf(const TransformAnalysis & a) {
 //  The pipeline of a transform in UTF-8 mode (see TransformAnalyzer::mode),
 //  on the basis bits of the UTF-8 code units of a well-formed text (see
 //  utf8TransformText).
+//  The checks of --check-utf8-masks: their labels, and whether one failed.
+static std::vector<std::string> gUTF8MaskChecks;
+static bool gUTF8MaskViolation = false;
+
+static void reportUTF8MaskCheck(const uint64_t check, const uint64_t count) {
+    if (count == 0) return;
+    gUTF8MaskViolation = true;
+    llvm::errs() << "tconv: a UTF-8 mask not uniform over the bytes of " << count << " character(s): "
+                 << (check < gUTF8MaskChecks.size() ? gUTF8MaskChecks[check] : std::string("?")) << "\n";
+}
+
+//  (One callback per check, its index a template argument: a constant
+//  scalar given to a pipeline call crashes the pipeline compiler.)
+template <unsigned K> void tconv_utf8_mask_check(const uint64_t count) {reportUTF8MaskCheck(K, count);}
+using UTF8MaskCheckFn = void (const uint64_t);
+template <unsigned... K> static constexpr std::array<UTF8MaskCheckFn *, sizeof...(K)> utf8MaskCheckFns(std::integer_sequence<unsigned, K...>) {
+    return {&tconv_utf8_mask_check<K>...};
+}
+static const auto gUTF8MaskCheckFns = utf8MaskCheckFns(std::make_integer_sequence<unsigned, 64>{});
+
+//  The characters whose bytes do not all have the same bit in a mask (see
+//  --check-utf8-masks): the continuation bytes whose bit differs from that of
+//  the byte before them, counted.
+class UTF8MaskSplits : public pablo::PabloKernel {
+public:
+    UTF8MaskSplits(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Mask, Scalar * Count)
+    : PabloKernel(ts, "UTF8MaskSplits", {Binding{"Basis", Basis}, Binding{"Mask", Mask}}, {}, {}, {Binding{"Count", Count}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        PabloAST * const mask = getInputStreamSet("Mask")[0];
+        PabloAST * const continuation = pb.createAnd(basis[7], pb.createNot(basis[6]));
+        PabloAST * const split = pb.createAnd(continuation, pb.createXor(mask, pb.createAdvance(mask, 1)));
+        pb.createAssign(getOutputScalarVar("Count"), pb.createCount(pb.createInFile(split)));
+    }
+};
+
 class UTF8PipelineBuilder {
 public:
     UTF8PipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
@@ -12191,6 +12233,27 @@ private:
     //  first bytes in its Advance mode), and complemented.
     StreamSet * utf8Mask(const UCD::UnicodeSet & inside, StreamSet * Basis);
     void popFilter() {mMasks.pop();}
+public:
+    //  --check-utf8-masks: each mask (and the bounds of a region) checked on the text, after what the label names.
+    void checkMasks(const std::string & label, StreamSet * Basis) {
+        if (!CheckUTF8Masks) return;
+        auto check = [&](const std::string & what, StreamSet * mask) {
+            Scalar * const count = mP.CreateScalar(mP.getTypeSystem().getInt64Ty());
+            mP.CreateKernelCall<UTF8MaskSplits>(Basis, mask, count);
+            const size_t k = std::min(gUTF8MaskChecks.size(), gUTF8MaskCheckFns.size() - 1);
+            gUTF8MaskChecks.push_back(label + ": " + what);
+            if (k == gUTF8MaskCheckFns.size() - 1) gUTF8MaskChecks[k] = "one of the checks after the 63rd";
+            mP.CreateCall("tconv_utf8_mask_check" + std::to_string(k), *gUTF8MaskCheckFns[k], {count});
+        };
+        std::set<StreamSet *> seen;
+        for (size_t i = 0; i < mMasks.size(); i++) {
+            const TransformMask & m = mMasks[i];
+            const std::string which = "mask " + std::to_string(i) + (m.scope == ContextScope::Region ? " (region)" : "");
+            if (seen.insert(m.apply).second) check(which, m.apply);
+            if (m.bounds && seen.insert(m.bounds).second) check(which + " bounds", m.bounds);
+        }
+    }
+private:
     StreamSet * inStep(const Staged & s) {
         mMasks.keepInStep(s.positions);
         return s.text;
@@ -12358,7 +12421,10 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
     const bool outermost = mDepth++ == 0;
     const bool invokedWithFilter = mInvokedWithFilter;
     mInvokedWithFilter = false;
-    if (a.plan.filter) pushFilter(a.plan.filterSet, Basis);
+    if (a.plan.filter) {
+        pushFilter(a.plan.filterSet, Basis);
+        checkMasks(name + ": its filter", Basis);
+    }
     //  A transform of one conversion group inserts anywhere within its own filter,
     //  or the one it is invoked with (see TransformMask::insertBefore; its
     //  insertion rules are applied in a Unicode segment).
@@ -12372,6 +12438,7 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
         if (MixedModes && !utf8Step(step)) {
             const size_t j = segmentEnd(a, i);
             Basis = unicodeSegment(name + "U" + std::to_string(++mSegments), a, i, j, Basis);
+            checkMasks(name + ": after the Unicode segment of steps " + std::to_string(i + 1) + "-" + std::to_string(j), Basis);
             i = j;
             continue;
         }
@@ -12385,6 +12452,7 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
             mGroupLabel = name + "G" + std::to_string(++group);
             Basis = conversionGroup(step, Basis, outermost);
         }
+        checkMasks(name + ": after step " + std::to_string(i + 1), Basis);
         i++;
     }
     if (a.plan.filter) popFilter();
@@ -12667,7 +12735,10 @@ static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformR
                                      bool bounded = false) {
     UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
     StreamSet * const text = kernel::WellFormedUTF8(P, Basis);
-    if (regions) builder.pushRegions(text);
+    if (regions) {
+        builder.pushRegions(text);
+        builder.checkMasks("the regions", text);
+    }
     if (bounded) builder.boundRegions();
     return builder.transform(entry, text);
 }
@@ -14013,7 +14084,8 @@ static bool openInputAndOutput(const std::string & inputFile) {
 
 static int finishOutput() {
     toolio::closeInput(MainInput);
-    return toolio::finishOutput() ? 0 : 1;
+    if (!toolio::finishOutput()) return 1;
+    return gUTF8MaskViolation ? 3 : 0;
 }
 
 //  A compiled pipeline as a runner: the input it is given is mapped if it is

@@ -610,6 +610,29 @@ contexts see the characters outside the runs.
     compilers' marking (Advance marks the last unit, LookAhead the first),
     the UTF-8 character maps and DivCode on bytes, so that a mask decoded in
     step 13 is exact.
+    **Done (2026-11-20).** The hidden option `--check-utf8-masks` checks the
+    convention where it matters: after each filter's mask is made, after the
+    regions of `--lines`, and after each step (a character map, a DivCode
+    group, a built-in on the bytes, a Unicode segment with its masks spread
+    back), each mask of the stack and the bounds of the regions. A kernel
+    (`UTF8MaskSplits`) counts the continuation bytes whose bit differs from
+    that of the byte before, and a pipeline call reports each mask with a
+    count other than 0 (exit status 3). It held for: filters with characters
+    of one to four bytes outside them; character maps that change the number
+    of bytes (1 to 2, 2 to 1, 1 to 4, one character to two) before and after
+    a capture rule in a Unicode segment; a DivCode group of string rules on
+    the bytes; and `am-am_FONIPA` with `--lines` (two Unicode segments), each
+    with output equal to Unicode mode's
+    (`QA/tconv_utf8_masks_test.py`). A negative control (the check applied to
+    `UTF8_index`, which marks only final bytes) was reported. The class
+    compilers' marking does not enter the masks: the masks are made by
+    `utf8Mask` from a class in LookAhead mode, and kept in step by the
+    position maps of the character maps and DivCode (a byte inserted after a
+    character takes its bit). So a mask decoded at a character's final byte
+    is exact. Found on the way: a constant scalar (`CreateConstant`) given to a
+    pipeline call (`CreateCall`) crashes the pipeline compiler
+    (`PipelineCompiler::getFinalOutputScalars`); the check uses a callback
+    per check instead.
 15. **UTF-8 components with masks of both scopes.** So that fewer components
     need Unicode segments:
     - **Run ends in UTF-8 mode** (step 7's remaining item), for single-character
@@ -665,4 +688,5 @@ which move work from Unicode segments to UTF-8 segments.
 - **Where the type lives.** `TransformMask` in the library (with kernel support
   for region scope) or in tconv's pipeline builder until a second tool needs it?
 - **UTF-8 mode.** Mask conventions per code unit, and how they combine with the
-  UTF-8 class compilers' Advance and LookAhead marking.
+  UTF-8 class compilers' Advance and LookAhead marking. Resolved by step 14: all
+  the bytes of a character have its bit, and `--check-utf8-masks` checks it.

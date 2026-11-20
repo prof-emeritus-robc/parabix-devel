@@ -377,6 +377,7 @@ public:
     Value * hasKernelTerminated(KernelBuilder & b, const size_t kernel, const bool normally = false);
     Value * isClosed(KernelBuilder & b, const StreamSetPort inputPort, const bool normally = false);
     Value * isClosed(KernelBuilder & b, const unsigned streamSet, const bool normally = false);
+    Value * partitionExternalInputsClosed(KernelBuilder & b);
     unsigned getTerminationSignalIndex(const unsigned consumer) const;
     bool kernelCanTerminateAbnormally(const unsigned kernel) const;
     void checkIfKernelIsAlreadyTerminated(KernelBuilder & b);
@@ -843,6 +844,7 @@ protected:
     PHINode *                                   mStrideStepSizeAtLoopEntryPhi = nullptr;
     Value *                                     mStrideStepSize = nullptr;
     Value *                                     mAnyClosed = nullptr;
+    Value *                                     mPartitionExternalInputsClosed = nullptr;
     Value *                                     mHasExhaustedClosedInput = nullptr;
     Rational                                    mFixedRateLCM;
     Value *                                     mTerminatedExplicitly = nullptr;

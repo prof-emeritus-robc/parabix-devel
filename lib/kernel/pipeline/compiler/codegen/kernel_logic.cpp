@@ -324,6 +324,7 @@ void PipelineCompiler::clearInternalStateForCurrentKernel() {
     mHasZeroExtendedInput = nullptr;
     mStrideStepSize = nullptr;
     mAnyClosed = nullptr;
+    mPartitionExternalInputsClosed = nullptr;
 
     mHasExhaustedClosedInput = nullptr;
     mStrideStepSizeAtLoopEntryPhi = nullptr;

@@ -159,6 +159,11 @@ static cl::opt<bool> ConvertedContextWhile("converted-context-while",
              "by a While loop, exact at any chain length, instead of --converted-context-rounds rounds (doc/round-replacement.md "
              "§1; default on, --converted-context-while=0 for the rounds)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> SequentialWhile("sequential-while",
+    cl::desc("With --converted-string-while, select the string matches of a whole group selected sequentially (two-way or cyclic "
+             "overlaps) in the correction kernel's While loop, instead of in --converted-context-rounds staged rounds of "
+             "matching, LeftmostMatches and applying kernels (doc/round-replacement.md step 6; default on)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> ConvertedStringWhile("converted-string-while",
     cl::desc("With --converted-context-while, also resolve by the While loop the string rules whose before contexts are matched "
              "against the converted text, with the string rules whose selection depends on them (doc/round-replacement.md "
@@ -3885,7 +3890,12 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         }
     }
     if (wholeGroup && step.sequentialSelection) {
-        toolio::out() << "    string matches selected sequentially between the " << ConvertedContextRounds + 1
+        //  (In the While loop where every string rule can be decided there: no runs, and
+        //  results fixed at each position of their texts; see FusedRulesConfig::sequential.)
+        toolio::out() << "    string matches selected sequentially "
+                     << (SequentialWhile && ConvertedStringWhile && ConvertedContextWhile
+                         ? "in the correction kernel's While loop if its rules allow, otherwise " : "")
+                     << "between the " << ConvertedContextRounds + 1
                      << " rounds of matching before contexts against the converted text\n";
     }
     //  The contexts that are not fused (with unbounded repetitions) are matched
@@ -4168,6 +4178,14 @@ struct FusedRulesConfig {
     //  for the selection of the other string matches, which does not depend on
     //  the converted text.
     bool resolve = false;
+    //  With resolve, a whole group whose string matches are selected sequentially
+    //  (see TransformStep::sequentialSelection): every string rule is decided in
+    //  the loop (see loopStringRules), with no overlap order (selection is
+    //  empty): a candidate applies where no match that may cover its first
+    //  position applies (mayBeginWithin, by the sets of the texts), the
+    //  leftmost-first selection of LeftmostMatches.  In place of the staged
+    //  rounds (--sequential-while).
+    bool sequential = false;
     //  The case mappings marked in the state given or by the subgroups (see
     //  CaseMapSplit), whose outcomes a correction kernel takes into account.
     std::set<unsigned> marks;
@@ -4596,6 +4614,8 @@ static bool mayBeginWithin(const FusedRulesConfig & c, size_t r, size_t p, unsig
 }
 
 static std::vector<bool> loopStringRules(const FusedRulesConfig & c) {
+    //  (With sequential selection, all: see FusedRulesConfig::sequential.)
+    if (c.sequential) return std::vector<bool>(c.strings.size(), true);
     std::vector<bool> d(c.strings.size(), false);
     for (size_t r = 0; r < c.strings.size(); r++) d[r] = c.strings[r].converted;
     for (bool changed = true; changed; ) {
@@ -5247,6 +5267,7 @@ private:
             if (c.groupCoverage) s += "G";
             if (c.staged) s += "T";
             if (c.resolve) s += "W";
+            if (c.sequential) s += "Q";
             for (const FusedRulesConfig::Selection & sel : c.selection) {
                 s += "/" + std::to_string(sel.length) + (sel.selfOverlapping ? "s" : "");
                 for (size_t p : sel.predecessors) s += "." + std::to_string(p);
@@ -10973,7 +10994,21 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         for (const ConversionOutcome & o : outcomes) {
             config.replacementChars = config.replacementChars + o.resultChars();
         }
-        if (step.sequentialSelection) {
+        //  The string matches selected sequentially in the While loop of one
+        //  correction kernel, where it can decide all the string rules (see
+        //  FusedRulesConfig::sequential); otherwise in staged rounds.
+        bool sequentialLoop = false;
+        if (step.sequentialSelection && SequentialWhile && ConvertedStringWhile) {
+            FusedRulesConfig trial = config;
+            trial.selection.clear();
+            trial.sequential = true;
+            sequentialLoop = resolvableByWhile(trial);
+            if (sequentialLoop) {
+                config.selection.clear();
+                config.sequential = true;
+            }
+        }
+        if (step.sequentialSelection && !sequentialLoop) {
             //  The string matches are selected sequentially, between the rounds:
             //  each round is a kernel matching the before contexts against the
             //  converted text of the previous round, the selection of the matches

@@ -246,16 +246,10 @@ static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied b
                                    "invoke), or the path of a rules file; the transforms tconv does not implement are "
                                    "applied by ICU, unless 0"),
                                    cl::init(""), cl::cat(TconvOptions));
-static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
+static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test "
+                                             "data), in one run over the whole input, each line a region of a mask (region "
+                                             "scope: see --plan --lines); the steps ICU applies, line by line"),
                            cl::init(false), cl::cat(TconvOptions));
-static cl::opt<bool> BoundRegions("bound-regions",
-    cl::desc("With --lines (and --lines-regions), also apply in one run a transform whose conversion groups have contexts that "
-             "are not line-bound, bounded by the lines in the fused kernels and the engine (default on)"),
-    cl::init(true), cl::cat(TconvOptions));
-static cl::opt<bool> LinesRegions("lines-regions",
-    cl::desc("With --lines, apply a transform whose components all support region scope (see --plan --lines) in one run "
-             "over the whole input, each line a region of a mask (default on; --lines-regions=0 for one run per line)"),
-    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<std::string> RegionSeparators("region-separators",
     cl::desc("With --lines, for testing that region scope relies only on the masks: the characters outside the regions, as "
              "hexadecimal code points separated by commas (default 0A, the line feed)"),
@@ -13606,43 +13600,35 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
         //  (Insertion rules: their contexts bounded by the regions, in the
         //  correction kernel or by the engine.)
         if (!step.insertions.empty()) {
-            if (!BoundRegions) return fail("insertion rules");
             scope.bounded = true;
         }
         //  (Deferred rules: their rounds work on the text mapped with the masks.)
         if (!step.deferred.empty() || !step.copyCaptures.empty()) {
-            if (!BoundRegions) return fail("deferred rules");
             scope.bounded = true;
         }
         if (!step.prefixRuns.empty()) {
-            if (!BoundRegions) return fail("prefix runs");
             scope.bounded = true;
         }
         if (!step.chainRevisitRules.empty()) {
-            if (!BoundRegions) return fail("chain revisits");
             scope.bounded = true;
         }
         if (!step.markRunEditRules.empty()) {
-            if (!BoundRegions) return fail("mark run edits");
             scope.bounded = true;
         }
         //  (The capture replacements are matched by the engine, bounded by the
         //  regions: see RulePipelineBuilder::boundRegions.)
         if (!step.captureReplacements.empty()) {
-            if (!BoundRegions) return fail("capture replacements");
             scope.bounded = true;
         }
         //  (Front-letter revisits: runs of classes, which end at a position
         //  outside the regions as at the end of a text: see pushRegions.)
         if (step.hasFrontLetters || step.frontLettersEnd) {
-            if (!BoundRegions) return fail("front-letter revisits");
             scope.bounded = true;
         }
         for (const ldml::ConversionRule * r : step.rules) {
             if (revisits(r->getRightSide())) return fail("a rule with a revisit");
         }
         if (!groupLineBound(step)) {
-            if (!BoundRegions) return fail("a context not bound to the line");
             scope.bounded = true;
         }
     }
@@ -13674,46 +13660,16 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
 //  The line printed by --plan --lines.
 static void printRegionScope(const RegionScope & scope) {
     toolio::out() << "  region scope (--lines): "
-                  << (!scope.supported() ? "per-line runs: " + scope.problem
+                  << (!scope.supported() ? "not supported (an error with --lines): " + scope.problem
                       : scope.bounded ? "supported, one run, contexts bounded by the lines" : "supported, one run")
                   << (scope.supported() && scope.icu ? ", the steps of ICU line by line" : "") << "\n";
 }
 
-//  Applies a transform function to the input: the whole text, or with --lines,
-//  each line as a text of its own (given through a pipe), followed by its line
-//  break; with regions, the function applies to each line as a region of the
-//  whole text (see regionScope), in one run.
-static void applyToInput(const std::function<void (int)> & fn, int fd, bool regions = false) {
-    if (!Lines || regions) {
-        fn(fd);
-        return;
-    }
-    std::string text;
-    char buffer[1 << 16];
-    for (ssize_t n; (n = toolio_read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
-    for (size_t pos = 0; pos < text.size(); ) {
-        const size_t nl = text.find('\n', pos);
-        const size_t end = nl == std::string::npos ? text.size() : nl;
-        int fds[2];
-        if (pipe(fds) != 0) {
-            llvm::errs() << "Error: cannot create a pipe.\n";
-            exit(1);
-        }
-        std::thread writer([&] {
-            for (size_t i = pos; i < end; ) {
-                const ssize_t n = write(fds[1], text.data() + i, end - i);
-                if (n <= 0) break;
-                i += static_cast<size_t>(n);
-            }
-            close(fds[1]);
-        });
-        fn(fds[0]);
-        writer.join();
-        close(fds[0]);
-        if (nl == std::string::npos) break;
-        toolio_write(STDOUT_FILENO, "\n", 1);
-        pos = nl + 1;
-    }
+//  Applies a transform function to the input, in one run (with --lines, each
+//  line a region of the whole text, see regionScope, or the steps of ICU line
+//  by line, see icuLinesRunner).
+static void applyToInput(const std::function<void (int)> & fn, int fd) {
+    fn(fd);
 }
 
 //  The transforms applied by ICU (see --use-ICU): those whose names match the
@@ -15872,7 +15828,7 @@ static int run(int argc, char *argv[]) {
                 return 2;
             }
             if (!openInputAndOutput(inputFile)) return 1;
-            applyToInput(Lines && LinesRegions ? icuLinesRunner(t) : icuRunner(t), MainInput.fd, Lines && LinesRegions);
+            applyToInput(Lines ? icuLinesRunner(t) : icuRunner(t), MainInput.fd);
             return finishOutput();
         }
         if (!openInputAndOutput(inputFile)) return 1;
@@ -15882,17 +15838,21 @@ static int run(int argc, char *argv[]) {
         if (std::any_of(a.plan.steps.begin(), a.plan.steps.end(), byICU)) {
             Runner runner;
             std::string error;
-            if (!stagedTransformRunner(driver, registry, analyzer, a, byICU, runner, error, Lines && LinesRegions)) {
+            if (!stagedTransformRunner(driver, registry, analyzer, a, byICU, runner, error, Lines)) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
             }
-            applyToInput(runner, MainInput.fd, Lines && LinesRegions);
+            applyToInput(runner, MainInput.fd);
             return finishOutput();
         }
         //  (With --lines, the lines as regions where every component supports it;
         //  with contexts bounded by them, in Unicode mode.)
         const RegionScope scope = regionScope(registry, analyzer, a);
-        const bool regions = Lines && LinesRegions && scope.supported();
+        if (Lines && !scope.supported()) {
+            llvm::errs() << "Error: with --lines, not supported in region scope: " << scope.problem << "\n";
+            return 2;
+        }
+        const bool regions = Lines;
         const bool bounded = regions && scope.bounded;
         //  (In UTF-8 mode, where its steps can be: see TransformAnalyzer::mode.)
         if (UTF8Mode && analyzer.modeOf(a).utf8 && !bounded && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A))) {
@@ -15904,11 +15864,11 @@ static int run(int argc, char *argv[]) {
             if (regions) builder.pushRegions(text);
             StreamSet * const Result = builder.applyAnalysis("rules", a, text);
             P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), BytesOf(P, Result));
-            applyToInput(pipelineRunner(P.compile()), MainInput.fd, regions);
+            applyToInput(pipelineRunner(P.compile()), MainInput.fd);
             return finishOutput();
         }
         TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a, regions, bounded);
-        applyToInput(pipelineRunner(fn), MainInput.fd, regions);
+        applyToInput(pipelineRunner(fn), MainInput.fd);
         return finishOutput();
     }
 
@@ -16069,17 +16029,17 @@ static int run(int argc, char *argv[]) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(Lines && LinesRegions ? icuLinesRunner(t) : icuRunner(t), MainInput.fd, Lines && LinesRegions);
+        applyToInput(Lines ? icuLinesRunner(t) : icuRunner(t), MainInput.fd);
         return finishOutput();
     }
     if (staged) {
         Runner runner;
         std::string error;
-        if (!stagedTransformRunner(driver, registry, analyzer, analyzer.analyze(entry), byICU, runner, error, Lines && LinesRegions)) {
+        if (!stagedTransformRunner(driver, registry, analyzer, analyzer.analyze(entry), byICU, runner, error, Lines)) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(runner, MainInput.fd, Lines && LinesRegions);
+        applyToInput(runner, MainInput.fd);
         return finishOutput();
     }
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
@@ -16094,12 +16054,16 @@ static int run(int argc, char *argv[]) {
     //  (With --lines, the lines as regions where every component supports it,
     //  by the rule pipeline.)
     const RegionScope scope = regionScope(registry, analyzer, entry);
-    const bool regions = Lines && LinesRegions && scope.supported();
+    if (Lines && !scope.supported()) {
+        llvm::errs() << "Error: with --lines, not supported in region scope: " << scope.problem << "\n";
+        return 2;
+    }
+    const bool regions = Lines;
     const bool bounded = regions && scope.bounded;
     TransformFunctionType fn = direct && !regions ? generatePipeline(driver, impl->second)
                                : (UTF8Mode && analyzer.mode(entry).utf8 && !bounded && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A)))
                                  ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
                                : generateRulePipeline(driver, registry, analyzer, entry, regions, bounded);
-    applyToInput(pipelineRunner(fn), MainInput.fd, regions);
+    applyToInput(pipelineRunner(fn), MainInput.fd);
     return finishOutput();
 }

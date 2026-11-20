@@ -5,8 +5,8 @@
 #  tconv --lines with region scope (see regionScope in tools/ldml/tconv.cpp and
 #  doc/masked-transforms-plan.md, steps 3 and 4): a transform whose components
 #  all support it is applied in one run over the whole input, each line a
-#  region of a mask, and must give the output of one run per line
-#  (--lines-regions=0).  Contexts that are not line-bound are bounded by the
+#  region of a mask, and must give the output of one run per line (from the
+#  last build with per-line runs, EXPECTED; step 12 removed them).  Contexts that are not line-bound are bounded by the
 #  lines (step 4), in the fused kernels (also the before contexts matched
 #  against the converted text, by the correction kernels) and by the engine,
 #  which also matches the capture replacements, bounded by the lines.
@@ -72,6 +72,36 @@ CASES = [
     ("Any-FCC", "a\u0301\n\u0301\ne\u0323\u0302\n\u0302\u0323", ONE),
 ]
 
+# The outputs of each case, from the last build with per-line runs (one run
+# per line, --lines-regions=0), which one run must give (step 12).
+EXPECTED = [
+    '\nd\nd\nd\n\nax\ny\naxy\na\ne\nX\nxa\nx\nt\n-t\n\na',
+    'b\nd\nbd\ndb\n\nax\ny\naxy\na\ne\nX\nxa\nbx\nt\n-t\n\n',
+    'Z\nd\nYd\ndZ\n\nax\ny\naxy\na\ne\naZ\nxa\nZx\nt\n-t\n\nZ',
+    'ZZ\nd\nZd\ndY\n\nax\ny\naxy\na\ne\naZ\nxa\nZx\nt\n-t\n\n',
+    'b\nd\nbd\ndb\n\nRx\ny\nQxy\nR\ne\nRb\nxR\nbx\nt\n-t\n\n',
+    'Z\nd\nYd\ndZ\n\nax\ny\naxy\na\ne\naZ\nxa\nZx\nt\n-t\n\n',
+    'Q\nd\nRd\nQ\ndx\nQ\nb\n',
+    'b\nd\nbd\ndb\n\nax\ny\naxy\na\ne\nab\nxa\nbx\nT\n-T\n\n',
+    'ab\na\nN\nab\na\nN\naab\na\nab\nyN\ny\nNN\n\nN\nNa\nqN\nq\nN',
+    'ab\na\nB\nab\na\nB\naab\na\nab\nxb\nx\nBb\n\nB\nBa\nqb\nq\nB',
+    'aB\na\nB\naB\na\nB\naaB\na\naB\nyb\ny\nBb\n\nB\nBa\nqb\nq\nB',
+    'acB\nc\nb\nab\ncB\nc\nab',
+    'a\ny\nay\naxy\na b\ny',
+    'a\ncb\nacB\naB\na\nb',
+    'ab\nbc\nabbC\na\nc\nabC',
+    'b\nd\nbId\ndb\n\nax\ny\naxy\na\ne\nab\nxa\nbx\nt\n-t\n\n',
+    '\\u0061\n\n\\u0062',
+    'ASS\nB',
+    'ας\nσα\nας β\nσ',
+    'Hello World\nFoo\n\nBar Baz',
+    'é\ńx\ne\ń',
+    'é\ńé',
+    '\n\n',
+    'á\nḅ́\ṇ́\ṇ̈́',
+    'á\ń\nệ\ṇ̂',
+]
+
 
 def main():
     tconv = sys.argv[1]
@@ -92,21 +122,15 @@ def main():
             verdict = [l for l in plan.stdout.decode("utf-8", "replace").split("\n") if "region scope" in l]
             got = None
             if verdict:
-                got = PER_LINE if "per-line runs" in verdict[0] else BOUNDED if "bounded" in verdict[0] else ONE
+                got = PER_LINE if "not supported" in verdict[0] else BOUNDED if "bounded" in verdict[0] else ONE
             if got != expected:
                 failures += 1
                 print("FAIL %r: region scope %r, expected %s" % (spec, verdict, expected))
-            outputs = []
-            for regions in ("1", "0"):
-                run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--lines-regions=" + regions] + transform + [path],
-                                     capture_output=True)
-                outputs.append((run.returncode, run.stdout))
-            if outputs[0] != outputs[1]:
+            run = subprocess.run([tconv, "--use-ICU=0", "--lines"] + transform + [path], capture_output=True)
+            want = EXPECTED[CASES.index((spec, text, expected))]
+            if run.returncode != 0 or run.stdout.decode("utf-8", "replace") != want:
                 failures += 1
-                print("FAIL %r on %r:\n  one run    %r\n  line runs  %r" % (spec, text, outputs[0], outputs[1]))
-            elif outputs[0][0] != 0:
-                failures += 1
-                print("FAIL %r: exit status %d" % (spec, outputs[0][0]))
+                print("FAIL %r on %r:\n  want %r\n  got  %r" % (spec, text, want, run.stdout.decode("utf-8", "replace")))
     print("%d failures" % failures)
     return 1 if failures else 0
 

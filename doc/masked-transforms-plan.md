@@ -533,6 +533,15 @@ contexts see the characters outside the runs.
     --lines` and in the tests), and the tests that compared one run with
     per-line runs (`tconv_lines_regions_test`) compare with expected
     outputs (from ICU, or from the last per-line build).
+    **Done (2026-11-20).** One run gave the output of the per-line runs on
+    the CLDR test data of all 290 test files (the eight that differ from
+    their expected results do so both ways: six transforms tconv does not
+    know, ka-Latn-t-ka-m0-bgn-2009 and my-fonipa-t-my). `--lines-regions`
+    and `--bound-regions` are removed, `applyToInput` runs once, the ICU
+    paths use the line runners with `--lines`, and a transform without
+    region scope is an error with `--lines` (`--plan --lines`: "not
+    supported"). `tconv_lines_regions_test` compares one run with the
+    outputs of the last build with per-line runs (`EXPECTED`).
 13. **Mixed modes.** The plan of a transform becomes a sequence of segments,
     each in UTF-8 or Unicode mode, through the transforms it invokes:
     - **Choice.** A component is in UTF-8 mode if it can be (the built-ins of

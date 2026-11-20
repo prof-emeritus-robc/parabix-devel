@@ -10045,6 +10045,26 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     for (size_t r = 0; r < numStringRules; r++) {
         correctedString[r] = convertible[r] && step.stringOrder.empty() && !needCoverage;
     }
+    //  Whether a string rule matched by the correction kernel may begin at a later
+    //  position of the text of a string rule (itself included), where ICU, having
+    //  applied that rule, applies none.  The overlap order (empty here) has no
+    //  such pair where the rule's before context cannot match there in the text,
+    //  but matched against the converted text it may, the rule containing it
+    //  having applied (x { bb → c ; aab → ; on xaabb).  Its matches then apply only
+    //  outside the applied matches of the other string rules (see
+    //  UncoveredPositions), whose coverage the kernels applying them give.
+    bool correctedWithin = false;
+    for (size_t r = 0; r < numStringRules && !correctedWithin; r++) {
+        if (!correctedString[r]) continue;
+        for (size_t p = 0; p < numStringRules && !correctedWithin; p++) {
+            for (size_t o = 1; o < texts[p].size(); o++) {
+                if (texts[p][o].intersects(texts[r].front())) {
+                    correctedWithin = true;
+                    break;
+                }
+            }
+        }
+    }
     std::function<StreamSet *(size_t)> engineFirsts;
     auto matchFirsts = [&](size_t r) {
         const ldml::StringRule & rule = step.stringRules[r];
@@ -11188,7 +11208,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             for (size_t r : applying) applyingLengths.push_back(lengths[r]);
             for (const std::vector<size_t> & chunk : fusedStringChunks(applyingLengths, order)) {
                 FusedRulesConfig config;
-                config.coverage = needCoverage && (step.stringOrder.empty() || selected);
+                config.coverage = (needCoverage || correctedWithin) && (step.stringOrder.empty() || selected);
                 if (selected) {
                     config.selected = static_cast<int>(config.sources.size());
                     config.sources.push_back(FusedMatchSource{selected, 0});
@@ -11283,7 +11303,14 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             flush();
         }
         //  ... and, last, of the rules whose before contexts are matched against the
-        //  converted text (given the results of all the others).
+        //  converted text (given the results of all the others; the string rules
+        //  outside the applied matches of the others, see correctedWithin).
+        if (correctedWithin && state.spans) {
+            StreamSet * const uncovered = P.CreateStreamSet(1);
+            P.CreateKernelCall<UncoveredPositions>(state.spans, state.starts, uncovered);
+            correction.selected = static_cast<int>(correction.sources.size());
+            correction.sources.push_back(FusedMatchSource{uncovered, 0});
+        }
         for (size_t r = 0; r < numStringRules; r++) {
             if (correctedString[r]) {
                 FusedStringRule fr = fusedRule(r);

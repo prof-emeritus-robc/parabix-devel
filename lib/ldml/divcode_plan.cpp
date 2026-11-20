@@ -271,6 +271,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     //  The stages of the string rules: one-way overlaps in an acyclic graph
     //  (see DivRule::stage); others are not eligible.
     std::vector<unsigned> stageOf(step.stringRules.size(), 1);
+    std::vector<std::vector<size_t>> stagePredecessors(step.stringRules.size());
     plan.stages = step.stringRules.empty() ? 0 : 1;
     if (step.stringRules.size() > 1) {
         const StringRuleOverlaps o = analyzeStringRuleOverlaps(step);
@@ -283,6 +284,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
                 problem("string rule overlaps, cyclic" + counts);
             } else {
                 plan.overlapPairs = o.oneWay;
+                stagePredecessors = o.predecessors;
                 for (size_t r : o.order) {
                     for (size_t q : o.predecessors[r]) stageOf[r] = std::max(stageOf[r], stageOf[q] + 1);
                     plan.stages = std::max(plan.stages, stageOf[r]);
@@ -990,6 +992,28 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     }
     for (const Source & src : sources) {
         if (src.stringRule >= 0 && src.converted && src.family < 0) problem("string rules with before contexts matched against the converted text");
+    }
+    //  A string rule whose before context is matched against the converted text
+    //  may begin at a later position of the text of a string rule (itself
+    //  included) where the overlaps (analyzeStringRuleOverlaps) have no such
+    //  pair: they exclude it where its before context cannot match there in the
+    //  text, but matched against the converted text it may, the rule containing it
+    //  having applied (x { bb → c ; aab → ; on xaabb, where ICU applies no rule
+    //  within aab).  Not eligible: the regular plan applies such matches only
+    //  outside the applied matches of the others.
+    for (const Source & src : sources) {
+        if (src.stringRule < 0 || !src.converted || src.text.empty()) continue;
+        const std::vector<size_t> & pre = stagePredecessors[static_cast<size_t>(src.stringRule)];
+        bool within = false;
+        for (const Source & other : sources) {
+            if (other.stringRule < 0 || std::find(pre.begin(), pre.end(), static_cast<size_t>(other.stringRule)) != pre.end()) continue;
+            for (size_t o = 1; o < other.text.size() && !within; o++) within = other.text[o].intersects(src.text.front());
+            if (within) break;
+        }
+        if (within) {
+            problem("a string rule with a before context matched against the converted text may begin within the text of a string rule");
+            break;
+        }
     }
 
     //  The alphabet: the blocks of the texts, of the explicit context sets (or

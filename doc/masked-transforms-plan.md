@@ -435,6 +435,23 @@ also run line by line through `applyToInput`.
 
 ### Steps
 
+**Region scope relies only on the mask.** A region is a run of 1 bits, with
+at least one position outside the mask (mask = 0) between any two regions,
+which may hold any character: no component may rely on it being a line feed.
+Where the analyses of contexts take it to be one (`groupLineBound`: a
+context that cannot match a line feed needs no bounds), a line feed is
+inserted, outside the mask, at each edge of each region whose outside
+positions are not line feeds, and deleted after the transform
+(`RulePipelineBuilder::pushRegions`, `popRegions`; the original positions are
+an outermost mask, kept in step). With `--lines` the separators are line
+feeds and nothing is inserted. The hidden option `--region-separators=<hex,...>`
+sets other characters outside the regions, for testing: one run must equal
+each region transformed as a text of its own, with separators taken from
+the alphabet of the transform (a cased letter for Final_Sigma, a combining
+mark for the normalizations, a run character for prefix runs, an iteration
+mark for the deferred rules). Text scope (filters) is unaffected: its
+contexts see the characters outside the runs.
+
 10. **Region scope for the remaining components, in Unicode mode.** Each is
     checked as steps 3 and 4 were: one run against the per-line runs on the
     CLDR test data of the transforms it enables (also `-thread-num=4
@@ -455,6 +472,29 @@ also run line by line through `applyToInput`.
       has no line feed), Any-Name and Any-CaseFold are per character, so they
       need only to be checked and listed (`regionScope`); Any-BreakInternal
       needs its break kernel bounded by the regions.
+    **Done (2026-11-20).** Of the 453 transform names, 448 are now applied in
+    one run with `--lines` (251 with contexts bounded by the lines); the other
+    five are ICU's (step 11). Accepted in region scope, bounded: insertion
+    rules, prefix runs, deferred rules, mark run edits, chain revisits and
+    front-letter revisits; and the built-ins Hex-Any (seven forms) and
+    Any-CaseFold (now in the rule pipeline, by the `cf` mapping within the
+    mask: `maskedStringOverrides`). The revisits that are not composed make a
+    plan not implementable (applied by ICU), so the check of a rule with a
+    revisit is left as a safeguard. Fixed on the way: the rounds of the
+    deferred rules matched their rules with the bounds of the regions in the
+    positions of the text rather than of each round's compacted text
+    (`mRegionsOverride`; `ハヽヽ` gave `hahaヽ`); `boundedRegions` took the mask
+    at the bottom of the stack, which an outermost mask (the front letters,
+    the separators) may be; and the front letters' placeholders, kept out of
+    every mask, cut the regions (`TransformMask::bounds`, where an inserted
+    position belongs to the region of the position it follows: Grek-Latn gave
+    `CHha` for `Χἁ`). Checks: one run equals the per-line runs on the CLDR
+    test data of the transforms each component enables, and on 1,500 lines
+    each of Wikibooks Japanese and Persian text (Kana-Latn, Hira-Latn,
+    fa-fa_FONIPA, also equal to ICU per line) and 3,000 random Greek lines
+    (Grek-Latn, Grek-Latn/UNGEGN); with `--region-separators` taken from each
+    transform's alphabet, one run equals each region as a text of its own
+    (`QA/tconv_region_separators_test.py`).
 11. **ICU under `--lines`.** ICU's `uconv -x` already gives `--lines`
     semantics in one process: it transliterates each line as a text (checked
     with ICU 78.3's `uconv`, the version tconv links,
@@ -470,6 +510,21 @@ also run line by line through `applyToInput`.
     without the pipe and thread of `applyToInput`. A transform with ICU stages
     (`stagedTransformRunner`) runs each tconv stage once over all the lines,
     in region scope, and each ICU stage likewise on the intermediate text.
+
+    **Done (2026-11-20), in the process.** `icuLinesRunner` applies an ICU
+    transform to each line (the same transliterator, from the checkout's
+    rules, so `uconv` is not needed), and `stagedTransformRunner` with
+    `--lines` generates its tconv stages once with regions and applies its ICU
+    stages line by line. Any-Name, Name-Any, Any-BreakInternal, Thai-Latn and
+    Latn-Grek (and rules files tconv does not implement) are applied in one
+    run (`--plan --lines`: "the steps of ICU line by line"), with the output of
+    the per-line runs and of ICU (`QA/tconv_icu_lines_test.py`). Remaining:
+    a transform with ICU stages and a global filter (Thai-Latn, the only one)
+    applies all its stages to each run of the filter (`filteredRunner`, as ICU
+    does), so its tconv stages are still run once per run of the filter (no
+    faster than per line: 1.65 s against 1.54 s on 2,000 lines). Applying them
+    once needs the runs' boundaries carried through the tconv stages to the
+    ICU stage.
 12. **Remove the per-line runs.** When steps 10 and 11 are done, one run gives
     the per-line output on the CLDR test data of every transform, in both
     modes and with four threads. Then `applyToInput`'s per-line loop and
@@ -499,12 +554,18 @@ also run line by line through `applyToInput`.
       (`--utf8-mode=0`) on the CLDR test data, with and without `--lines`,
       and against ICU on random text for the transforms whose segments
       change.
-14. **UTF-8 mask conventions** (the open question below). A mask covers every
-    code unit of a character, and a region starts at a character's first code
-    unit and follows its last. Checked against the UTF-8 class compilers'
-    marking (Advance marks the last unit, LookAhead the first), the UTF-8
-    character maps and DivCode on bytes, so that a mask decoded in step 13 is
-    exact.
+14. **UTF-8 mask conventions** (the open question below). All the bytes of a
+    character outside a region (or a filter) are 0 in the mask. A mask
+    computed from a character class is made from the characters outside it:
+    their class in LookAhead mode (marking their first bytes), `U8Spans` over
+    `UTF8_index` in its Advance mode (which takes marks at first bytes and
+    spreads them forward to the final byte; its LookAhead mode takes marks at
+    last bytes), and the complement
+    (`UTF8PipelineBuilder::utf8Mask`, used by `pushFilter` and so by
+    `pushRegions`; done 2026-11-20). Still to check against the UTF-8 class
+    compilers' marking (Advance marks the last unit, LookAhead the first),
+    the UTF-8 character maps and DivCode on bytes, so that a mask decoded in
+    step 13 is exact.
 15. **UTF-8 components with masks of both scopes.** So that fewer components
     need Unicode segments:
     - **Run ends in UTF-8 mode** (step 7's remaining item), for single-character
@@ -547,9 +608,16 @@ which move work from Unicode segments to UTF-8 segments.
 - **The position map.** A pair of insertion and deletion masks, or one
   spread-and-filter description, so that a chain of transforms composes their
   maps once instead of each caller re-spreading its streams?
-- **Adjacent arguments.** Regions must not be adjacent, so how are function
-  arguments side by side separated: by a position inserted between them and
-  deleted afterwards, or by applying them in separate passes?
+- **Adjacent arguments** (step 8). The arguments of the calls of one function
+  are the regions of one mask, and two of them may touch: the arguments of
+  adjacent matches (`(.) → &Any-Lower($1) ;`, where each character is a text
+  of its own, so that a Σ lowercases to ς), or two arguments of one rule
+  (`(a)(b) → &T($1) &T($2) ;`). Without a position outside the mask between
+  them they would be one region, and the function's contexts would see across.
+  (Arguments of different functions are in different masks.) Resolved by the
+  mechanism of region scope above: a position (a line feed, outside the mask)
+  is inserted before each argument that starts right after another, and
+  deleted afterwards, rather than a pass for each argument.
 - **Where the type lives.** `TransformMask` in the library (with kernel support
   for region scope) or in tconv's pipeline builder until a second tool needs it?
 - **UTF-8 mode.** Mask conventions per code unit, and how they combine with the

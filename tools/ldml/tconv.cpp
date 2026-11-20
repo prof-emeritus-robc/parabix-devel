@@ -256,6 +256,19 @@ static cl::opt<bool> LinesRegions("lines-regions",
     cl::desc("With --lines, apply a transform whose components all support region scope (see --plan --lines) in one run "
              "over the whole input, each line a region of a mask (default on; --lines-regions=0 for one run per line)"),
     cl::init(true), cl::cat(TconvOptions));
+static cl::opt<std::string> RegionSeparators("region-separators",
+    cl::desc("With --lines, for testing that region scope relies only on the masks: the characters outside the regions, as "
+             "hexadecimal code points separated by commas (default 0A, the line feed)"),
+    cl::init("0A"), cl::Hidden, cl::cat(TconvOptions));
+//  The characters outside the regions of --lines (see RegionSeparators).
+static UCD::UnicodeSet regionSeparators() {
+    UCD::UnicodeSet set;
+    std::stringstream in(RegionSeparators);
+    for (std::string cp; std::getline(in, cp, ','); ) {
+        if (!cp.empty()) set.insert(static_cast<UCD::codepoint_t>(std::stoul(cp, nullptr, 16)));
+    }
+    return set;
+}
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(TconvOptions));
@@ -1427,18 +1440,41 @@ static_assert(DeletionMark == ldml::StringRuleDeleted, "the deletion mark of the
 //  the spread mask (the inserted positions, which hold 0 in the basis).
 class FillInsertedPositions : public pablo::PabloKernel {
 public:
-    FillInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Basis, StreamSet * Filled)
-    : PabloKernel(ts, "FillInsertedPositions" + std::to_string(DeletionMark),
-                  {Binding{"SpreadMask", SpreadMask}, Binding{"Basis", Basis}}, {Binding{"Filled", Filled}}) {}
+    FillInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Basis, StreamSet * Filled,
+                          UCD::codepoint_t filler = DeletionMark)
+    : PabloKernel(ts, "FillInsertedPositions" + std::to_string(filler),
+                  {Binding{"SpreadMask", SpreadMask}, Binding{"Basis", Basis}}, {Binding{"Filled", Filled}})
+    , mFiller(filler) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
         std::vector<PabloAST *> basis = getInputStreamSet("Basis");
         for (unsigned b = 0; b < basis.size(); b++) {
-            if ((DeletionMark >> b) & 1) basis[b] = pb.createOr(basis[b], inserted);
+            if ((mFiller >> b) & 1) basis[b] = pb.createOr(basis[b], inserted);
         }
         writeOutputStreamSet("Filled", basis);
+    }
+private:
+    const UCD::codepoint_t mFiller;
+};
+
+//  The positions before which a line feed is inserted, for regions separated by
+//  other characters (see RulePipelineBuilder::pushRegions): the follow of each
+//  region (the first position outside it), and the start of each region after a
+//  position outside the regions.
+class RegionLineFeedPositions final : public pablo::PabloKernel {
+public:
+    RegionLineFeedPositions(LLVMTypeSystemInterface & ts, StreamSet * Outside, StreamSet * At)
+    : PabloKernel(ts, "RegionLineFeedPositions", {Binding{"Outside", Outside}}, {Binding{"At", At}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const outside = getInputStreamSet("Outside")[0];
+        PabloAST * const before = pb.createAdvance(outside, 1);
+        PabloAST * const follow = pb.createAnd(outside, pb.createNot(before));
+        PabloAST * const start = pb.createAnd(pb.createInFile(pb.createNot(outside)), before);
+        writeOutputStreamSet("At", std::vector<PabloAST *>{pb.createInFile(pb.createOr(follow, start))});
     }
 };
 
@@ -1543,6 +1579,12 @@ struct TransformMask {
     MaskKind kind = MaskKind::PassThru;
     ContextScope scope = ContextScope::Text;
     bool insertBefore = true;
+    //  Region scope: the positions of the regions, for the bounds of contexts.
+    //  As apply, but a position inserted belongs to the region of the position
+    //  it follows even where it is kept out of apply (PositionMap::Inserted::Out,
+    //  as the placeholders of the front-letter revisits): it is in the text the
+    //  region's contexts see.
+    StreamSet * bounds = nullptr;
 };
 
 //  The changes a stage makes to the positions of a text, in order: positions
@@ -1588,6 +1630,7 @@ public:
     StreamSet * active() const {return mMasks.empty() ? nullptr : mMasks.back().apply;}
     void push(StreamSet * apply, ContextScope scope = ContextScope::Text) {
         mMasks.push_back(TransformMask{apply, MaskKind::PassThru, scope});
+        if (scope == ContextScope::Region) mMasks.back().bounds = apply;
     }
     void pop() {mMasks.pop_back();}
     //  The innermost mask does not restrict insertions (see TransformMask::insertBefore).
@@ -1618,8 +1661,13 @@ public:
         for (const TransformMask & m : mMasks) streams.push_back(m.apply);
         return streams;
     }
+    //  (The bounds of a region then those of the stage, which keeps no position
+    //  out of a region.)
     void setApplyStreams(const std::vector<StreamSet *> & streams) {
-        for (size_t k = 0; k < mMasks.size(); k++) mMasks[k].apply = streams[k];
+        for (size_t k = 0; k < mMasks.size(); k++) {
+            mMasks[k].apply = streams[k];
+            if (mMasks[k].bounds) mMasks[k].bounds = streams[k];
+        }
     }
     //  The positions added to every mask.
     void include(StreamSet * positions) {
@@ -1627,6 +1675,11 @@ public:
             StreamSet * const combined = mP.CreateStreamSet(1);
             OrCombine(mP, m.apply, positions, combined);
             m.apply = combined;
+            if (m.bounds) {
+                StreamSet * const bounds = mP.CreateStreamSet(1);
+                OrCombine(mP, m.bounds, positions, bounds);
+                m.bounds = bounds;
+            }
         }
     }
     //  The run ends of the innermost mask (text scope): the positions outside it,
@@ -1649,7 +1702,16 @@ public:
         return mask;
     }
     void keepInStep(const PositionMap & map) {
-        for (TransformMask & m : mMasks) m.apply = mapped(m.apply, map);
+        for (TransformMask & m : mMasks) {
+            m.apply = mapped(m.apply, map);
+            if (m.bounds) {
+                for (const PositionMap::Edit & e : map.edits) {
+                    PositionMap::Edit b = e;
+                    if (b.inserted == PositionMap::Inserted::Out) b.inserted = PositionMap::Inserted::Inherit;
+                    m.bounds = mapped(m.bounds, b);
+                }
+            }
+        }
     }
 private:
     enum Op {Complement, Filter, Inherit, In, Out};
@@ -8705,7 +8767,13 @@ public:
     //  The lines of U21 as regions (see --lines and regionScope): a mask
     //  of region scope, outside every filter, of the characters other than the
     //  line feeds, which pass through unchanged.
-    void pushRegions(StreamSet * U21);
+    //  The lines (or the regions of --region-separators) as the regions of a mask
+    //  of region scope, outside every filter; returns the text the transform is
+    //  applied to, with line feeds inserted at the edges of the regions where
+    //  the positions outside them are not line feeds, and popRegions deletes
+    //  them from its result.
+    StreamSet * pushRegions(StreamSet * U21);
+    StreamSet * popRegions(StreamSet * Result);
     //  The contexts of the conversion groups that are not line-bound bounded by
     //  the regions (see RegionScope::bounded): in the fused kernels, and by the
     //  engine, with the starts and follows of the regions; such a group is not
@@ -8732,9 +8800,15 @@ private:
     StreamSet * activeMask() const {return mMasks.active();}
     //  The positions of the regions (the mask of region scope, kept in step), if
     //  their contexts are bounded (see boundRegions), or nullptr.
+    //  (Within a stage on other positions, as the rounds of the deferred rules,
+    //  the regions in its positions: mRegionsOverride.)
     StreamSet * boundedRegions() const {
-        if (!mBoundRegions || mMasks.empty() || mMasks[0].scope != ContextScope::Region) return nullptr;
-        return mMasks[0].apply;
+        if (!mBoundRegions) return nullptr;
+        if (mRegionsOverride) return mRegionsOverride;
+        for (size_t i = 0; i < mMasks.size(); i++) {
+            if (mMasks[i].scope == ContextScope::Region) return mMasks[i].bounds ? mMasks[i].bounds : mMasks[i].apply;
+        }
+        return nullptr;
     }
     //  The text of a stage, with the masks kept in step with its positions.
     StreamSet * inStep(const Staged & s) {
@@ -8824,6 +8898,7 @@ private:
     std::pair<char32_t, char32_t> mFrontLetters;
     StreamSet * mFrontLetterMask = nullptr;
     bool mBoundRegions = false;
+    StreamSet * mRegionsOverride = nullptr;
     //  The starts and follows of the regions (see RegionEdges), by the regions' stream.
     std::map<StreamSet *, std::pair<StreamSet *, StreamSet *>> mRegionEdges;
 };
@@ -8849,10 +8924,42 @@ static const ldml::TransformPlan & finalSigmaPlan() {
     return plan;
 }
 
-void RulePipelineBuilder::pushRegions(StreamSet * U21) {
+StreamSet * RulePipelineBuilder::pushRegions(StreamSet * U21) {
     assert (mMasks.empty());
-    StreamSet * const lines = classes({UCD::UnicodeSet(0, 0x10FFFF) - UCD::UnicodeSet(0x0A)}, U21);
-    mMasks.push(lines, ContextScope::Region);
+    const UCD::UnicodeSet separators = regionSeparators();
+    if (separators == UCD::UnicodeSet(0x0A)) {
+        StreamSet * const lines = classes({UCD::UnicodeSet(0, 0x10FFFF) - separators}, U21);
+        mMasks.push(lines, ContextScope::Region);
+        return U21;
+    }
+    //  Region scope relies only on the mask, with at least one position outside
+    //  it between regions; the analyses of contexts (groupLineBound) take that
+    //  position to be a line feed, so a line feed is inserted (outside the mask)
+    //  at each edge of a region, where the positions outside hold other
+    //  characters.  The original positions are an outermost mask, kept in step.
+    PipelineBuilder & P = mP;
+    StreamSet * const outside = classes({separators}, U21);
+    StreamSet * const at = P.CreateStreamSet(1);
+    P.CreateKernelCall<RegionLineFeedPositions>(outside, at);
+    StreamSet * const spread = P.CreateStreamSet(1);
+    UnitInsertionSpreadMask(P, at, spread, kernel::InsertPosition::Before);
+    StreamSet * const spreadText = P.CreateStreamSet(U21->getNumElements());
+    SpreadByMask(P, spread, U21, spreadText);
+    StreamSet * const text = P.CreateStreamSet(U21->getNumElements());
+    P.CreateKernelCall<FillInsertedPositions>(spread, spreadText, text, 0x0A);
+    StreamSet * const regions = combine(classes({UCD::UnicodeSet(0, 0x10FFFF) - separators}, text), spread, false);
+    mMasks.pushOutermost(spread);
+    mMasks.push(regions, ContextScope::Region);
+    return text;
+}
+
+StreamSet * RulePipelineBuilder::popRegions(StreamSet * Result) {
+    if (regionSeparators() == UCD::UnicodeSet(0x0A)) return Result;
+    mMasks.pop();
+    StreamSet * const kept = mMasks.popOutermost();
+    StreamSet * const out = mP.CreateStreamSet(Result->getNumElements());
+    FilterByMask(mP, kept, Result, out);
+    return out;
 }
 
 void RulePipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21) {
@@ -8932,6 +9039,11 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
         const UCD::property_t prop = name == "Any-Lower" ? UCD::lc : UCD::uc;
         if (StreamSet * const mask = activeMask()) return inStep(maskedStringOverrides({{prop, mask}}, U21));
         return U21_StringOverridePipeline(P, prop, U21);
+    }
+    //  Full case folding (cf), per character (no contexts), within the mask if any.
+    if (name == "Any-CaseFold") {
+        if (StreamSet * const mask = activeMask()) return inStep(maskedStringOverrides({{UCD::cf, mask}}, U21));
+        return U21_StringOverridePipeline(P, UCD::cf, U21);
     }
     if (name == "Any-Title") return titlecase(U21);
     if (name == "Any-Hex") return inStep(hexJava(U21));
@@ -11995,7 +12107,7 @@ public:
     //  The lines as regions, as in Unicode mode (see RulePipelineBuilder::pushRegions).
     void pushRegions(StreamSet * Basis) {
         assert (mMasks.empty());
-        pushFilter(UCD::UnicodeSet(0, 0x10FFFF) - UCD::UnicodeSet(0x0A), Basis);
+        pushFilter(UCD::UnicodeSet(0, 0x10FFFF) - regionSeparators(), Basis);
         std::vector<StreamSet *> streams = mMasks.applyStreams();
         mMasks.pop();
         mMasks.push(streams.back(), ContextScope::Region);
@@ -12012,6 +12124,11 @@ private:
     //  before it), over the bytes of the characters each selects, kept in step
     //  with the text as bytes are deleted and inserted.
     void pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis);
+    //  The mask of the characters of a set: all the bytes of a character
+    //  outside it are 0.  The characters outside are marked at their first
+    //  bytes (LookAhead), spread to their bytes (U8Spans, which takes marks at
+    //  first bytes in its Advance mode), and complemented.
+    StreamSet * utf8Mask(const UCD::UnicodeSet & inside, StreamSet * Basis);
     void popFilter() {mMasks.pop();}
     StreamSet * inStep(const Staged & s) {
         mMasks.keepInStep(s.positions);
@@ -12187,14 +12304,30 @@ protected:
     }
 };
 
+StreamSet * UTF8PipelineBuilder::utf8Mask(const UCD::UnicodeSet & inside, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    StreamSet * const outsideFirsts = P.CreateStreamSet(1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(UCD::UnicodeSet(0, 0x10FFFF) - inside, &cc::Unicode)},
+                                          Basis, outsideFirsts, pablo::BitMovementMode::LookAhead);
+    StreamSet * const index = P.CreateStreamSet(1);
+    P.CreateKernelCall<UTF8_index>(Basis, index);
+    StreamSet * const outside = P.CreateStreamSet(1);
+    //  (Marks at first bytes, spread forward to the final byte: U8Spans's Advance mode.)
+    P.CreateKernelCall<U8Spans>(outsideFirsts, index, outside, pablo::BitMovementMode::Advance);
+    StreamSet * const mask = P.CreateStreamSet(1);
+    Invert(P, outside, mask);
+    return mask;
+}
+
 void UTF8PipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * Basis) {
     PipelineBuilder & P = mP;
-    StreamSet * const firsts = P.CreateStreamSet(1);
-    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(filter, &cc::Unicode)}, Basis, firsts,
-                                          pablo::BitMovementMode::LookAhead);
-    StreamSet * const spans = P.CreateStreamSet(1);
-    P.CreateKernelCall<UTF8_CharSpans>(Basis, firsts, mMasks.active(), spans);
-    mMasks.push(spans);
+    StreamSet * mask = utf8Mask(filter, Basis);
+    if (StreamSet * const outer = mMasks.active()) {
+        StreamSet * const within = P.CreateStreamSet(1);
+        AndCombine(P, mask, outer, within);
+        mask = within;
+    }
+    mMasks.push(mask);
 }
 
 //  A normalization within a filter, as in Unicode mode (see RulePipelineBuilder::
@@ -12894,6 +13027,9 @@ Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, Stre
     positions.insert(SpreadMask);
     //  The active mask over the reserved positions.
     StreamSet * const reservedMask = activeMask() ? mMasks.mapped(activeMask(), positions) : nullptr;
+    //  The bounded regions over the reserved positions (the engine's matches of
+    //  each round are on the round's text, compacted to its live positions).
+    StreamSet * const reservedRegions = boundedRegions() ? mMasks.mapped(boundedRegions(), positions) : nullptr;
     StreamSet * live = SpreadMask;
     //  The positions written by the deferred rules in the rounds so far, and the
     //  blocks written by the self-reproducing rules (see DeferredRuns).
@@ -12913,6 +13049,7 @@ Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, Stre
     };
     for (unsigned round = 0; round < DeferredRounds; round++) {
         StreamSet * const text = compact(X);
+        mRegionsOverride = compact(reservedRegions);
         StreamSet * const mask = compact(reservedMask);
         StreamSet * const textWritten = compact(written);
         config.masked = mask != nullptr;
@@ -12974,6 +13111,7 @@ Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, Stre
         //  DeferredRuns): the blocks they wrote, and where their texts may follow.
         if (srcCount > 0) {
             StreamSet * const runText = compact(X);
+            mRegionsOverride = compact(reservedRegions);
             std::vector<StreamSet *> textMatches;
             for (const auto & key : matchKeys) {
                 const ldml::DeferredRule & d = step.deferred[key];
@@ -13015,6 +13153,7 @@ Staged RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, Stre
             live = select(DeferredRuns::LiveStream);
         }
     }
+    mRegionsOverride = nullptr;
     //  The positions not live deleted, once.
     StreamSet * const result = compact(X);
     positions.remove(live);
@@ -13109,9 +13248,10 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
-    if (regions) builder.pushRegions(U21);
+    StreamSet * const text = regions ? builder.pushRegions(U21) : U21;
     if (bounded) builder.boundRegions();
-    StreamSet * const Result = builder.transform(entry, U21);
+    StreamSet * Result = builder.transform(entry, text);
+    if (regions) Result = builder.popRegions(Result);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
@@ -13387,9 +13527,10 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
-    if (regions) builder.pushRegions(U21);
+    StreamSet * const text = regions ? builder.pushRegions(U21) : U21;
     if (bounded) builder.boundRegions();
-    StreamSet * const Result = builder.applyAnalysis(a, U21);
+    StreamSet * Result = builder.applyAnalysis(a, text);
+    if (regions) Result = builder.popRegions(Result);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<FDSinkKernel>(P.getInputScalar("outputFD"), OutputBytes);
     return P.compile();
@@ -13424,6 +13565,7 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 struct RegionScope {
     std::string problem;
     bool bounded = false;
+    bool icu = false;           // with steps (or the whole) applied by ICU, line by line (step 11)
     bool supported() const {return problem.empty();}
 };
 
@@ -13437,7 +13579,14 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
         scope.problem = p;
         return scope;
     };
-    if (!a.implementable) return fail("not implementable by the regular plan");
+    //  (Applied by ICU as a whole, if it is available: line by line.)
+    if (!a.implementable) {
+        if (UseICU != "0" && tconv::ICUTransform::available()) {
+            scope.icu = true;
+            return scope;
+        }
+        return fail("not implementable by the regular plan");
+    }
     auto revisits = [](const ldml::RuleSide * result) {
         if (result == nullptr || !result->hasCursor()) return false;
         if (result->getCursorOffset() != 0) return true;
@@ -13451,20 +13600,44 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
             const RegionScope inner = regionScope(registry, analyzer, used);
             if (!inner.supported()) return fail(used->canonicalName + ": " + inner.problem);
             scope.bounded |= inner.bounded;
+            scope.icu |= inner.icu;
             continue;
         }
-        if (!step.insertions.empty()) return fail("insertion rules");
-        if (!step.deferred.empty() || !step.copyCaptures.empty()) return fail("deferred rules");
-        if (!step.prefixRuns.empty()) return fail("prefix runs");
-        if (!step.chainRevisitRules.empty()) return fail("chain revisits");
-        if (!step.markRunEditRules.empty()) return fail("mark run edits");
+        //  (Insertion rules: their contexts bounded by the regions, in the
+        //  correction kernel or by the engine.)
+        if (!step.insertions.empty()) {
+            if (!BoundRegions) return fail("insertion rules");
+            scope.bounded = true;
+        }
+        //  (Deferred rules: their rounds work on the text mapped with the masks.)
+        if (!step.deferred.empty() || !step.copyCaptures.empty()) {
+            if (!BoundRegions) return fail("deferred rules");
+            scope.bounded = true;
+        }
+        if (!step.prefixRuns.empty()) {
+            if (!BoundRegions) return fail("prefix runs");
+            scope.bounded = true;
+        }
+        if (!step.chainRevisitRules.empty()) {
+            if (!BoundRegions) return fail("chain revisits");
+            scope.bounded = true;
+        }
+        if (!step.markRunEditRules.empty()) {
+            if (!BoundRegions) return fail("mark run edits");
+            scope.bounded = true;
+        }
         //  (The capture replacements are matched by the engine, bounded by the
         //  regions: see RulePipelineBuilder::boundRegions.)
         if (!step.captureReplacements.empty()) {
             if (!BoundRegions) return fail("capture replacements");
             scope.bounded = true;
         }
-        if (step.hasFrontLetters || step.frontLettersEnd) return fail("front-letter revisits");
+        //  (Front-letter revisits: runs of classes, which end at a position
+        //  outside the regions as at the end of a text: see pushRegions.)
+        if (step.hasFrontLetters || step.frontLettersEnd) {
+            if (!BoundRegions) return fail("front-letter revisits");
+            scope.bounded = true;
+        }
         for (const ldml::ConversionRule * r : step.rules) {
             if (revisits(r->getRightSide())) return fail("a rule with a revisit");
         }
@@ -13482,8 +13655,15 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
         static const std::vector<std::string> supported = {
             "Any-Null", "Any-Upper", "Any-Lower", "Any-Title", "Any-NFD", "Any-NFKD", "Any-NFC", "Any-NFKC",
             "Any-FCD", "Any-FCC", "Any-Remove", "Any-Hex", "Any-Hex/Java", "Any-Hex/Unicode", "Any-Hex/C", "Any-Hex/XML", "Any-Hex/XML10",
-            "Any-Hex/Perl"};
+            "Any-Hex/Perl", "Any-CaseFold", "Hex-Any", "Hex-Any/Java", "Hex-Any/C", "Hex-Any/Perl", "Hex-Any/Unicode", "Hex-Any/XML",
+            "Hex-Any/XML10"};
         if (std::find(supported.begin(), supported.end(), entry->canonicalName) != supported.end()) return RegionScope();
+        //  (Applied by ICU: each line a text, in the process; see icuLinesRunner.)
+        if (isICUBuiltIn(entry->canonicalName)) {
+            RegionScope s;
+            s.icu = true;
+            return s;
+        }
         RegionScope s;
         s.problem = "the built-in " + entry->canonicalName;
         return s;
@@ -13495,7 +13675,8 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
 static void printRegionScope(const RegionScope & scope) {
     toolio::out() << "  region scope (--lines): "
                   << (!scope.supported() ? "per-line runs: " + scope.problem
-                      : scope.bounded ? "supported, one run, contexts bounded by the lines" : "supported, one run") << "\n";
+                      : scope.bounded ? "supported, one run, contexts bounded by the lines" : "supported, one run")
+                  << (scope.supported() && scope.icu ? ", the steps of ICU line by line" : "") << "\n";
 }
 
 //  Applies a transform function to the input: the whole text, or with --lines,
@@ -13678,6 +13859,27 @@ static Runner icuRunner(std::shared_ptr<tconv::ICUTransform> t) {
     };
 }
 
+//  With --lines: a transform applied by ICU to each line of the text as a text
+//  of its own, in the process (as uconv -x does), the line feeds as they are;
+//  within a run of a filter (see filteredRunner), with its surroundings in its
+//  line.
+static Runner icuLinesRunner(std::shared_ptr<tconv::ICUTransform> t) {
+    return [t](int fd) {
+        const std::string text = readAll(fd);
+        std::string out;
+        for (size_t pos = 0; pos < text.size(); ) {
+            const size_t nl = text.find('\n', pos);
+            const size_t end = nl == std::string::npos ? text.size() : nl;
+            const std::string line = text.substr(pos, end - pos);
+            out += runSurroundings ? t->apply(runSurroundings->first, line, runSurroundings->second) : t->apply(line);
+            if (nl == std::string::npos) break;
+            out += '\n';
+            pos = nl + 1;
+        }
+        writeAll(STDOUT_FILENO, out);
+    };
+}
+
 //  A temporary file (removed when closed).
 static int temporaryFile() {
     const char * dir = getenv("TMPDIR");
@@ -13713,13 +13915,22 @@ static std::string runOn(const Runner & runner, const std::string & text) {
 //  A runner applied to the runs of the characters within a filter (the global
 //  filter of a transform: ICU applies all its steps to each run of its text,
 //  and leaves the other characters), the others copied.
-static Runner filteredRunner(Runner inner, const UCD::UnicodeSet & filter) {
-    return [inner, filter](int fd) {
+//  With lines (--lines), the line feeds are outside the filter, and the
+//  surroundings of a run are those within its line.
+static Runner filteredRunner(Runner inner, const UCD::UnicodeSet & filter, bool lines = false) {
+    return [inner, filter, lines](int fd) {
         const std::string text = readAll(fd);
         std::string out, run;
         size_t i = 0;
         auto transformRun = [&]() {
-            const std::pair<std::string, std::string> surroundings{out, text.substr(i)};
+            std::string before = out, after = text.substr(i);
+            if (lines) {
+                const size_t b = before.rfind('\n');
+                if (b != std::string::npos) before = before.substr(b + 1);
+                const size_t a = after.find('\n');
+                if (a != std::string::npos) after = after.substr(0, a);
+            }
+            const std::pair<std::string, std::string> surroundings{before, after};
             runSurroundings = &surroundings;
             out += runOn(inner, run);
             runSurroundings = nullptr;
@@ -13732,7 +13943,7 @@ static Runner filteredRunner(Runner inner, const UCD::UnicodeSet & filter) {
             if (i + n > text.size()) n = 1;
             UCD::codepoint_t cp = n == 1 ? b : (b & (0x7F >> n));
             for (size_t k = 1; k < n; k++) cp = (cp << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3F);
-            if (filter.contains(cp) && !(n == 1 && b >= 0x80)) {
+            if (filter.contains(cp) && !(n == 1 && b >= 0x80) && !(lines && cp == 0x0A)) {
                 run.append(text, i, n);
             } else {
                 if (!run.empty()) transformRun();
@@ -13775,9 +13986,12 @@ static Runner stagedRunner(std::vector<Runner> stages) {
 //  those steps), and each of the transforms ICU applies (with the filter of
 //  the step), on each run of the text within the filter of the transform (if
 //  any; see filteredRunner); or false, and the reason.
+//  With lines (--lines): the stages of tconv applied once to all the lines, as
+//  regions (each one run), and those of ICU to each line (icuLinesRunner).
+static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer, const TransformAnalysis & a);
 static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                   const TransformAnalysis & a, const std::function<bool(const ldml::TransformStep &)> & byICU,
-                                  Runner & result, std::string & error) {
+                                  Runner & result, std::string & error, bool lines = false) {
     std::vector<Runner> stages;
     std::vector<ldml::TransformStep> run;
     auto endRun = [&]() {
@@ -13788,7 +14002,12 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
         part.problems.clear();
         part.plan.problems.clear();
         part.implementable = true;
-        const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part);
+        const RegionScope scope = lines ? regionScope(registry, analyzer, part) : RegionScope();
+        if (lines && !scope.supported()) {
+            error = "with --lines, the steps tconv applies are not supported in region scope: " + scope.problem;
+            return;
+        }
+        const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part, lines, lines && scope.bounded);
         stages.push_back(pipelineRunner(fn));
         run.clear();
     };
@@ -13798,16 +14017,18 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
             continue;
         }
         endRun();
+        if (!error.empty()) return false;
         std::optional<UCD::UnicodeSet> filter;
         if (step.filter) filter = step.filterSet;
         const std::string id = step.transform.getText();
         std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, id, registry.lookup(id), filter ? &*filter : nullptr, error);
         if (!t) return false;
-        stages.push_back(icuRunner(t));
+        stages.push_back(lines ? icuLinesRunner(t) : icuRunner(t));
     }
     endRun();
+    if (!error.empty()) return false;
     const Runner runner = stagedRunner(stages);
-    result = a.plan.filter ? filteredRunner(runner, a.plan.filterSet) : runner;
+    result = a.plan.filter ? filteredRunner(runner, a.plan.filterSet, lines) : runner;
     return true;
 }
 
@@ -15651,7 +15872,7 @@ static int run(int argc, char *argv[]) {
                 return 2;
             }
             if (!openInputAndOutput(inputFile)) return 1;
-            applyToInput(icuRunner(t), MainInput.fd);
+            applyToInput(Lines && LinesRegions ? icuLinesRunner(t) : icuRunner(t), MainInput.fd, Lines && LinesRegions);
             return finishOutput();
         }
         if (!openInputAndOutput(inputFile)) return 1;
@@ -15661,11 +15882,11 @@ static int run(int argc, char *argv[]) {
         if (std::any_of(a.plan.steps.begin(), a.plan.steps.end(), byICU)) {
             Runner runner;
             std::string error;
-            if (!stagedTransformRunner(driver, registry, analyzer, a, byICU, runner, error)) {
+            if (!stagedTransformRunner(driver, registry, analyzer, a, byICU, runner, error, Lines && LinesRegions)) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
             }
-            applyToInput(runner, MainInput.fd);
+            applyToInput(runner, MainInput.fd, Lines && LinesRegions);
             return finishOutput();
         }
         //  (With --lines, the lines as regions where every component supports it;
@@ -15674,7 +15895,7 @@ static int run(int argc, char *argv[]) {
         const bool regions = Lines && LinesRegions && scope.supported();
         const bool bounded = regions && scope.bounded;
         //  (In UTF-8 mode, where its steps can be: see TransformAnalyzer::mode.)
-        if (UTF8Mode && analyzer.modeOf(a).utf8 && !bounded) {
+        if (UTF8Mode && analyzer.modeOf(a).utf8 && !bounded && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A))) {
             auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
             StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
             P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
@@ -15848,17 +16069,17 @@ static int run(int argc, char *argv[]) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(icuRunner(t), MainInput.fd);
+        applyToInput(Lines && LinesRegions ? icuLinesRunner(t) : icuRunner(t), MainInput.fd, Lines && LinesRegions);
         return finishOutput();
     }
     if (staged) {
         Runner runner;
         std::string error;
-        if (!stagedTransformRunner(driver, registry, analyzer, analyzer.analyze(entry), byICU, runner, error)) {
+        if (!stagedTransformRunner(driver, registry, analyzer, analyzer.analyze(entry), byICU, runner, error, Lines && LinesRegions)) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;
         }
-        applyToInput(runner, MainInput.fd);
+        applyToInput(runner, MainInput.fd, Lines && LinesRegions);
         return finishOutput();
     }
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
@@ -15876,7 +16097,8 @@ static int run(int argc, char *argv[]) {
     const bool regions = Lines && LinesRegions && scope.supported();
     const bool bounded = regions && scope.bounded;
     TransformFunctionType fn = direct && !regions ? generatePipeline(driver, impl->second)
-                               : (UTF8Mode && analyzer.mode(entry).utf8 && !bounded) ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
+                               : (UTF8Mode && analyzer.mode(entry).utf8 && !bounded && (!regions || regionSeparators() == UCD::UnicodeSet(0x0A)))
+                                 ? generateUTF8Pipeline(driver, registry, analyzer, entry, regions)
                                : generateRulePipeline(driver, registry, analyzer, entry, regions, bounded);
     applyToInput(pipelineRunner(fn), MainInput.fd, regions);
     return finishOutput();

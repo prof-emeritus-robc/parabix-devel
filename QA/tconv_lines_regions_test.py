@@ -58,8 +58,8 @@ CASES = [
     # string rule, --capture-strings)
     ("(a [c\\u000A]*) b \u2192 $1 B ;\n", "a\ncb\nacb\nab\na\nb", BOUNDED),
     ("(a b*) c \u2192 $1 C ;\n", "ab\nbc\nabbc\na\nc\nabc", BOUNDED),
-    # Insertions keep the per-line runs
-    ("b { } d \u2192 I ;\n", LINES, PER_LINE),
+    # Insertions, their contexts bounded (step 10)
+    ("b { } d \u2192 I ;\n", LINES, BOUNDED),
     # Built-ins
     ("Any-Hex", "a\n\nb", ONE),
     ("Any-Upper", "a\u00df\nb", ONE),

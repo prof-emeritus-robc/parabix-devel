@@ -591,7 +591,13 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  and, for E1 = ab and L = a, a } [^b] → result, and for E = a } b* c and
 //  L = a, a } b* [^bc] → result; for E = c { a } b and L = a,
 //  a } [^b] → result ; [^c] { a } b → result.  The text boundary is a class of its own
-//  beyond the key (e.g. E = a } [b$] gives a } [^b$] → result).  Earlier
+//  beyond the key (e.g. E = a } [b$] gives a } [^b$] → result).  With a
+//  global filter and transform rules (as ICU applies the rules to each run
+//  of the filter's characters, see MoveTextAnchors), the text of a rule
+//  ends with the run but its after context does not: a negated set beyond
+//  L where the earlier rules still matching have no after contexts (E = abc
+//  and L = a: a } b [^c]) also matches at the end of a run (it is marked
+//  with FilterRunEndMark).  Earlier
 //  rules with items before the position contribute before contexts.  An L
 //  masked by its earlier rules is removed.
 //

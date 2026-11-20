@@ -8,8 +8,12 @@
 #  of the text with the end of the text ([$], [^c]) also matches nothing at
 #  the end of a run, where the after context is a character outside the filter
 #  (ldml::FilterRunEndMark), as am_Ethi-d0_Morse deletes the space after the
-#  last character of a run.  The expected results are ICU's (createFromRules,
-#  each line a text).
+#  last character of a run.  The text of a rule ends with the run, but its
+#  after context does not: a later rule ordered after an earlier one without
+#  an after context (ldml::DisambiguateOrder, a } b [^c] for abc) applies
+#  where the earlier one's text meets the end of a run (as Hira-Latn
+#  transforms デ before ィ outside its filter).  The expected results are
+#  ICU's (createFromRules, each line a text).
 #
 #  tconv_filter_run_end_test.py <tconv binary> [--extended-testing]
 
@@ -37,6 +41,16 @@ GROUPS = [
     # A capture of a complement revisited
     (":: [a-z] ;\n:: Null ;\n$nd = [^c] ;\n^ q ($nd) \u2192 | W $1 ;\nW \u2192 U ;\n",
      [('q', 'U'), ('qa', 'Ua'), ('q1', 'U1'), ('qc', 'qc'), ('qa1', 'Ua1')]),
+    # The text of an earlier rule ends with the run: the negated set of the
+    # later rule's order (a } b [^c]) also matches at the end of a run
+    (":: [ab] ;\n:: Lower ;\nabc → X ;\na → A ;\nb → B ;\n",
+     [('abc', 'ABc'), ('ab', 'AB'), ('xabcx', 'xABcx'), ('abd', 'ABd'), ('abC', 'ABC'), ('ab1abc', 'AB1ABc')]),
+    # As Hira-Latn (Katakana-Latin): ディ with ィ outside the filter
+    (":: [デ] ;\n:: NFD ;\nディ → di ;\nデ → de ;\n",
+     [('ディ', 'deィ'), ('デ', 'de'), ('aディb', 'adeィb'), ('デデ', 'dede')]),
+    # An earlier rule's after context sees beyond the run: not at its end
+    (":: [ab] ;\n:: Lower ;\nab } c → X ;\na → A ;\nb → B ;\n",
+     [('abc', 'Xc'), ('ab', 'AB'), ('abd', 'ABd'), ('xabcx', 'xXcx')]),
     # As am_Ethi-d0_Morse: a space before the end of a run deleted
     (":: [a-z\\u0020\\-] ;\n:: Null ;\na \u2192 a ;\n:: Null ;\n([b\\-]) \\u0020 [$] \u2192 $1 ;\n",
      [('b ', 'b'), ('b 1', 'b1'), ('b b', 'b b'), ('- 1x', '-1x'), ('b', 'b'), ('- ', '-'), ('b  1', 'b  1')]),

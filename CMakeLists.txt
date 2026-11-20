@@ -951,6 +951,11 @@ add_test(
   COMMAND python3 tconv_kept_captures_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_fused_captures_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_fused_captures_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_icu_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_icu_test.py ${BIN_DIR}/tconv)

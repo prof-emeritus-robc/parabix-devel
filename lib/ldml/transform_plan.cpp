@@ -1528,6 +1528,8 @@ static bool keptStringRule(const ConversionRule * c, CharSetAnalysis & sets, Str
     if (result->hasCursor()) return false;
     std::vector<std::vector<UCD::UnicodeSet>> texts(1), captures;
     std::vector<std::string> names;
+    //  (Whether an item follows the optional set: then it is not at the end.)
+    bool afterOptional = false;
     std::function<bool (re::RE *, bool)> flatten = [&](re::RE * re, bool inCapture) -> bool {
         //  An optional set at the end of the text (see keptStringRules).
         if (const re::Rep * rep = dyn_cast<re::Rep>(re); optional && inCapture && rep && rep->getLB() == 0 && rep->getUB() == 1
@@ -1536,6 +1538,7 @@ static bool keptStringRule(const ConversionRule * c, CharSetAnalysis & sets, Str
             if (present) captures.back().push_back(**optional);
             return true;
         }
+        if (optional && optional->has_value() && (plainSet(re) || isa<re::Capture>(re))) afterOptional = true;
         if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
             for (re::RE * e : *seq) if (!flatten(e, inCapture)) return false;
             return true;
@@ -1554,7 +1557,7 @@ static bool keptStringRule(const ConversionRule * c, CharSetAnalysis & sets, Str
         }
         return false;
     };
-    if (!flatten(source->getText(), false) || captures.empty()) return false;
+    if (!flatten(source->getText(), false) || captures.empty() || afterOptional) return false;
     //  (The optional set at the end of the last capture, the end of the text.)
     if (optional && optional->has_value() && (texts.back().size() > 0 || source->hasAfterContext())) return false;
     for (const auto & b : captures) if (b.empty()) return false;

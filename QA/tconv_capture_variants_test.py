@@ -101,12 +101,12 @@ def check(tconv, tmp, name, rules_text, cases):
     input = os.path.join(tmp, name + ".txt")
     with open(input, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line, _ in cases))
-    plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules, input], capture_output=True)
+    plan = subprocess.run([tconv, "--plan", "--capture-strings=0", "--rules-file=" + rules, input], capture_output=True)
     text = plan.stdout.decode("utf-8", "replace")
     if ": implementable" not in text.split("\n")[0] or "variants by" not in text:
         failures += 1
         print("FAIL %s: the rules are not planned as variants\n%s" % (name, text))
-    run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+    run = subprocess.run([tconv, "--use-ICU=0", "--capture-strings=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         failures += 1
         print("FAIL %s: exit status %d\n%s" % (name, run.returncode, run.stderr.decode("utf-8", "replace")))

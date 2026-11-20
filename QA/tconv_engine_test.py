@@ -43,9 +43,9 @@ def main():
             rules = os.path.join(tmp, "rules%d.txt" % i)
             with open(rules, "w", encoding="utf-8") as f:
                 f.write(rule + "\n")
-            argvs.append([tconv, "--plan", "--rules-file=" + rules])
-            argvs.append([tconv, "--rules-file=" + rules, text])
-            argvs.append([tconv, "--disable-engine-search-replace", "--rules-file=" + rules, text])
+            argvs.append([tconv, "--plan", "--capture-strings=0", "--rules-file=" + rules])
+            argvs.append([tconv, "--capture-strings=0", "--rules-file=" + rules, text])
+            argvs.append([tconv, "--capture-strings=0", "--disable-engine-search-replace", "--rules-file=" + rules, text])
         runs = [subprocess.run(argv, capture_output=True) for argv in argvs]
         for i, (rule, pattern, replacement) in enumerate(CASES):
             plan, engine, kernels = runs[3 * i: 3 * i + 3]

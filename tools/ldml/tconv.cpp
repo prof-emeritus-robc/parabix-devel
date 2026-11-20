@@ -188,6 +188,12 @@ static cl::opt<bool, true> CaptureVariants("capture-variants",
     cl::desc("Merge MultipleCaptureMultipleReplacement rules differing only in one character of a text and their results "
              "into one set, matched once (see ldml::MultipleCaptureMultipleReplacementSet::variants)"),
     cl::location(ldml::MergeCaptureVariants), cl::init(true), cl::cat(TconvOptions));
+static cl::opt<bool> CaptureStrings("capture-strings",
+    cl::desc("Plan the MultipleCaptureMultipleReplacement rules whose captures are fixed sequences of sets, with their "
+             "results referring to them in order, as string rules keeping the characters of their captures "
+             "(ldml::StringRule::kept), matched in the fused kernels with the other string rules, rather than one regular "
+             "expression pipeline for each set (default on)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
     cl::desc("Rounds of applying the rules deferred after the BeforeCaptureCopy rules of a group, to the converted text "
              "(exact for chains of up to this many triggers whose before contexts reach back to each other)"),
@@ -1086,9 +1092,18 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         //  as string rules keeping the characters of their captures (whose
         //  before contexts are matched against the converted text; see
         //  ldml::StringRule::kept), planned again.
+        //  With --capture-strings, all the MultipleCaptureMultipleReplacement rules
+        //  are offered (those that cannot be stated so remain as they are).
         {
             std::set<const ldml::Rule *> converted;
-            for (const ldml::TransformStep & step : a.plan.steps) convertedContextCaptureRules(step, converted);
+            for (const ldml::TransformStep & step : a.plan.steps) {
+                convertedContextCaptureRules(step, converted);
+                if (CaptureStrings) {
+                    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+                        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) converted.insert(r.rule);
+                    }
+                }
+            }
             if (!converted.empty()) {
                 a.plan = ldml::planTransform(rules, &converted);
                 translateCaptureContexts(a.plan);

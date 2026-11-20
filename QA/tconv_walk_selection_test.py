@@ -55,12 +55,12 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write(TEXT)
-        plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules], capture_output=True)
+        plan = subprocess.run([tconv, "--plan", "--capture-strings=0", "--rules-file=" + rules], capture_output=True)
         out = plan.stdout.decode("utf-8", "replace")
         if out.count("walk branches") != 4 or ": implementable" not in out:
             failures += 1
             print("FAIL: not planned with selection by walks\n%s" % out)
-        run = subprocess.run([tconv, "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([tconv, "--capture-strings=0", "--rules-file=" + rules, input], capture_output=True)
         got = run.stdout.decode("utf-8", "replace")
         if run.returncode != 0 or got != WANT:
             failures += 1

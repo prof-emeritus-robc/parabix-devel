@@ -479,7 +479,9 @@ struct TransformPlan {
 // position, are planned as string rules keeping the characters of their
 // captures (StringRule::kept), rather than MultipleCaptureMultipleReplacement
 // rules, so that their before contexts may be matched against the converted
-// text.
+// text, or (tconv --capture-strings) so that they are matched in the fused
+// kernels with the other string rules.  An optional set must be the last item
+// of the text.
 TransformPlan planTransform(const std::vector<Rule *> & rules, const std::set<const Rule *> * keptCaptures = nullptr);
 
 //  The overlaps of the string rules of a conversion group.

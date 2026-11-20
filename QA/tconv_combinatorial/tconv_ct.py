@@ -447,6 +447,20 @@ def git(*args, cwd=REPO):
     return subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
 
 
+def fingerprint(tconv):
+    """A hash of tconv and the libraries it loads from its build (the object cache's keys follow them)."""
+    h = hashlib.sha1()
+    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(tconv))), "lib")
+    files = [tconv] + sorted(os.path.join(d, f) for d, _, fs in os.walk(lib) for f in fs
+                             if f.endswith((".dylib", ".so")) or ".so." in f)
+    for path in files:
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+    return h.hexdigest()
+
+
 def cmake_settings(reference_build):
     settings = {"CMAKE_BUILD_TYPE": "Release"}
     cache = os.path.join(reference_build, "CMakeCache.txt")
@@ -504,6 +518,7 @@ def cmd_run(a):
     log = open(os.path.join(a.state, "build.log"), "a")
     tconv = a.tconv or os.path.join(build_dir, "bin", "tconv")
     print("tconv_ct: following %s; worktree %s; state %s" % (branch, worktree, a.state), flush=True)
+    checker = None
     while True:
         commit = git("rev-parse", "--short", branch)
         commits = state.data["commits"]
@@ -513,8 +528,19 @@ def cmd_run(a):
                 state.log({"commit": commit, "status": "build-failed"})
                 time.sleep(300)
                 continue
-            shutil.rmtree(objcache, ignore_errors=True)
             commits.append(commit)
+            #  (A commit that leaves tconv and its libraries unchanged, e.g. of
+            #  documentation or tests, keeps the object cache, the catalog and
+            #  the anomalies' status: the objects are keyed by the binaries.)
+            fp = fingerprint(tconv)
+            changed = a.tconv or fp != state.data.get("fingerprint") or "catalog" not in state.data
+            state.data["fingerprint"] = fp
+            state.data.setdefault("baseline_fingerprint", fp)
+            if not changed:
+                print("  tconv unchanged", flush=True)
+                state.save()
+                continue
+            shutil.rmtree(objcache, ignore_errors=True)
             state.data["catalog"] = build_catalog(tconv, a.cldr) if not a.only else \
                 {n: c for n, c in build_catalog_for(tconv, a.only).items()}
             state.save()
@@ -528,7 +554,10 @@ def cmd_run(a):
                     an["status"], an["fixed_at"] = "fixed", commit
                     state.save_anomaly(an)
                     print("  fixed at %s: %s %s" % (commit, an["id"], an["kind"]), flush=True)
-        baseline = len(commits) == 1
+        if checker is None:
+            checker = Checker(tconv, a.cldr, objcache)
+        #  (The CLDR and ICU mismatches of the first build tested are the baseline.)
+        baseline = state.data.get("fingerprint") == state.data.get("baseline_fingerprint")
         state.data["passes"] += 1
         seed = state.data["passes"]
         t = a.t if state.data["passes"] <= a.pairwise_passes else a.t + 1

@@ -1701,6 +1701,82 @@ void RE_PipelineBuilder::prepareExternals(RE * re) {
     }
 }
 
+// The number of characters of an RE of fixed length as compiled in the UTF-8
+// indexed mode, or -1: a UTF-8 class begins a character unless it holds only
+// continuation bytes, and a named class of several UTF-8 lengths is one.
+static int fixedCharacters(RE * re) {
+    if (const CC * c = dyn_cast<CC>(re)) {
+        if (c->getAlphabet() == &cc::UTF8) return (c->min_codepoint() >= 0x80 && c->max_codepoint() <= 0xBF) ? 0 : 1;
+        return 1;
+    }
+    if (Name * n = dyn_cast<Name>(re)) {
+        RE * const d = n->getDefinition();
+        if (d == nullptr) return -1;
+        if (isa<CC>(d)) return 1;
+        return fixedCharacters(d);
+    }
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        int total = 0;
+        for (RE * e : *seq) {
+            const int k = fixedCharacters(e);
+            if (k < 0) return -1;
+            total += k;
+        }
+        return total;
+    }
+    if (const Alt * alt = dyn_cast<Alt>(re)) {
+        int k = -1;
+        for (RE * e : *alt) {
+            const int j = fixedCharacters(e);
+            if (j < 0 || (k >= 0 && j != k)) return -1;
+            k = j;
+        }
+        return k;
+    }
+    if (const Rep * rep = dyn_cast<Rep>(re)) {
+        if (rep->getLB() != rep->getUB()) return -1;
+        const int k = fixedCharacters(rep->getRE());
+        return (k < 0) ? -1 : k * rep->getLB();
+    }
+    if (isa<Assertion>(re)) return 0;
+    return -1;
+}
+
+// The unique prefix of an RE whose starts matchStartPipeline finds by it, or nullptr.
+static RE * startsPrefix(RE * re) {
+    if (Seq * const seq = dyn_cast<Seq>(re)) {
+        Name * const front = seq->empty() ? nullptr : dyn_cast<Name>(seq->front());
+        if (front && isUniquePrefixName(front)) return front;
+    }
+    return nullptr;
+}
+
+// Marks at the last code units of characters, moved to their first code
+// units (of UTF-8 characters, given the index of their last code units).
+class FirstCodeUnits final : public pablo::PabloKernel {
+public:
+    FirstCodeUnits(LLVMTypeSystemInterface & ts, StreamSet * Marks, StreamSet * Index, StreamSet * Firsts)
+    : PabloKernel(ts, "FirstCodeUnits",
+                  {Binding{"marks", Marks, FixedRate(1), LookAhead(3)}, Binding{"index", Index, FixedRate(1), LookAhead(3)}},
+                  {Binding{"firsts", Firsts}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const marks = getInputStreamSet("marks")[0];
+        PabloAST * const index = getInputStreamSet("index")[0];
+        // A first code unit: after an index position (or at the start).  Its
+        // character's last code unit is the first index position from it.
+        PabloAST * const firsts = pb.createInFile(pb.createNot(pb.createAdvance(pb.createNot(index), 1)));
+        PabloAST * result = pb.createAnd(index, marks);
+        PabloAST * within = pb.createNot(index);
+        for (unsigned k = 1; k <= 3; ++k) {
+            result = pb.createOr(result, pb.createAnd(within, pb.createAnd(pb.createLookahead(index, k), pb.createLookahead(marks, k))));
+            within = pb.createAnd(within, pb.createNot(pb.createLookahead(index, k)));
+        }
+        writeOutputStreamSet("firsts", std::vector<PabloAST *>{pb.createAnd(firsts, result)});
+    }
+};
+
 void RE_PipelineBuilder::compileExternal(Name * n) {
     auto name = n->getFullName();
     auto f = mCtxt.mExternals.find(name);
@@ -1787,7 +1863,29 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         RE * asserted = a->getAsserted();
         const bool negated = (a->getSense() == Assertion::Sense::Negative);
         auto r = getLengthRange(asserted, mCtxt.mLengthAlphabet);
-        const MatchStarts starts = matchStartPipeline(asserted);
+        MatchStarts starts = matchStartPipeline(asserted);
+        // In the UTF-8 indexed mode, the offset counts the positions of the RE
+        // as compiled: a code unit for each of its UTF-8 classes, but a
+        // character for each of its classes of characters of several UTF-8
+        // lengths (named, see VariableLengthCCNamer), while the readers of the
+        // external (RE_Compiler) count it in code units.  Where the code units
+        // of the matched part vary, the marks (at the last code unit of that
+        // part) are moved to the first code units of the starts, with offset 1.
+        RE * const measured = (r.first == r.second) ? asserted : startsPrefix(asserted);
+        const int characters = measured ? fixedCharacters(measured) : -1;
+        const auto units = measured ? getLengthRange(measured, &cc::UTF8) : std::make_pair(0, 0);
+        if ((mCtxt.mLengthAlphabet == &cc::Unicode) && (mCtxt.mCodeUnitAlphabet == &cc::UTF8) && (mCtxt.mIndexStream != nullptr)
+                && (units.first != units.second) && (characters > 0)) {
+            StreamSet * marks = starts.stream;
+            for (int k = 1; k < characters; ++k) {
+                StreamSet * const shifted = mPB.CreateStreamSet(1);
+                mPB.CreateKernelCall<IndexedShiftBack>(mCtxt.mIndexStream, marks, shifted);
+                marks = shifted;
+            }
+            StreamSet * const firsts = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<FirstCodeUnits>(marks, mCtxt.mIndexStream, firsts);
+            starts = MatchStarts{firsts, 1};
+        }
         addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, starts.offset, r, starts.stream, negated});
     }
 }

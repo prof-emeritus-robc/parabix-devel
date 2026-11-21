@@ -1442,4 +1442,18 @@ xkj
 </datafile>
 <grepcase regexp="(?&lt;=(?&lt;!ə)[ʃk])j" datafile="negative_lookbehind_mixed_lengths" greplines="2 4 5 6"/>
 <grepcase regexp="(?&lt;=(?&lt;!\p{L})[ʃj]j)ə" datafile="negative_lookbehind_mixed_lengths" greplines="6"/>
+<!-- Lookaheads of characters of several UTF-8 lengths within lookbehinds
+     (the UTF-8 indexed mode): their offsets in characters, and negative
+     lookaheads holding only at the starts of characters. -->
+<datafile id="lookahead_in_lookbehind_mixed_lengths">😀éʃ
+😀éé
+éʃ😀éʃ
+😀😀é
+xéé
+中é😀é
+😀éa
+</datafile>
+<grepcase regexp="(?&lt;=😀(?=[é😀][é😀]))" datafile="lookahead_in_lookbehind_mixed_lengths" greplines="2 4"/>
+<grepcase regexp="(?&lt;=(?![b😀][é😀b])[中é😀])é" datafile="lookahead_in_lookbehind_mixed_lengths" greplines="2 5 6"/>
+<grepcase regexp="(?&lt;!(?=😀[é😀])[中é😀])é" datafile="lookahead_in_lookbehind_mixed_lengths" greplines="2 3 5 6"/>
 </greptest>

@@ -883,9 +883,11 @@ which move work from Unicode segments to UTF-8 segments.
   masks for the case maps' expanding slots.
 - Step 11: Thai-Latn (ICU stages under a global filter) still runs its tconv
   stages once per run of the filter.
-- Step 12: 8 of the 290 test files differ from their expected results (six
-  transforms tconv does not know, ka-Latn-t-ka-m0-bgn-2009 and
-  my-fonipa-t-my).
+- Step 12: 2 of the 290 test files differ from their expected results, both
+  issues of the test data (ka-Latn-t-ka-m0-bgn-2009 and my-fonipa-t-my, see
+  doc/ICU-uconv-CLDR-issues.md, CLDR). The six whose names tconv did not know
+  (BCP 47 IDs with aliases of registered values, and one malformed) are found
+  since 2026-11-21 and equal their expected results.
 
 **Found on the way, not yet investigated.**
 - The pipeline's handling of a block-sized lookahead at the final stride

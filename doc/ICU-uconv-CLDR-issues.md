@@ -1,9 +1,11 @@
-# ICU and uconv issues
+# ICU, uconv and CLDR issues
 
 Known cases where ICU's output for a transform is not what the transform's
-rules specify (UTS #35 Part 2), or where the output of ICU's `uconv` command
-differs from what ICU itself produces through its API on the whole text. These
-matter wherever ICU or `uconv` is the reference for tconv's output.
+rules specify (UTS #35 Part 2), where the output of ICU's `uconv` command
+differs from what ICU itself produces through its API on the whole text, and
+where CLDR's transform test data disagree with the transforms' rules. These
+matter wherever ICU, `uconv` or the CLDR test data are the reference for
+tconv's output.
 
 ## ICU
 
@@ -172,3 +174,113 @@ Observed with `uconv v2.1`, ICU 78.3.
     compare against ICU's API on the whole text (for example
     `Transliterator::createInstance` or `createFromRules`, then `transliterate`),
     not `uconv`.
+
+- **`uconv -x` does not transliterate each line as a text of its own.** It
+  transliterates the input a line at a time (as above), but each line's text
+  includes its line feed. So the start of a line is the start of a text, but
+  its end is not the end of a text. On the three lines `xa`, `b`, `ab` (no
+  final line feed):
+
+  ```
+  rules                    uconv          each line as a text (tconv --lines, ICU per line)
+  [$] { a > Y ;            xa  b  Yb      xa  b  Yb
+  [a\u000A] { b > X ;      xa  b  aX      xa  b  aX
+  b } [$] > X ;            xa  b  aX      xa  X  aX
+  b } \u000A > Z ;         xa  Z  ab      xa  b  ab
+  ```
+
+  The first two rows agree (a line's start is a text's start: the `b` after
+  the line feed is not changed); in the last two, `uconv` sees the line feed
+  after the `b` of the second line, and the end of the text only on the last
+  line.
+
+  A rule that looks at the end of a text, or at a line feed after it, applies
+  differently from the CLDR test data, which take each line as a text without
+  its line feed (as `tconv --lines` does).
+
+  **Example: my-my_FONIPA.** Under `uconv -x my-my_FONIPA`, 57 of the 1,228
+  lines of `my-fonipa-t-my.txt` lose a word-final inherent vowel at the end of
+  the line: `က` gives `k` (expected `ka̰`), `ကုလသမဂ္ဂ` gives `kṵ.lə.θə.mɛʔ.ɡ`
+  (expected `kṵ.lə.θə.mɛʔ.ɡa̰`). The same happens with the checkout's rule text
+  given to `-x`, and not on a last line without a line feed (`က` alone gives
+  `ka̰`). ICU's API applied to each line without its line feed (`tconv --lines
+  --use-ICU`) gives the expected output on all of them.
+
+  **Consequence.** `uconv` cannot serve as the per-line reference for rules
+  sensitive to the end of a text; tconv applies ICU to each line in its own
+  process (doc/masked-transforms-plan.md, step 11).
+
+## CLDR
+
+Observed with the CLDR checkout at `~/cldr` (`common/transforms` and
+`common/testData/transforms`), 2026-11-21. Each test file has one case per
+line: the input, a tab, and the expected output, the input taken as a text of
+its own.
+
+- **Test files named by IDs their transforms do not declare.** Six test files
+  are named by IDs that no transform file declares as an alias, so ICU
+  (`uconv -x`: `U_INVALID_ID`) does not find their transforms by the file
+  names (nor did tconv before 2026-11-21, see below):
+
+  ```
+  test file                                         transform (as declared)
+  byn-Latn-t-byn-ethi-m0-tekie-alibekit             byn-Latn-t-byn-ethi-m0-tekieali, Ethiopic-Latin/Tekie_Alibekit
+  d0-morse-t-am-Ethi                                am-Ethi-t-d0-morse, am_Ethi-d0_Morse
+  und-Latn-t-und-ethi-m0-beta-metsehaf              und-Latn-t-und-ethi-m0-betamets, Ethiopic-Latin/Beta_Metsehaf
+  und-Latn-t-und-ethi-m0-beta-metsehaf-geminate     und-Latn-t-und-ethi-m0-betamets-geminate, Ethiopic-Latin/BetaMetsehaf_Geminate
+  und-Latn-t-und-ethi-m0-ies-jes-1964               und-Latn-t-und-ethi-m0-iesjes-1964, Ethiopic-Latin/IES_JES_1964
+  und-Latn-t-und-ethi-m0-ies-jes-1964-geminate      und-Latn-t-und-ethi-m0-iesjes-1964-geminate, Ethiopic-Latin/IES_JES_1964_Geminate
+  ```
+
+  Applied by their declared names, all six give the expected output on every
+  case, in `uconv`, ICU through tconv and tconv. (The upstream repository has
+  the test files under the same names: checked for the byn and Morse files.)
+
+  **The names as BCP 47 transform IDs.** A BCP 47 transform ID (RFC 6497, as
+  UTS #35 Part 2 uses it) is the tag of the result, `-t-`, the tag of the
+  source, then fields: `m0` the mechanism (a variant), `d0` and `s0` a
+  destination or source that is not a language, in which case the main tag is
+  the language of the text itself (`und-t-d0-publish` for Any-Publishing).
+  Script codes are lowercase in the extension. CLDR registers the field values
+  (`common/bcp47/transform.xml` for `m0`, `transform-destination.xml` for `d0`
+  and `s0`; not in every checkout), some with aliases.
+
+  - The four Ethiopic `m0` names spell a registered value by its registered
+    alias, where the transform files declare the registered name: `tekieali`
+    (alias `tekie-alibekit`), `betamets` (alias `beta-metsehaf`), `iesjes`
+    (alias `ies-jes`). They are valid but not canonical. ICU does not map the
+    aliases to the names. The subtags `geminate` and `1964` are not registered
+    at all, in the test file names or in the transforms' declared IDs (nor in
+    `am-Ethi-t-am-ethi-m0-geminate`).
+  - `d0-morse-t-am-Ethi` is not well formed: a tag begins with a language
+    subtag, and the `d0` field belongs after `-t-`; the halves seem swapped by
+    analogy with "result-t-source". It also has `Ethi` in title case within
+    the extension. `morse` is registered for `d0` and `s0`. The transform
+    file's IDs are right: `am-Ethi-t-d0-morse` (Amharic text to Morse, forward)
+    and `am-Ethi-t-s0-morse` (Amharic text from Morse, backward).
+
+  ICU does not find `ka-Latn-t-ka-m0-bgn-2009` and `my-fonipa-t-my` either,
+  although their transform files declare them as aliases and both are well
+  formed (`bgn` is a registered `m0` value, `2009` is not; `fonipa` is a
+  registered variant of the main tag): ICU apparently does not register every
+  BCP 47 alias of a transform file (not checked in ICU's source).
+
+  **tconv** (2026-11-21) finds a BCP 47 transform ID not found as it is with
+  its field values canonical, the registered aliases replaced by their names
+  (`ldml::TransformRegistry::lookup`), and reads a name with a `d0` or `s0`
+  field before `-t-` as the tag with the field after it. So all eight test
+  files are found by their names.
+
+- **`ka-Latn-t-ka-m0-bgn-2009.txt` expects U+02BC where the rules write
+  U+2019.** 215 of its 682 cases differ from the output of
+  `Georgian-Latin-BGN.xml`, all by one character: the test data have the
+  modifier letter apostrophe `ʼ` (U+02BC) for the ejective consonants, and the
+  rules write the right single quotation mark `’` (U+2019; the file has no
+  U+02BC). For example `ყოველ`: expected `qʼovel`, `uconv`, ICU through tconv
+  and tconv all give `q’ovel`. The test data or the rules need changing.
+
+- **`my-fonipa-t-my.txt` has two expected outputs with a trailing space.**
+  `နန်းယွန်းမြို့` expects `náɴ.jʊ́ɴ.mjo̰ ` and `မင်းဘူးမြို့` expects
+  `mɪ́ɴ.bú.mjo̰ `; `my-my_FONIPA.xml` gives `náɴ.jʊ́ɴ.mjo̰` and `mɪ́ɴ.bú.mjo̰`
+  (ICU through tconv and tconv agree; `uconv` too, apart from the issue above).
+  The space is presumably an artifact of the test file.

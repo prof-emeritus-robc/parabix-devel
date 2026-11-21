@@ -10,6 +10,12 @@ Modes:
     (default)         Compare Parabix vs HuggingFace side by side
     --hf-only         Run HuggingFace normalizers only
     --parabix-only    Run Parabix normalizers only
+    --sweep           Codepoint sweep instead of --input: every assigned codepoint
+                      of Python's unicodedata (not Cn, not Cs), each in five
+                      contexts (alone, twice, after 'a', before U+0301, between
+                      two 'a's).  Lists each differing codepoint with its Unicode
+                      age, and for nfc/nfd/nfkc/nfkd says which side equals
+                      Python's unicodedata.normalize.
 
 Usage:
     python compare_normalizers.py                           # compare all modes
@@ -17,6 +23,8 @@ Usage:
     python compare_normalizers.py --parabix-only            # Parabix only
     python compare_normalizers.py nfd nfc nfkd nfkc            # specific modes
     python compare_normalizers.py --input /path/to/file.txt # custom input file
+    python compare_normalizers.py --sweep                   # codepoint sweep, 10 modes
+    python compare_normalizers.py --sweep nfc nfkc          # sweep some modes
 """
 
 import sys
@@ -24,6 +32,8 @@ import subprocess
 import tempfile
 import os
 import argparse
+import re
+import unicodedata
 
 from tokenizers.normalizers import NFD, NFC, NFKD, NFKC, StripAccents, Strip, Sequence, ByteLevel, Lowercase, Nmt, BertNormalizer
 
@@ -38,6 +48,11 @@ DEFAULT_INPUT     = os.path.join(REPO_ROOT, "build19/test.txt")
 DEFAULT_TOKENIZER = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 OUTPUT_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "compare_normalizers_output.txt")
+SWEEP_OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "compare_normalizers_sweep_output.txt")
+# Unicode age of each codepoint: the ranges in the comments of the generated
+# Parabix UCD table (the same ranges as the Unicode file DerivedAge.txt).
+DERIVED_AGE       = os.path.join(REPO_ROOT, "lib/ucd/data/DerivedAge.cpp")
 
 SEP = "=" * 65
 
@@ -219,6 +234,101 @@ def write_summary(out, results: dict[str, str]) -> None:
         out.write(f"  [{mark}]  {name}\n")
 
 # ---------------------------------------------------------------------------
+# Codepoint sweep
+# ---------------------------------------------------------------------------
+
+# Written after every context.  Digits are kept unchanged by every mode and
+# nothing composes with them, so both outputs can be split here.
+SWEEP_SEP = "0123456789"
+# The neighbours normalization depends on: alone; twice (a mark that composes
+# with itself); after a base letter (a mark composing with it); before a
+# combining acute (the codepoint as a base); between letters (word-internal
+# rules such as final sigma).
+SWEEP_CONTEXTS = {"alone": "{}", "twice": "{0}{0}", "after_a": "a{}",
+                  "before_acute": "{}\u0301", "between_a": "a{}a"}
+# Single modes only; strip* change only the ends of the whole text.
+SWEEP_MODES = ["nfc", "nfd", "nfkc", "nfkd", "stripaccents", "bytelevel",
+               "lowercase", "nmt", "bertchinesechars", "bertcleantext"]
+UNICODEDATA_FORMS = {"nfc": "NFC", "nfd": "NFD", "nfkc": "NFKC", "nfkd": "NFKD"}
+
+
+def unicode_ages() -> dict[int, str]:
+    with open(DERIVED_AGE, encoding="utf-8") as f:
+        src = f.read()
+    ages = {}
+    for name, body in re.findall(r"Code Point Ranges for (V\w+)(.*?)\*/", src, re.S):
+        age = name[1:].replace("_", ".")
+        for lo, hi in re.findall(r"\[([0-9a-f]+), ([0-9a-f]+)\]", body):
+            for cp in range(int(lo, 16), int(hi, 16) + 1):
+                ages[cp] = age
+    return ages
+
+
+def run_sweep(requested: list[str]) -> None:
+    ages = unicode_ages()
+    cps = [cp for cp in range(0x110000)
+           if unicodedata.category(chr(cp)) not in ("Cn", "Cs")]
+    missing = [cp for cp in cps if cp not in ages]
+    if missing:
+        sys.exit(f"Error: no Unicode age in {DERIVED_AGE} for U+{missing[0]:04X} "
+                 f"and {len(missing) - 1} more")
+    n = len(SWEEP_CONTEXTS)
+    text = "".join(c.format(chr(cp)) + SWEEP_SEP
+                   for cp in cps for c in SWEEP_CONTEXTS.values())
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        f.write(text.encode("utf-8"))
+        tmp = f.name
+    try:
+        with open(SWEEP_OUTPUT_FILE, "w", encoding="utf-8") as f:
+            out = Tee(f)
+            out.write(f"Codepoint sweep: {len(cps):,} assigned codepoints of Unicode "
+                      f"{unicodedata.unidata_version} (Python unicodedata), "
+                      f"contexts {', '.join(SWEEP_CONTEXTS)}\n")
+            out.write(f"Tokenizer: {DEFAULT_TOKENIZER}\n\n")
+            for mode in requested:
+                # Bytes, not text: universal newlines would turn \r into \n.
+                r = subprocess.run([DEFAULT_TOKENIZER, f"--normalize={mode}", tmp],
+                                   capture_output=True)
+                if r.returncode != 0:
+                    out.write(f"{mode:18} CRASH: {ParabixCrash(r.returncode, r.stderr.decode(errors='replace'))}\n")
+                    continue
+                pbx = r.stdout.decode("utf-8").split(SWEEP_SEP)
+                hf = run_hf(MODES[mode], text).split(SWEEP_SEP)
+                if not len(pbx) == len(hf) == n * len(cps) + 1:
+                    out.write(f"{mode:18} CANNOT ALIGN: {len(pbx)} Parabix pieces, "
+                              f"{len(hf)} HF pieces, {n * len(cps) + 1} expected\n")
+                    continue
+                form = UNICODEDATA_FORMS.get(mode)
+                rows, both, pbx_py, hf_py = [], 0, 0, 0
+                for i, cp in enumerate(cps):
+                    ctx = []
+                    for j, name in enumerate(SWEEP_CONTEXTS):
+                        k = n * i + j
+                        if pbx[k] == hf[k]:
+                            continue
+                        ctx.append(name)
+                        if form:
+                            py = unicodedata.normalize(form, SWEEP_CONTEXTS[name].format(chr(cp)))
+                            both += 1
+                            pbx_py += pbx[k] == py
+                            hf_py += hf[k] == py
+                    if ctx:
+                        rows.append(f"  U+{cp:04X}\t{ages[cp]}\t"
+                                    f"{unicodedata.name(chr(cp), '')}\t{','.join(ctx)}\n")
+                span = sorted({r.split("\t")[1] for r in rows},
+                              key=lambda v: tuple(map(int, v.split("."))))
+                line = f"{mode:18} {len(rows):5} differing codepoints"
+                if rows:
+                    line += f"  (Unicode ages {', '.join(span)})"
+                if form and both:
+                    line += (f"; of {both} differing contexts, Parabix = unicodedata "
+                             f"in {pbx_py}, HF in {hf_py}")
+                out.write(line + "\n")
+                f.write("".join(rows))
+    finally:
+        os.unlink(tmp)
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -238,11 +348,24 @@ def main() -> None:
                              f"Available: {all_modes}")
     parser.add_argument("--tokenizer",    default=DEFAULT_TOKENIZER,
                         help=f"Parabix tokenizer binary (default: {DEFAULT_TOKENIZER})")
+    parser.add_argument("--sweep",        action="store_true",
+                        help="Codepoint sweep instead of --input (default modes: "
+                             f"{SWEEP_MODES}); output in {SWEEP_OUTPUT_FILE}")
     args = parser.parse_args()
     DEFAULT_TOKENIZER = args.tokenizer
+    if args.sweep and (args.hf_only or args.parabix_only):
+        parser.error("--sweep compares both sides; drop --hf-only/--parabix-only")
     if not args.hf_only and not os.path.isfile(DEFAULT_TOKENIZER):
         print(f"Error: tokenizer binary not found: {DEFAULT_TOKENIZER}")
         sys.exit(1)
+
+    if args.sweep:
+        unknown = [m for m in args.modes if m not in all_modes]
+        if unknown:
+            parser.error(f"unknown mode(s): {unknown}")
+        run_sweep(args.modes or SWEEP_MODES)
+        print(f"\nOutput written to: {SWEEP_OUTPUT_FILE}")
+        return
 
     with open(args.input, "r", encoding="utf-8") as f:
         text = f.read()

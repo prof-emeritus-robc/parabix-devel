@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE supplementalData SYSTEM "../../common/dtd/ldmlSupplemental.dtd">
+<!--
+Copyright © 1991-2013 Unicode, Inc.
+CLDR data files are interpreted according to the LDML specification (http://unicode.org/reports/tr35/)
+For terms of use, see http://www.unicode.org/copyright.html
+-->
+<supplementalData>
+	<version number="$Revision$"/>
+	<transforms>
+		<transform source="Hebr" target="Latn" direction="both" alias="Hebrew-Latin und-Latn-t-und-hebr" backwardAlias="Latin-Hebrew und-Hebr-t-und-latn">
+			<tRule><![CDATA[
+# Transliteration table for Hebrew
+# Based on the UNGEGN table at:
+#   http://www.eki.ee/wgrs/rom1_he.pdf
+#
+# Exceptions:
+# - Accents are added to disambiguate letters
+# - Combinations of dagesh, shin/sin dot that produce different
+#   letters are not yet encoded.
+#
+# To test, open:
+#   http://www.ibm.com/software/globalization/icu/demo/transform
+# Click Edit, paste in this file, Save As hebrew-latin/XXX
+# (where XXX is a username)
+# Now go back to the main window, and try it out.
+# Use hebrew-latin/XXX for Output 1, and (Inverse) for Output 2
+# Paste in hebrew text in Input, and hit Transliterate.
+#
+# For more information, see:
+#   https://unicode-org.github.io/icu/userguide/transforms/general/
+:: [[־׳״][:Hebrew:] [:^ccc=0:] [ְ-ֹֻ-ּׁ-ׂℵ-ℸֿ̄] - [ֽ]] ;
+:: nfkd (nfc) ;
+
+׳ ↔ '′';
+״ ↔ '″';
+־ ↔ '-';
+
+$letterAfter = [:M:]* [:L:] ;
+# move longer items here to avoid masking
+ח ↔ ẖ ;
+צ ↔ ẕ } $letterAfter;
+ץ ↔ ẕ ;
+ש ↔ ş ;
+ת ↔ ţ ;
+א ↔ ʼ ;
+ב ↔ b ;
+ג ↔ g ;
+ד ↔ d ;
+ה ↔ h ;
+ו ↔ w ;
+ז ↔ z ;
+ט ↔ t ;
+י ↔ y ;
+כ ↔ k } $letterAfter;
+ך ↔ k ;
+ל ↔ l ;
+מ ↔ m } $letterAfter;
+ם ↔ m ;
+נ ↔ n  } $letterAfter;
+ן ↔ n ;
+ס ↔ s ;
+ע ↔ ʻ ;
+פ ↔ p } $letterAfter;
+ף ↔ p ;
+ק ↔ q ;
+ר ↔ r ;
+װ → |  וו; # HEBREW LIGATURE YIDDISH DOUBLE VAV
+ױ → | וי; # HEBREW LIGATURE YIDDISH VAV YOD
+ײ → | יי ; # HEBREW LIGATURE YIDDISH DOUBLE YOD
+ּ ↔ ̇ ; # dagesh just goes to overdot for now
+ׁ ↔ ̌ ; # shin dot -→ sh
+ׂ ↔ ̂ ; # sin dot -→ s
+# points
+$above = [^[:ccc=0:][:ccc=230:]]*;
+‎ֲ‎ → à ;
+‎ֲ‎ $1← a ($above)  ̀;
+‎ָ‎ → á ;
+‎ָ‎  $1 ← a ($above)  ́;
+‎ֱ‎ → è ;
+‎ֱ‎  $1 ← e ($above)  ̀;
+‎ֵ‎ → é ;
+‎ֵ‎  $1 ← e ($above)   ́;
+‎ְ‎ → e ̆ ;
+‎ְ‎  $1 ← e ($above)   ̆;
+‎ֹ‎ → ò ;
+‎ֹ‎  $1 ← o ($above)   ̀;
+ִ ↔ i ;
+ֻ ↔ u ;
+ַ ↔ a ;
+ֶ ↔ e ;
+ֳ ↔ o ;
+ֿ ↔   ̄ ;
+# fallbacks
+ק ← c ;
+פ ← f } $letterAfter;
+ף ← f ;
+ז ← j ;
+ו ← v ;
+כס ← x ;
+:: (lower);
+:: nfc (nfd) ;
+:: ([[-′″][:Latin:] [:^ccc=0:] [ʻ-ʼ̀-̧̱̂̇̌̀-́    ̄ ]]);
+			]]></tRule>
+		</transform>
+	</transforms>
+</supplementalData>

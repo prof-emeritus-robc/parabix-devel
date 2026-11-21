@@ -10,7 +10,11 @@
 #  replacements of one to four bytes and deletions, and before contexts matched
 #  against the converted text (correction kernels, the selectors' strings as the
 #  converted text): of string rules, of single-character rules (a group with no
-#  string rules), with a repetition, with --lines.  The rule sets are applied
+#  string rules), with a repetition; string rules selected sequentially (texts
+#  that overlap both ways), string rules with runs (the run deleted), and
+#  rules with captures (selected with string rules; text replaced after a
+#  capture, inserted before and after one, the captured characters kept), with
+#  --lines.  The rule sets are applied
 #  in turn as the groups of one transform (:: Null ; between them); with
 #  --extended-testing also each on its own, and also as a text.
 #
@@ -27,9 +31,14 @@ RULES = {
     "converted": "ab → ξ ;\nξ { c → ж ;\né → ξ ;\nq → 中 ;\n",
     "chain": "ab → x ;\nx { b → é ;\né { b → y ;\n",
     "singles": "[xж] [:L:]* { b → ξ ;\na → ж ;\nξ { ξ → 😀 ;\n",
+    "sequential": "ab → ξ ;\nbξ → 中 ;\nξa → d ;\nξ { c → ж ;\n",
+    "runs": "aé+ → ж ;\nb ξ+ → 中 ;\nc → 😀 ;\n",
+    "captures": "\\. a → ʔa ;\n([aé] ː?) ̯ } [aéξ] → $1 w ;\n(b+) y → ξ $1 中 ;\nx (d) → $1 😀 ;\n",
 }
-ALPHABET = "abcdéqxξж中😀 "
-RULE_SETS = {"all": "\n:: Null ;\n".join(RULES.values())}
+ALPHABET = "abcdéqxyξж中😀 .̯ː"
+#  (By default, some of the rule sets chained, which keeps the test within its time.)
+DEFAULT = ("strings", "sequential", "captures")
+RULE_SETS = {"all": "\n:: Null ;\n".join(RULES[name] for name in DEFAULT)}
 
 
 def main():

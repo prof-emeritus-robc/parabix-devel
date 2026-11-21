@@ -3838,8 +3838,18 @@ static void translateCaptureContexts(ldml::TransformPlan & plan) {
     }
 }
 
+static std::string captureSpanProblem(const ldml::MultipleCaptureMultipleReplacementSet & set, const cc::Alphabet * encoding);
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
     if (step.captureReplacements.empty()) return;
+    //  The spans of the matches of the rules, matched by the engine (in Unicode mode).
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        const std::string why = captureSpanProblem(set, &cc::Unicode);
+        if (why.empty()) continue;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            problems.push_back(ldml::printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but the engine "
+                               "cannot match the spans of its matches: " + why + ")");
+        }
+    }
     //  The captures of the rules whose regions are moved must be found by a
     //  possessive walk (see CaptureWalk).
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
@@ -4315,6 +4325,9 @@ struct FusedRulesConfig {
     //  are those of the selector values).
     bool absolute = false;
     std::vector<std::u32string> selectorStrings;
+    //  With absolute results, the selector of the empty string, written where
+    //  the run following a string rule's text is deleted (see FusedStringRule::run).
+    UCD::codepoint_t deletionSelector = 0;
 };
 
 //  The text of a replacement of a fused kernel: with absolute results, the
@@ -5433,7 +5446,7 @@ private:
         if (c.coverage) s += "V";
         if (c.region) s += "Rg";
         if (c.absolute) {
-            s += "Ab";
+            s += "Ab" + std::to_string(c.deletionSelector);
             for (const std::u32string & w : c.selectorStrings) {
                 s += "s";
                 for (char32_t ch : w) s += std::to_string(ch) + ",";
@@ -5809,7 +5822,7 @@ void FusedRules::generatePabloMethod() {
             if (!rule.run.empty()) {
                 //  The run following the text (within the mask) is deleted.
                 PabloAST * const tail = runTail(rule, last);
-                changeChar(tail, DeletionMark, nullptr);
+                changeChar(tail, mConfig.absolute ? mConfig.deletionSelector : DeletionMark, nullptr);
                 if (mConfig.coverage) res.spans = pb.createOr(res.spans, tail);
             }
             if (mConfig.coverage) res.firsts = pb.createOr(res.firsts, first);
@@ -6009,9 +6022,13 @@ void FusedRules::generatePabloMethod() {
             PabloAST * changed0 = nullptr;
             std::map<unsigned, PabloAST *> insert;
             std::function<PabloAST * (unsigned, const UCD::UnicodeSet &)> slotClass;
+            //  (Absolute: a slot after the first of a string that keeps the
+            //  character there, as the character itself, for a set.)
+            std::function<PabloAST * (unsigned, const UCD::UnicodeSet &)> keptClass;
         };
         auto convertedSlots = [&](const Results & res) {
             ConvertedSlots cs;
+            cs.keptClass = [&pb](unsigned, const UCD::UnicodeSet &) -> PabloAST * {return pb.createZeroes();};
             cs.anyInsert = zeroes;
             cs.changed0 = zeroes;
             for (unsigned b = 0; b < 21; b++) cs.changed0 = pb.createOr(cs.changed0, res.changes[0][b]);
@@ -6026,18 +6043,30 @@ void FusedRules::generatePabloMethod() {
                     if (set.empty()) return pb.createZeroes();
                     return pb.createInFile(compiler->compileCC(re::makeCC(set, &cc::Unicode), pb));
                 };
+                //  (A string that keeps the character: slot 0 is the character itself,
+                //  as where unchanged.)
+                cs.changed0 = pb.createAnd(cs.changed0, pb.createNot(selectors([](const std::u32string & w) {
+                    return !w.empty() && w[0] == static_cast<char32_t>(ldml::StringRuleKept);
+                })));
                 for (const std::u32string & w : strings) cs.maxInsert = std::max<unsigned>(cs.maxInsert, w.empty() ? 0 : w.size() - 1);
                 for (unsigned k = 1; k <= cs.maxInsert; k++) {
                     PabloAST * const v = selectors([k](const std::u32string & w) {return w.size() == k + 1;});
                     cs.insert[k] = v;
                     cs.anyInsert = pb.createOr(cs.anyInsert, v);
                 }
-                //  (The deletion mark at slot 0: the empty strings.)
+                //  (The deletion mark at slot 0: the empty strings.  The character
+                //  kept after a prefix: the character itself.)
                 cs.slotClass = [selectors](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
                     return selectors([i, &set](const std::u32string & w) {
                         if (i < w.size()) return set.contains(static_cast<UCD::codepoint_t>(w[i]));
                         return i == 0 && w.empty() && set.contains(DeletionMark);
                     });
+                };
+                cs.keptClass = [selectors, &pb, &classAt](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                    PabloAST * const kept = selectors([i](const std::u32string & w) {
+                        return i > 0 && i < w.size() && w[i] == static_cast<char32_t>(ldml::StringRuleKept);
+                    });
+                    return pb.createAnd(kept, classAt(0, set));
                 };
                 return cs;
             }
@@ -6129,7 +6158,7 @@ void FusedRules::generatePabloMethod() {
                         return markedSlot(pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, item.chars)),
                                                       pb.createAnd(changed0, slotClass(0, inReplaced))), 0, item.chars);
                     }
-                    return markedSlot(slotClass(i, inReplaced), i, item.chars);
+                    return markedSlot(pb.createOr(slotClass(i, inReplaced), slots.keptClass(i, item.chars)), i, item.chars);
                 };
                 auto previous = [&](PabloAST * v) {
                     PabloAST * p = stepBack(v);
@@ -6161,7 +6190,7 @@ void FusedRules::generatePabloMethod() {
                     return markedSlot(pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)),
                                                   pb.createAnd(changed0, slotClass(0, inReplaced))), 0, set);
                 }
-                return markedSlot(slotClass(i, inReplaced), i, set);
+                return markedSlot(pb.createOr(slotClass(i, inReplaced), slots.keptClass(i, set)), i, set);
             };
             //  For a possessive repetition of S at depth j, with T beyond it: whether,
             //  going back from the j-th last character of the converted text up to
@@ -6512,7 +6541,7 @@ void FusedRules::generatePabloMethod() {
                 if (i == 0) {
                     m = pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)), pb.createAnd(changed0, slotClass(0, inReplaced)));
                 } else {
-                    m = slotClass(i, inReplaced);
+                    m = pb.createOr(slotClass(i, inReplaced), slots.keptClass(i, set));
                 }
                 if (marked != zeroes) {
                     m = pb.createAnd(m, unmarked);
@@ -9024,22 +9053,30 @@ private:
     void classKernel(const std::vector<re::CC *> & ccs, StreamSet * U21, StreamSet * out);
     //  The engine's matches of a pattern on the bytes (see selectorGroup), at
     //  the characters' positions: the positions of their last characters.
-    StreamSet * byteMatches(re::RE * pattern);
+    StreamSet * byteMatches(re::RE * pattern, StreamSet ** spans = nullptr);
+    //  The starts of the matches of a pattern by the engine on the bytes, at the
+    //  characters' positions.
+    void byteStarts(re::RE * pattern, StreamSet * starts);
     //  The selectors of the hybrid (see selectorGroup): the id of a string (from 1).
     char32_t selectorFor(const std::u32string & str) {
         auto f = mSelectorIds.emplace(str, static_cast<unsigned>(mSelectorStrings.size() + 1));
         if (f.second) mSelectorStrings.push_back(str);
         return static_cast<char32_t>(f.first->second);
     }
-    std::u32string selectorReplacement(const ldml::StringRule & rule);
+    std::u32string selectorReplacement(size_t n, const std::u32string & replacement);
     std::vector<ldml::CharMapping> selectorMappings(const std::vector<ldml::CharMapping> & maps) {
         if (!mBytes) return maps;
         std::vector<ldml::CharMapping> result;
         for (const ldml::CharMapping & m : maps) result.push_back(ldml::CharMapping{m.chars, std::u32string(1, selectorFor(m.replacement))});
         return result;
     }
-    FusedRulesConfig absolutely(FusedRulesConfig c) const {
+    FusedRulesConfig absolutely(FusedRulesConfig c) {
         c.absolute = mBytes != nullptr;
+        if (c.absolute) {
+            for (const FusedStringRule & r : c.strings) {
+                if (!r.run.empty()) c.deletionSelector = selectorFor(U"");
+            }
+        }
         //  (A correction kernel reads the strings of the selectors.)
         if (c.absolute && c.rounds > 0) c.selectorStrings = mSelectorStrings;
         return c;
@@ -9838,6 +9875,44 @@ static re::RE * startsPattern(re::RE * engineBefore, re::RE * engineAfter, const
     return withContextMarks(re::makeSeq(items.begin(), items.end()));
 }
 
+static RE_ModeOptions spanOptions() {
+    RE_ModeOptions opts = engineOptions();
+    opts.goal = re::RE_Goal::MatchSpans;
+    return opts;
+}
+
+//  The items of the pattern of the matches of a set of
+//  MultipleCaptureMultipleReplacement rules, as RulePipelineBuilder::
+//  conversionGroup matches them: T0 (the union of the sets of its rules at each
+//  position), and each capture (matched possessively, as ICU matches it, with
+//  its sets resolved) followed by its text.
+static std::vector<re::RE *> captureItems(const ldml::MultipleCaptureMultipleReplacementSet & set) {
+    std::vector<re::RE *> items;
+    const size_t n0 = set.rules.front().first.size();
+    for (size_t j = 0; j < n0; j++) {
+        UCD::UnicodeSet chars;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) chars = chars + r.first[j];
+        items.push_back(re::makeCC(chars, &cc::Unicode));
+    }
+    for (size_t i = 0; i < set.captures.size(); i++) {
+        items.push_back(ldml::possessiveCapture(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark)));
+        for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
+    }
+    return items;
+}
+
+//  Why the regular expression engine cannot give the exact spans of the
+//  matches of a set of MultipleCaptureMultipleReplacement rules (see
+//  RE_ModeOptions::partialSpans), on a text of an encoding (cc::Unicode in
+//  Unicode mode, cc::UTF8 for the hybrid of UTF-8 mode), or "".  (The spans are
+//  matched unless the matches have one character or their starts are walked.)
+static std::string captureSpanProblem(const ldml::MultipleCaptureMultipleReplacementSet & set, const cc::Alphabet * encoding) {
+    if (set.singleCharacter || set.walkStarts) return "";
+    const PreparedRE prepared = prepareRE(contextPattern(set.engineBefore, set.engineAfter, captureItems(set)), spanOptions());
+    const std::vector<PreconditionFailure> failures = checkPreconditions(prepared, encoding);
+    return failures.empty() ? std::string() : failures.front().reason;
+}
+
 static RE_ModeOptions startsOptions() {
     RE_ModeOptions opts = engineOptions();
     opts.goal = re::RE_Goal::MatchStarts;
@@ -9918,15 +9993,13 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
         return f->second.first;
     }
     if (mBytes) {
-        //  (The hybrid, see selectorGroup: no spans.)
-        if (spans) llvm::report_fatal_error("tconv: a hybrid group with the spans of matches");
-        StreamSet * const matches = byteMatches(pattern);
-        mEngineMatches.emplace(key, std::make_pair(matches, nullptr));
+        StreamSet * const matches = byteMatches(pattern, spans);
+        mEngineMatches.emplace(key, std::make_pair(matches, spans ? *spans : nullptr));
         return matches;
     }
     //  The engine marks a match at an offset after its last character (e.g. 1
     //  for a pattern ending with a zero-width lookahead): shift the marks back.
-    const PreparedRE prepared = prepareRE(pattern, engineOptions());
+    const PreparedRE prepared = prepareRE(pattern, spans ? spanOptions() : engineOptions());
     StreamSet * matches = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, engineContext(U21, pattern));
     if (spans) {
@@ -9959,9 +10032,13 @@ StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * eng
     mEngineMatches.emplace(key, std::make_pair(starts, nullptr));
     if (mBytes) {
         //  (The hybrid, see selectorGroup: the ends of the matches of a text of
-        //  single characters, moved back to their first characters.)
-        for (const re::RE * item : text) {
-            if (!llvm::isa<re::CC>(item)) llvm::report_fatal_error("tconv: a hybrid group with a text of other than characters");
+        //  single characters, moved back to their first characters; otherwise,
+        //  the starts by the engine on the bytes.)
+        bool characters = true;
+        for (const re::RE * item : text) characters &= llvm::isa<re::CC>(item);
+        if (!characters) {
+            byteStarts(startsPattern(engineBefore, engineAfter, text, false), starts);
+            return starts;
         }
         StreamSet * const ends = byteMatches(contextPattern(engineBefore, engineAfter, text));
         if (text.size() > 1) {
@@ -10137,45 +10214,118 @@ void RulePipelineBuilder::classKernel(const std::vector<re::CC *> & ccs, StreamS
         mP.CreateKernelCall<CharClassesKernel>(ccs, U21, out);
         return;
     }
-    //  (On the bytes, each character marked at its last byte, kept by the index.)
-    StreamSet * const atBytes = mP.CreateStreamSet(ccs.size());
-    mP.CreateKernelCall<CharClassesKernel>(ccs, mBytes->basis, atBytes, pablo::BitMovementMode::Advance);
-    FilterByMask(mP, mBytes->index, atBytes, out);
+    //  (On the bytes, each character marked at its last byte, kept by the index.
+    //  Many classes are compressed in chunks of a fixed number of streams, the
+    //  last padded with empty classes: one compression kernel, compiled once,
+    //  instead of a large one for each number of classes.)
+    constexpr size_t Chunk = 32;
+    auto compressed = [&](const std::vector<re::CC *> & part, StreamSet * into) {
+        StreamSet * const atBytes = mP.CreateStreamSet(part.size());
+        mP.CreateKernelCall<CharClassesKernel>(part, mBytes->basis, atBytes, pablo::BitMovementMode::Advance);
+        FilterByMask(mP, mBytes->index, atBytes, into);
+    };
+    if (ccs.size() <= Chunk) {
+        compressed(ccs, out);
+        return;
+    }
+    std::vector<StreamSet *> chunks;
+    std::vector<std::pair<unsigned, unsigned>> order;
+    for (size_t i = 0; i < ccs.size(); i += Chunk) {
+        std::vector<re::CC *> part(ccs.begin() + i, ccs.begin() + std::min(ccs.size(), i + Chunk));
+        for (size_t k = 0; k < part.size(); k++) order.emplace_back(static_cast<unsigned>(chunks.size()), static_cast<unsigned>(k));
+        while (part.size() < Chunk) part.push_back(re::makeCC(&cc::Unicode));
+        StreamSet * const chunk = mP.CreateStreamSet(Chunk);
+        compressed(part, chunk);
+        chunks.push_back(chunk);
+    }
+    mP.CreateKernelCall<MergeStreamSets>(chunks, order, out);
 }
 
-StreamSet * RulePipelineBuilder::byteMatches(re::RE * pattern) {
+StreamSet * RulePipelineBuilder::byteMatches(re::RE * pattern, StreamSet ** spans) {
     for (const std::string & name : {FilterRunEndName, DeletedRunEndName, NotDeletedRunEndName, DeletedRunAfterName}) {
         if (usesExternal(pattern, name)) llvm::report_fatal_error(llvm::StringRef("tconv: a hybrid group with the external ") + name);
     }
-    const PreparedRE prepared = prepareRE(pattern, engineOptions());
+    const PreparedRE prepared = prepareRE(pattern, spans ? spanOptions() : engineOptions());
     StreamSet * matches = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, RE_context{&cc::UTF8, mBytes->basis, mBytes->regions.first, mBytes->regions.second});
-    engine.matchSearchPipeline(prepared, matches);
+    StreamSet * spanned = nullptr;
+    if (spans) {
+        spanned = mP.CreateStreamSet(1);
+        engine.matchSpanPipeline(prepared, matches, spanned);
+    } else {
+        engine.matchSearchPipeline(prepared, matches);
+    }
     //  (The marks as the engine places them on the bytes, see utf8Applies.)
+    //  (In the UTF-8 indexed mode, the offset is of characters, the marks at
+    //  their last bytes: shifted back once compressed to the characters.)
     const RE_Plan plan = planRE(prepared, &cc::UTF8);
-    if (plan.matchOffset > 0) {
+    const bool characterOffset = plan.modeName() == "UTF-8 indexed";
+    if (plan.matchOffset > 0 && !characterOffset) {
         StreamSet * const shifted = mP.CreateStreamSet(1);
         mP.CreateKernelCall<ShiftBack>(matches, shifted, plan.matchOffset);
         matches = shifted;
     }
+    //  (The spans, of all the bytes of their characters or, with Unicode
+    //  indexing, of the characters, likewise at their last bytes.)
     if (engine.usesUnicodeIndexing()) {
-        StreamSet * const atBytes = mP.CreateStreamSet(1);
-        SpreadByMask(mP, engine.getU8Index(), matches, atBytes);
-        matches = atBytes;
+        for (StreamSet ** s : {&matches, &spanned}) {
+            if (*s == nullptr) continue;
+            StreamSet * const atBytes = mP.CreateStreamSet(1);
+            SpreadByMask(mP, engine.getU8Index(), *s, atBytes);
+            *s = atBytes;
+        }
     }
-    StreamSet * const atChars = mP.CreateStreamSet(1);
+    StreamSet * atChars = mP.CreateStreamSet(1);
     FilterByMask(mP, mBytes->index, matches, atChars);
+    if (plan.matchOffset > 0 && characterOffset) {
+        StreamSet * const shifted = mP.CreateStreamSet(1);
+        mP.CreateKernelCall<ShiftBack>(atChars, shifted, plan.matchOffset);
+        atChars = shifted;
+    }
+    if (spans) {
+        *spans = mP.CreateStreamSet(1);
+        FilterByMask(mP, mBytes->index, spanned, *spans);
+    }
     return atChars;
 }
 
-//  A string rule's replacement as selectors (see selectorGroup): one for each
-//  position of its text, the part of the replacement that position becomes (as
-//  FusedRules divides it: the last takes the rest of a longer one, the
-//  positions beyond a shorter one are deleted), or StringRuleKept for a
-//  character kept.
-std::u32string RulePipelineBuilder::selectorReplacement(const ldml::StringRule & rule) {
-    const std::u32string & r = rule.replacement;
-    const size_t n = rule.text.size(), m = r.size();
+//  The starts of the matches of a pattern by the engine on the bytes (see
+//  selectorGroup), at the characters' positions: marked at their first bytes,
+//  or, with Unicode indexing, at the characters (their last bytes).
+void RulePipelineBuilder::byteStarts(re::RE * pattern, StreamSet * starts) {
+    for (const std::string & name : {FilterRunEndName, DeletedRunEndName, NotDeletedRunEndName, DeletedRunAfterName}) {
+        if (usesExternal(pattern, name)) llvm::report_fatal_error(llvm::StringRef("tconv: a hybrid group with the external ") + name);
+    }
+    const PreparedRE prepared = prepareRE(pattern, startsOptions());
+    const std::vector<PreconditionFailure> failures = checkPreconditions(prepared, &cc::UTF8);
+    if (!failures.empty()) {
+        llvm::report_fatal_error(llvm::StringRef("tconv: a hybrid group with starts the engine cannot find on the bytes: ")
+                                 + Printer_RE::PrintRE(pattern));
+    }
+    RE_PipelineBuilder engine(mP, RE_context{&cc::UTF8, mBytes->basis, mBytes->regions.first, mBytes->regions.second});
+    StreamSet * marks = mP.CreateStreamSet(1);
+    engine.matchStartsPipeline(prepared, marks);
+    StreamSet * by = mBytes->index;
+    if (engine.usesUnicodeIndexing()) {
+        StreamSet * const atBytes = mP.CreateStreamSet(1);
+        SpreadByMask(mP, engine.getU8Index(), marks, atBytes);
+        marks = atBytes;
+    } else {
+        by = mP.CreateStreamSet(1);
+        mP.CreateKernelCall<UTF8_InitialMask>(mBytes->basis, by);
+    }
+    FilterByMask(mP, by, marks, starts);
+}
+
+//  A replacement of a text of n characters as selectors (see selectorGroup):
+//  one for each position of the text, the part of the replacement that position
+//  becomes (as FusedRules divides it: the last takes the rest of a longer one,
+//  the positions beyond a shorter one are deleted), or StringRuleKept for a
+//  character kept (with characters inserted before or after it: the selector
+//  of a string that keeps it, see kernel::UTF8_SelectorKept).
+static_assert(kernel::UTF8_SelectorKept == static_cast<char32_t>(ldml::StringRuleKept), "the kept marks of tconv and the selectors");
+std::u32string RulePipelineBuilder::selectorReplacement(size_t n, const std::u32string & r) {
+    const size_t m = r.size();
     std::u32string out;
     for (size_t j = 0; j < n; j++) {
         const bool last = j + 1 == n;
@@ -10184,14 +10334,16 @@ std::u32string RulePipelineBuilder::selectorReplacement(const ldml::StringRule &
             continue;
         }
         std::u32string part = last ? r.substr(j) : r.substr(j, 1);
-        if (part[0] == static_cast<char32_t>(ldml::StringRuleKept)) {
-            if (part.size() > 1) llvm::report_fatal_error("tconv: a hybrid group with a kept character before inserted ones");
+        if (part.size() == 1 && part[0] == static_cast<char32_t>(ldml::StringRuleKept)) {
             out.push_back(part[0]);
             continue;
         }
         if (part[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) part.erase(0, 1);
+        //  (At most one character kept, with strings inserted before and after it.)
+        unsigned kept = 0;
         for (char32_t c : part) {
-            if (c == static_cast<char32_t>(ldml::StringRuleKept) || c == static_cast<char32_t>(ldml::StringRuleDeleted)) {
+            if (c == static_cast<char32_t>(ldml::StringRuleKept)) kept++;
+            if (c == static_cast<char32_t>(ldml::StringRuleDeleted) || kept > 1) {
                 llvm::report_fatal_error("tconv: a hybrid group with kept characters in an insertion");
             }
         }
@@ -10632,7 +10784,8 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         fr.run = step.stringRules[r].run;
         fr.runSingles = step.stringRules[r].runSingles;
         fr.runStrings = step.stringRules[r].runStrings;
-        fr.replacement = mBytes ? selectorReplacement(step.stringRules[r]) : step.stringRules[r].replacement;
+        fr.replacement = mBytes ? selectorReplacement(step.stringRules[r].text.size(), step.stringRules[r].replacement)
+                                : step.stringRules[r].replacement;
         fr.before = befores[r];
         fr.after = afters[r];
         if (fusedMatch[r]) fr.yields = stringYields[r];
@@ -10914,17 +11067,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         capturesMatched = true;
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
             const size_t n0 = set.rules.front().first.size();
-            std::vector<re::RE *> items;
-            for (size_t j = 0; j < n0; j++) {
-                UCD::UnicodeSet chars;
-                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) chars = chars + r.first[j];
-                items.push_back(re::makeCC(chars, &cc::Unicode));
-            }
-            for (size_t i = 0; i < set.captures.size(); i++) {
-                //  (A capture matched possessively, as ICU matches it, with its sets resolved.)
-                items.push_back(ldml::possessiveCapture(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark)));
-                for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
-            }
+            const std::vector<re::RE *> items = captureItems(set);
             //  Only the streams used are made (the pipeline compiler fails on kernels
             //  whose outputs are unused): the starts, if replacements are made from
             //  them, the spans are covered or selected, and the spans, for the starts.
@@ -11065,6 +11208,17 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     //  matches selected with them, with jointSelection), and the starts of their
     //  matches.
     StreamSet * captureStarts = nullptr;
+    //  (The hybrid, see selectorGroup: the replacements of the sets as selectors,
+    //  a character kept with a replacement after it as a string that keeps it.)
+    auto asSelectors = [&](FusedStringRule & fr) {
+        if (!mBytes) return;
+        std::u32string r = fr.replacement;
+        if (fr.keep >= 0) {
+            r.insert(r.begin() + fr.keep, static_cast<char32_t>(ldml::StringRuleKept));
+            fr.keep = -1;
+        }
+        fr.replacement = selectorReplacement(fr.text.size(), r);
+    };
     auto applyCaptures = [&]() {
         //  ... of the MultipleCaptureMultipleReplacement rules: for each set, the
         //  spans of its matches, found by the regular expression engine, and their
@@ -11226,6 +11380,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                     earlier = earlier + r.first.front();
                     if (fr.text.front().empty()) continue;
                     fr.replacement = r.firstReplacement;
+                    asSelectors(fr);
                     config.strings.push_back(std::move(fr));
                 }
                 applyFused(std::move(config), nullptr);
@@ -11254,6 +11409,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 fr.text = text;
                 fr.replacement = replacement;
                 fr.keep = keep;
+                asSelectors(fr);
                 config.strings.push_back(std::move(fr));
                 applyFused(std::move(config), nullptr);
             };
@@ -11339,6 +11495,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                         fr.text = ch.text;
                         fr.replacement = ch.replacement;
                         fr.keep = ch.keep;
+                        asSelectors(fr);
                         if (ch.variants.size() < set.variants.size()) {
                             StreamSet * at = nullptr;
                             for (size_t v : ch.variants) {
@@ -12578,19 +12735,25 @@ private:
 //  RulePipelineBuilder::selectorGroup): why a conversion group cannot be applied
 //  by it, or "".  Groups of string rules whose results are written at the
 //  positions of their texts (with correction kernels: before contexts matched
-//  against the converted text, as the strings of the selectors), with no
+//  against the converted text, as the strings of the selectors), and of
+//  MultipleCaptureMultipleReplacement rules whose captures stay in place, with no
 //  insertion rules, and no contexts that need the streams of tconv's marks (run
 //  ends, deleted runs) in the engine.
 static std::string hybridProblem(const ldml::TransformStep & step) {
     if (step.kind != ldml::TransformStep::Kind::Conversion) return "not a conversion group";
-    if (!step.captureReplacements.empty()) return "rules with captures";
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (set.reversed) return "captures reversed";
+        if (set.moved) return "captures moved";
+        if (const std::string why = captureSpanProblem(set, &cc::UTF8); !why.empty()) {
+            return "rules with captures whose spans the engine cannot match on the bytes (" + why + ")";
+        }
+    }
     if (!step.insertions.empty()) return "insertion rules";
     if (!step.deferred.empty() || !step.copyCaptures.empty()) return "deferred rules";
     if (!step.prefixRuns.empty()) return "prefix runs";
     if (!step.chainRevisitRules.empty()) return "chain revisits";
     if (!step.markRunEditRules.empty()) return "mark run edits";
     if (step.hasFrontLetters || step.frontLettersEnd) return "front-letter revisits";
-    if (step.sequentialSelection) return "sequential selection";
     auto externals = [&](re::RE * before, re::RE * after) {
         re::RE * const p = contextPattern(before, after, {re::makeCC(UCD::UnicodeSet(0, 0x10FFFF), &cc::Unicode)});
         for (const std::string & name : {FilterRunEndName, DeletedRunEndName, NotDeletedRunEndName, DeletedRunAfterName}) {
@@ -12599,11 +12762,10 @@ static std::string hybridProblem(const ldml::TransformStep & step) {
         return false;
     };
     for (const ldml::StringRule & r : step.stringRules) {
-        if (!r.run.empty()) return "string rules with runs";
         const size_t n = r.text.size(), m = r.replacement.size();
         for (size_t j = n ? n - 1 : 0; j < m; j++) {
             const char32_t c = r.replacement[j];
-            if (c == static_cast<char32_t>(ldml::StringRuleKept) && !(j + 1 == n && m == n)) return "a kept character with inserted ones";
+            if (c == static_cast<char32_t>(ldml::StringRuleKept) && j + 1 != n) return "a kept character among inserted ones";
             if (c == static_cast<char32_t>(ldml::StringRuleDeleted) && j >= n) return "a deleted character among inserted ones";
         }
         if (externals(r.engineBefore, r.engineAfter)) return "contexts with tconv's marks";

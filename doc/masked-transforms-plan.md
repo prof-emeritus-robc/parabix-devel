@@ -782,14 +782,64 @@ contexts see the characters outside the runs.
     selectorStrings`: the length and the classes of each slot are classes of
     the selector values), and groups of single-character rules only are taken
     too. `--plan --hybrid-groups` gives the hybrid's reason where it does not
-    apply. On the CLDR test transforms it removes 21 of the 67 Unicode
+    apply.
+
+    *Then:* sequential selection (the match-only kernels, `LeftmostMatches`
+    and the staged rounds needed nothing new), and string rules with runs (the
+    run's deletion written as the selector of the empty string,
+    `FusedRulesConfig::deletionSelector`). The selector application and the
+    tails of the UTF-8 character maps compile each output bit as a class over
+    the numbers (selectors, tails) instead of a test of each number, and the
+    hybrid compresses its classes in chunks of 32 streams: a group of 7718
+    string rules (am-Ethi-t-am-ethi-m0-geminate) had made both kernels too
+    large to compile in minutes. Its cold compile is still 100 s against
+    52 s in Unicode mode (the fused kernels' absolute writes are 1.4 times
+    larger: every bit of a selector rather than the bits that differ from a
+    known character); once, then cached.
+
+    On the CLDR test transforms the hybrid now removes 43 of the 67 Unicode
     segments of string-rule groups and all 5 of single-character rules with
-    converted before contexts; outputs equal Unicode mode's on the CLDR data
-    of eight of the transforms moved, as a text and with `--lines`
-    (`QA/tconv_hybrid_test.py` has small cases). What still keeps string-rule
-    groups out (segments): sequential selection (29), captures (14), contexts
-    with tconv's marks (5), a kept character with inserted ones (4),
-    insertion rules (1). Not yet measured against the Unicode segments.
+    converted before contexts: 34 transforms lose all such segments. Outputs
+    equal Unicode mode's on the CLDR data of 26 of them, as a text and with
+    `--lines` (`QA/tconv_hybrid_test.py` has small cases). What still keeps
+    string-rule groups out (segments): captures (14), contexts with tconv's
+    marks (5), a kept character with inserted ones (4), insertion rules (1).
+    Not yet measured against the Unicode segments.
+
+    *Slice 3, partly (2026-11-21):* the MultipleCaptureMultipleReplacement
+    rules whose captures stay in place (not reversed, not moved). Their
+    replacements are selectors like those of string rules; a captured
+    character kept with text inserted around it is the selector of a string
+    with `kernel::UTF8_SelectorKept` (tconv's `StringRuleKept`) at the place
+    of the character: its bytes are kept, the text after the mark inserted
+    after its last byte (as a tail), and the text before the mark inserted
+    before its first byte by a second spread (`InsertPosition::Before`, only
+    where such a prefix occurs; the bytes inserted have the character's
+    masks). String rules with a kept character before inserted ones are the
+    same selectors. The correction kernels read a kept slot as the character
+    itself. The engine gives the hybrid the spans of matches, and the starts
+    of patterns other than sequences of sets, on the bytes, compressed to the
+    characters. This found an engine bug: `LongestSpan` (unique-prefix spans)
+    dropped the end of a match marked after it (a lookahead) where the next
+    match's prefix began, so that the spans of adjacent matches lost the
+    first character of the second (fixed).
+
+    The engine's spans were partial where no span algorithm applied to an
+    alternative of the pattern (the shortest matches ending at each end), as
+    for a capture set of cy-fonipa-t-cy on the bytes; planning now reports
+    such patterns for the MatchSpans goal, unless `RE_ModeOptions::
+    partialSpans` accepts them (icgrep's coloring does), and the hybrid leaves
+    such capture sets to Unicode mode (none of the CLDR transforms needs
+    them in Unicode mode). In the UTF-8 indexed mode the engine's match marks
+    after a lookahead are a character, not a byte, after the match (the
+    hybrid and the UTF-8 character maps with contexts shift them back by
+    characters), and its spans are completed to whole characters.
+
+    The hybrid now removes all the Unicode segments of string-rule groups of
+    39 CLDR test transforms (from 34). What keeps the rest out (segments):
+    contexts with tconv's marks (5), capture sets whose spans the engine
+    cannot match on the bytes (3), captures reversed (3) and moved (2), the
+    rest of "bytes moved by character", and insertion rules (1).
 
 Order: steps 10 to 12 first (the per-line runs removed, in Unicode mode, which
 every component already has); then 14 and 13 (mixed modes); then 15 and 16,

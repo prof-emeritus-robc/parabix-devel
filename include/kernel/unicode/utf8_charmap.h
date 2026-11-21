@@ -54,7 +54,11 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
 //  character, and spread back to the bytes).  The replacement does not depend
 //  on the character replaced: the first byte of the string is written at the
 //  character's last byte, its other bytes deleted, and the rest of the string
-//  inserted after it.  Masks as for UTF8_CharMapPipeline.
+//  inserted after it.  A string with UTF8_SelectorKept keeps the character
+//  (its bytes unchanged), with the part of the string before the mark inserted
+//  before it, and the part after inserted after it.  Masks as for
+//  UTF8_CharMapPipeline (the bytes inserted before a character have its mask).
+constexpr char32_t UTF8_SelectorKept = 0xFDD1;     // (a noncharacter)
 StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u32string> & strings, StreamSet * Basis,
                                   StreamSet * Selectors, std::vector<StreamSet *> * Masks = nullptr);
 

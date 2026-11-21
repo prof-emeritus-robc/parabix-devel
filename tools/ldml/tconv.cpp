@@ -3337,6 +3337,18 @@ static bool groupLineBound(const ldml::TransformStep & step) {
     for (const ldml::StringRule & r : step.stringRules) {
         if (!contextsBound(r.before, r.after, r.engineBefore, r.engineAfter)) return false;
     }
+    //  (The MultipleCaptureMultipleReplacement rules: their captures and texts
+    //  inner items, which may not reach a line feed or beyond the line.)
+    auto innerSets = [](const std::vector<UCD::UnicodeSet> & text) {
+        for (const UCD::UnicodeSet & chars : text) if (chars.contains(0x0A) || chars.intersects(marks)) return false;
+        return true;
+    };
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (!contextsBound(set.before, set.after, set.engineBefore, set.engineAfter)) return false;
+        for (const re::RE * c : set.captures) if (!lineBound(c, true, false)) return false;
+        for (const auto & text : set.texts) if (!innerSets(text)) return false;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) if (!innerSets(r.first)) return false;
+    }
     return true;
 }
 
@@ -12287,9 +12299,18 @@ static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml
         engine.matchSearchPipeline(prepared, matches);
         //  (The marks as the engine places them, see RE_Plan: matchOffset
         //  positions after the last unit, of code units or, with Unicode
-        //  indexing, of characters, mapped to their last code units.)
+        //  indexing, of characters, mapped to their last code units; in the
+        //  UTF-8 indexed mode, of characters, at their last code units.)
         const RE_Plan plan = planRE(prepared, &cc::UTF8);
-        if (plan.matchOffset > 0) {
+        if (plan.matchOffset > 0 && plan.modeName() == "UTF-8 indexed") {
+            StreamSet * const index = P.CreateStreamSet(1);
+            P.CreateKernelCall<UTF8_index>(Basis, index);
+            for (unsigned k = 0; k < plan.matchOffset; k++) {
+                StreamSet * const shifted = P.CreateStreamSet(1);
+                P.CreateKernelCall<IndexedShiftBack>(index, matches, shifted);
+                matches = shifted;
+            }
+        } else if (plan.matchOffset > 0) {
             StreamSet * const shifted = P.CreateStreamSet(1);
             P.CreateKernelCall<ShiftBack>(matches, shifted, plan.matchOffset);
             matches = shifted;

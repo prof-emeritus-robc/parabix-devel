@@ -259,8 +259,9 @@ static cl::opt<bool> MixedModes("mixed-modes",
 static cl::opt<bool> HybridGroups("hybrid-groups",
     cl::desc("In UTF-8 mode, apply the conversion groups of string rules that need Unicode mode in the hybrid of "
              "doc/masked-transforms-plan.md step 16 (option C): matched one position per character on classes of the bytes, "
-             "with selectors applied to the bytes, without decoding the text"),
-    cl::init(false), cl::Hidden, cl::cat(TconvOptions));
+             "with selectors applied to the bytes, without decoding the text (default on; --hybrid-groups=0 for Unicode "
+             "segments)"),
+    cl::init(true), cl::cat(TconvOptions));
 static cl::opt<bool> CheckUTF8Masks("check-utf8-masks",
     cl::desc("In UTF-8 mode, check that every mask gives all the bytes of a character the same bit (doc/masked-transforms-plan.md "
              "step 14) after each filter and each step, and report each mask that does not (exit status 3)"),
@@ -4993,7 +4994,14 @@ static SubgroupOutcomes subgroupOutcomes(const FusedRulesConfig & c, const Fused
     o.literal = g;
     o.literal.caseMaps = false;
     o.literal.mappings = split.literal;
-    for (ldml::CharMapping & m : o.literal.mappings) m.replacement = selectedText(c, m.replacement);
+    for (ldml::CharMapping & m : o.literal.mappings) {
+        //  (The selector 0: the character mapped to itself, see selectorMappings.)
+        if (c.absolute && m.replacement == std::u32string(1, U'\0')) {
+            m.replacement = std::u32string(1, static_cast<char32_t>(m.chars.front().first));
+        } else {
+            m.replacement = selectedText(c, m.replacement);
+        }
+    }
     o.caseMap = split.caseMap;
     o.literalAll = split.literalAll;
     o.lengths = mappingLengths(o.literal);
@@ -9123,11 +9131,24 @@ private:
         if (f.second) mSelectorStrings.push_back(str);
         return static_cast<char32_t>(f.first->second);
     }
-    std::u32string selectorReplacement(size_t n, const std::u32string & replacement);
+    std::u32string selectorReplacement(size_t n, const std::u32string & replacement,
+                                       const std::vector<UCD::UnicodeSet> * text = nullptr);
     std::vector<ldml::CharMapping> selectorMappings(const std::vector<ldml::CharMapping> & maps) {
         if (!mBytes) return maps;
+        //  (A character mapped to itself has the selector 0, no change, as its
+        //  change in Unicode mode is none: a selector written there would be
+        //  combined with that of another rule written at the position; see
+        //  subgroupOutcomes.)
         std::vector<ldml::CharMapping> result;
-        for (const ldml::CharMapping & m : maps) result.push_back(ldml::CharMapping{m.chars, std::u32string(1, selectorFor(m.replacement))});
+        for (const ldml::CharMapping & m : maps) {
+            UCD::UnicodeSet chars = m.chars;
+            if (m.replacement.size() == 1 && chars.contains(static_cast<UCD::codepoint_t>(m.replacement[0]))) {
+                const UCD::UnicodeSet self(static_cast<UCD::codepoint_t>(m.replacement[0]));
+                result.push_back(ldml::CharMapping{self, std::u32string(1, U'\0')});
+                chars = chars - self;
+            }
+            if (!chars.empty()) result.push_back(ldml::CharMapping{chars, std::u32string(1, selectorFor(m.replacement))});
+        }
         return result;
     }
     FusedRulesConfig absolutely(FusedRulesConfig c) {
@@ -10389,7 +10410,7 @@ void RulePipelineBuilder::byteStarts(re::RE * pattern, StreamSet * starts) {
 //  character kept (with characters inserted before or after it: the selector
 //  of a string that keeps it, see kernel::UTF8_SelectorKept).
 static_assert(kernel::UTF8_SelectorKept == static_cast<char32_t>(ldml::StringRuleKept), "the kept marks of tconv and the selectors");
-std::u32string RulePipelineBuilder::selectorReplacement(size_t n, const std::u32string & r) {
+std::u32string RulePipelineBuilder::selectorReplacement(size_t n, const std::u32string & r, const std::vector<UCD::UnicodeSet> * text) {
     const size_t m = r.size();
     std::u32string out;
     for (size_t j = 0; j < n; j++) {
@@ -10401,6 +10422,13 @@ std::u32string RulePipelineBuilder::selectorReplacement(size_t n, const std::u32
         std::u32string part = last ? r.substr(j) : r.substr(j, 1);
         if (part.size() == 1 && part[0] == static_cast<char32_t>(ldml::StringRuleKept)) {
             out.push_back(part[0]);
+            continue;
+        }
+        //  (A character replaced by itself is kept, as its change in Unicode mode
+        //  is none: a selector written there would be combined with that of
+        //  another rule written at the position.)
+        if (text && part.size() == 1 && (*text)[j].count() == 1 && (*text)[j].contains(static_cast<UCD::codepoint_t>(part[0]))) {
+            out.push_back(static_cast<char32_t>(ldml::StringRuleKept));
             continue;
         }
         if (part[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) part.erase(0, 1);
@@ -10849,7 +10877,8 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         fr.run = step.stringRules[r].run;
         fr.runSingles = step.stringRules[r].runSingles;
         fr.runStrings = step.stringRules[r].runStrings;
-        fr.replacement = mBytes ? selectorReplacement(step.stringRules[r].text.size(), step.stringRules[r].replacement)
+        fr.replacement = mBytes ? selectorReplacement(step.stringRules[r].text.size(), step.stringRules[r].replacement,
+                                                      &step.stringRules[r].text)
                                 : step.stringRules[r].replacement;
         fr.before = befores[r];
         fr.after = afters[r];
@@ -11292,7 +11321,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             r.insert(r.begin() + fr.keep, static_cast<char32_t>(ldml::StringRuleKept));
             fr.keep = -1;
         }
-        fr.replacement = selectorReplacement(fr.text.size(), r);
+        fr.replacement = selectorReplacement(fr.text.size(), r, &fr.text);
     };
     auto applyCaptures = [&]() {
         //  ... of the MultipleCaptureMultipleReplacement rules: for each set, the

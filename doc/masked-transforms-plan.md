@@ -782,7 +782,7 @@ contexts see the characters outside the runs.
     other components. Each slice is checked against Unicode mode on the CLDR
     test data of the transforms it moves.
 
-    *Done (2026-11-20), behind `--hybrid-groups` (off by default):* slices 1
+    *Done (2026-11-20), behind `--hybrid-groups` (then off by default):* slices 1
     and 2. Slice 2: the correction kernels (staged rounds and the While loop)
     read the converted text from the selectors (`FusedRulesConfig::
     selectorStrings`: the length and the classes of each slot are classes of
@@ -846,6 +846,26 @@ contexts see the characters outside the runs.
     cannot match on the bytes (3), captures reversed (3) and moved (2), the
     rest of "bytes moved by character", and insertion rules (1).
 
+    *Multiplexed classes, and on by default (2026-11-21).* The hybrid
+    compressed one stream for each class of a fused kernel (in chunks of 32,
+    padded), which cost about as much as the Unicode segment it replaced
+    (es-fonipa-t-es: 23% of the cycles, against 29% for the segment). The
+    classes are now partitioned into their exclusive sets
+    (`cc::MultiplexedAlphabet`), only the bits of their codes are computed on
+    the bytes and compressed, and each fused kernel compiles its classes from
+    the code bits (`FusedRulesConfig::classCodes`): class compression fell to
+    0.8% of es-fonipa-t-es's cycles. `--hybrid-groups` is now on by default
+    (`--hybrid-groups=0` for the Unicode segments). Found by the tests with it
+    on: a rule that replaces a character by itself writes no change in Unicode
+    mode (an XOR of 0), but wrote a selector in the hybrid, which another
+    rule's selector at the same position combined with (by OR): the string
+    rule `[^﷯] { ့ ့* → ့ ;`, its before context matched against the text
+    itself, and a subgroup deleting `့` after `﷯` in the converted text
+    (`tconv_split_runs_test`). Such a replacement is now kept (no selector):
+    a string rule's character of a single character replaced by itself
+    (`selectorReplacement`), and a character mapped to itself (the selector
+    0, `selectorMappings`).
+
 Order: steps 10 to 12 first (the per-line runs removed, in Unicode mode, which
 every component already has); then 14 and 13 (mixed modes); then 15 and 16,
 which move work from Unicode segments to UTF-8 segments.
@@ -853,7 +873,11 @@ which move work from Unicode segments to UTF-8 segments.
 ## Outstanding issues (2026-11-21)
 
 **Step 16, UTF-8 mode for every component.**
-- The hybrid (`--hybrid-groups`) is off by default.
+- The hybrid (`--hybrid-groups`) is on by default since 2026-11-21. Its
+  fused kernels are larger than Unicode mode's for groups with many rules
+  (selectors written whole): the cold compile of the largest group
+  (am-Ethi-t-am-ethi-m0-geminate) was 100 s against 52 s before the classes
+  were multiplexed; not measured since.
 - String-rule groups the hybrid still leaves to Unicode mode (segments, CLDR
   test transforms): contexts with tconv's marks (5); capture sets whose spans
   the engine cannot give exactly on the bytes (3, cy-fonipa-t-cy); captures

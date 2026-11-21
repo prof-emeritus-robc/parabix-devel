@@ -164,10 +164,19 @@ transforms it can affect, and against ICU.
    the DivCode translation, the deferred rules' rounds) shares the kernels of the
    stack's update. Barrier normalization is a map too: the characters outside
    the mask deleted, and the normalized characters inserted between the
-   barriers, within the masks. Three stages still carry the masks themselves:
+   barriers, within the masks. Three stages still carried the masks themselves:
    the engine's search and replace (shape groups), `kernel::UTF8_CharMapPipeline`
    (whose inserted bytes inherit by `UTF8_InheritMask`), and the front-letter
-   revisits, which keep their placeholders out by an outermost mask.
+   revisits, which kept their placeholders out by an outermost mask.
+   **Done (2026-11-21):** the position maps are the library's
+   (`kernel::PositionMap`, mapped by `kernel::PositionMapper`, with an
+   inserted position inheriting from the next position too, `InheritNext`);
+   the engine's search and replace, the UTF-8 character maps and the hybrid's
+   selectors (`UTF8_SelectorPipeline`) return their maps instead of carrying
+   the masks; and the front-letter placeholders and the original positions of
+   `--region-separators` are streams tracked by `TransformMasks`
+   (`pushTracked`), kept in step as the masks are but not masks, instead of
+   outermost masks.
    Output unchanged: the tconv tests, and the CLDR test data of the transforms
    with filters (single-threaded and `-thread-num=4 -segment-size=1`),
    compared with the previous build.
@@ -894,9 +903,6 @@ which move work from Unicode segments to UTF-8 segments.
 - Bounded DivCode groups with `--lines` (65 transforms, left from step 15).
 
 **Remaining items of the earlier steps.**
-- Step 2: three stages still carry the masks themselves (the engine's search
-  and replace for shape groups, `kernel::UTF8_CharMapPipeline`, the
-  front-letter revisits).
 - Step 5: adjacent regions are not separated by the engine (region spans,
   the lookahead chain kernels and region reversal).
 - Step 7: no run ends in UTF-8 mode (only am_Ethi-d0_Morse uses them, in

@@ -1583,6 +1583,9 @@ struct TransformMask {
     //  as the placeholders of the front-letter revisits): it is in the text the
     //  region's contexts see.
     StreamSet * bounds = nullptr;
+    //  Not a mask: a stream of positions kept in step with the text as the masks
+    //  are (see TransformMasks::pushTracked).
+    bool tracked = false;
 };
 
 //  (The changes a stage makes to the positions of a text: kernel::PositionMap.)
@@ -1598,15 +1601,20 @@ struct Staged {
 //  before it), all of text scope, kept in step with the text by the position
 //  maps of the stages.  The streams mapped are cached, so that a stage that
 //  needs the mapped active mask itself (e.g. to place its replacements) and
-//  the update of the masks after it share their kernels.
+//  the update of the masks after it share their kernels.  Under the masks
+//  (first), streams tracked: kept in step and given the positions included as
+//  the masks are, but not masks (not active, restricting no insertion, no
+//  region), and taken out and put back with them (release, restore).
 class TransformMasks {
 public:
     explicit TransformMasks(PipelineBuilder & P) : mP(P), mMapper(P) {}
-    bool empty() const {return mMasks.empty();}
+    //  Whether there is no mask (streams tracked aside).
+    bool empty() const {return mMasks.empty() || mMasks.back().tracked;}
+    //  (The masks and the streams tracked.)
     size_t size() const {return mMasks.size();}
     const TransformMask & operator[](size_t i) const {return mMasks[i];}
     //  The innermost mask's positions, or nullptr without a filter.
-    StreamSet * active() const {return mMasks.empty() ? nullptr : mMasks.back().apply;}
+    StreamSet * active() const {return empty() ? nullptr : mMasks.back().apply;}
     void push(StreamSet * apply, ContextScope scope = ContextScope::Text) {
         mMasks.push_back(TransformMask{apply, MaskKind::PassThru, scope});
         if (scope == ContextScope::Region) mMasks.back().bounds = apply;
@@ -1616,15 +1624,20 @@ public:
     void insertAnywhere() {mMasks.back().insertBefore = false;}
     //  The innermost mask restricting insertions, or nullptr.
     StreamSet * insertionMask() const {
-        for (auto m = mMasks.rbegin(); m != mMasks.rend(); ++m) if (m->insertBefore) return m->apply;
+        for (auto m = mMasks.rbegin(); m != mMasks.rend(); ++m) if (!m->tracked && m->insertBefore) return m->apply;
         return nullptr;
     }
-    //  A mask outside all others (taken out by popOutermost).
-    void pushOutermost(StreamSet * apply) {mMasks.insert(mMasks.begin(), TransformMask{apply});}
-    StreamSet * popOutermost() {
-        StreamSet * const apply = mMasks.front().apply;
+    //  A stream tracked (under the masks), and taken out (the last tracked).
+    void pushTracked(StreamSet * positions) {
+        TransformMask t{positions};
+        t.tracked = true;
+        mMasks.insert(mMasks.begin(), t);
+    }
+    StreamSet * popTracked() {
+        if (mMasks.empty() || !mMasks.front().tracked) llvm::report_fatal_error("tconv: no stream tracked");
+        StreamSet * const positions = mMasks.front().apply;
         mMasks.erase(mMasks.begin());
-        return apply;
+        return positions;
     }
     //  The masks taken out (for a stage on a text without them), and put back.
     std::vector<TransformMask> release() {
@@ -1650,7 +1663,7 @@ public:
     //  where an after context's set with the end of a run (ldml::FilterRunEndMark,
     //  see ldml::MoveTextAnchors) matches, as ICU applies a compound transform to
     //  each run of a filter; nullptr without a mask.
-    StreamSet * runEnds() {return mMasks.empty() ? nullptr : complement(mMasks.back().apply);}
+    StreamSet * runEnds() {return empty() ? nullptr : complement(mMasks.back().apply);}
     //  The complement of a stream of one bit per position (cached).
     StreamSet * complement(StreamSet * s) {return mMapper.complement(s);}
     //  A mask (of one bit per position) after the changes of a map (cached).
@@ -9116,6 +9129,7 @@ private:
     //  and the mask of the positions other than their placeholders.
     std::pair<char32_t, char32_t> mFrontLetters;
     StreamSet * mFrontLetterMask = nullptr;
+    bool mFrontLetterOwnMask = false;
     bool mBoundRegions = false;
     StreamSet * mRegionsOverride = nullptr;
     //  The starts and follows of the regions (see RegionEdges), by the regions' stream.
@@ -9155,7 +9169,7 @@ StreamSet * RulePipelineBuilder::pushRegions(StreamSet * U21) {
     //  it between regions; the analyses of contexts (groupLineBound) take that
     //  position to be a line feed, so a line feed is inserted (outside the mask)
     //  at each edge of a region, where the positions outside hold other
-    //  characters.  The original positions are an outermost mask, kept in step.
+    //  characters.  The original positions are a stream tracked, kept in step.
     PipelineBuilder & P = mP;
     StreamSet * const outside = classes({separators}, U21);
     StreamSet * const at = P.CreateStreamSet(1);
@@ -9167,7 +9181,7 @@ StreamSet * RulePipelineBuilder::pushRegions(StreamSet * U21) {
     StreamSet * const text = P.CreateStreamSet(U21->getNumElements());
     P.CreateKernelCall<FillInsertedPositions>(spread, spreadText, text, 0x0A);
     StreamSet * const regions = combine(classes({UCD::UnicodeSet(0, 0x10FFFF) - separators}, text), spread, false);
-    mMasks.pushOutermost(spread);
+    mMasks.pushTracked(spread);
     mMasks.push(regions, ContextScope::Region);
     return text;
 }
@@ -9175,7 +9189,7 @@ StreamSet * RulePipelineBuilder::pushRegions(StreamSet * U21) {
 StreamSet * RulePipelineBuilder::popRegions(StreamSet * Result) {
     if (regionSeparators() == UCD::UnicodeSet(0x0A)) return Result;
     mMasks.pop();
-    StreamSet * const kept = mMasks.popOutermost();
+    StreamSet * const kept = mMasks.popTracked();
     StreamSet * const out = mP.CreateStreamSet(Result->getNumElements());
     FilterByMask(mP, kept, Result, out);
     return out;
@@ -13545,18 +13559,20 @@ Staged RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & step, 
     StreamSet * const Filled = P.CreateStreamSet(21);
     P.CreateKernelCall<FrontLetterFill>(SpreadMask, Spread, SpreadLetters, Filled);
     SHOW_BIXNUM(Filled);
-    //  (The placeholders are kept out of the steps until frontLettersEnd by a
-    //  mask outside the others, pushed once the masks are in step.)
+    //  (The placeholders are tracked until frontLettersEnd, and kept out of the
+    //  steps there, once the masks are in step: see RulePipelineBuilder::
+    //  applyAnalysis.)
     mFrontLetterMask = SpreadMask;
     mFrontLetters = {f.lowerLetter, f.upperLetter};
     return Staged(Filled, std::move(positions));
 }
 
-//  The placeholders of the front-letter revisits (outside the first mask) as
+//  The placeholders of the front-letter revisits (outside the stream tracked) as
 //  their letters, within the filters (as the replacements of the roughs).
 StreamSet * RulePipelineBuilder::frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    StreamSet * const front = mMasks.popOutermost();
+    if (mFrontLetterOwnMask) mMasks.pop();
+    StreamSet * const front = mMasks.popTracked();
     StreamSet * const Placed = P.CreateStreamSet(1);
     Invert(P, front, Placed);
     StreamSet * const Result = P.CreateStreamSet(21);
@@ -14049,7 +14065,11 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             const size_t kernels = mP.getNumOfKernelCalls();
             if (step.hasFrontLetters) {
                 U21 = inStep(frontLettersBegin(step, U21));
-                mMasks.pushOutermost(mFrontLetterMask);
+                //  (The placeholders kept out of the steps: out of every mask, and
+                //  without one, by a mask of the other positions.)
+                mMasks.pushTracked(mFrontLetterMask);
+                mFrontLetterOwnMask = mMasks.empty();
+                if (mFrontLetterOwnMask) mMasks.push(mFrontLetterMask);
             }
             if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
             if (!step.markRunEditRules.empty()) U21 = inStep(markRunEditsGroup(step, U21));

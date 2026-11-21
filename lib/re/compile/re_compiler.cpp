@@ -463,7 +463,15 @@ Marker RE_Block_Compiler::compileAssertionBody(Assertion * const a, Marker marke
         AlignMarkers(marker, lookback);
         PabloAST * lb = lookback.stream();
         if (a->getSense() == Assertion::Sense::Negative) {
-            lb = mPB.createAnd(mPB.createNot(lb), mMain.mIndexStream);
+            // The negation holds at the positions of the marker's kind only: the
+            // final code units of characters (AtEnd, AtNextChar), or their first
+            // code units (AtNextCodeUnit: those after an index position, or at
+            // the start), not within a character of several code units.
+            PabloAST * valid = mMain.mIndexStream;
+            if (marker.position() == Position::AtNextCodeUnit) {
+                valid = mPB.createNot(mPB.createAdvance(mPB.createNot(mMain.mIndexStream), 1), "charStarts");
+            }
+            lb = mPB.createAnd(mPB.createNot(lb), valid);
         }
         return Marker(mPB.createAnd(marker.stream(), lb, "lookback"), marker.position());
     }

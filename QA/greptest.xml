@@ -1430,4 +1430,16 @@ b5d
 <grepcase regexp="b(?![^\w]*d)" datafile="lookahead_chain_properties" greplines="4 5 7 8 9 11 12 13"/>
 <grepcase regexp="b(?=(?:\Wc|\W)*d)" datafile="lookahead_chain_properties" greplines="1 2 3 10 11"/>
 <grepcase regexp="b(?=(?:\p{Greek}c)*d)" datafile="lookahead_chain_properties" greplines="3"/>
+<!-- A negative lookbehind before a class of characters of several UTF-8
+     lengths, within a lookbehind: it holds only at the starts of characters. -->
+<datafile id="negative_lookbehind_mixed_lengths">əʃj
+xʃj
+əkj
+xkj
+ʃj
+ ʃjə
+əʃjə
+</datafile>
+<grepcase regexp="(?&lt;=(?&lt;!ə)[ʃk])j" datafile="negative_lookbehind_mixed_lengths" greplines="2 4 5 6"/>
+<grepcase regexp="(?&lt;=(?&lt;!\p{L})[ʃj]j)ə" datafile="negative_lookbehind_mixed_lengths" greplines="6"/>
 </greptest>

@@ -656,7 +656,7 @@ contexts see the characters outside the runs.
     test transforms with `--lines`: 65 have Unicode segments for bounded
     groups; the character maps' bounds remove one segment from 2 of them
     (zh-t-es-fonipa, zh-t-ru); the others' bounded groups are DivCode groups.
-    Not done, by measurement:
+    Not done:
     - **Bounded contexts in DivCode.** The segments they would remove cost
       little: zh-t-es-fonipa, on 2 MB with one thread, takes 0.33 s with
       `--lines` (three bounded groups in Unicode segments) and 0.40 s without
@@ -666,12 +666,11 @@ contexts see the characters outside the runs.
       filtered run"): the engine on the bytes would need externals of the
       client (the positions outside the mask), which it supports for Unicode
       sources only.
-16. **More components in UTF-8 mode** (optional, by measurement). The string-rule
+16. **More components in UTF-8 mode.** The string-rule
     groups that DivCode cannot plan (186 transforms through them) run in a
     Unicode segment after step 13. Reducing that set means either DivCode
     support for their problems (overlaps, runs, kept characters, captures) or
-    the fused kernels on UTF-8 code units. Worth it only where the switches
-    cost more than the segment.
+    the fused kernels on UTF-8 code units.
 
     **Goal (2026-11-20): UTF-8 support for every component.** Survey and
     profile (2026-11-20):
@@ -734,8 +733,7 @@ contexts see the characters outside the runs.
     Recommended: C, as one mechanism for all components, adopted component
     by component (string-rule groups first, then several subgroups, prefix
     runs, converted before contexts, insertions, captures, deferred rules,
-    shape groups), each kept only where it measures faster than its Unicode
-    segment on Latin and non-Latin text. **Chosen (2026-11-20): C.**
+    shape groups). **Chosen (2026-11-20): C.**
 
     **Design of C.** The Unicode-mode group builder
     (`RulePipelineBuilder::conversionGroup`) reads the text through a few
@@ -773,8 +771,7 @@ contexts see the characters outside the runs.
     kernels (the converted text in selectors: the classes of a selector's
     string are static); (3) captures (bytes moved by character); (4) the
     other components. Each slice is checked against Unicode mode on the CLDR
-    test data of the transforms it moves, and measured (cycles, Greek and
-    Latin text) against its Unicode segment.
+    test data of the transforms it moves.
 
     *Done (2026-11-20), behind `--hybrid-groups` (off by default):* slices 1
     and 2. Slice 2: the correction kernels (staged rounds and the While loop)
@@ -804,7 +801,6 @@ contexts see the characters outside the runs.
     `--lines` (`QA/tconv_hybrid_test.py` has small cases). What still keeps
     string-rule groups out (segments): captures (14), contexts with tconv's
     marks (5), a kept character with inserted ones (4), insertion rules (1).
-    Not yet measured against the Unicode segments.
 
     *Slice 3, partly (2026-11-21):* the MultipleCaptureMultipleReplacement
     rules whose captures stay in place (not reversed, not moved). Their
@@ -844,6 +840,56 @@ contexts see the characters outside the runs.
 Order: steps 10 to 12 first (the per-line runs removed, in Unicode mode, which
 every component already has); then 14 and 13 (mixed modes); then 15 and 16,
 which move work from Unicode segments to UTF-8 segments.
+
+## Outstanding issues (2026-11-21)
+
+**Step 16, UTF-8 mode for every component.**
+- The hybrid (`--hybrid-groups`) is off by default.
+- String-rule groups the hybrid still leaves to Unicode mode (segments, CLDR
+  test transforms): contexts with tconv's marks (5); capture sets whose spans
+  the engine cannot give exactly on the bytes (3, cy-fonipa-t-cy); captures
+  reversed (3) and moved (2), the rest of slice 3 (bytes moved by character);
+  insertion rules (1).
+- Compile time of very large groups: am-Ethi-t-am-ethi-m0-geminate (7718
+  string rules in one group) takes 100 s cold against 52 s in Unicode mode;
+  the fused kernels' absolute writes are about 1.4 times larger.
+- Slice 4 (the other components in UTF-8 mode) not started: characters of
+  several subgroups (10 segments), prefix runs (10), single-character rules
+  with before contexts matched against the converted text (5), shape groups
+  (am-am_FONIPA, 3), before contexts that are not sequences of sets (3),
+  insertion rules (2), deferred rules (1).
+- Bounded DivCode groups with `--lines` (65 transforms, left from step 15).
+
+**Remaining items of the earlier steps.**
+- Step 2: three stages still carry the masks themselves (the engine's search
+  and replace for shape groups, `kernel::UTF8_CharMapPipeline`, the
+  front-letter revisits).
+- Step 5: adjacent regions are not separated by the engine (region spans,
+  the lookahead chain kernels and region reversal).
+- Step 7: no run ends in UTF-8 mode (only am_Ethi-d0_Morse uses them, in
+  Unicode mode for its insertion rules); DivCode complements the mask itself
+  instead of taking the run ends.
+- Step 8: function calls by masks, not started.
+- Step 9: block skipping in the NFC stages and the masked case maps; narrower
+  masks for the case maps' expanding slots.
+- Step 11: Thai-Latn (ICU stages under a global filter) still runs its tconv
+  stages once per run of the filter.
+- Step 12: 8 of the 290 test files differ from their expected results (six
+  transforms tconv does not know, ka-Latn-t-ka-m0-bgn-2009 and
+  my-fonipa-t-my).
+
+**Found on the way, not yet investigated.**
+- The pipeline's handling of a block-sized lookahead at the final stride
+  (step 13: `FixedMatchSpansKernel` lost the spans of the final partial
+  stride until it declared its actual lookahead).
+- A constant scalar (`CreateConstant`) given to a pipeline call crashes the
+  pipeline compiler (`PipelineCompiler::getFinalOutputScalars`; step 14).
+- An anomaly of the combinatorial tester (859c10cfc0): am-t-am-fonipa in
+  Unicode mode, the filter-half input, `-segment-size=1`.
+- The combinatorial tester does not vary `--hybrid-groups`.
+
+The open questions below remain: ICU's run semantics under filters, the
+position map, and where `TransformMask` lives.
 
 ## Testing
 

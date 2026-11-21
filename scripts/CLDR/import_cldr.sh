@@ -58,7 +58,7 @@ COMMIT=$(git -C "$CLONE" rev-parse --verify "$REF^{commit}" 2>/dev/null ||
          git -C "$CLONE" rev-parse --verify "origin/$REF^{commit}")
 SHORT=$(git -C "$CLONE" rev-parse --short=12 "$COMMIT")
 DATE=$(git -C "$CLONE" log -1 --format=%cs "$COMMIT")
-DESCRIBE=$(git -C "$CLONE" describe --tags "$COMMIT" 2>/dev/null || echo "$SHORT")
+DESCRIBE=$(git -C "$CLONE" describe --tags --match 'release-*' "$COMMIT" 2>/dev/null || echo "$SHORT")
 
 #  Fetch the blobs of the imported files in one request (the clone is blobless,
 #  and would otherwise fetch them one at a time).

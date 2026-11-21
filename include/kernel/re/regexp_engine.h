@@ -103,6 +103,12 @@ struct RE_ModeOptions {
     // reversedStarts).  A client whose regions may exceed the region limit
     // (re::ReverseRegionLimit, a runtime error) turns it off.
     bool reversal = true;
+    // For the MatchSpans goal: whether spans may be partial where no span
+    // algorithm applies to an alternative of the RE (see checkPreconditions):
+    // the spans of the shortest matches ending at each end, which cover a
+    // part of a longer match (e.g. enough for coloring).  Without it, such an
+    // RE fails the preconditions of the goal.
+    bool partialSpans = false;
 };
 
 struct RE_Mode {
@@ -175,12 +181,16 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
 //   - compiled: the RE after the mode passes, as compiled;
 //   - matchOffset: the marks of matchSearchPipeline are this many positions
 //     after the last position of each match (e.g. for a trailing lookahead
-//     not looked ahead by name): positions of code units, or, with Unicode
-//     indexing of a UTF-8 source (codeUnitAlphabet Unicode), of characters,
-//     which RE_PipelineBuilder::getU8Index maps to their last code units;
+//     not looked ahead by name): positions of code units in byte mode; of
+//     characters in the UTF-8 indexed mode (the marks at their last code
+//     units); or, with Unicode indexing of a UTF-8 source (codeUnitAlphabet
+//     Unicode), of characters, which RE_PipelineBuilder::getU8Index maps to
+//     their last code units;
 //   - startsByReversal: the starts of the matches found by reversal (the
 //     MatchStarts goal);
-//   - failures: the preconditions that do not hold (see checkPreconditions).
+//   - failures: the preconditions that do not hold (see checkPreconditions;
+//     for the MatchSpans goal, the alternatives with no span algorithm,
+//     unless RE_ModeOptions::partialSpans).
 //
 struct RE_Plan {
     const cc::Alphabet * lengthAlphabet = nullptr;

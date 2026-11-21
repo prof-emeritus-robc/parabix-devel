@@ -283,6 +283,9 @@ void GrepEngine::initRE(re::RE * re) {
     opts.unicodeIndexingOverride = UnicodeIndexing;
     opts.unicodeBasisOverride = UnicodeBasisMode || mColoring;
     opts.byteCClimit = ByteCClimit;
+    // (Coloring accepts partial spans, where no span algorithm applies to the
+    // RE: the shortest matches ending at each end are colored.)
+    opts.partialSpans = mColoring;
     if (mReplacement) {
         // The engine replaces the matches; the lines are printed uncolored.
         mColoring = false;

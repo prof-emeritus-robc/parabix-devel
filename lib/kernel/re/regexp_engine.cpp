@@ -516,6 +516,11 @@ void LongestSpan::generatePabloMethod() {
     PabloAST * longestEnd = pb.createAnd(matchEnd, pb.createNot(endBack));
     PabloAST * spans = nullptr;
     if (mEndOffset > 0) {
+        // An end marked after the match (a lookahead) may coincide with the
+        // prefix of the next match: an end shifted back to it is that match's,
+        // not a longer one of the match it ends (which cannot consume a prefix
+        // character, as the prefix is unique), so the end there is kept.
+        longestEnd = pb.createAnd(matchEnd, pb.createNot(pb.createAnd(endBack, pb.createNot(pfxStrm))));
         spans = pb.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {pfxStart, longestEnd});
     } else {
         spans = pb.createIntrinsicCall(pablo::Intrinsic::InclusiveSpan, {pfxStart, longestEnd});
@@ -1977,6 +1982,36 @@ void RE_PipelineBuilder::matchSpanPipeline(RE * re, StreamSet * matches, StreamS
     matchSpanPipeline(PreparedRE{re, RE_Mode{nullptr, nullptr}, mModeOptions}, matches, spans);
 }
 
+static RE * spanFactoringOf(RE * re, const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet);
+static void partialSpanAlternatives(RE * re, const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet,
+                                    std::vector<std::pair<RE *, std::string>> & partial);
+
+// The spans of an RE compiled in the UTF-8 indexed mode, completed to whole
+// characters: the code units of a character before a code unit of a span (a
+// span may begin at the last code unit of a character, see uniquePrefixSpans).
+class CharacterSpans final : public pablo::PabloKernel {
+public:
+    CharacterSpans(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Index, StreamSet * Completed)
+    : PabloKernel(ts, "CharacterSpans",
+                  {Binding{"spans", Spans, FixedRate(1), LookAhead(3)}, Binding{"index", Index, FixedRate(1), LookAhead(3)}},
+                  {Binding{"completed", Completed}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const spans = getInputStreamSet("spans")[0];
+        PabloAST * const index = getInputStreamSet("index")[0];
+        // (A code unit k before one of a span, with no last code unit of a
+        // character from it to there.)
+        PabloAST * completed = spans;
+        PabloAST * within = pb.createNot(index);
+        for (unsigned k = 1; k <= 3; ++k) {
+            completed = pb.createOr(completed, pb.createAnd(within, pb.createLookahead(spans, k)));
+            within = pb.createAnd(within, pb.createNot(pb.createLookahead(index, k)));
+        }
+        writeOutputStreamSet("completed", std::vector<PabloAST *>{pb.createInFile(completed)});
+    }
+};
+
 void RE_PipelineBuilder::matchSpanPipeline(const PreparedRE & prepared, StreamSet * matches, StreamSet * spans) {
     usePrepared(prepared);
     RE * re = prepared.re;
@@ -1986,10 +2021,24 @@ void RE_PipelineBuilder::matchSpanPipeline(const PreparedRE & prepared, StreamSe
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, matches);
     // The spans are the union of the extents of the nonempty matches,
-    // computed for the alternatives of a factored form of the RE.
+    // computed for the alternatives of a factored form of the RE (see
+    // partialSpanAlternatives: those with no span algorithm have partial
+    // spans, only where RE_ModeOptions::partialSpans allows them).
     RE * const spanRE = spanFactoring(mRE);
+    if (!mModeOptions.partialSpans) {
+        std::vector<std::pair<RE *, std::string>> partial;
+        partialSpanAlternatives(spanRE, mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet, partial);
+        if (!partial.empty()) {
+            llvm::report_fatal_error(llvm::StringRef("matchSpanPipeline: ") + partial.front().second + ": "
+                                     + Printer_RE::PrintRE(partial.front().first));
+        }
+    }
     prepareExternals(spanRE);
-    getSpan(spanRE, spans);
+    StreamSet * const spanned = (mCtxt.mIndexStream != nullptr) ? mPB.CreateStreamSet(1) : spans;
+    getSpan(spanRE, spanned);
+    if (mCtxt.mIndexStream != nullptr) {
+        mPB.CreateKernelCall<CharacterSpans>(spanned, mCtxt.mIndexStream, spans);
+    }
 }
 
 void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
@@ -3115,6 +3164,21 @@ RE * expandBoundedReps(RE * re, const cc::Alphabet * lengthAlphabet) {
 }
 
 namespace {
+// Replace the names of the repetitions of string classes (named by
+// StringClassRepNamer) by their definitions.
+class StringClassRepSubstitution final : public RE_Transformer {
+public:
+    StringClassRepSubstitution(const std::map<std::string, std::vector<std::vector<CC *>>> & names)
+    : RE_Transformer("StringClassRepSubstitution"), mNames(names) {}
+protected:
+    RE * transformName(Name * n) override {
+        if (mNames.count(n->getFullName()) && n->getDefinition()) return transform(n->getDefinition());
+        return n;
+    }
+private:
+    const std::map<std::string, std::vector<std::vector<CC *>>> & mNames;
+};
+
 // Replace the names of the given externals by their definitions.
 class ExternalDefinitionSubstitution final : public RE_Transformer {
 public:
@@ -3138,6 +3202,12 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
     // The repetitions of string classes (named by StringClassRepNamer for the
     // matches) are factored as written: their spans are computed by chainSpans.
     re = ExternalDefinitionSubstitution(mCtxt.mExternals, ExternalStreamKind::StringClassRep).transformRE(re);
+    return spanFactoringOf(re, mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet);
+}
+
+// The factoring of spanFactoring, after the names of the repetitions of string
+// classes are replaced by their definitions.
+static RE * spanFactoringOf(RE * re, const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet) {
     // The empty matches are eliminated, and variable-length alternations
     // (including small bounded repetitions) are promoted to the top level,
     // so that the alternatives are fixed-length, have a unique prefix or
@@ -3150,19 +3220,71 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
         if (const Alt * alt = dyn_cast<Alt>(r)) return alt->size();
         return 1;
     };
-    RE * promoted = BoundedRepExpander(mCtxt.mLengthAlphabet).transformRE(nonempty);
+    RE * promoted = BoundedRepExpander(lengthAlphabet).transformRE(nonempty);
     for (unsigned pass = 0; pass < 4; ++pass) {
-        RE * const next = variableAltPromotion(promoted, mCtxt.mLengthAlphabet);
+        RE * const next = variableAltPromotion(promoted, lengthAlphabet);
         if ((next == promoted) || (alternatives(next) > limit)) break;
         promoted = next;
     }
     promoted = emptyMatchElimination(promoted);
     if (alternatives(promoted) > limit) promoted = nonempty;
-    re::FixedSpanNamer FLnamer(mCtxt.mCodeUnitAlphabet);
+    re::FixedSpanNamer FLnamer(codeUnitAlphabet);
     RE * xfrmedRE = FLnamer.transformRE(promoted);
     //re::Repeated_CC_Seq_Namer RCCSnamer;
     //xfrmedRE = mRCCSnamer.transformRE(xfrmedRE);
     return xfrmedRE;
+}
+
+// Why the spans of an RE as factored for spans (see spanFactoring) are
+// partial, by alternative, as getSpan computes them: an external (a name) or
+// an alternative with no other span algorithm (FixedMatchSpansKernel) is
+// spanned by its shortest length, counted in positions, which is exact only if
+// its length in code units is fixed and the same as in the length alphabet; a
+// lookahead chain or one bounded with few lengths (chainSpans,
+// lengthClassSpans: one position per code unit) is exact; a unique prefix
+// (uniquePrefixSpans) is exact if the prefix has a fixed length in code units,
+// or (in the UTF-8 indexed mode, the spans completed to whole characters, see
+// CharacterSpans) is one character.
+static void partialSpanAlternatives(RE * re, const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet,
+                                    std::vector<std::pair<RE *, std::string>> & partial) {
+    if (Alt * const a = dyn_cast<Alt>(re)) {
+        for (RE * e : *a) partialSpanAlternatives(e, lengthAlphabet, codeUnitAlphabet, partial);
+        return;
+    }
+    const bool indexed = (lengthAlphabet == &cc::Unicode) && (codeUnitAlphabet == &cc::UTF8);
+    auto fixedPositions = [&](RE * r) {
+        const auto units = getLengthRange(r, codeUnitAlphabet);
+        const auto lengths = getLengthRange(r, lengthAlphabet);
+        return (units.first == units.second) && (lengths.first == units.first);
+    };
+    if (isa<Name>(re)) {
+        if (!fixedPositions(re)) partial.emplace_back(re, "partial spans: an external of variable length in code units");
+        return;
+    }
+    if (!indexed) {
+        ChainForm form;
+        if (parseChainForm(re, lengthAlphabet, form)) return;
+    }
+    RE * prefix, * suffix;
+    std::tie(prefix, suffix) = ParseUniquePrefix(re);
+    if (!isEmptySeq(prefix) && !isEmptySeq(suffix)) {
+        const auto units = getLengthRange(prefix, codeUnitAlphabet);
+        if (units.first == units.second) return;
+        if (indexed && (getLengthRange(prefix, &cc::Unicode) == std::make_pair(1, 1))) return;
+        partial.emplace_back(re, "partial spans: a unique prefix of variable length in code units");
+        return;
+    }
+    if (!indexed) {
+        LengthClasses classes;
+        if (lengthClasses(re, lengthAlphabet, LengthClassLimit, classes)) {
+            classes.erase(0);
+            if (!classes.empty()) return;
+        }
+    }
+    if (fixedPositions(re)) return;
+    partial.emplace_back(re, "no span algorithm (partial spans): not of fixed length in code units, without a unique prefix "
+                             "of fixed length, not bounded with at most " + std::to_string(LengthClassLimit) + " lengths "
+                             "and not a lookahead chain (one position per code unit)");
 }
 
 namespace {
@@ -3298,6 +3420,8 @@ struct ModeTransformation {
     bool mAllowReversal = true;
     bool mAcceptStartsByReversal = true;
     bool mStartsByReversal = false;
+    // Whether partial spans are accepted (see RE_ModeOptions::partialSpans).
+    bool mPartialSpans = false;
     std::vector<std::pair<Assertion *, std::string>> mLookaheadsNotReversed;
     UCD::PropertyExternalizer PE;
     // (CCs of U+FFFD are named too: they also match ill-formed input.)
@@ -3410,6 +3534,15 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
                               "chain (with full Unicode indexing)"});
         }
     }
+    // The spans of the matches (see RE_PipelineBuilder::matchSpanPipeline), of
+    // the RE as factored for them.
+    if ((goal == RE_Goal::MatchSpans) && !mPartialSpans) {
+        RE * const unnamed = StringClassRepSubstitution(SCnamer.mStrings).transformRE(fixedRefs);
+        std::vector<std::pair<RE *, std::string>> partial;
+        partialSpanAlternatives(spanFactoringOf(unnamed, mLengthAlphabet, mCodeUnitAlphabet), mLengthAlphabet,
+                                mCodeUnitAlphabet, partial);
+        for (const auto & p : partial) failures.push_back(PreconditionFailure{goal, p.first, p.second});
+    }
     if (!forward.empty() && (goal == RE_Goal::MatchStarts) && mAllowReversal && mAcceptStartsByReversal) {
         const std::string reason = reversalFailure(mSource, mCodeUnitAlphabet);
         if (reason.empty()) {
@@ -3443,6 +3576,7 @@ static std::vector<PreconditionFailure> modeFailures(const PreparedRE & prepared
     QuietREPrinting quiet;
     ModeTransformation M(lengthAlphabet, codeUnitAlphabet);
     M.mAllowReversal = prepared.options.reversal;
+    M.mPartialSpans = prepared.options.partialSpans;
     RE * const transformed = M.transform(prepared.re, prepared.options.goal);
     std::vector<PreconditionFailure> failures = M.failures(transformed, prepared.options.goal);
     byReversal = M.mStartsByReversal;
@@ -3478,6 +3612,7 @@ RE_Plan planRE(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding)
     QuietREPrinting quiet;
     ModeTransformation M(plan.lengthAlphabet, plan.codeUnitAlphabet);
     M.mAllowReversal = prepared.options.reversal;
+    M.mPartialSpans = prepared.options.partialSpans;
     plan.compiled = M.transform(prepared.re, prepared.options.goal);
     plan.failures = M.failures(plan.compiled, prepared.options.goal);
     plan.startsByReversal = M.mStartsByReversal;

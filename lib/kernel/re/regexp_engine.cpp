@@ -4652,26 +4652,9 @@ void RE_PipelineBuilder::captureSpansPipeline(const PreparedSearchReplace & sr, 
     mPB.CreateKernelCall<CaptureSpans>(marks, spans);
 }
 
-//  Masks carried through a replacement (see searchReplaceCodeUnitsPipeline):
-//  1 at the positions inserted (where the spread mask is 0).
-class MarkInsertedPositions final : public pablo::PabloKernel {
-public:
-    MarkInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Masks, StreamSet * Marked)
-    : PabloKernel(ts, "MarkInsertedPositions" + std::to_string(Masks->getNumElements()),
-                  {Binding{"SpreadMask", SpreadMask}, Binding{"Masks", Masks}}, {Binding{"Marked", Marked}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
-        std::vector<PabloAST *> masks = getInputStreamSet("Masks");
-        for (PabloAST *& m : masks) m = pb.createOr(m, inserted);
-        writeOutputStreamSet("Marked", masks);
-    }
-};
-
 RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const PreparedSearchReplace & sr, bool follows,
                                                                     bool replaced, StreamSet * result,
-                                                                    StreamSet * masks, StreamSet * resultMasks) {
+                                                                    kernel::PositionMap * positions) {
     if (sr.search.options.goal != RE_Goal::SearchReplace) {
         llvm::report_fatal_error("search and replace: the search pattern must be prepared with prepareSearchReplace");
     }
@@ -4715,12 +4698,16 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     StreamSet * marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
     const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
     StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
-    // The masks carried (at the positions of the text, extended as it is).
-    // (Rotations only move text within matches, where the masks are 1.)
-    if (masks && mTextExtended) {
-        StreamSet * const extended = mPB.CreateStreamSet(masks->getNumElements(), 1);
-        mPB.CreateKernelCall<ExtendByOne>(masks, extended);
-        masks = extended;
+    // The changes to the positions of the source (see
+    // searchReplaceCodeUnitsPipeline): the position after the text, where it
+    // is extended (outside the matches).  (Rotations only move text within
+    // matches.)
+    if (positions && mTextExtended) {
+        StreamSet * const end = mPB.CreateStreamSet(1, 1);
+        mPB.CreateKernelCall<EndOfTextMark>(mSourceContext.source, end);
+        StreamSet * const notEnd = mPB.CreateStreamSet(1, 1);
+        Invert(mPB, end, notEnd);
+        positions->insert(notEnd, kernel::PositionMap::Inserted::Out);
     }
     // The captures moved back rotated into place, in each selected match
     // (within the match: its coverage and the positions kept outside the
@@ -4829,11 +4816,8 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
         };
         text = spread(text);
         keep = spread(keep);
-        if (masks) {
-            StreamSet * const marked = mPB.CreateStreamSet(masks->getNumElements());
-            mPB.CreateKernelCall<MarkInsertedPositions>(spreadMask, spread(masks), marked);
-            masks = marked;
-        }
+        // (The text inserted lies within the matches replaced.)
+        if (positions) positions->insert(spreadMask, kernel::PositionMap::Inserted::In);
         flags = spread(flags);
         if (resultFollows) resultFollows = spread(resultFollows);
         if (resultReplaced) resultReplaced = spread(resultReplaced);
@@ -4854,12 +4838,7 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     }
     ReplacedText r;
     r.text = filtered(text, result);
-    if (masks) {
-        if (resultMasks == nullptr || resultMasks->getNumElements() != masks->getNumElements()) {
-            llvm::report_fatal_error("searchReplaceCodeUnitsPipeline: the result masks must have the streams of the masks");
-        }
-        filtered(masks, resultMasks);
-    }
+    if (positions) positions->remove(keep);
     if (resultFollows) r.follows = filtered(resultFollows, nullptr);
     if (resultReplaced) r.replaced = filtered(resultReplaced, nullptr);
     return r;
@@ -4894,8 +4873,8 @@ void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr,
 }
 
 void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, StreamSet * codeUnits,
-                                                        StreamSet * masks, StreamSet * resultMasks) {
-    replaceMatches(sr, false, false, codeUnits, masks, resultMasks);
+                                                        kernel::PositionMap * positions) {
+    replaceMatches(sr, false, false, codeUnits, positions);
 }
 
 RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {

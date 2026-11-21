@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <kernel/streamutils/position_map.h>
 #include <kernel/core/streamset.h>
 #include <map>
 #include <string>
@@ -693,13 +694,16 @@ public:
     // The text with the matches replaced, as for searchReplacePipeline, but
     // as the basis bits of the code units of the source (codeUnits: 8 streams
     // for UTF-8, 21 for a source of Unicode codepoints, see RE_context).
-    // With masks (streams of the source, each of which must be 1 throughout
-    // every match replaced, e.g. the masks of filters the matches lie in),
-    // resultMasks: the masks at the positions of the result, 1 at the text
-    // the replacements insert, and otherwise the bit of the source position
-    // kept there.
+    // With positions, the changes from the positions of the source to those
+    // of the result are added to it (see kernel::PositionMap), by which the
+    // client keeps its other streams of the source in step: the position after
+    // the text if the engine extends it (outside the matches), the text the
+    // replacements insert (within the matches replaced: Inserted::In), and the
+    // positions deleted.  A stream of the client's that is 1 throughout every
+    // match replaced (as the mask of a filter the matches lie in) is 1 at the
+    // text inserted.
     void searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, kernel::StreamSet * codeUnits,
-                                        kernel::StreamSet * masks = nullptr, kernel::StreamSet * resultMasks = nullptr);
+                                        kernel::PositionMap * positions = nullptr);
 
     // The captures named (see re::capturesByName) in the matches replaced by
     // searchReplacePipeline, for clients that transform captured text
@@ -876,8 +880,7 @@ protected:
         kernel::StreamSet * replaced = nullptr;
     };
     ReplacedText replaceMatches(const PreparedSearchReplace & sr, bool follows, bool replaced,
-                                kernel::StreamSet * result, kernel::StreamSet * masks = nullptr,
-                                kernel::StreamSet * resultMasks = nullptr);
+                                kernel::StreamSet * result, kernel::PositionMap * positions = nullptr);
 
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);

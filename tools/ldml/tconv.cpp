@@ -1633,21 +1633,6 @@ public:
         return masks;
     }
     void restore(std::vector<TransformMask> && masks) {mMasks = std::move(masks);}
-    //  The positions of every mask replaced (by a stage that carries the masks
-    //  through itself, as the engine's search and replace does).
-    std::vector<StreamSet *> applyStreams() const {
-        std::vector<StreamSet *> streams;
-        for (const TransformMask & m : mMasks) streams.push_back(m.apply);
-        return streams;
-    }
-    //  (The bounds of a region then those of the stage, which keeps no position
-    //  out of a region.)
-    void setApplyStreams(const std::vector<StreamSet *> & streams) {
-        for (size_t k = 0; k < mMasks.size(); k++) {
-            mMasks[k].apply = streams[k];
-            if (mMasks[k].bounds) mMasks[k].bounds = streams[k];
-        }
-    }
     //  The positions added to every mask.
     void include(StreamSet * positions) {
         for (TransformMask & m : mMasks) {
@@ -12645,9 +12630,9 @@ public:
     void pushRegions(StreamSet * Basis) {
         assert (mMasks.empty());
         pushFilter(UCD::UnicodeSet(0, 0x10FFFF) - regionSeparators(), Basis);
-        std::vector<StreamSet *> streams = mMasks.applyStreams();
+        StreamSet * const lines = mMasks.active();
         mMasks.pop();
-        mMasks.push(streams.back(), ContextScope::Region);
+        mMasks.push(lines, ContextScope::Region);
     }
     //  The steps of an analysis (of a transform named name, or a rules file).
     StreamSet * applyAnalysis(const std::string & name, const TransformAnalysis & a, StreamSet * Basis);
@@ -13409,25 +13394,11 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
         if (!mask) {
             engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result);
         } else {
-            //  (Every match lies within each mask.  The engine carries the masks
-            //  through the replacement.)
-            std::vector<StreamSet *> streams = mMasks.applyStreams();
-            StreamSet * masks = streams.front();
-            if (streams.size() > 1) {
-                masks = mP.CreateStreamSet(streams.size());
-                mP.CreateKernelCall<CollectStreams>(streams, masks);
-            }
-            StreamSet * const resultMasks = mP.CreateStreamSet(streams.size());
-            engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result, masks, resultMasks);
-            for (size_t k = 0; k < streams.size(); k++) {
-                if (streams.size() == 1) {
-                    streams[k] = resultMasks;
-                    break;
-                }
-                streams[k] = mP.CreateStreamSet(1);
-                mP.CreateKernelCall<StreamSelect>(streams[k], Select(resultMasks, {static_cast<unsigned>(k)}));
-            }
-            mMasks.setApplyStreams(streams);
+            //  (Every match lies within each mask: the text the engine inserts is
+            //  within them.  The masks kept in step by its position map.)
+            PositionMap positions;
+            engine.searchReplaceCodeUnitsPipeline(step.prepared[i], result, &positions);
+            mMasks.keepInStep(positions);
         }
         if (ShapePhaseBoundaries) mP.InsertPhaseBoundary();
         return result;

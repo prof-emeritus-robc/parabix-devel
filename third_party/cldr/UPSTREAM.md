@@ -6,7 +6,7 @@ as in CLDR (`LICENSE` is the CLDR license, which covers them):
 | | |
 |---|---|
 | Repository | https://github.com/unicode-org/cldr.git |
-| Commit | `7cdeb9e7fac52c59f22fc7248b05f989ee5689c2` (release-49-beta4, 2026-10-09) |
+| Commit | `267bae66b10db620caca6d5df88c1719fc0fd457` (release-49-12-g267bae66b, 2026-11-19) |
 | Paths | `LICENSE` `common/README.md` `common/testData/README.md` `common/transforms` `common/testData/transforms`  |
 | Files | 675 |
 

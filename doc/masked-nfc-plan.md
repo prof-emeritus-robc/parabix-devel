@@ -3,7 +3,7 @@
 Status (2026-11-19): steps 1 to 6 done; step 7 in part (the generated
 kernels and `-nfc-kernels` removed, the generator kept).
 Part of step 6 of `doc/masked-transforms-plan.md` (normalization with a mask).
-tconv normalizes within a filter by the masked kernels in both modes (NFD,
+xlit normalizes within a filter by the masked kernels in both modes (NFD,
 NFKD, NFC, NFKC, FCC and FCD); barrier substitution
 (`RulePipelineBuilder::barrierNormalization`, the barrier branch of
 `UTF8PipelineBuilder::maskedNormalization`) remains only behind
@@ -23,7 +23,7 @@ across them. This is what barrier substitution computes today. The aims:
   transform (95 of the 112 CLDR transforms with masked normalization run in
   UTF-8 mode) needs no conversion to or from 21-bit code points.
 - **An output mask.** The output must report which positions are within the
-  mask, so tconv can keep its masks in step (`PositionMap`).
+  mask, so xlit can keep its masks in step (`PositionMap`).
 
 In CLDR, NFC under a global filter occurs 126 times, NFKC twice, and FCC is
 built on NFC passes. Every `--lines` run that normalizes also goes through
@@ -184,7 +184,7 @@ The mask has to travel with the bytes through the pipeline:
 filtered, transformed and reintegrated together with the basis. That facility
 would serve any masked focused transform, including UTF-8-mode NFD later.
 
-tconv then has a position map in Unicode mode, `remove(selected)` followed by
+xlit then has a position map in Unicode mode, `remove(selected)` followed by
 `insert(outputMask, In)`, the same map barrier normalization uses. In UTF-8
 mode the output byte mask replaces the masks directly.
 
@@ -212,7 +212,7 @@ doc/masked-transforms-plan.md, Execution).
 
 ## A U21 mode of NFC
 
-tconv's Unicode mode (and any application working on the 21-bit basis)
+xlit's Unicode mode (and any application working on the 21-bit basis)
 currently pays a conversion to UTF-8 and back around NFC (`UTF8_Of`,
 `BasisOf`, `U21_Of`). NFC should also run on the 21-bit basis directly. The
 analysis (`NFC_Tables`) does not depend on the encoding, only the kernels do:
@@ -239,7 +239,7 @@ UTF-8 bytes throughout.
 ## Rewriting the generator in C++
 
 The analysis would move into a C++ class computed once at run time from the
-UCD property objects tconv already uses: `dm`, `dt`, `Comp_Ex`/CE and `ccc`.
+UCD property objects xlit already uses: `dm`, `dt`, `Comp_Ex`/CE and `ccc`.
 The emission would become ordinary kernel classes whose `generatePabloMethod`
 builds the same Pablo code from those tables.
 
@@ -275,7 +275,7 @@ builds the same Pablo code from those tables.
 ### Structure
 
 - `NFC_Tables`: the analysis, one-to-one with the generator's methods, built
-  once (a static accessor, as `caseMapData` is in tconv). Its fields are the
+  once (a static accessor, as `caseMapData` is in xlit). Its fields are the
   maps the generator builds: `singleton_map`, `excluded_composite_map`,
   `short_composable_map`, `long_composable_map`, `self_composables`,
   `overridable_primaries`, `max_insert_map`, `ccc_pass_allocation`,
@@ -340,7 +340,7 @@ on the CLDR transforms that use NFC.
 
 1. **Tables in C++.** Port the analysis into `NFC_Tables`. Check it against the
    Python generator by dumping both in the same text form, for example a
-   `--dump` mode in the generator and a hidden tconv or `nfc` option, and
+   `--dump` mode in the generator and a hidden xlit or `nfc` option, and
    diffing them, map by map. The dumps must match exactly.
 
    Done: `NFC_Tables` (`include/kernel/unicode/normalization/nfc_tables.h`,
@@ -403,7 +403,7 @@ on the CLDR transforms that use NFC.
    - the source column of NormalizationTest.txt (UCD 18.0.0), whose NFC column
      the output matches exactly.
 
-   The tconv, ldml and normalization tests pass. Run times are the same: cold,
+   The xlit, ldml and normalization tests pass. Run times are the same: cold,
    2.97 s against 2.98 s; warm, 0.08 s on 4.75 MB of mixed text and 0.03 to
    0.04 s on every code point.
 
@@ -618,8 +618,8 @@ on the CLDR transforms that use NFC.
    | random (2.7 MB) | 0.06 s | 0.06 s | 0.10 s | 0.09 s |
 
    Focused U21 matches or beats the route through UTF-8 on every text, so it
-   can replace the conversion in tconv's Unicode mode (step 6).
-6. **tconv.**
+   can replace the conversion in xlit's Unicode mode (step 6).
+6. **xlit.**
    - Unicode mode: masked NFC in U21 mode, with the position map from the
      output mask, replacing `barrierNormalization` for NFC and NFKC (masked
      NFKD first).
@@ -683,7 +683,7 @@ on the CLDR transforms that use NFC.
    transforms.
 7. **Retire the generator.** Delete `nfc_generator.py` and
    `normalization-generated.cpp`, together with the transitional option
-   (`-nfc-kernels`), and the barrier substitution in tconv with
+   (`-nfc-kernels`), and the barrier substitution in xlit with
    `--masked-normalization` and `--u21-nfc`.
 
    In part (2026-11-19): `normalization-generated.cpp` and `-nfc-kernels` are
@@ -693,7 +693,7 @@ on the CLDR transforms that use NFC.
    `ShortComposablePipeline`, `LongComposablePipeline`) in `normalization.h`.
    `nfc_generator.py` is kept, for its `--dump-tables` comparison with
    `NFC_Tables`; the C++ it emits no longer compiles against the header.
-   Remaining: the generator itself, and tconv's barrier substitution.
+   Remaining: the generator itself, and xlit's barrier substitution.
 
 Step 1 can be checked on its own and is the cheapest test of whether the port
 is sound. Steps 3 and 4 could instead be done in the Python templates
@@ -729,13 +729,13 @@ in place, with a mask and an output mask (`NFD_PipelineBuilder`, in `nfd.cpp`).
     - The placement is the work expanded by the insertions of the source's
       decomposables within the mask.
     - `SpreadMask` is that insertion spread mask over the source, the same
-      position map as the in-place version's, which tconv uses.
+      position map as the in-place version's, which xlit uses.
 
 **Tools.** `nfd` and `nfkd` take `-nfd-u21`, plus `-nfd-mask` and
 `-nfd-mask-select` (hidden, for testing), as nfc does
 (`tools/transcoders/decomposition_modes.cpp`).
 
-**tconv.**
+**xlit.**
 - Unicode mode decomposes with `NFD_U21`: unmasked, within a filter, and in
   FCC's first step. It is focused unless `-NoFocus`.
 - UTF-8 mode normalizes NFD, NFKD and NFKC within a filter with `NFD_Masked`.
@@ -752,7 +752,7 @@ in place, with a mask and an output mask (`NFD_PipelineBuilder`, in `nfd.cpp`).
 - Masked: five masks × six routes (UTF-8 and 21-bit; focused, in place,
   multithreaded) × three output selections × three inputs, for both tools:
   540 runs, no failures.
-- tconv:
+- xlit:
   - Ten rules files (NFD, NFKD, NFKC, NFC and FCC, under global and step
     filters that cut through decompositions) on 4,000 random lines, in both
     modes, in one run and with `--lines`: the output equals ICU's, the

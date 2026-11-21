@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: string rules whose before contexts are matched against the converted
+#  xlit: string rules whose before contexts are matched against the converted
 #  text, resolved in the regular plan's correction kernel by the While loop
 #  (doc/round-replacement.md step 3; the rounds it replaced were removed in
 #  step 7), with the rules whose selection depends on them.  The loop decides
@@ -26,14 +26,14 @@
 #  stride (all with --extended-testing; otherwise the first only).  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_converted_strings_while_test.py <tconv binary> [--extended-testing]
+#  xlit_converted_strings_while_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 CASES = [
@@ -186,7 +186,7 @@ LONG_CASES = [
 CONFIGS = [[], ["-thread-num=1"], ["-thread-num=4", "-segment-size=1"]]
 
 
-def run(tconv, tmp, name, rules, lines, config):
+def run(xlit, tmp, name, rules, lines, config):
     rules_path = os.path.join(tmp, name + ".rules")
     with open(rules_path, "w", encoding="utf-8") as f:
         f.write(rules + "\n")
@@ -194,12 +194,12 @@ def run(tconv, tmp, name, rules, lines, config):
     with open(input_path, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line, _ in lines))
     failures = 0
-    plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules_path, input_path], capture_output=True)
+    plan = subprocess.run([xlit, "--plan", "--rules-file=" + rules_path, input_path], capture_output=True)
     text = plan.stdout.decode("utf-8", "replace")
     if ": implementable" not in text.split("\n")[0] or "warning" in text:
         failures += 1
         print("FAIL %s: the rules are not implementable without warnings\n%s" % (name, text))
-    args = [tconv, "--use-ICU=0", "--apply-shape-groups=0", "--divcode-groups=0", "--utf8-mode=0",
+    args = [xlit, "--use-ICU=0", "--apply-shape-groups=0", "--divcode-groups=0", "--utf8-mode=0",
             "--lines", "--rules-file=" + rules_path] + config + [input_path]
     r = subprocess.run(args, capture_output=True)
     what = "%s %s" % (name, " ".join(config) or "default")
@@ -219,15 +219,15 @@ def run(tconv, tmp, name, rules, lines, config):
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for n, (rules, lines) in enumerate(CASES):
-            failures += run(tconv, tmp, "rules%d" % n, rules, lines, [])
+            failures += run(xlit, tmp, "rules%d" % n, rules, lines, [])
         for n, (rules, lines) in enumerate(LONG_CASES):
             for config in (CONFIGS if EXTENDED else CONFIGS[:1]):
-                failures += run(tconv, tmp, "long%d" % n, rules, lines, config)
-    print("tconv_converted_strings_while_test: %s" % ("%d failures" % failures if failures else "all passed"))
+                failures += run(xlit, tmp, "long%d" % n, rules, lines, config)
+    print("xlit_converted_strings_while_test: %s" % ("%d failures" % failures if failures else "all passed"))
     return 1 if failures else 0
 
 

@@ -2,21 +2,21 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  Combinatorial testing of tconv (see README.md): t-way covering arrays
-#  (covering.py) over tconv's options and classes of transforms and inputs,
+#  Combinatorial testing of xlit (see README.md): t-way covering arrays
+#  (covering.py) over xlit's options and classes of transforms and inputs,
 #  each case checked against a reference run of the same transform, input,
 #  scope and filter (in Unicode mode, with the default switches): options
 #  that only choose how a transform is implemented must not change its
 #  output.  The reference runs are also checked against the CLDR test data's
 #  expected results and against ICU.
 #
-#  tconv_ct.py run      [--branch B] [--t 2] [--jobs 1]   continuous, on the commits of a branch
-#  tconv_ct.py once     --tconv BIN [--budget 120] [--transform NAME]... [--set PARAM=VALUE]...
-#  tconv_ct.py report                                      the state of the continuous runner
-#  tconv_ct.py check    ID --tconv BIN                     rerun an anomaly (exit 1 if it persists)
-#  tconv_ct.py bisect   ID [--good COMMIT] [--bad COMMIT] [--jobs N]
+#  xlit_ct.py run      [--branch B] [--t 2] [--jobs 1]   continuous, on the commits of a branch
+#  xlit_ct.py once     --xlit BIN [--budget 120] [--transform NAME]... [--set PARAM=VALUE]...
+#  xlit_ct.py report                                      the state of the continuous runner
+#  xlit_ct.py check    ID --xlit BIN                     rerun an anomaly (exit 1 if it persists)
+#  xlit_ct.py bisect   ID [--good COMMIT] [--bad COMMIT] [--jobs N]
 #
-#  Common options: --state DIR (default ~/.parabix/tconv-ct), --cldr DIR
+#  Common options: --state DIR (default ~/.parabix/xlit-ct), --cldr DIR
 #  (default ~/cldr/common/testData/transforms).
 
 import argparse
@@ -36,7 +36,7 @@ from covering import covering_array  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-DEFAULT_STATE = os.path.expanduser("~/.parabix/tconv-ct")
+DEFAULT_STATE = os.path.expanduser("~/.parabix/xlit-ct")
 DEFAULT_CLDR = os.path.expanduser("~/cldr/common/testData/transforms")
 RUN_TIMEOUT = 600
 
@@ -132,13 +132,13 @@ def classify(plan):
     return "+".join(parts)
 
 
-def build_catalog(tconv, cldr):
+def build_catalog(xlit, cldr):
     catalog = {}
     for fn in sorted(os.listdir(cldr)):
         if not fn.endswith(".txt"):
             continue
         name = fn[:-4]
-        r = subprocess.run([tconv, "--plan", "--lines", name], capture_output=True, timeout=120)
+        r = subprocess.run([xlit, "--plan", "--lines", name], capture_output=True, timeout=120)
         plan = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
         cls = classify(plan) if r.returncode == 0 else None
         if cls:
@@ -146,10 +146,10 @@ def build_catalog(tconv, cldr):
     return catalog
 
 
-def build_catalog_for(tconv, names):
+def build_catalog_for(xlit, names):
     catalog = {}
     for name in names:
-        r = subprocess.run([tconv, "--plan", "--lines", name], capture_output=True, timeout=120)
+        r = subprocess.run([xlit, "--plan", "--lines", name], capture_output=True, timeout=120)
         cls = classify(r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else None
         if cls:
             catalog[name] = cls
@@ -221,7 +221,7 @@ def filter_rules(case, text, alphabet):
     return ":: [" + "".join("\\u%04X" % ord(c) for c in keep) + "] ;\n:: " + case["transform"] + " ;\n"
 
 
-def tconv_args(case, objcache, salt=None, reference=False, icu=False, compile_threads=1):
+def xlit_args(case, objcache, salt=None, reference=False, icu=False, compile_threads=1):
     #  (One thread for running, and by default for compiling the kernels: the
     #  continuous runner keeps to one core.)
     args = ["-thread-num=1", "-compile-threads=%d" % compile_threads]
@@ -245,11 +245,11 @@ def tconv_args(case, objcache, salt=None, reference=False, icu=False, compile_th
     return args
 
 
-def run_tconv(tconv, args, case, text, rules, tmp, sep=None):
+def run_xlit(xlit, args, case, text, rules, tmp, sep=None):
     path = os.path.join(tmp, "input.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
-    cmd = [tconv] + args
+    cmd = [xlit] + args
     if sep is not None:
         cmd.append("--region-separators=%X" % ord(sep))
     if rules:
@@ -277,19 +277,19 @@ def run_tconv(tconv, args, case, text, rules, tmp, sep=None):
 
 
 class Checker:
-    """Runs cases with one tconv binary, with the reference runs cached."""
+    """Runs cases with one xlit binary, with the reference runs cached."""
 
-    def __init__(self, tconv, cldr, objcache=None, salt=None, compile_threads=1):
-        self.tconv, self.cldr, self.objcache, self.salt = tconv, cldr, objcache, salt
+    def __init__(self, xlit, cldr, objcache=None, salt=None, compile_threads=1):
+        self.xlit, self.cldr, self.objcache, self.salt = xlit, cldr, objcache, salt
         self.compile_threads = compile_threads
         self.refs = {}
-        self.tmp = tempfile.mkdtemp(prefix="tconv-ct-")
+        self.tmp = tempfile.mkdtemp(prefix="xlit-ct-")
 
     def close(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def args(self, case, **kw):
-        return tconv_args(case, self.objcache, self.salt, compile_threads=self.compile_threads, **kw)
+        return xlit_args(case, self.objcache, self.salt, compile_threads=self.compile_threads, **kw)
 
     def prepared(self, case, text=None):
         gen, rows, alphabet = make_input(case, self.cldr)
@@ -309,10 +309,10 @@ class Checker:
         key = (case["transform"], scope, rules, text)
         if key not in self.refs:
             rc = dict(case, scope=scope)
-            res = run_tconv(self.tconv, self.args(rc, reference=True), rc, text, rules, self.tmp)
+            res = run_xlit(self.xlit, self.args(rc, reference=True), rc, text, rules, self.tmp)
             if res[0] == "unsupported":
                 # (The transform only in UTF-8 mode: the default configuration.)
-                res = run_tconv(self.tconv, [a for a in self.args(rc, reference=True)
+                res = run_xlit(self.xlit, [a for a in self.args(rc, reference=True)
                                              if a != "--utf8-mode=0"], rc, text, rules, self.tmp)
             self.refs[key] = res
         return self.refs[key]
@@ -325,7 +325,7 @@ class Checker:
             test_text = sep.join(pieces)
         else:
             test_text = text
-        res = run_tconv(self.tconv, self.args(case), case, test_text, rules, self.tmp, sep)
+        res = run_xlit(self.xlit, self.args(case), case, test_text, rules, self.tmp, sep)
         status, out, err, secs, cmd = res
         detail = {"secs": round(secs, 2), "cmd": cmd}
         if status in ("error", "timeout"):
@@ -363,7 +363,7 @@ class Checker:
         src = text.split("\n")
         if rows is not None:
             found["expected"] = [s for k, (s, e) in enumerate(rows) if k >= len(got) or got[k] != e]
-        icu = run_tconv(self.tconv, self.args(dict(case, scope="lines"), icu=True),
+        icu = run_xlit(self.xlit, self.args(dict(case, scope="lines"), icu=True),
                         case, text, None, self.tmp)
         if icu[0] == "ok":
             ig = icu[1].split("\n")
@@ -447,11 +447,11 @@ def git(*args, cwd=REPO):
     return subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
 
 
-def fingerprint(tconv):
-    """A hash of tconv and the libraries it loads from its build (the object cache's keys follow them)."""
+def fingerprint(xlit):
+    """A hash of xlit and the libraries it loads from its build (the object cache's keys follow them)."""
     h = hashlib.sha1()
-    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(tconv))), "lib")
-    files = [tconv] + sorted(os.path.join(d, f) for d, _, fs in os.walk(lib) for f in fs
+    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(xlit))), "lib")
+    files = [xlit] + sorted(os.path.join(d, f) for d, _, fs in os.walk(lib) for f in fs
                              if f.endswith((".dylib", ".so")) or ".so." in f)
     for path in files:
         if os.path.isfile(path):
@@ -482,7 +482,7 @@ def build(worktree, build_dir, commit, jobs, reference_build, log):
         os.makedirs(build_dir, exist_ok=True)
         cmd = ["cmake", "-S", worktree, "-B", build_dir] + ["-D%s=%s" % kv for kv in cmake_settings(reference_build).items()]
         subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
-    r = subprocess.run(["nice", "-n", "10", "make", "-j%d" % jobs, "tconv"], cwd=build_dir, stdout=log, stderr=subprocess.STDOUT)
+    r = subprocess.run(["nice", "-n", "10", "make", "-j%d" % jobs, "xlit"], cwd=build_dir, stdout=log, stderr=subprocess.STDOUT)
     return r.returncode == 0
 
 
@@ -516,35 +516,35 @@ def cmd_run(a):
     objcache = os.path.join(a.state, "objcache")
     branch = a.branch or git("branch", "--show-current")
     log = open(os.path.join(a.state, "build.log"), "a")
-    tconv = a.tconv or os.path.join(build_dir, "bin", "tconv")
-    print("tconv_ct: following %s; worktree %s; state %s" % (branch, worktree, a.state), flush=True)
+    xlit = a.xlit or os.path.join(build_dir, "bin", "xlit")
+    print("xlit_ct: following %s; worktree %s; state %s" % (branch, worktree, a.state), flush=True)
     checker = None
     while True:
         commit = git("rev-parse", "--short", branch)
         commits = state.data["commits"]
         if not commits or commits[-1] != commit:
             print("[%s] building %s" % (time.strftime("%H:%M:%S"), commit), flush=True)
-            if not a.tconv and not build(worktree, build_dir, commit, a.jobs, a.reference_build, log):
+            if not a.xlit and not build(worktree, build_dir, commit, a.jobs, a.reference_build, log):
                 state.log({"commit": commit, "status": "build-failed"})
                 time.sleep(300)
                 continue
             commits.append(commit)
-            #  (A commit that leaves tconv and its libraries unchanged, e.g. of
+            #  (A commit that leaves xlit and its libraries unchanged, e.g. of
             #  documentation or tests, keeps the object cache, the catalog and
             #  the anomalies' status: the objects are keyed by the binaries.)
-            fp = fingerprint(tconv)
-            changed = a.tconv or fp != state.data.get("fingerprint") or "catalog" not in state.data
+            fp = fingerprint(xlit)
+            changed = a.xlit or fp != state.data.get("fingerprint") or "catalog" not in state.data
             state.data["fingerprint"] = fp
             state.data.setdefault("baseline_fingerprint", fp)
             if not changed:
-                print("  tconv unchanged", flush=True)
+                print("  xlit unchanged", flush=True)
                 state.save()
                 continue
             shutil.rmtree(objcache, ignore_errors=True)
-            state.data["catalog"] = build_catalog(tconv, a.cldr) if not a.only else \
-                {n: c for n, c in build_catalog_for(tconv, a.only).items()}
+            state.data["catalog"] = build_catalog(xlit, a.cldr) if not a.only else \
+                {n: c for n, c in build_catalog_for(xlit, a.only).items()}
             state.save()
-            checker = Checker(tconv, a.cldr, objcache)
+            checker = Checker(xlit, a.cldr, objcache)
             # The open anomalies first: fixed, or still there.
             for an in state.anomalies():
                 if an["status"] != "open" or an["kind"] in ("expected", "icu"):
@@ -555,7 +555,7 @@ def cmd_run(a):
                     state.save_anomaly(an)
                     print("  fixed at %s: %s %s" % (commit, an["id"], an["kind"]), flush=True)
         if checker is None:
-            checker = Checker(tconv, a.cldr, objcache)
+            checker = Checker(xlit, a.cldr, objcache)
         #  (The CLDR and ICU mismatches of the first build tested are the baseline.)
         baseline = state.data.get("fingerprint") == state.data.get("baseline_fingerprint")
         state.data["passes"] += 1
@@ -587,10 +587,10 @@ def cmd_run(a):
 
 
 def cmd_once(a):
-    state = State(a.state or tempfile.mkdtemp(prefix="tconv-ct-once-"))
-    catalog = build_catalog_for(a.tconv, a.transform) if a.transform else build_catalog(a.tconv, a.cldr)
+    state = State(a.state or tempfile.mkdtemp(prefix="xlit-ct-once-"))
+    catalog = build_catalog_for(a.xlit, a.transform) if a.transform else build_catalog(a.xlit, a.cldr)
     settings = dict(s.split("=", 1) for s in a.set)
-    checker = Checker(a.tconv, a.cldr, salt=a.salt, compile_threads=a.compile_threads)
+    checker = Checker(a.xlit, a.cldr, salt=a.salt, compile_threads=a.compile_threads)
     start = time.time()
     deadline = start + a.budget
     cases = cases_for(state, catalog, a.t, a.seed, set(a.transform) if a.transform else None, settings)
@@ -640,7 +640,7 @@ def cmd_check(a):
         if os.path.exists(os.path.join(d, fn)) and an["kind"] not in ("expected", "icu"):
             text = open(os.path.join(d, fn), encoding="utf-8").read()
             break
-    checker = Checker(a.tconv, a.cldr, salt=a.salt)
+    checker = Checker(a.xlit, a.cldr, salt=a.salt)
     if an["kind"] in ("expected", "icu"):
         found = checker.oracles(an["case"])
         persists = an["case"].get("oracle_line") in found.get(an["kind"], [])
@@ -671,8 +671,8 @@ def cmd_bisect(a):
         f.write("#!/bin/sh\n")
         f.write("if [ ! -f '%s/CMakeCache.txt' ]; then cmake -S '%s' -B '%s' %s >/dev/null || exit 125; fi\n" % (
             build_dir, wt, build_dir, " ".join("-D%s=%s" % kv for kv in cmake_settings(a.reference_build).items())))
-        f.write("make -C '%s' -j%d tconv >/dev/null 2>&1 || exit 125\n" % (build_dir, a.jobs))
-        f.write("exec python3 '%s' check %s --state '%s' --cldr '%s' --tconv '%s/bin/tconv' --salt bisect\n" % (
+        f.write("make -C '%s' -j%d xlit >/dev/null 2>&1 || exit 125\n" % (build_dir, a.jobs))
+        f.write("exec python3 '%s' check %s --state '%s' --cldr '%s' --xlit '%s/bin/xlit' --salt bisect\n" % (
             os.path.abspath(__file__), an["id"], a.state, a.cldr, build_dir))
     os.chmod(script, 0o755)
     git("bisect", "start", bad, good, cwd=wt)
@@ -682,7 +682,7 @@ def cmd_bisect(a):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Combinatorial testing of tconv")
+    p = argparse.ArgumentParser(description="Combinatorial testing of xlit")
     sub = p.add_subparsers(dest="command", required=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--state", help="(default %s; for once, a temporary directory)" % DEFAULT_STATE)
@@ -695,10 +695,10 @@ def main():
     r.add_argument("--t", type=int, default=2)
     r.add_argument("--pairwise-passes", type=int, default=3, help="passes at strength t before t+1")
     r.add_argument("--jobs", type=int, default=1)
-    r.add_argument("--tconv", help="(testing the runner) a tconv binary to use instead of building the commits")
+    r.add_argument("--xlit", help="(testing the runner) a xlit binary to use instead of building the commits")
     r.add_argument("--only", action="append", default=[], help="(testing the runner) only these transforms")
     o = sub.add_parser("once", parents=[common])
-    o.add_argument("--tconv", required=True)
+    o.add_argument("--xlit", required=True)
     o.add_argument("--budget", type=float, default=120)
     o.add_argument("--transform", action="append", default=[])
     o.add_argument("--set", action="append", default=[], help="PARAM=VALUE: fix a parameter")
@@ -710,7 +710,7 @@ def main():
     rp.add_argument("-v", "--verbose", action="store_true")
     c = sub.add_parser("check", parents=[common])
     c.add_argument("id")
-    c.add_argument("--tconv", required=True)
+    c.add_argument("--xlit", required=True)
     c.add_argument("--salt", default="ct")
     b = sub.add_parser("bisect", parents=[common])
     b.add_argument("id")

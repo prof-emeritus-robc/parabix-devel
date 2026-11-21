@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: sets with strings in contexts take their longest strings, as ICU
+#  xlit: sets with strings in contexts take their longest strings, as ICU
 #  matches them (see ldml::possessiveContext): outward from the text, forward in
 #  an after context and backward (from the right) in a before context, and the
 #  repetitions of a before context possessively.  a $e* { c does not match abc
@@ -12,14 +12,14 @@
 #  rule, and the repetition of $e).  The expected results are ICU's
 #  (createFromRules, each line a text).
 #
-#  tconv_context_strings_test.py <tconv binary> [--extended-testing]
+#  xlit_context_strings_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("$e = [{ab} b] ;\n"
          "a $e* { c → X ;\n"
@@ -56,7 +56,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -64,7 +64,7 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         print("FAIL: exit status %d\n%s" % (run.returncode, run.stderr.decode("utf-8", "replace")))
         return 1

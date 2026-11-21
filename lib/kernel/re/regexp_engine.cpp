@@ -476,7 +476,7 @@ FixedMatchSpansKernel::FixedMatchSpansKernel(LLVMTypeSystemInterface & ts, unsig
 : PabloKernel(ts, "FixedMatchSpansKernel" + std::to_string(MatchMarks->getNumElements()) + "x1_by" + std::to_string(length) + '@' + std::to_string(offset),
 // (The lookahead is that of the starts, length + offset - 1: a lookahead
 // rounded up to a block lost the spans of the final partial stride in some
-// pipelines, e.g. tconv --lines am-am_FONIPA in mixed mode.)
+// pipelines, e.g. xlit --lines am-am_FONIPA in mixed mode.)
 {Binding{"MatchMarks", MatchMarks, FixedRate(1), LookAhead(std::max(length + offset, 2u) - 1)}}, {Binding{"MatchSpans", MatchSpans}}),
 mMatchLength(length), mOffset(offset) {
 }

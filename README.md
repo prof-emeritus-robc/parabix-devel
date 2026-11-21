@@ -34,7 +34,7 @@ To build Parabix, you need a development environment that meets a few requiremen
 -  The [`cmake`](https://cmake.org/download/) build system version 3.12 or better (3.14 or better to install).
 -  [`Boost`](https://www.boost.org/users/download/) libraries version `1.61` or better (Ubuntu `libboost-all-dev`).
 -  [`LLVM`](https://releases.llvm.org/download.html) version `17` or later (built in Release mode).
--  [`ICU`](https://icu.unicode.org/) (Ubuntu `libicu-dev`, Homebrew `icu4c`): required by the `tokenizer` tool, and used by `tconv` if found.
+-  [`ICU`](https://icu.unicode.org/) (Ubuntu `libicu-dev`, Homebrew `icu4c`): required by the `tokenizer` tool, and used by `xlit` if found.
 -  Python 3, to run the test suite.
 
 Linux, the BSDs and macOS are supported.
@@ -92,7 +92,7 @@ By default this installs the tools for your own use, under `~/.local` (make sure
 
 The tool sets:
 
-- `default`: `icgrep`, `wc`, `base64`, `csvcut`, `csvgrep`, `csv2json`, `tconv`, `hexlines`,
+- `default`: `icgrep`, `wc`, `base64`, `csvcut`, `csvgrep`, `csv2json`, `xlit`, `hexlines`,
   the transcoders `gb18030`, `u32u16`, `u32u8`, `u8u16`, `x8u16`, and the Unicode normalizers
   `nfc`, `nfd`, `nfkd`.
 - `dev`: developer tools and demonstrations (`ldml_trules`, `ucount`, `tokenizer`, `xch`,

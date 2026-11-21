@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: prefix runs that only delete (te~ \u2192 | t ; fu~ \u2192 | f ;), applied before
+#  xlit: prefix runs that only delete (te~ \u2192 | t ; fu~ \u2192 | f ;), applied before
 #  their group (see ldml::ComposeRevisits, prefixRunConflict) although
 #    - a rule revisits a character of P (' ' { t \u2192 | d), its text a character
 #      whose prefix runs are those of the character revisited (t and d, with e~
@@ -14,14 +14,14 @@
 #  either not implementable (exit status 2) or as ICU applies them.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_prefix_run_revisits_test.py <tconv binary> [--extended-testing]
+#  xlit_prefix_run_revisits_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 REVISIT = ("te \\~ \u2192 | t ;\n"
          "to \\~ \u2192 | t ;\n"
@@ -76,7 +76,7 @@ BLOCKED_CASES = [
 
 
 
-def run(tconv, rules_text, cases):
+def run(xlit, rules_text, cases):
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -84,7 +84,7 @@ def run(tconv, rules_text, cases):
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in cases))
-        return subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        return subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
 
 
 def compare(r, cases):
@@ -98,10 +98,10 @@ def compare(r, cases):
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     for rules, cases, implementable in ((REVISIT, REVISIT_CASES, True), (AFTER, AFTER_CASES, True), (BLOCKED, BLOCKED_CASES, False)):
-        r = run(tconv, rules, cases)
+        r = run(xlit, rules, cases)
         if r.returncode == 0:
             failures += compare(r, cases)
         elif implementable or r.returncode != 2:

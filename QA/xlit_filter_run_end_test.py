@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: the ends of the runs of a global filter (see ldml::MoveTextAnchors),
+#  xlit: the ends of the runs of a global filter (see ldml::MoveTextAnchors),
 #  as ICU matches them: each stage of a compound transform with a global filter
 #  transforms each run of filtered characters as a text of its own, so a set
 #  of the text with the end of the text ([$], [^c]) also matches nothing at
@@ -15,14 +15,14 @@
 #  transforms デ before ィ outside its filter).  The expected results are
 #  ICU's (createFromRules, each line a text).
 #
-#  tconv_filter_run_end_test.py <tconv binary> [--extended-testing]
+#  xlit_filter_run_end_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # The implementations of a group whose rules match characters outside the
 # filter only: the default, UTF-8 mode, without DivCode, and in four threads.
@@ -78,7 +78,7 @@ if EXTENDED:
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for group in GROUPS:
@@ -91,7 +91,7 @@ def main():
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
             for config in configs:
-                run = subprocess.run([tconv, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input], capture_output=True)
+                run = subprocess.run([xlit, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input], capture_output=True)
                 if run.returncode != 0:
                     failures += 1
                     print("FAIL %r %s: exit status %d\n%s" % (rules_text, " ".join(config), run.returncode,

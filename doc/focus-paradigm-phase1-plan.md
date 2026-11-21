@@ -14,7 +14,7 @@ parts:
 | nfd | focus+filter, placement and transform in `NFD_PipelineBuilder` (library); source and reintegration in `tools/transcoders/nfd.cpp` | NoFocus; ByteMerging, ByteReplace, RunFilter, RunMerge, RunReplace; fill-run-gaps; SeparatedPipelineStages=2/4; UseLayers | focus and filter are one function, so the filter cannot be chosen separately |
 | nfc | all in `tools/transcoders/nfc.cpp` (NFC_Focus, working-space expansion, transform, final placement and merge) | NoFocus; ByteFiltering; MultiStage; UseLayers | reintegration is MergeByMask only; placement needs the transform's ValidWorkMask |
 | nfkd | `tools/transcoders/nfkd.cpp` | none | no focus: transforms the whole input |
-| tconv | `tools/ldml/tconv.cpp`: NFD/NFKD via NFD_PipelineBuilder, NFC via a copy of nfc's kernels | none | copies NFC_Focus and nfd's bit-level reintegration |
+| xlit | `tools/ldml/xlit.cpp`: NFD/NFKD via NFD_PipelineBuilder, NFC via a copy of nfc's kernels | none | copies NFC_Focus and nfd's bit-level reintegration |
 | lex/normalize | own variants | | out of scope for Phase 1 |
 
 Consequences:
@@ -91,11 +91,11 @@ a timing check with `QA/focus_baseline.py` against the step before.
      modes; MultiStage and ByteFiltering remain as aliases.
    - Gate: `nfc_test`, plus a matrix over nfc's modes on de.nfd and ko.nfd (the
      inputs where nfc has work) and on de (no work).
-3. **nfkd with focus, and tconv.**
+3. **nfkd with focus, and xlit.**
    - Give nfkd a focused mode (work: characters with a compatibility or
      canonical decomposition, or nonzero CCC) on the builder; `-NoFocus` keeps
      the current behaviour.
-   - Switch tconv's Any-NFD, Any-NFKD and Any-NFC forms to the builder and
+   - Switch xlit's Any-NFD, Any-NFKD and Any-NFC forms to the builder and
      delete its copies of the NFC kernels.
    - Gate: `ldml_trules_test`, nfkd output identical to the current nfkd on the
      corpora.
@@ -142,7 +142,7 @@ a timing check with `QA/focus_baseline.py` against the step before.
   mode, at 1 and 3 threads, on de, ko, vi, their NFD forms and small inputs.  New
   test: `nfc_multistage_test`.
 
-- **Step 3 (nfkd and tconv):** done.  nfkd has a focused mode, now its default
+- **Step 3 (nfkd and xlit):** done.  nfkd has a focused mode, now its default
   (`-NoFocus` keeps the previous whole-text pipeline).  Its work is the characters
   that NFKD changes (canonical or compatibility decomposition, including Hangul
   syllables) or with a nonzero combining class, and the character after each
@@ -150,11 +150,11 @@ a timing check with `QA/focus_baseline.py` against the step before.
   placement uses NFD_BixData for NFKD, whose UTF-8 insertion BixNum now has as many
   bits as needed (5 for NFKD: up to 30 bytes are inserted).  The library provides
   `NFD_FocusedTransform`, `NFKD_FocusedTransform` and `NFC_FocusedTransform`, used by
-  nfd, nfkd, nfc and tconv.  tconv's Any-NFD, Any-NFKD, Any-NFC and Any-NFKC use them
+  nfd, nfkd, nfc and xlit.  xlit's Any-NFD, Any-NFKD, Any-NFC and Any-NFKC use them
   with the focused-transform options; its copies of the NFC kernels are gone.  Its rule
   pipeline still uses the U21 pipelines for NFD and NFKD within rules.
   Output: focused nfkd = `-NoFocus` = Python's NFKD on the conformance files and
-  corpora, in all modes at 1 and 3 threads; tconv's forms match the tools (and Python
+  corpora, in all modes at 1 and 3 threads; xlit's forms match the tools (and Python
   for NFKC).  New tests: `nfkd_test`, `nfkd_nofocus_test`.  Timing (3 threads):
   focused nfkd is 52% faster than `-NoFocus` on de (0.111 s against 0.230 s), 17% on
   vi, and 26% slower on ko (64% density, as for nfd).
@@ -204,5 +204,5 @@ a timing check with `QA/focus_baseline.py` against the step before.
 - **Pipeline signatures change,** so cached pipelines recompile once. This is
   harmless but makes first runs after each step slow; timings must use a warm
   cache.
-- **tconv is large (6,600 lines) and transform-heavy;** its tests are the gate
+- **xlit is large (6,600 lines) and transform-heavy;** its tests are the gate
   for step 3.

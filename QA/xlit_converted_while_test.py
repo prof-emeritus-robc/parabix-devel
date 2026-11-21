@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: before contexts matched against the converted text, resolved in the
+#  xlit: before contexts matched against the converted text, resolved in the
 #  regular plan's correction kernel by a While loop (doc/round-replacement.md
 #  §1; the rounds it replaced were removed in step 7): single-character rules
 #  whose before contexts have two or three items, in chains longer than the
@@ -20,14 +20,14 @@
 #  with four threads and segments of one stride.
 #  The expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_converted_while_test.py <tconv binary> [--extended-testing]
+#  xlit_converted_while_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 CASES = [
@@ -119,7 +119,7 @@ CONFIGS = [[], ["-thread-num=1"], ["-thread-num=4", "-segment-size=1"]]
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for n, (rules, lines) in enumerate(CASES):
@@ -131,7 +131,7 @@ def main():
                 f.write("".join(line + "\n" for line, _ in lines))
             expected = "".join(result + "\n" for _, result in lines)
             for config in (CONFIGS if EXTENDED or n < 2 else CONFIGS[:1]):
-                args = [tconv, "--use-ICU=0", "--apply-shape-groups=0", "--divcode-groups=0", "--utf8-mode=0",
+                args = [xlit, "--use-ICU=0", "--apply-shape-groups=0", "--divcode-groups=0", "--utf8-mode=0",
                         "--lines", "--rules-file=" + rules_path] + config + [input_path]
                 r = subprocess.run(args, capture_output=True)
                 what = "rules %d %s" % (n, " ".join(config) or "default")
@@ -145,7 +145,7 @@ def main():
                     for (line, want), have in zip(lines, got.split("\n")):
                         if have != want:
                             print("FAIL %s: %r gives %r, expected %r" % (what, line, have, want))
-    print("tconv_converted_while_test: %s" % ("%d failures" % failures if failures else "all passed"))
+    print("xlit_converted_while_test: %s" % ("%d failures" % failures if failures else "all passed"))
     return 1 if failures else 0
 
 

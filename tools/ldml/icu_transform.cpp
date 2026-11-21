@@ -5,7 +5,7 @@
 
 #include "icu_transform.h"
 
-#ifdef TCONV_WITH_ICU
+#ifdef XLIT_WITH_ICU
 #include <unicode/translit.h>
 #include <unicode/uniset.h>
 #include <unicode/unistr.h>
@@ -13,9 +13,9 @@
 #include <regex>
 #endif
 
-namespace tconv {
+namespace xlit {
 
-#ifdef TCONV_WITH_ICU
+#ifdef XLIT_WITH_ICU
 
 struct ICUTransform::Impl {
     std::unique_ptr<icu::Transliterator> t;
@@ -115,19 +115,19 @@ bool ICUTransform::available() {
 }
 
 bool ICUTransform::registerRules(const std::string &, const std::string &, bool, std::string & error) {
-    error = "tconv was built without ICU";
+    error = "xlit was built without ICU";
     return false;
 }
 
 std::unique_ptr<ICUTransform> ICUTransform::fromName(const std::string &, const std::vector<std::pair<uint32_t, uint32_t>> *,
                                                      std::string & error) {
-    error = "tconv was built without ICU";
+    error = "xlit was built without ICU";
     return nullptr;
 }
 
 std::unique_ptr<ICUTransform> ICUTransform::fromRules(const std::string &, const std::string &, bool,
                                                       const std::vector<std::pair<uint32_t, uint32_t>> *, std::string & error) {
-    error = "tconv was built without ICU";
+    error = "xlit was built without ICU";
     return nullptr;
 }
 

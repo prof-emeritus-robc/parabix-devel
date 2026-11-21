@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: after contexts that repeat a set with strings, matched by lookahead
+#  xlit: after contexts that repeat a set with strings, matched by lookahead
 #  chains (W10, from cy-cy_FONIPA).  ICU repeats $cons possessively, taking
 #  the longest string at each step, which re::resolvePossessive makes
 #  unambiguous (m(?!U+0325) | m U+0325): the chain's string class takes such
@@ -10,14 +10,14 @@
 #  assertions before the end of the text that hold there are dropped.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_lookahead_strings_test.py <tconv binary> [--extended-testing]
+#  xlit_lookahead_strings_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 GROUPS = [
@@ -34,7 +34,7 @@ GROUPS = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for rules_text, cases in GROUPS:
@@ -44,7 +44,7 @@ def main():
             input = os.path.join(tmp, "input.txt")
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
-            run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+            run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
             if run.returncode != 0:
                 failures += 1
                 print("FAIL %r: exit status %d\n%s" % (rules_text, run.returncode, run.stderr.decode("utf-8", "replace")))

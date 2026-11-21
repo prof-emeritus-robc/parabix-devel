@@ -2,37 +2,37 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 
-#  tconv_coverage.py: assess which LDML transforms tconv implements.
+#  xlit_coverage.py: assess which LDML transforms xlit implements.
 #
-#  tconv_coverage.py --tconv <tconv binary> --transforms-dir <CLDR common/transforms>
+#  xlit_coverage.py --xlit <xlit binary> --transforms-dir <CLDR common/transforms>
 #                    [--test-data <CLDR common/testData/transforms>] [--jobs N]
-#                    [--tconv-threads N]
+#                    [--xlit-threads N]
 #                    [--out <directory>]
 #
-#  Runs tconv --plan on every transform tconv knows (built-in and defined by
+#  Runs xlit --plan on every transform xlit knows (built-in and defined by
 #  the CLDR files), classifies the problems it reports by the kind of work
 #  needed to implement them, and propagates the classes through the transform
 #  rules (:: X) that invoke other transforms.  With --test-data, each CLDR test
-#  file of an implementable transform is run through tconv and compared with
+#  file of an implementable transform is run through xlit and compared with
 #  its expected results.  A case whose result differs from the expected one
-#  but is ICU's (tconv --use-ICU, the transform made by ICU from the same
-#  rules) is a discrepancy, where the test data disagrees with the rules, tconv
+#  but is ICU's (xlit --use-ICU, the transform made by ICU from the same
+#  rules) is a discrepancy, where the test data disagrees with the rules, xlit
 #  and ICU, not a failure.
 #
-#  Writes to the output directory (default ./tconv-coverage):
+#  Writes to the output directory (default ./xlit-coverage):
 #      plans/<name>.txt     the --plan output of each transform ('/' as '%')
 #      kernels/<name>.txt   the --kernel-counts output of each transform
 #      kernels-regular/<name>.txt   the same with --apply-shape-groups=0
 #      coverage.json        per transform: status, own problem classes,
 #                           transforms used, transitive work items
 #      coverage.md          summary tables and the per-transform table
-#      coverage-meta.json   where the results come from: the tconv commit, the
+#      coverage-meta.json   where the results come from: the xlit commit, the
 #                           transforms and test data directories, and the runs
 #      changes.md           (with --update) what changed from the previous results
 #
 #  Incremental runs: with --update, the previous results in the output directory
 #  are kept, and only the selected transforms (--only, --builtins, --blocked,
-#  and transforms tconv now knows that the results do not have) are planned and
+#  and transforms xlit now knows that the results do not have) are planned and
 #  tested again, with the transforms that use one whose status changed (and so
 #  on), whose status depends on theirs.  The kernels of the transforms planned
 #  are counted again, with those of all the transforms that use them, directly
@@ -45,7 +45,7 @@
 #  between <!-- coverage:NAME --> and <!-- /coverage:NAME --> (see REPORT_BLOCKS),
 #  leaving the rest of it as it is.
 #
-#  Kernel counts (tconv --kernel-counts, which builds the pipeline of a transform
+#  Kernel counts (xlit --kernel-counts, which builds the pipeline of a transform
 #  without compiling it): the conversion groups of each transform's own rules,
 #  their rules, and their kernels, and the kernels of the whole transform,
 #  including those of its filters and of the transforms it uses, transitively
@@ -58,7 +58,7 @@
 #
 #  Interrupted runs: the results of each transform (its plan, kernel counts and
 #  test files) are saved as they are computed, in <out>/progress.jsonl; run again
-#  with the same arguments (and the same tconv binary), a run interrupted takes
+#  with the same arguments (and the same xlit binary), a run interrupted takes
 #  them from there and computes only the rest (see Progress).  --no-resume starts
 #  it afresh.
 
@@ -74,8 +74,8 @@ import subprocess
 import sys
 import threading
 
-#  Work items: the problem classes of tconv --plan, grouped by the kind of
-#  work needed in tconv / the Parabix framework (see doc/ldml-tconv-coverage.md).
+#  Work items: the problem classes of xlit --plan, grouped by the kind of
+#  work needed in xlit / the Parabix framework (see doc/ldml-xlit-coverage.md).
 #  A string rule that may match within the text of another (W2b) is classed by
 #  the overlaps of the string rules of its conversion group (see
 #  ldml::StringRuleOverlaps): all one-way, with an acyclic precedence graph
@@ -104,7 +104,7 @@ CLASS_TO_ITEM = {c: w for w, cs in WORK_ITEMS.items() for c in cs}
 #  appended to <out>/progress.jsonl, so that a run interrupted (by a reboot, or
 #  killed) does not compute them again: run again with the same arguments, it
 #  takes them from the file and computes only the others.  The first line of the
-#  file identifies the run (the tconv binary by its digest, the directories and
+#  file identifies the run (the xlit binary by its digest, the directories and
 #  the selection), and the results are used only by a run that it identifies
 #  the same way (otherwise, or with --no-resume, the file is started afresh).
 #  The file is removed once the run's results are written.
@@ -112,10 +112,10 @@ class Progress:
     def __init__(self, args):
         self.path = os.path.join(args.out, 'progress.jsonl')
         digest = hashlib.sha256()
-        with open(args.tconv, 'rb') as f:
+        with open(args.xlit, 'rb') as f:
             for block in iter(lambda: f.read(1 << 20), b''):
                 digest.update(block)
-        self.header = dict(tconv=digest.hexdigest(), transforms_dir=os.path.abspath(args.transforms_dir),
+        self.header = dict(xlit=digest.hexdigest(), transforms_dir=os.path.abspath(args.transforms_dir),
                            test_data=args.test_data and os.path.abspath(args.test_data), update=args.update,
                            only=args.only, builtins=args.builtins, blocked=args.blocked,
                            kernel_counts=not args.no_kernel_counts)
@@ -130,7 +130,7 @@ class Progress:
             except ValueError:
                 same = False
             if not same:
-                print('tconv_coverage.py: %s is of another run (tconv, directories or selection): started afresh'
+                print('xlit_coverage.py: %s is of another run (xlit, directories or selection): started afresh'
                       % self.path, file=sys.stderr)
                 lines = []
         for line in lines[1:]:
@@ -141,7 +141,7 @@ class Progress:
             self.records[self.key(r['phase'], r['name'], r.get('file'))] = r['value']
         if self.records:
             phases = collections.Counter(k[0] for k in self.records)
-            print('tconv_coverage.py: resuming from %s: %s' % (self.path, ', '.join(
+            print('xlit_coverage.py: resuming from %s: %s' % (self.path, ', '.join(
                 '%d %s' % (phases[p], p) for p in ('plan', 'kernels', 'test') if phases[p])), file=sys.stderr)
         with open(self.path, 'w', encoding='utf-8') as f:
             f.write(json.dumps(self.header) + '\n')
@@ -171,12 +171,12 @@ class Progress:
             os.remove(self.path)
 
 
-#  The tconv command (with --tconv-threads, at most that many threads for the
+#  The xlit command (with --xlit-threads, at most that many threads for the
 #  pipelines and for their compilation).
-def tconv_command(args):
-    command = [args.tconv, '--transforms-dir=' + args.transforms_dir]
-    if args.tconv_threads:
-        command += ['--thread-num=%d' % args.tconv_threads, '--compile-threads=%d' % args.tconv_threads]
+def xlit_command(args):
+    command = [args.xlit, '--transforms-dir=' + args.transforms_dir]
+    if args.xlit_threads:
+        command += ['--thread-num=%d' % args.xlit_threads, '--compile-threads=%d' % args.xlit_threads]
     return command
 
 
@@ -185,7 +185,7 @@ def file_name(name):
 
 
 def list_transforms(args):
-    out = subprocess.run(tconv_command(args) + ['--list-transforms'],
+    out = subprocess.run(xlit_command(args) + ['--list-transforms'],
                          capture_output=True, text=True, check=True).stdout
     entries = collections.OrderedDict()
     for line in out.splitlines():
@@ -218,7 +218,7 @@ def select(args, entries, previous):
     chosen = set()
     for n in args.only or []:
         if n.lower() not in index:
-            sys.exit('tconv_coverage.py: unknown transform ' + n)
+            sys.exit('xlit_coverage.py: unknown transform ' + n)
         chosen.add(index[n.lower()])
     if args.builtins:
         chosen |= {name for name, e in entries.items() if e['builtin']}
@@ -231,7 +231,7 @@ def select(args, entries, previous):
 
 
 #  Plan the transforms of names; with previous results, also the transforms that
-#  use (directly) one whose exit status of tconv --plan changed, whose own status
+#  use (directly) one whose exit status of xlit --plan changed, whose own status
 #  depends on it, and so on.  Returns all the transforms planned.
 def plan_with_users(args, entries, names, previous):
     run_plans(args, entries, names)
@@ -246,7 +246,7 @@ def plan_with_users(args, entries, names, previous):
         changed = [n for n in batch if n not in previous or entries[n]['rc'] != previous[n].get('rc')]
         batch = [u for u in entries if u not in planned and any(u in users[n] for n in changed)]
         if batch:
-            print('tconv_coverage.py: planning %d transforms using ones whose status changed' % len(batch),
+            print('xlit_coverage.py: planning %d transforms using ones whose status changed' % len(batch),
                   file=sys.stderr)
             run_plans(args, entries, batch)
             planned += batch
@@ -262,7 +262,7 @@ def run_plans(args, entries, names):
         if args.progress.has('plan', name) and os.path.exists(path):
             return name, args.progress.get('plan', name)
         try:
-            r = subprocess.run(tconv_command(args) + ['--plan', name],
+            r = subprocess.run(xlit_command(args) + ['--plan', name],
                                capture_output=True, timeout=args.timeout)
             text, rc = (r.stdout + r.stderr).decode('utf-8', 'replace'), r.returncode
         except subprocess.TimeoutExpired:
@@ -277,8 +277,8 @@ def run_plans(args, entries, names):
             entries[name]['rc'] = rc
 
 
-#  The kernel counts of the transforms of names (see tconv --kernel-counts):
-#  with tconv's default plans (with shape groups, where they take fewer
+#  The kernel counts of the transforms of names (see xlit --kernel-counts):
+#  with xlit's default plans (with shape groups, where they take fewer
 #  kernels, see doc/ldml-shape-groups-report.md), and with the regular plans
 #  only (--apply-shape-groups=0, in kernels-regular/).
 def run_kernel_counts(args, entries, names, regular=False):
@@ -291,7 +291,7 @@ def run_kernel_counts(args, entries, names, regular=False):
         if args.progress.has(key, name) and os.path.exists(path):
             return name, args.progress.get(key, name)
         try:
-            r = subprocess.run(tconv_command(args) + (['--apply-shape-groups=0'] if regular else []) + ['--kernel-counts', name],
+            r = subprocess.run(xlit_command(args) + (['--apply-shape-groups=0'] if regular else []) + ['--kernel-counts', name],
                                capture_output=True, timeout=args.timeout)
             text = (r.stdout + r.stderr).decode('utf-8', 'replace')
         except subprocess.TimeoutExpired:
@@ -308,7 +308,7 @@ def run_kernel_counts(args, entries, names, regular=False):
 
 
 #  groups, rules, group_kernels, kernels (the last two None if the pipeline
-#  was not built), and the rules and kernels of each group; None if tconv
+#  was not built), and the rules and kernels of each group; None if xlit
 #  reported no counts.
 def parse_kernel_counts(text):
     counts = None
@@ -412,7 +412,7 @@ def classify(args, entries):
         for n in [name] + e['aliases']:
             index.setdefault(n.lower(), name)
     #  Names may mix the forms of the scripts of the names of a transform (as
-    #  ::Hira-Latin ; for Hira-Latn, also Hiragana-Latin), which tconv resolves:
+    #  ::Hira-Latin ; for Hira-Latn, also Hiragana-Latin), which xlit resolves:
     #  the components of the names of each transform with the same form (source,
     #  target, variant) are taken as equivalent.
     equivalent = {}
@@ -550,7 +550,7 @@ def run_tests(args, entries, names=None, previous=None):
         with open(src, 'w', encoding='utf-8') as t:
             t.write(''.join(p[0] + '\n' for p in pairs))
         try:
-            r = subprocess.run(tconv_command(args) + [name, src],
+            r = subprocess.run(xlit_command(args) + [name, src],
                                capture_output=True, timeout=args.timeout)
         except subprocess.TimeoutExpired:
             e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(pairs), timeout=True)
@@ -561,31 +561,31 @@ def run_tests(args, entries, names=None, previous=None):
         results = {i: out[i] if i < len(out) else None for i in failing}
         # Each case is a text of its own: in the text of all the cases, one per
         # line, a context may see the line break instead of the text boundary.
-        # The failing cases are run again, each as a text (tconv --lines, which
+        # The failing cases are run again, each as a text (xlit --lines, which
         # runs the pipeline once per line, too slowly for all the cases).
         if failing:
             retry = src + '.failing'
             with open(retry, 'w', encoding='utf-8') as t:
                 t.write(''.join(pairs[i][0] + '\n' for i in failing))
             try:
-                r = subprocess.run(tconv_command(args) + ['--lines', name, retry],
+                r = subprocess.run(xlit_command(args) + ['--lines', name, retry],
                                    capture_output=True, timeout=args.timeout)
                 out = r.stdout.decode('utf-8', 'replace').split('\n')
                 results = {i: out[k] if k < len(out) else None for k, i in enumerate(failing)}
                 failing = [i for i in failing if results[i] != pairs[i][1]]
             except subprocess.TimeoutExpired:
                 pass
-        # A case that fails where tconv gives ICU's result (the transform made
-        # by ICU from the same rules, tconv --use-ICU) is a discrepancy: the
-        # test data disagrees with the rules, tconv and ICU.
+        # A case that fails where xlit gives ICU's result (the transform made
+        # by ICU from the same rules, xlit --use-ICU) is a discrepancy: the
+        # test data disagrees with the rules, xlit and ICU.
         discrepant = discrepancies(args, name, src, pairs, failing, results)
         e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(failing) - len(discrepant),
                                                    discrepant=len(discrepant))
         args.progress.put('test', name, e['test_results'][f], f)
 
 
-#  The failing cases (indexes in pairs) whose results by tconv (results) are
-#  ICU's, each case run as a text (tconv --use-ICU --lines); none if tconv is
+#  The failing cases (indexes in pairs) whose results by xlit (results) are
+#  ICU's, each case run as a text (xlit --use-ICU --lines); none if xlit is
 #  built without ICU.
 def discrepancies(args, name, src, pairs, failing, results):
     if not failing:
@@ -594,7 +594,7 @@ def discrepancies(args, name, src, pairs, failing, results):
     with open(cases, 'w', encoding='utf-8') as t:
         t.write(''.join(pairs[i][0] + '\n' for i in failing))
     try:
-        r = subprocess.run(tconv_command(args) + ['--use-ICU=.*', '--lines', name, cases],
+        r = subprocess.run(xlit_command(args) + ['--use-ICU=.*', '--lines', name, cases],
                            capture_output=True, timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return []
@@ -659,12 +659,12 @@ def summary(entries):
     md.append('## Transforms\n')
     md.append('Status: **ok** implementable; otherwise the work items needed (own problems and those of the '
               'transforms used).  Tests: CLDR test files (failed/total cases for implementable transforms, and the '
-              'discrepant cases: those where the test data disagrees with the rules, tconv and ICU).  '
+              'discrepant cases: those where the test data disagrees with the rules, xlit and ICU).  '
               'Groups, rules: the conversion groups of the transform\'s own rules (not of the transforms it uses), '
               'and their rules (as planned: without the rules reported as problems).  Group kernels: the kernels '
               'of these groups; kernels: of the whole transform, including its filters and the transforms it '
-              'uses, transitively (tconv --kernel-counts; implementable transforms only).  These are counted '
-              'with tconv\'s default plans (--apply-shape-groups=1: each segment by its shape groups where they '
+              'uses, transitively (xlit --kernel-counts; implementable transforms only).  These are counted '
+              'with xlit\'s default plans (--apply-shape-groups=1: each segment by its shape groups where they '
               'take fewer kernels, see [ldml-shape-groups-report.md](ldml-shape-groups-report.md)); '
               'regular kernels: of the whole transform with the regular plans only (--apply-shape-groups=0), '
               'where they differ.  The tests are run with the default plans.\n')
@@ -698,19 +698,19 @@ def git_info(path, ignore=()):
                                *[':!' + p for p in ignore])))
 
 
-#  The tconv source (the repository of this script), and the CLDR data.
+#  The xlit source (the repository of this script), and the CLDR data.
 def source_info(args):
     def directory(d):
         if not d:
             return None
         d = os.path.realpath(os.path.expanduser(d))
         return dict(path=d, git=git_info(d))
-    #  The documents and this script do not change tconv.
+    #  The documents and this script do not change xlit.
     here = os.path.dirname(os.path.realpath(__file__))
     root = git_info(here) and subprocess.run(['git', '-C', here, 'rev-parse', '--show-toplevel'],
                                              capture_output=True, text=True).stdout.strip()
     ignore = ['doc', os.path.relpath(os.path.realpath(__file__), root)] if root else []
-    return dict(tconv=git_info(root or here, ignore),
+    return dict(xlit=git_info(root or here, ignore),
                 transforms_dir=directory(args.transforms_dir), test_data=directory(args.test_data))
 
 
@@ -758,8 +758,8 @@ def status_of(e):
 #  own problem classes and test results, and the totals.
 def changes(previous, entries, names, meta):
     md = ['# Coverage changes\n',
-          'Run of %s: tconv %s; %d transforms planned again: %s\n' % (
-              meta['runs'][-1]['date'], describe_commit(meta['source']['tconv']), len(names), ', '.join(names) or 'none')]
+          'Run of %s: xlit %s; %d transforms planned again: %s\n' % (
+              meta['runs'][-1]['date'], describe_commit(meta['source']['xlit']), len(names), ', '.join(names) or 'none')]
     added = [n for n in entries if n not in previous]
     removed = [n for n in previous if n not in entries]
     if added:
@@ -808,12 +808,12 @@ def table_doc(entries, meta, note, cldr_note=None):
     cldr = 'CLDR transforms in `%s`%s' % (shown, ' at ' + describe_commit(t['git']) if t and t['git'] else '') if t else 'CLDR transforms'
     if cldr_note:
         cldr += ', ' + cldr_note
-    branch = src['tconv']['branch'] if src['tconv'] else None
-    head = ('# tconv coverage: per-transform table\n\n'
-            'Generated by `tools/ldml/tconv_coverage.py` (tconv%s at %s%s; %s). '
-            'See [ldml-tconv-coverage.md](ldml-tconv-coverage.md) for the status report, '
+    branch = src['xlit']['branch'] if src['xlit'] else None
+    head = ('# xlit coverage: per-transform table\n\n'
+            'Generated by `tools/ldml/xlit_coverage.py` (xlit%s at %s%s; %s). '
+            'See [ldml-xlit-coverage.md](ldml-xlit-coverage.md) for the status report, '
             'the work items and the problem classes.\n\n') % (
-        ' on branch ' + branch if branch else '', describe_commit(src['tconv']), ': ' + note if note else '', cldr)
+        ' on branch ' + branch if branch else '', describe_commit(src['xlit']), ': ' + note if note else '', cldr)
     return head + re.sub(r'(?m)^## ', '### ', summary(entries))
 
 
@@ -821,7 +821,7 @@ def bar(n, total):
     return '█' * round(40 * n / total)
 
 
-#  The generated blocks of the status report (doc/ldml-tconv-coverage.md), by
+#  The generated blocks of the status report (doc/ldml-xlit-coverage.md), by
 #  name, each given the entries and the current text of the block.
 def block_summary(entries, old):
     builtins = [e for e in entries.values() if e['builtin']]
@@ -913,14 +913,14 @@ def update_report(path, entries):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--tconv', required=True)
+    ap.add_argument('--xlit', required=True)
     ap.add_argument('--transforms-dir', required=True)
     ap.add_argument('--test-data')
     ap.add_argument('--jobs', type=int, default=2)
     ap.add_argument('--timeout', type=int, default=1200)
-    ap.add_argument('--tconv-threads', type=int, metavar='N',
-                    help='at most N threads for each tconv run (its pipelines and their compilation)')
-    ap.add_argument('--out', default='tconv-coverage')
+    ap.add_argument('--xlit-threads', type=int, metavar='N',
+                    help='at most N threads for each xlit run (its pipelines and their compilation)')
+    ap.add_argument('--out', default='xlit-coverage')
     ap.add_argument('--update', action='store_true', help='keep the previous results in --out; plan and test only the selected transforms')
     ap.add_argument('--only', nargs='+', metavar='NAME', help='with --update: these transforms')
     ap.add_argument('--builtins', action='store_true', help='with --update: all the built-in transforms')
@@ -929,7 +929,7 @@ def main():
     ap.add_argument('--no-kernel-counts', action='store_true',
                     help='do not count kernels (keep the previous counts with --update)')
     ap.add_argument('--table-doc', metavar='PATH', help='write the per-transform table document')
-    ap.add_argument('--note', help='for --table-doc: what the tconv version includes')
+    ap.add_argument('--note', help='for --table-doc: what the xlit version includes')
     ap.add_argument('--cldr-note', help='for --table-doc: about the CLDR data (e.g. local fixes applied or not)')
     ap.add_argument('--report-doc', metavar='PATH', help='rewrite the generated blocks of the status report')
     ap.add_argument('--no-resume', action='store_true',
@@ -950,15 +950,15 @@ def main():
             for key in ('transforms_dir', 'test_data'):
                 old, new = meta['source'].get(key), source[key]
                 if (old and old['path']) != (new and new['path']) and not args.force:
-                    sys.exit('tconv_coverage.py: --%s %s differs from %s of the previous results (use --force)'
+                    sys.exit('xlit_coverage.py: --%s %s differs from %s of the previous results (use --force)'
                              % (key.replace('_', '-'), new and new['path'], old and old['path']))
         else:
-            print('tconv_coverage.py: no %s; assuming the previous results used these directories' % meta_path,
+            print('xlit_coverage.py: no %s; assuming the previous results used these directories' % meta_path,
                   file=sys.stderr)
     args.progress = Progress(args)
     entries = list_transforms(args)
     names = select(args, entries, previous)
-    print('tconv_coverage.py: planning %d transforms' % len(names), file=sys.stderr)
+    print('xlit_coverage.py: planning %d transforms' % len(names), file=sys.stderr)
     if previous is not None:
         for name in entries:
             if name not in names:
@@ -966,7 +966,7 @@ def main():
     names = plan_with_users(args, entries, names, previous)
     classify(args, entries)
     today = datetime.date.today().isoformat()
-    checked = dict(tconv=source['tconv'] and source['tconv']['commit'], date=today)
+    checked = dict(xlit=source['xlit'] and source['xlit']['commit'], date=today)
     for name, e in entries.items():
         if name in names:
             e['checked'] = checked
@@ -981,7 +981,7 @@ def main():
                 if name not in counted and name in previous and key in previous[name]:
                     e[key] = previous[name][key]
     if counted:
-        print('tconv_coverage.py: counting the kernels of %d transforms' % len(counted), file=sys.stderr)
+        print('xlit_coverage.py: counting the kernels of %d transforms' % len(counted), file=sys.stderr)
         run_kernel_counts(args, entries, counted)
         run_kernel_counts(args, entries, counted, regular=True)
     if args.test_data:
@@ -991,7 +991,7 @@ def main():
             for key in ('tests', 'test_results'):
                 if key in previous[name] and (key == 'tests' or (name not in names and e['implementable'])):
                     e[key] = previous[name][key]
-    run = dict(date=today, tconv=source['tconv'], mode='update' if args.update else 'full',
+    run = dict(date=today, xlit=source['xlit'], mode='update' if args.update else 'full',
                planned=len(names), selected=names if args.update else 'all', kernel_counts=len(counted))
     meta = dict(source=source, runs=(meta['runs'] if meta else []) + [run])
     with open(os.path.join(args.out, 'coverage.json'), 'w', encoding='utf-8') as f:
@@ -1008,7 +1008,7 @@ def main():
             f.write(table_doc(entries, meta, args.note, args.cldr_note))
     if args.report_doc:
         found = update_report(args.report_doc, entries)
-        print('tconv_coverage.py: %s: blocks rewritten: %s' % (args.report_doc, ', '.join(found) or 'none (no markers)'),
+        print('xlit_coverage.py: %s: blocks rewritten: %s' % (args.report_doc, ', '.join(found) or 'none (no markers)'),
               file=sys.stderr)
     args.progress.finish()
 

@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: a whole group whose string matches are selected sequentially (two-way
+#  xlit: a whole group whose string matches are selected sequentially (two-way
 #  or cyclic overlaps, TransformStep::sequentialSelection), with string rules
 #  whose before contexts are matched against the converted text, selected in
 #  the correction kernel's While loop (FusedRulesConfig::sequential,
@@ -12,14 +12,14 @@
 #  across blocks.  The expected results are ICU's (createFromRules, each line
 #  a text).  With --sequential-while=0 the chains of 9 or more fail.
 #
-#  tconv_sequential_while_test.py <tconv binary> [--extended-testing]
+#  xlit_sequential_while_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 GROUPS = [
     # Two-way overlaps (bc, cb), a longer rule over both, and a converted
@@ -46,7 +46,7 @@ CONFIGS = [[], ["-thread-num=4", "-segment-size=1"]] + ([["-thread-num=1"]] if E
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
@@ -57,7 +57,7 @@ def main():
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
             for config in CONFIGS:
-                run = subprocess.run([tconv, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input],
+                run = subprocess.run([xlit, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input],
                                      capture_output=True)
                 if run.returncode != 0:
                     failures += 1

@@ -1,6 +1,8 @@
-# tconv: UTF-8 mode
+# xlit: UTF-8 mode
 
-tconv builds its rule pipelines in one of two modes:
+(xlit was formerly named tconv.)
+
+xlit builds its rule pipelines in one of two modes:
 
 - **Unicode mode:** the text is decoded from UTF-8 to the 21 basis bits of
   its codepoints (one position per character), the steps are applied there,
@@ -9,10 +11,10 @@ tconv builds its rule pipelines in one of two modes:
   units (one position per byte), without decoding.
 
 Each transform is classified (`TransformAnalyzer::mode` in
-`tools/ldml/tconv.cpp`). A transform is in UTF-8 mode when every step of its
+`tools/ldml/xlit.cpp`). A transform is in UTF-8 mode when every step of its
 plan can be applied to UTF-8 code units, including those of the transforms
 it invokes, transitively. If any step, or any transform it invokes, needs
-Unicode mode, the whole transform is in Unicode mode. `tconv --plan` reports
+Unicode mode, the whole transform is in Unicode mode. `xlit --plan` reports
 the mode as its last line:
 
 ```
@@ -20,7 +22,7 @@ the mode as its last line:
   mode: Unicode: invokes Any-NFD (the built-in Any-NFD)
 ```
 
-By default tconv uses UTF-8 mode wherever a transform is in it;
+By default xlit uses UTF-8 mode wherever a transform is in it;
 `--utf8-mode=0` always uses Unicode mode. `--kernel-counts` counts the
 kernels of the pipeline used (`mode: UTF-8`).
 
@@ -104,7 +106,7 @@ Those bytes are changed by XOR.
 A map whose characters all keep their lengths, applied to well-formed text,
 takes two kernels: the classes and the in-place changes.
 
-**Contexts.** For each subgroup with contexts, tconv matches the pattern
+**Contexts.** For each subgroup with contexts, xlit matches the pattern
 `(?<=before) [chars] (?=after)` with the regular expression engine on the
 UTF-8 basis bits (`RE_context{&cc::UTF8, Basis}`, `utf8Applies`). The engine
 chooses its mode: byte mode, UTF-8 indexed, or Unicode indexed. Unicode
@@ -113,7 +115,7 @@ around dropped input become adjacent. The marks of all the subgroups are
 ORed and given to `UTF8_CharMapPipeline`, which maps a contextual character
 only where its last byte is marked.
 
-To place the marks, tconv queries the engine's plan, `planRE(prepared,
+To place the marks, xlit queries the engine's plan, `planRE(prepared,
 &cc::UTF8)` (`RE_Plan` in `include/kernel/re/regexp_engine.h`), which the
 engine computes without building a pipeline. The plan gives:
 - the mode as compiled (`modeName()`);
@@ -123,7 +125,7 @@ engine computes without building a pipeline. The plan gives:
 - whether the starts of matches are found by reversal;
 - the precondition failures.
 
-tconv uses the plan to decide whether a rule with contexts can be in UTF-8
+xlit uses the plan to decide whether a rule with contexts can be in UTF-8
 mode, and `--plan` reports the engine's mode for each context:
 
 ```
@@ -198,8 +200,8 @@ the rules and ICU. Normalization within filters was stressed on 600 lines
 per transform for the 11 transforms that do it (and for Accents-Any and
 lt-Lower). The text was dense with combining marks and nuktas next to
 filtered characters, with decomposed and precomposed letters and the barrier
-characters themselves, and the output was identical to Unicode mode and ICU. `QA/tconv_utf8_mode_test.py`
-(ctest `tconv_utf8_mode_test`) checks nine of the transforms (Thai-ThaiSemi,
+characters themselves, and the output was identical to Unicode mode and ICU. `QA/xlit_utf8_mode_test.py`
+(ctest `xlit_utf8_mode_test`) checks nine of the transforms (Thai-ThaiSemi,
 Accents-Any, lt-Lower and Deva-Beng among them) in both modes
 and both error treatments.
 
@@ -239,7 +241,7 @@ slower for Fullwidth-Halfwidth.
 - **Engine plans.** `RE_Plan` is a first step towards plans of the engine
   that clients query before building: for example, the strategies for the
   starts of matches and the walks of captures, and the kernels a pattern
-  would take. tconv could then choose between implementations by their
+  would take. xlit could then choose between implementations by their
   costs, as it does now by counting kernels.
 - **More patterns:** string rules (85 of the transforms invoking a
   normalization have them), and contexts that see the converted text (51).

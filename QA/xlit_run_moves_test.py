@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: run moves (ldml::MarkRunMoves), fa-fa_FONIPA's ([َ-ِ]) ّ → ّ | $1,
+#  xlit: run moves (ldml::MarkRunMoves), fa-fa_FONIPA's ([َ-ِ]) ّ → ّ | $1,
 #  which ICU applies again and again, writing the run of shaddas after the
 #  vowel and then converting the vowel with what follows the run; replaced by
 #  rules writing a mark at the vowel (where the group reaches it), the result
@@ -15,14 +15,14 @@
 #  round each to delete.  The expected results are ICU's (createFromRules,
 #  each line a text).
 #
-#  tconv_run_moves_test.py <tconv binary> [--extended-testing]
+#  xlit_run_moves_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RUN_MOVES = """\
 ::NFD;
@@ -119,7 +119,7 @@ DELETION_RUN_CASES = [
 ]
 
 
-def check(tconv, tmp, name, rules_text, cases):
+def check(xlit, tmp, name, rules_text, cases):
     failures = 0
     rules = os.path.join(tmp, name + ".rules")
     with open(rules, "w", encoding="utf-8") as f:
@@ -127,12 +127,12 @@ def check(tconv, tmp, name, rules_text, cases):
     input = os.path.join(tmp, name + ".txt")
     with open(input, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line, _ in cases))
-    plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules, input], capture_output=True)
+    plan = subprocess.run([xlit, "--plan", "--rules-file=" + rules, input], capture_output=True)
     text = plan.stdout.decode("utf-8", "replace")
     if ": implementable" not in text.split("\n")[0] or "warning" in text:
         failures += 1
         print("FAIL %s: the rules are not implementable without warnings\n%s" % (name, text))
-    run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+    run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         failures += 1
         print("FAIL %s: exit status %d\n%s" % (name, run.returncode, run.stderr.decode("utf-8", "replace")))
@@ -146,10 +146,10 @@ def check(tconv, tmp, name, rules_text, cases):
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
-        failures = check(tconv, tmp, "run_moves", RUN_MOVES, RUN_MOVE_CASES)
-        failures += check(tconv, tmp, "deletion_runs", DELETION_RUNS, DELETION_RUN_CASES)
+        failures = check(xlit, tmp, "run_moves", RUN_MOVES, RUN_MOVE_CASES)
+        failures += check(xlit, tmp, "deletion_runs", DELETION_RUNS, DELETION_RUN_CASES)
     print("%d failures" % failures)
     return 1 if failures else 0
 

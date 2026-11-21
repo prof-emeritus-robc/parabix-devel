@@ -12,7 +12,7 @@ the marker bit on one of two bytes of each multibyte UTF-8 sequence:
 
 The new option `-u8-bit-movement=advance|lookahead` (category "Normalization
 Options", `NormalizationOptions()`) selects the mode for `NFD_PipelineBuilder`. It
-applies to nfd, nfkd and tconv's Any-NFD/Any-NFKD.
+applies to nfd, nfkd and xlit's Any-NFD/Any-NFKD.
 
 ## Changes
 

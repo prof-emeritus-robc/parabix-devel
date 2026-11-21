@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: the hybrid of UTF-8 mode (--hybrid-groups; doc/masked-transforms-plan.md
+#  xlit: the hybrid of UTF-8 mode (--hybrid-groups; doc/masked-transforms-plan.md
 #  step 16, option C): a conversion group decided one position per character,
 #  on classes computed on the bytes, and applied to the bytes by selectors.  Its
 #  output must equal Unicode mode's.  The cases (with DivCode off, so that the
@@ -18,7 +18,7 @@
 #  in turn as the groups of one transform (:: Null ; between them); with
 #  --extended-testing also each on its own, and also as a text.
 #
-#  tconv_hybrid_test.py <tconv binary> [--extended-testing]
+#  xlit_hybrid_test.py <xlit binary> [--extended-testing]
 
 import os
 import random
@@ -42,7 +42,7 @@ RULE_SETS = {"all": "\n:: Null ;\n".join(RULES[name] for name in DEFAULT)}
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     rnd = random.Random(7)
     text = "\n".join("".join(rnd.choice(ALPHABET) for _ in range(rnd.randint(0, 40))) for _ in range(80)) + "\n"
     failures = 0
@@ -58,8 +58,8 @@ def main():
                 f.write(rules)
             for lines in (([], ["--lines"]) if extended else (["--lines"],)):
                 args = lines + ["--rules-file=" + rp, path]
-                expected = subprocess.run([tconv, "--utf8-mode=0"] + args, capture_output=True)
-                hybrid = subprocess.run([tconv, "--hybrid-groups", "--divcode-groups=0", "--check-utf8-masks"] + args,
+                expected = subprocess.run([xlit, "--utf8-mode=0"] + args, capture_output=True)
+                hybrid = subprocess.run([xlit, "--hybrid-groups", "--divcode-groups=0", "--check-utf8-masks"] + args,
                                         capture_output=True)
                 label = name + (" --lines" if lines else "")
                 if expected.returncode != 0 or hybrid.returncode != 0 or expected.stdout != hybrid.stdout:

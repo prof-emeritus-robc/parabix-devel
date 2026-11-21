@@ -2,21 +2,21 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: prefix runs, (P) S → A | $1 ; and p S → A | p ; with S of one or
+#  xlit: prefix runs, (P) S → A | $1 ; and p S → A | p ; with S of one or
 #  more characters, which ICU applies to each run P S^n to leave A^n P (see
 #  ComposeRevisits in include/ldml/transform_rules.h).  Each rules file must be planned with its
-#  prefix runs in a group of their own (tconv --plan), and its result must be
+#  prefix runs in a group of their own (xlit --plan), and its result must be
 #  ICU's (as given by uconv -x on the same rules), including on a run longer
 #  than a block.
 #
-#  tconv_prefix_runs_test.py <tconv binary> [--extended-testing]
+#  xlit_prefix_runs_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 LONG = 600
 
@@ -57,7 +57,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         argvs = []
@@ -68,8 +68,8 @@ def main():
             input = os.path.join(tmp, "input%d.txt" % i)
             with open(input, "w", encoding="utf-8") as f:
                 f.write(text)
-            argvs.append([tconv, "--plan", "--rules-file=" + rules])
-            argvs.append([tconv, "--rules-file=" + rules, input])
+            argvs.append([xlit, "--plan", "--rules-file=" + rules])
+            argvs.append([xlit, "--rules-file=" + rules, input])
         runs = [subprocess.run(argv, capture_output=True) for argv in argvs]
         for i, (rule, _, want) in enumerate(CASES):
             plan, run = runs[2 * i: 2 * i + 2]

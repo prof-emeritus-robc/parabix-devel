@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: region scope relies only on the mask (doc/masked-transforms-plan.md,
+#  xlit: region scope relies only on the mask (doc/masked-transforms-plan.md,
 #  steps 10-16): a region is a run of positions of the mask, with at least one
 #  position outside it between any two regions, which may hold any character.
 #  With --region-separators (hidden, for testing), the regions of --lines are
@@ -17,7 +17,7 @@
 #  feeds (each line a region, the semantics of --lines), with the separators
 #  put back, unchanged.
 #
-#  tconv_region_separators_test.py <tconv binary> [--extended-testing]
+#  xlit_region_separators_test.py <xlit binary> [--extended-testing]
 
 import os
 import random
@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (transform name or rules file text, separators (hex), alphabet of the pieces)
 CASES = [
@@ -55,8 +55,8 @@ if EXTENDED:
     ]
 
 
-def run(tconv, spec, extra, path, tmp):
-    args = [tconv, "--use-ICU=0", "--lines"] + extra
+def run(xlit, spec, extra, path, tmp):
+    args = [xlit, "--use-ICU=0", "--lines"] + extra
     if "\u2192" in spec:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -69,7 +69,7 @@ def run(tconv, spec, extra, path, tmp):
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for spec, seps, alpha in CASES:
@@ -84,8 +84,8 @@ def main():
                 f.write(text)
             with open(lines, "w", encoding="utf-8") as f:
                 f.write("\n".join(pieces))
-            one = run(tconv, spec, ["--region-separators=" + seps], path, tmp)
-            ref = run(tconv, spec, [], lines, tmp)
+            one = run(xlit, spec, ["--region-separators=" + seps], path, tmp)
+            ref = run(xlit, spec, [], lines, tmp)
             name = spec.split("\n")[0]
             if one[0] or ref[0]:
                 failures += 1

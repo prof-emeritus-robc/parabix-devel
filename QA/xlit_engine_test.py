@@ -2,15 +2,15 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: conversion groups of a single rule applied by the search and replace
-#  of the regular expression engine (see engineSearchReplace in tconv.cpp).
-#  Each rules file must be planned for the engine (tconv --plan), and its
+#  xlit: conversion groups of a single rule applied by the search and replace
+#  of the regular expression engine (see engineSearchReplace in xlit.cpp).
+#  Each rules file must be planned for the engine (xlit --plan), and its
 #  result must be that of Python's re.sub on the whole text (as ICU applies
 #  these rules: their matches cannot overlap, and their repetitions match as
-#  ICU's possessive ones do), and that of tconv's own kernels
+#  ICU's possessive ones do), and that of xlit's own kernels
 #  (--disable-engine-search-replace).
 #
-#  tconv_engine_test.py <tconv binary> [--extended-testing]
+#  xlit_engine_test.py <xlit binary> [--extended-testing]
 
 import os
 import re
@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 TEXT = "abx cd abc. abcd #ab-1; #k-23; #-4; cdcd\nx#a-9;\n"
 
@@ -32,7 +32,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         text = os.path.join(tmp, "input.txt")
@@ -43,9 +43,9 @@ def main():
             rules = os.path.join(tmp, "rules%d.txt" % i)
             with open(rules, "w", encoding="utf-8") as f:
                 f.write(rule + "\n")
-            argvs.append([tconv, "--plan", "--capture-strings=0", "--rules-file=" + rules])
-            argvs.append([tconv, "--capture-strings=0", "--rules-file=" + rules, text])
-            argvs.append([tconv, "--capture-strings=0", "--disable-engine-search-replace", "--rules-file=" + rules, text])
+            argvs.append([xlit, "--plan", "--capture-strings=0", "--rules-file=" + rules])
+            argvs.append([xlit, "--capture-strings=0", "--rules-file=" + rules, text])
+            argvs.append([xlit, "--capture-strings=0", "--disable-engine-search-replace", "--rules-file=" + rules, text])
         runs = [subprocess.run(argv, capture_output=True) for argv in argvs]
         for i, (rule, pattern, replacement) in enumerate(CASES):
             plan, engine, kernels = runs[3 * i: 3 * i + 3]
@@ -61,7 +61,7 @@ def main():
                           % (rule, label, run.returncode, got, want, run.stderr.decode()[:300]))
     if failures:
         sys.exit(1)
-    print("tconv_engine_test: all tests passed")
+    print("xlit_engine_test: all tests passed")
 
 
 if __name__ == "__main__":

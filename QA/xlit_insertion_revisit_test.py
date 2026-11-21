@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: a rule inserting a string between its captures and revisiting all,
+#  xlit: a rule inserting a string between its captures and revisiting all,
 #  ($c) ($c) → | $1 a $2, applied as an insertion rule before its group (see
 #  ldml::ComposeRevisits, insertionRevisit), also where it is not the first rule
 #  of its group: the rules before it that begin with a character of the first
@@ -13,14 +13,14 @@
 #  either not implementable (exit status 2) or as ICU applies them.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_insertion_revisit_test.py <tconv binary> [--extended-testing]
+#  xlit_insertion_revisit_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("$c = [bcdfg] ;\n"
          "x → X ;\n"
@@ -49,7 +49,7 @@ BLOCKED = "$c = [bcdfg] ;\nc → K ;\n($c) ($c) → | $1 a $2 ;\nb → B ;\nd �
 BLOCKED_CASES = [('bc', 'BaK'), ('cb', 'KB'), ('bcd', 'BaKD'), ('cc', 'KK')]
 
 
-def run(tconv, rules_text, cases):
+def run(xlit, rules_text, cases):
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -57,7 +57,7 @@ def run(tconv, rules_text, cases):
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in cases))
-        return subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        return subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
 
 
 def compare(r, cases):
@@ -71,13 +71,13 @@ def compare(r, cases):
 
 
 def main():
-    tconv = sys.argv[1]
-    r = run(tconv, RULES, CASES)
+    xlit = sys.argv[1]
+    r = run(xlit, RULES, CASES)
     if r.returncode != 0:
         print("FAIL: exit status %d\n%s" % (r.returncode, r.stderr.decode("utf-8", "replace")))
         return 1
     failures = compare(r, CASES)
-    r = run(tconv, BLOCKED, BLOCKED_CASES)
+    r = run(xlit, BLOCKED, BLOCKED_CASES)
     if r.returncode == 0:
         failures += compare(r, BLOCKED_CASES)
     elif r.returncode != 2:

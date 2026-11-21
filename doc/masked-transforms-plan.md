@@ -2,10 +2,10 @@
 
 Status (2026-11-18): plan. The first step, a mask input for the class and
 property kernels, is done (`MaskKind`, `StreamMask` in
-`include/kernel/unicode/charclasses.h`, commit fc7aaa956) and used by tconv's
+`include/kernel/unicode/charclasses.h`, commit fc7aaa956) and used by xlit's
 case-map marks (c85065bb7). Step 2, the pipeline-level `TransformMask` with
-position maps, is done in tconv (`TransformMask`, `PositionMap`,
-`TransformMasks` in `tools/ldml/tconv.cpp`). Step 3, `--lines` in one run for
+position maps, is done in xlit (`TransformMask`, `PositionMap`,
+`TransformMasks` in `tools/ldml/xlit.cpp`). Step 3, `--lines` in one run for
 the transforms whose components support region scope, is done
 (`regionScope`, `pushRegions`, `--lines-regions`). Step 4, contexts bounded by
 the regions in the fused kernels (correction kernels included) and the engine,
@@ -30,7 +30,7 @@ basis, to part of a text:
 - **Filters.** A global filter `:: [set] ;`, a filtered step `:: [set] T ;`, and
   the filters of the transforms a transform invokes.
 - **`--lines`.** Each line is a text of its own. Today
-  `applyToInput` (`tools/ldml/tconv.cpp`) runs the whole pipeline once per line,
+  `applyToInput` (`tools/ldml/xlit.cpp`) runs the whole pipeline once per line,
   through a pipe.
 - **Function calls.** `&T($k)` applies T to a captured text. Case maps are done
   by marks (`CaseMapSplit`); other functions are expanded per character
@@ -177,7 +177,7 @@ transforms it can affect, and against ICU.
    `--region-separators` are streams tracked by `TransformMasks`
    (`pushTracked`), kept in step as the masks are but not masks, instead of
    outermost masks.
-   Output unchanged: the tconv tests, and the CLDR test data of the transforms
+   Output unchanged: the xlit tests, and the CLDR test data of the transforms
    with filters (single-threaded and `-thread-num=4 -segment-size=1`),
    compared with the previous build.
 3. **`--lines` as region scope, for the transforms whose components support it.**
@@ -207,7 +207,7 @@ transforms it can affect, and against ICU.
      alternation or difference of classes and the anchor of its end) must match
      both the line feed and the end, or neither. An inner item must match
      neither. A lookaround of such an item (as the engine has a complement)
-     must match both or neither. No item may match a mark of tconv's or the
+     must match both or neither. No item may match a mark of xlit's or the
      deletion mark.
 
    Of the 252 CLDR transforms with test data, 112 are applied in one run. The
@@ -215,7 +215,7 @@ transforms it can affect, and against ICU.
    at the start of a line taken as a text but not after a line feed), capture
    replacements, prefix runs or insertion rules. On the test data of the 112,
    one run gives the output of the per-line runs, also with `-thread-num=4
-   -segment-size=1` (`tconv_lines_regions_test` covers the edges). Warm run times
+   -segment-size=1` (`xlit_lines_regions_test` covers the edges). Warm run times
    on the largest test data, per-line runs to one run: 0.45 s to 0.04 s
    (und-Ethi-t-sgw-ethi-m0-gurage-2013, 8532 lines), 0.22 s to 0.05 s
    (es-419-fonipa-t-es-fonipa), 0.24 s to 0.05 s (ug-fonipa-t-ug); 36.8 s to
@@ -248,7 +248,7 @@ transforms it can affect, and against ICU.
    (112 after step 3), 116 of them with bounded contexts; the others have
    capture replacements, prefix runs, insertion or deferred rules. On the test
    data of the 116, one run gives the output of the per-line runs, also with
-   `-thread-num=4 -segment-size=1`. `tconv_lines_regions_test` has rules files
+   `-thread-num=4 -segment-size=1`. `xlit_lines_regions_test` has rules files
    whose contexts reach across lines (after and before, the engine's, and
    before contexts matched against the converted text, which differ without
    the bounds). Warm run times, per-line runs to one run: zh-t-es 2.86 s to
@@ -316,7 +316,7 @@ transforms it can affect, and against ICU.
    the insertion eligibility into text scope, and retire the special cases one at
    a time.
 
-   Done (2026-11-19) in tconv's Unicode mode:
+   Done (2026-11-19) in xlit's Unicode mode:
    - **Insertion eligibility** is a property of a mask of text scope,
      `TransformMask::insertBefore`: an insertion within its runs is made only
      before one of its positions (ICU's compound transforms under a filter).
@@ -329,13 +329,13 @@ transforms it can affect, and against ICU.
      (the positions outside the innermost mask, cached). The classes of the
      sets with `FilterRunEndMark` are ORed with it (`WithRunEnds`, which
      replaces `OutsideMask`, a kernel that complemented the mask itself), and
-     the engine's `tconvFilterRunEnd` external is the same stream instead of
+     the engine's `xlitFilterRunEnd` external is the same stream instead of
      a complement of its own.
 
    `FilterRunEndMark` itself stays: it is how the rule analysis
    (`ldml::MoveTextAnchors`) tells the pipeline that a set matches at the end
    of a run, which the rules alone do not say.
-   Checks: the tconv tests (`tconv_filter_run_end_test`, the insertion and
+   Checks: the xlit tests (`xlit_filter_run_end_test`, the insertion and
    DivCode tests) pass, and insertions under global filters, with one group
    and with several, give the previous output. On the CLDR test data of the
    151 transforms with a filter (am_Ethi-d0_Morse included), with `--lines`,
@@ -350,17 +350,17 @@ transforms it can affect, and against ICU.
 8. **Function calls by masks.** `&T($k)` on a captured character applies T at the
    marked position, in region scope with each argument a region (separated
    from its neighbours, see the open question on adjacent arguments), as the
-   case maps are now, but for any transform tconv implements.
+   case maps are now, but for any transform xlit implements.
    Deferred calls in shape groups use the same.
 9. **Masked kernels skipping blocks without mask bits** (a Pablo `If` on the
    mask), and narrower masks where the work is rare (case maps' expanding
    slots). This step is independent and can come earlier.
 
    In progress (2026-11-19): the class and property kernels with a mask
-   (`CharClassesKernel`, `UnicodePropertyKernelBuilder`, tconv's
+   (`CharClassesKernel`, `UnicodePropertyKernelBuilder`, xlit's
    `PropertyClasses`) compute their streams within an If on the mask
    (`kernel::computeMasked`; `-masked-block-skip`, default on, which the
-   kernel names encode as `+MaskZIf`/`+MaskPIf`). The normalization and tconv
+   kernel names encode as `+MaskZIf`/`+MaskPIf`). The normalization and xlit
    tests pass, and the CLDR test data of the 151 transforms with a filter give
    the previous output.
 
@@ -398,7 +398,7 @@ Goals (2026-11-20):
   and the region scope of `--lines` in the mode it runs in, and the masks
   (with their run ends, insertion eligibility and regions) cross each switch.
 
-### Survey (2026-11-20, `tconv --plan` and `--plan --lines` for all 453 names)
+### Survey (2026-11-20, `xlit --plan` and `--plan --lines` for all 453 names)
 
 Of the 424 implementable transforms defined by rules, 183 are in UTF-8 mode
 and 241 in Unicode mode: 111 for a component of their own, 130 only because
@@ -503,11 +503,11 @@ contexts see the characters outside the runs.
     fa-fa_FONIPA, also equal to ICU per line) and 3,000 random Greek lines
     (Grek-Latn, Grek-Latn/UNGEGN); with `--region-separators` taken from each
     transform's alphabet, one run equals each region as a text of its own
-    (`QA/tconv_region_separators_test.py`).
+    (`QA/xlit_region_separators_test.py`).
 11. **ICU under `--lines`.** ICU's `uconv -x` does not give `--lines`
     semantics. It transliterates the input a line at a time, but each line's
     text includes its line feed (checked with ICU 78.3's `uconv`, the version
-    tconv links, `/opt/homebrew/opt/icu4c@78/bin/uconv`):
+    xlit links, `/opt/homebrew/opt/icu4c@78/bin/uconv`):
     - the start of a line is the start of a text: `[a\u000A] { b > X ;`
       leaves the `b` after a line feed, and `[$] { b > X ;` matches at the
       start of each line;
@@ -519,29 +519,29 @@ contexts see the characters outside the runs.
     differ from the CLDR test data, which takes each line as a text without
     its line feed: my-my_FONIPA drops a word-final `a̰` at the end of 57 of its
     1,228 test lines under uconv (`က` gives `k` instead of `ka̰`). (Nor could
-    `-x` take every transform as tconv has it: a transform ID uses ICU's own
+    `-x` take every transform as xlit has it: a transform ID uses ICU's own
     CLDR data rather than the checkout's rules, which carry local fixes, and
     rule text is applied forward, so a backward transform of an XML file
     cannot be passed as it is.) A transform applied by ICU is therefore
-    applied to each line as a text of its own, in the process, by tconv's own
+    applied to each line as a text of its own, in the process, by xlit's own
     `ICUTransform` (the same transliterator, from the checkout's rules),
     without the pipe and thread of `applyToInput`. A transform with ICU stages
-    (`stagedTransformRunner`) runs each tconv stage once over all the lines,
+    (`stagedTransformRunner`) runs each xlit stage once over all the lines,
     in region scope, and each ICU stage likewise on the intermediate text.
 
     **Done (2026-11-20), in the process.** `icuLinesRunner` applies an ICU
     transform to each line (the same transliterator, from the checkout's
     rules, so `uconv` is not needed), and `stagedTransformRunner` with
-    `--lines` generates its tconv stages once with regions and applies its ICU
+    `--lines` generates its xlit stages once with regions and applies its ICU
     stages line by line. Any-Name, Name-Any, Any-BreakInternal, Thai-Latn and
-    Latn-Grek (and rules files tconv does not implement) are applied in one
+    Latn-Grek (and rules files xlit does not implement) are applied in one
     run (`--plan --lines`: "the steps of ICU line by line"), with the output of
-    the per-line runs and of ICU (`QA/tconv_icu_lines_test.py`). Remaining:
+    the per-line runs and of ICU (`QA/xlit_icu_lines_test.py`). Remaining:
     a transform with ICU stages and a global filter (Thai-Latn, the only one)
     applies all its stages to each run of the filter (`filteredRunner`, as ICU
-    does), so its tconv stages are still run once per run of the filter (no
+    does), so its xlit stages are still run once per run of the filter (no
     faster than per line: 1.65 s against 1.54 s on 2,000 lines). Applying them
-    once needs the runs' boundaries carried through the tconv stages to the
+    once needs the runs' boundaries carried through the xlit stages to the
     ICU stage.
 12. **Remove the per-line runs.** When steps 10 and 11 are done, one run gives
     the per-line output on the CLDR test data of every transform, in both
@@ -549,16 +549,16 @@ contexts see the characters outside the runs.
     `--lines-regions` are removed, `regionScope` becomes a check that must
     succeed (a component without region scope is an error in `--plan
     --lines` and in the tests), and the tests that compared one run with
-    per-line runs (`tconv_lines_regions_test`) compare with expected
+    per-line runs (`xlit_lines_regions_test`) compare with expected
     outputs (from ICU, or from the last per-line build).
     **Done (2026-11-20).** One run gave the output of the per-line runs on
     the CLDR test data of all 290 test files (the eight that differ from
-    their expected results do so both ways: six transforms tconv does not
+    their expected results do so both ways: six transforms xlit does not
     know, ka-Latn-t-ka-m0-bgn-2009 and my-fonipa-t-my). `--lines-regions`
     and `--bound-regions` are removed, `applyToInput` runs once, the ICU
     paths use the line runners with `--lines`, and a transform without
     region scope is an error with `--lines` (`--plan --lines`: "not
-    supported"). `tconv_lines_regions_test` compares one run with the
+    supported"). `xlit_lines_regions_test` compares one run with the
     outputs of the last build with per-line runs (`EXPECTED`).
 13. **Mixed modes.** The plan of a transform becomes a sequence of segments,
     each in UTF-8 or Unicode mode, through the transforms it invokes:
@@ -641,7 +641,7 @@ contexts see the characters outside the runs.
     a capture rule in a Unicode segment; a DivCode group of string rules on
     the bytes; and `am-am_FONIPA` with `--lines` (two Unicode segments), each
     with output equal to Unicode mode's
-    (`QA/tconv_utf8_masks_test.py`). A negative control (the check applied to
+    (`QA/xlit_utf8_masks_test.py`). A negative control (the check applied to
     `UTF8_index`, which marks only final bytes) was reported. The class
     compilers' marking does not enter the masks: the masks are made by
     `utf8Mask` from a class in LookAhead mode, and kept in step by the
@@ -816,15 +816,15 @@ contexts see the characters outside the runs.
     segments of string-rule groups and all 5 of single-character rules with
     converted before contexts: 34 transforms lose all such segments. Outputs
     equal Unicode mode's on the CLDR data of 26 of them, as a text and with
-    `--lines` (`QA/tconv_hybrid_test.py` has small cases). What still keeps
-    string-rule groups out (segments): captures (14), contexts with tconv's
+    `--lines` (`QA/xlit_hybrid_test.py` has small cases). What still keeps
+    string-rule groups out (segments): captures (14), contexts with xlit's
     marks (5), a kept character with inserted ones (4), insertion rules (1).
 
     *Slice 3, partly (2026-11-21):* the MultipleCaptureMultipleReplacement
     rules whose captures stay in place (not reversed, not moved). Their
     replacements are selectors like those of string rules; a captured
     character kept with text inserted around it is the selector of a string
-    with `kernel::UTF8_SelectorKept` (tconv's `StringRuleKept`) at the place
+    with `kernel::UTF8_SelectorKept` (xlit's `StringRuleKept`) at the place
     of the character: its bytes are kept, the text after the mark inserted
     after its last byte (as a tail), and the text before the mark inserted
     before its first byte by a second spread (`InsertPosition::Before`, only
@@ -851,7 +851,7 @@ contexts see the characters outside the runs.
 
     The hybrid now removes all the Unicode segments of string-rule groups of
     39 CLDR test transforms (from 34). What keeps the rest out (segments):
-    contexts with tconv's marks (5), capture sets whose spans the engine
+    contexts with xlit's marks (5), capture sets whose spans the engine
     cannot match on the bytes (3), captures reversed (3) and moved (2), the
     rest of "bytes moved by character", and insertion rules (1).
 
@@ -870,7 +870,7 @@ contexts see the characters outside the runs.
     rule's selector at the same position combined with (by OR): the string
     rule `[^﷯] { ့ ့* → ့ ;`, its before context matched against the text
     itself, and a subgroup deleting `့` after `﷯` in the converted text
-    (`tconv_split_runs_test`). Such a replacement is now kept (no selector):
+    (`xlit_split_runs_test`). Such a replacement is now kept (no selector):
     a string rule's character of a single character replaced by itself
     (`selectorReplacement`), and a character mapped to itself (the selector
     0, `selectorMappings`).
@@ -888,7 +888,7 @@ which move work from Unicode segments to UTF-8 segments.
   (am-Ethi-t-am-ethi-m0-geminate) was 100 s against 52 s before the classes
   were multiplexed; not measured since.
 - String-rule groups the hybrid still leaves to Unicode mode (segments, CLDR
-  test transforms): contexts with tconv's marks (5); capture sets whose spans
+  test transforms): contexts with xlit's marks (5); capture sets whose spans
   the engine cannot give exactly on the bytes (3, cy-fonipa-t-cy); captures
   reversed (3) and moved (2), the rest of slice 3 (bytes moved by character);
   insertion rules (1).
@@ -911,11 +911,11 @@ which move work from Unicode segments to UTF-8 segments.
 - Step 8: function calls by masks, not started.
 - Step 9: block skipping in the NFC stages and the masked case maps; narrower
   masks for the case maps' expanding slots.
-- Step 11: Thai-Latn (ICU stages under a global filter) still runs its tconv
+- Step 11: Thai-Latn (ICU stages under a global filter) still runs its xlit
   stages once per run of the filter.
 - Step 12: 2 of the 290 test files differ from their expected results, both
   issues of the test data (ka-Latn-t-ka-m0-bgn-2009 and my-fonipa-t-my, see
-  doc/ICU-uconv-CLDR-issues.md, CLDR). The six whose names tconv did not know
+  doc/ICU-uconv-CLDR-issues.md, CLDR). The six whose names xlit did not know
   (BCP 47 IDs with aliases of registered values, and one malformed) are found
   since 2026-11-21 and equal their expected results.
 
@@ -938,7 +938,7 @@ position map, and where `TransformMask` lives.
   test data of each transform the step enables, and ICU's output.
 - **Region boundaries:** rules files with contexts that would match across a line
   boundary, both edges, empty lines, and lines ending without LF.
-- **Filters:** the existing filter tests (`tconv_filter_run_end_test`, the
+- **Filters:** the existing filter tests (`xlit_filter_run_end_test`, the
   DivCode filter cases) unchanged at each step.
 - **In place and threads:** `-VerifyIR`, `-thread-num=4 -segment-size=1`
   (`inout_thread_local` covers the pipeline's in-place handling).
@@ -949,7 +949,7 @@ position map, and where `TransformMask` lives.
 
 - **ICU's run semantics under filters.** Contexts see beyond a run, anchors are
   the text's, and the characters inserted belong to the run they follow
-  (ldml-tconv-coverage.md). Are there further cases, such as a run end within a
+  (ldml-xlit-coverage.md). Are there further cases, such as a run end within a
   multi-character match, that text scope must reproduce?
 - **The position map.** A pair of insertion and deletion masks, or one
   spread-and-filter description, so that a chain of transforms composes their
@@ -965,7 +965,7 @@ position map, and where `TransformMask` lives.
   is inserted before each argument that starts right after another, and
   deleted afterwards, rather than a pass for each argument.
 - **Where the type lives.** `TransformMask` in the library (with kernel support
-  for region scope) or in tconv's pipeline builder until a second tool needs it?
+  for region scope) or in xlit's pipeline builder until a second tool needs it?
 - **UTF-8 mode.** Mask conventions per code unit, and how they combine with the
   UTF-8 class compilers' Advance and LookAhead marking. Resolved by step 14: all
   the bytes of a character have its bit, and `--check-utf8-masks` checks it.

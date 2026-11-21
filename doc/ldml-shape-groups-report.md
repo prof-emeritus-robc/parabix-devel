@@ -1,9 +1,9 @@
-# Shape groups in tconv: kernel counts and correctness
+# Shape groups in xlit: kernel counts and correctness
 
-How `tconv --apply-shape-groups` changes the pipelines of the CLDR transforms,
+How `xlit --apply-shape-groups` changes the pipelines of the CLDR transforms,
 compared with the regular plans and with
-[ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md) (generated at
-`d97c03f75`).  Measured on 2026-11-13 with tconv built from master
+[ldml-xlit-coverage-table.md](ldml-xlit-coverage-table.md) (generated at
+`d97c03f75`).  Measured on 2026-11-13 with xlit built from master
 (`3d56b029b`) plus the uncommitted shape-group work; CLDR transforms in
 `~/cldr/common/transforms`, test data in `~/cldr/testData/transforms`.
 
@@ -25,9 +25,9 @@ expression engine, one per *shape* of the rules' results (see
 - Before contexts read the converted text through a closure over the deleted
   characters, for example `(?<=\p{letter}(?:\x{FDD9}5|5)*)`.
 
-`tconv --shape-groups <transform>` prints the plan; `--apply-shape-groups`
+`xlit --shape-groups <transform>` prints the plan; `--apply-shape-groups`
 applies it. It is on by default; `--apply-shape-groups=0` uses the regular
-plan only. `tconv --plan` shows the plan chosen for each segment.
+plan only. `xlit --plan` shows the plan chosen for each segment.
 
 **Per-segment choice.** A *segment* is the run of conversion groups between
 consecutive `::X` transform rules. When the regular plan and the shape groups
@@ -54,7 +54,7 @@ shape groups, if they are implementable.
 
 ## Transforms whose pipelines change
 
-Kernel counts are from `tconv --kernel-counts`. "Group kernels" counts the
+Kernel counts are from `xlit --kernel-counts`. "Group kernels" counts the
 transform's own conversion groups. "Kernels" counts the whole transform,
 including the transforms it uses.
 
@@ -76,7 +76,7 @@ including the transforms it uses.
 
 ## Run-time performance
 
-**Setup.** Each transform was run with `tconv -thread-num=4` on 8 MB of input,
+**Setup.** Each transform was run with `xlit -thread-num=4` on 8 MB of input,
 one run at a time on an otherwise idle machine (Apple M3, 4 performance
 cores):
 
@@ -170,7 +170,7 @@ every count above at or below the regular plan.
 ## Where shape groups do not apply
 
 The first reason why a transform is not applied entirely by shape groups, as
-`tconv --kernel-counts` reports it, for each CLDR-defined transform for which
+`xlit --kernel-counts` reports it, for each CLDR-defined transform for which
 one is given (regenerated after rule ordering, see "Planning time" below; the
 earlier version of this table counted only transforms with conversion groups
 of their own, so the counts are not comparable):
@@ -199,20 +199,20 @@ contexts, `e { (tone) r → r &f($1)` and the bare `(tone) → &f($1)`.
 
 - **Correctness checks.** Each changed transform was run on 300 lines of
   random text, built from the characters of its rule file, and on its CLDR
-  test file where one exists. Both were compared with ICU (`tconv
+  test file where one exists. Both were compared with ICU (`xlit
   --use-ICU='.*'`).
   - An earlier round used `--use-ICU=1`. That option takes a regular
     expression over transform names, and `1` matches none, so those runs
-    compared tconv against its own regular pipeline. All results here are
+    compared xlit against its own regular pipeline. All results here are
     against ICU.
-- **am-chr.** Run with all its test cases as lines of one text, tconv differs
+- **am-chr.** Run with all its test cases as lines of one text, xlit differs
   from ICU on 52 of 53 cases. The regular plan does exactly the same, and the
   coverage table, which runs each case as its own text, records 0/53
   failures. This is not a shape-group difference.
 - **Bopo-Latn.** It invokes NumericPinyin-Latin within a filter (see "Within
   a filter" above). On random text both plans differ from ICU: ICU leaves
-  the tone digits where tconv applies them, although ICU's filters otherwise
-  behave as tconv's (text converted within a filter stays within it). This is
+  the tone digits where xlit applies them, although ICU's filters otherwise
+  behave as xlit's (text converted within a filter stays within it). This is
   a separate, existing issue.
 - **Number of passes.** Pipelines with more than about 24 chained engine
   passes fail to build, either in the rate analysis (`boost::bad_rational`)

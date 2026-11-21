@@ -2,20 +2,20 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: rules referring more than once to a capture of a character of a set
+#  xlit: rules referring more than once to a capture of a character of a set
 #  (([bcd]) \u02d0 \u2192 $1 $1, as sk_FONIPA-ja's length mark doubling a
 #  consonant), replaced by a rule for each character (see
 #  ldml::EnumerateRepeatedCaptures), also with two captures.  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
-#  tconv_repeated_captures_test.py <tconv binary> [--extended-testing]
+#  xlit_repeated_captures_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("([bcd]) \u02d0 \u2192 $1 $1 ;\n"
          "([xy]) ([pq]) w \u2192 $2 $1 $2 ;\n"
@@ -39,7 +39,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -47,7 +47,7 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         print("FAIL: exit status %d\n%s" % (run.returncode, run.stderr.decode("utf-8", "replace")))
         return 1

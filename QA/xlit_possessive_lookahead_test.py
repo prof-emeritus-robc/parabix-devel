@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: after contexts repeating a set with strings, matched by the regular
+#  xlit: after contexts repeating a set with strings, matched by the regular
 #  expression engine in lookaheads with ICU's possessive matching (each
 #  repetition takes the longest string of the set; see
 #  ldml::repeatsStringsOrSequences and re::resolvePossessiveQuantifiers).
@@ -10,14 +10,14 @@
 #  ywm̥ (as the greedy form would, by m then \u0325); $v+ takes ü (u \u0308)
 #  before [b-d]+.  The expected results are ICU's.
 #
-#  tconv_possessive_lookahead_test.py <tconv binary> [--extended-testing]
+#  xlit_possessive_lookahead_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("$cons = [{m\\u0325}{d\\u0361\\u0292} b d m] ;\n"
          "yw } $cons* [x \\u0325 \\u0361] → X ;\n"
@@ -39,7 +39,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -47,7 +47,7 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        run = subprocess.run([tconv, "--use-ICU=0", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--use-ICU=0", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         print("FAIL: exit status %d\n%s" % (run.returncode, run.stderr.decode("utf-8", "replace")))
         return 1

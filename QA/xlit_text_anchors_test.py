@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: the anchors of the texts of rules (see ldml::MoveTextAnchors), as ICU
+#  xlit: the anchors of the texts of rules (see ldml::MoveTextAnchors), as ICU
 #  matches them: ^ at the start of a text and $ at its end are its contexts,
 #  and a set including the text boundary as the last item of a text ([^b],
 #  [x $]) matches a character of the set or, matching nothing, the end of the
@@ -11,14 +11,14 @@
 #  unchanged, ^ 4 ($nd) → | W $1, as an after context).  The expected results are ICU's
 #  (createFromRules, each line a text).
 #
-#  tconv_text_anchors_test.py <tconv binary> [--extended-testing]
+#  xlit_text_anchors_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("a [^b] \u2192 X ;\n"
          "^ k } g \u2192 Y ;\n"
@@ -62,7 +62,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -70,7 +70,7 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         print("FAIL: exit status %d\n%s" % (run.returncode, run.stderr.decode("utf-8", "replace")))
         return 1

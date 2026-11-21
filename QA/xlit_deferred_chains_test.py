@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: chains of blocked triggers in DeferredPlan.  A trigger is not ready
+#  xlit: chains of blocked triggers in DeferredPlan.  A trigger is not ready
 #  while its before context may reach back to a trigger not yet replaced: one
 #  that matches a deferred rule, or is not ready itself and may match once it
 #  is.  In b s s ... s y with ([bc]) { s → d $1 ; and s { s } y → z ;, only
@@ -20,14 +20,14 @@
 #  the longest chain.  The expected results are ICU's (createFromRules, each
 #  line a text).
 #
-#  tconv_deferred_chains_test.py <tconv binary> [--extended-testing]
+#  xlit_deferred_chains_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 CHAINS = "([bc]) { s → d $1;\ns { s } y → z;\n"
 
@@ -62,7 +62,7 @@ REACH_CHAINS_CASES = [
 ]
 
 
-def check(tconv, tmp, name, rules_text, cases):
+def check(xlit, tmp, name, rules_text, cases):
     failures = 0
     rules = os.path.join(tmp, name + ".rules")
     with open(rules, "w", encoding="utf-8") as f:
@@ -70,12 +70,12 @@ def check(tconv, tmp, name, rules_text, cases):
     input = os.path.join(tmp, name + ".txt")
     with open(input, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line, _ in cases))
-    plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules, input], capture_output=True)
+    plan = subprocess.run([xlit, "--plan", "--rules-file=" + rules, input], capture_output=True)
     text = plan.stdout.decode("utf-8", "replace")
     if ": implementable" not in text.split("\n")[0] or "warning" in text or "deferred rules (2" not in text:
         failures += 1
         print("FAIL %s: the rules are not implementable as deferred rules without warnings\n%s" % (name, text))
-    run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--deferred-rule-rounds=16", "--rules-file=" + rules, input],
+    run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--deferred-rule-rounds=16", "--rules-file=" + rules, input],
                          capture_output=True)
     if run.returncode != 0:
         failures += 1
@@ -90,10 +90,10 @@ def check(tconv, tmp, name, rules_text, cases):
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
-        failures = check(tconv, tmp, "chains", CHAINS, CHAINS_CASES)
-        failures += check(tconv, tmp, "reach_chains", REACH_CHAINS, REACH_CHAINS_CASES)
+        failures = check(xlit, tmp, "chains", CHAINS, CHAINS_CASES)
+        failures += check(xlit, tmp, "reach_chains", REACH_CHAINS, REACH_CHAINS_CASES)
     print("%d failures" % failures)
     return 1 if failures else 0
 

@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: a string rule whose before context is matched against the converted
+#  xlit: a string rule whose before context is matched against the converted
 #  text, beginning at a later position of the text of another string rule's
 #  match.  ICU, having applied that match, applies no rule within it.  The
 #  overlaps of the string rules (analyzeStringRuleOverlaps) leave such a pair out
@@ -15,14 +15,14 @@
 #  the default plan and with --divcode-groups=0.  The expected results are
 #  ICU's (createFromRules, each line a text).
 #
-#  tconv_converted_within_test.py <tconv binary> [--extended-testing]
+#  xlit_converted_within_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 CASES = [
@@ -62,7 +62,7 @@ CONFIGS = [[], ["--divcode-groups=0"]]
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for n, (rules, lines) in enumerate(CASES):
@@ -73,7 +73,7 @@ def main():
             with open(input_path, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in lines))
             for config in CONFIGS:
-                args = [tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules_path] + config + [input_path]
+                args = [xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules_path] + config + [input_path]
                 r = subprocess.run(args, capture_output=True)
                 what = "rules %d %s" % (n, " ".join(config) or "default")
                 if r.returncode != 0:
@@ -86,7 +86,7 @@ def main():
                     if have != want:
                         failures += 1
                         print("FAIL %s: %r gives %r, expected %r" % (what, line, have, want))
-    print("tconv_converted_within_test: %s" % ("%d failures" % failures if failures else "all passed"))
+    print("xlit_converted_within_test: %s" % ("%d failures" % failures if failures else "all passed"))
     return 1 if failures else 0
 
 

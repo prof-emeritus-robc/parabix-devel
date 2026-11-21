@@ -1,6 +1,6 @@
-# Combinatorial testing of tconv
+# Combinatorial testing of xlit
 
-`tconv_ct.py` tests tconv with t-way covering arrays (`covering.py`, the IPOG
+`xlit_ct.py` tests xlit with t-way covering arrays (`covering.py`, the IPOG
 strategy that NIST's ACTS uses) instead of sweeps over all transforms. Every
 pair of parameter values (or every triple, at t=3) is covered by some test case
 in each pass, and each pass draws different transforms and inputs.
@@ -43,20 +43,20 @@ transform (ICU), is an anomaly.
 
 ```bash
 # Continuous testing of the commits of a branch, in the background, on one core
-nohup python3 QA/tconv_combinatorial/tconv_ct.py run --branch LDML > ~/.parabix/tconv-ct.log 2>&1 &
-python3 QA/tconv_combinatorial/tconv_ct.py report -v      # what it has found
+nohup python3 QA/xlit_combinatorial/xlit_ct.py run --branch LDML > ~/.parabix/xlit-ct.log 2>&1 &
+python3 QA/xlit_combinatorial/xlit_ct.py report -v      # what it has found
 # Foreground: a covering array restricted to the transforms or values a change affects, in a time budget
-python3 QA/tconv_combinatorial/tconv_ct.py once --tconv build/bin/tconv --budget 120 \
+python3 QA/xlit_combinatorial/xlit_ct.py once --xlit build/bin/xlit --budget 120 \
         --transform am-fonipa-t-am --set mode=mixed --set scope=lines
 # An anomaly against a binary (exit 1 if it is still there), and git bisect over commits
-python3 QA/tconv_combinatorial/tconv_ct.py check <id> --tconv build/bin/tconv
-python3 QA/tconv_combinatorial/tconv_ct.py bisect <id> [--good C] [--bad C] [--jobs N]
+python3 QA/xlit_combinatorial/xlit_ct.py check <id> --xlit build/bin/xlit
+python3 QA/xlit_combinatorial/xlit_ct.py bisect <id> [--good C] [--bad C] [--jobs N]
 ```
 
 `run` follows a branch from a worktree of its own (`<repo>-ct`, detached at the
-commit tested). It builds tconv there with one job (`--jobs`), copying the CMake
+commit tested). It builds xlit there with one job (`--jobs`), copying the CMake
 settings of `--reference-build`. So it tests committed code only, and a rebuild
-in the working tree does not affect it. It runs tconv with `-thread-num=1
+in the working tree does not affect it. It runs xlit with `-thread-num=1
 -compile-threads=1` and its own object cache, which it clears at each new commit.
 
 When the branch moves, it finishes the current case, builds the new commit, and
@@ -64,7 +64,7 @@ first reruns the open anomalies (marking them fixed or not). Then it continues
 with new passes. It starts at strength t (`--t`, default 2) and moves to t+1
 after `--pairwise-passes` passes.
 
-## The state (`--state`, default `~/.parabix/tconv-ct`)
+## The state (`--state`, default `~/.parabix/xlit-ct`)
 
 - `state.json`: the commits tested, the passes, the rotation of the classes, and
   the known CLDR/ICU mismatches.

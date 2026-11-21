@@ -174,7 +174,7 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
 //
 // The plan of the engine for a prepared RE on a source of an encoding: how its
 // pipeline methods compile the RE for its goal, without building a pipeline,
-// for clients that need to know before they build one (e.g. tconv choosing
+// for clients that need to know before they build one (e.g. xlit choosing
 // between implementations, or reporting how a pattern is matched).
 //   - lengthAlphabet, codeUnitAlphabet: the alphabets as compiled (byte mode:
 //     UTF-8/UTF-8; UTF-8 indexed: Unicode lengths over UTF-8 code units;

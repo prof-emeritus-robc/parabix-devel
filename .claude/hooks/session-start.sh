@@ -5,7 +5,7 @@
 #  SessionStart hook for Claude Code cloud sessions: installs the build
 #  dependencies of Parabix (LLVM >= 16 development files, Boost),
 #  configures a Release build in build/ and builds the LDML tools
-#  (ldml_trules, tconv).  Idempotent: packages already installed are not
+#  (ldml_trules, xlit).  Idempotent: packages already installed are not
 #  reinstalled, and make rebuilds only what changed.
 set -euo pipefail
 
@@ -28,4 +28,4 @@ fi
 
 mkdir -p build "$HOME/.cache"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/lib/llvm-18 > build/cmake.log
-make -C build -j"$(nproc)" ldml_trules tconv > build/make.log
+make -C build -j"$(nproc)" ldml_trules xlit > build/make.log

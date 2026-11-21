@@ -2274,7 +2274,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                     set.greedyStarts = !supported;
                     continue;
                 }
-                //  (Possessive captures in the lookahead, which tconv checks the
+                //  (Possessive captures in the lookahead, which xlit checks the
                 //  engine supports in their form.)
                 set.engineStarts = true;
             }

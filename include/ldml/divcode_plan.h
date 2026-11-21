@@ -63,7 +63,7 @@ struct DivCodeOptions {
     // Whether the before contexts that ICU matches against the converted text
     // (see DivRule::converted) are matched against it, resolved by the
     // Converted kernel's While loop (doc/ldml-divcode-plan.md §10); if not,
-    // against the text itself, as with tconv --converted-context-rounds=0.
+    // against the text itself, as with xlit --converted-context-rounds=0.
     bool convertedContexts = true;
     // Whether a before context (as given for the regular expression engine)
     // may match differently in the text as converted by the group, against
@@ -157,7 +157,7 @@ struct DivRule {
     // unless it begins strictly within an applied match of an earlier stage.
     unsigned stage = 0;
     // A rule whose before context ICU matches against the converted text (it
-    // may match differently there: see convertedContextMatters in tconv):
+    // may match differently there: see convertedContextMatters in xlit):
     // resolved against the converted text by the Converted kernel's While loop
     // (doc/ldml-divcode-plan.md §10).  (Phase 1: a single-character rule, with
     // a before context of one item, that no rule yields to.)
@@ -203,7 +203,7 @@ struct DivConvertedFamily {
     std::vector<bool> in;
 };
 
-// Whether covering families are planned (phase 2; tconv --divcode-families):
+// Whether covering families are planned (phase 2; xlit --divcode-families):
 // otherwise their groups keep the problem, as before phase 2.
 extern bool DivCodeFamilies;
 

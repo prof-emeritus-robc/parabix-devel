@@ -2,17 +2,17 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv --shape-groups: a conversion group planned as search and replace
+#  xlit --shape-groups: a conversion group planned as search and replace
 #  passes, one for each shape of the results of its rules (see
 #  include/ldml/shape_groups.h).  The passes of NumericPinyin-Latin (the
-#  backward rules of Latin-NumericPinyin), as printed by tconv, are applied
+#  backward rules of Latin-NumericPinyin), as printed by xlit, are applied
 #  with icgrep --replace to the text in NFD, the deferred function calls
 #  (their marks and arguments) replaced by their values, and the result (in
-#  NFC) compared with ICU's (tconv --use-ICU=.*, if tconv is built with ICU),
-#  or else with tconv's regular plan (--apply-shape-groups=0); and so is tconv
+#  NFC) compared with ICU's (xlit --use-ICU=.*, if xlit is built with ICU),
+#  or else with xlit's regular plan (--apply-shape-groups=0); and so is xlit
 #  --apply-shape-groups (the default), which applies the same passes itself.  (Skipped without the CLDR transforms.)
 #
-#  tconv_shape_groups_test.py <tconv binary> <icgrep binary> [--extended-testing]
+#  xlit_shape_groups_test.py <xlit binary> <icgrep binary> [--extended-testing]
 
 import os
 import re
@@ -21,7 +21,7 @@ import sys
 import tempfile
 import unicodedata
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 TRANSFORM = "NumericPinyin-Latin"
 
@@ -50,11 +50,11 @@ FILTERED_CASES = [
 ]
 
 
-def plan(tconv):
+def plan(xlit):
     """The passes (search, replacement) and the values of the marked calls."""
-    run = subprocess.run([tconv, "--shape-groups", TRANSFORM], capture_output=True)
+    run = subprocess.run([xlit, "--shape-groups", TRANSFORM], capture_output=True)
     if b"unknown transform" in run.stderr:
-        print("tconv_shape_groups_test: skipped (no CLDR transforms directory)")
+        print("xlit_shape_groups_test: skipped (no CLDR transforms directory)")
         sys.exit(0)
     out = run.stdout.decode("utf-8")
     passes, values, steps = [], {}, []
@@ -98,8 +98,8 @@ def apply_pass(icgrep, search, replacement, lines, tmp):
 
 
 def main():
-    tconv, icgrep = sys.argv[1], sys.argv[2]
-    steps, passes, values = plan(tconv)
+    xlit, icgrep = sys.argv[1], sys.argv[2]
+    steps, passes, values = plan(xlit)
     if [k for k, _ in steps] != ["transform", "group", "transform"] or steps[0][1] != "NFD" or steps[2][1] != "NFC":
         print("FAIL: unexpected steps %r" % steps)
         sys.exit(1)
@@ -114,13 +114,13 @@ def main():
         marks = "".join(sorted(set(k[0] for k in values)))
         lines = [re.sub("[" + marks + "].", lambda m: values[m.group(0)], l) for l in lines]
         got = [unicodedata.normalize("NFC", l) for l in lines]
-        # The expected text: ICU's, or tconv's.
+        # The expected text: ICU's, or xlit's.
         path = os.path.join(tmp, "input.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write("".join(l + "\n" for l in TEXT))
         reference = []
         for icu in ("--use-ICU=.*", "--apply-shape-groups=0"):
-            argv = [tconv, icu, TRANSFORM, path]
+            argv = [xlit, icu, TRANSFORM, path]
             run = subprocess.run(argv, capture_output=True)
             if run.returncode == 0:
                 reference = run.stdout.decode("utf-8").split("\n")[:len(TEXT)]
@@ -132,36 +132,36 @@ def main():
         if len(reference) != len(TEXT):
             failures += 1
             print("FAIL: no reference output")
-        # The same passes, applied by tconv itself.
-        run = subprocess.run([tconv, "--apply-shape-groups", TRANSFORM, path], capture_output=True)
+        # The same passes, applied by xlit itself.
+        run = subprocess.run([xlit, "--apply-shape-groups", TRANSFORM, path], capture_output=True)
         applied = run.stdout.decode("utf-8").split("\n")[:len(TEXT)]
         if run.returncode != 0 or run.stderr:
             failures += 1
-            print("FAIL: tconv --apply-shape-groups: exit %d %s" % (run.returncode, run.stderr.decode()[:300]))
+            print("FAIL: xlit --apply-shape-groups: exit %d %s" % (run.returncode, run.stderr.decode()[:300]))
         for i, (g, w) in enumerate(zip(applied, reference)):
             if g != w:
                 failures += 1
                 print("FAIL --apply-shape-groups line %d:\n  got:      %r\n  expected: %r" % (i + 1, g[:200], w[:200]))
         # The shape groups within a filter.
-        counts = subprocess.run([tconv, "--plan", FILTERED], capture_output=True).stdout.decode("utf-8")
+        counts = subprocess.run([xlit, "--plan", FILTERED], capture_output=True).stdout.decode("utf-8")
         if "NumericPinyin-Latin (segment 2 by shape groups" not in counts:
             failures += 1
             print("FAIL: %s does not apply NumericPinyin-Latin by its shape groups:\n%s" % (FILTERED, counts[:500]))
         path = os.path.join(tmp, "filtered.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write("".join(c + "\n" for c, _ in FILTERED_CASES))
-        run = subprocess.run([tconv, FILTERED, path], capture_output=True)
+        run = subprocess.run([xlit, FILTERED, path], capture_output=True)
         got = run.stdout.decode("utf-8").split("\n")
         if run.returncode != 0 or run.stderr:
             failures += 1
-            print("FAIL: tconv %s: exit %d %s" % (FILTERED, run.returncode, run.stderr.decode()[:300]))
+            print("FAIL: xlit %s: exit %d %s" % (FILTERED, run.returncode, run.stderr.decode()[:300]))
         for i, (source, expected) in enumerate(FILTERED_CASES):
             if i >= len(got) or got[i] != expected:
                 failures += 1
                 print("FAIL %s %r:\n  got:      %r\n  expected: %r" % (FILTERED, source, got[i] if i < len(got) else None, expected))
     if failures:
         sys.exit(1)
-    print("tconv_shape_groups_test: all tests passed")
+    print("xlit_shape_groups_test: all tests passed")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
 //  bits of the character, the code identifies each character of the blocks
 //  (its pseudo-codepoint, (code << shift) | (cp & (2^shift - 1))), so that a
 //  small pseudo-basis replaces the full basis for the character classes of
-//  these characters.  (See doc/ldml-divcode-plan.md, where tconv applies the
+//  these characters.  (See doc/ldml-divcode-plan.md, where xlit applies the
 //  conversion rules of LDML transforms by these codes.)
 
 #pragma once

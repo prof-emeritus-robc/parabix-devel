@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: rules whose texts begin with a run (see ldml::SplitLeadingRuns, from
+#  xlit: rules whose texts begin with a run (see ldml::SplitLeadingRuns, from
 #  Zawgyi-my): R* T → C (and R+ T → C) as R } R* T → ; then T → C (R T → C),
 #  and a block of rules beginning with the same run as one deletion before
 #  them, R } R+ (T1 | T2 | ...) → ; then R Ti → Ci in order.  An earlier rule
@@ -10,14 +10,14 @@
 #  a run (w U+1037).  The expected results are ICU's (createFromRules, each
 #  line a text).
 #
-#  tconv_leading_runs_test.py <tconv binary> [--extended-testing]
+#  xlit_leading_runs_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 GROUPS = [
@@ -46,7 +46,7 @@ GROUPS = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for rules_text, cases in GROUPS:
@@ -56,7 +56,7 @@ def main():
             input = os.path.join(tmp, "input.txt")
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
-            run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+            run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
             if run.returncode != 0:
                 failures += 1
                 print("FAIL %r: exit status %d\n%s" % (rules_text, run.returncode, run.stderr.decode("utf-8", "replace")))

@@ -3,7 +3,7 @@
 #  SPDX-License-Identifier: OSL-3.0
 #
 #  Smoke test of the Div32Code / Div64Code kernels (doc/ldml-divcode-plan.md):
-#  tconv --divcode-codes=G replaces each character by U+10000 | (the external
+#  xlit --divcode-codes=G replaces each character by U+10000 | (the external
 #  classes it is in << 10) | its code in the alphabet of conversion group G,
 #  and describes the alphabet (shift, blocks, external sets) on the standard
 #  error.  For conversion groups with small and large alphabets (up to 9 code
@@ -11,7 +11,7 @@
 #  classes of random text (characters of each block, of the external sets,
 #  and others, of 1 to 4 UTF-8 bytes) must be those the description gives.
 #
-#  The translation kernels (tconv --divcode-groups), on the 21-bit basis and on
+#  The translation kernels (xlit --divcode-groups), on the 21-bit basis and on
 #  the UTF-8 code units (UTF-8 mode, --utf8-mode, where the transform can be):
 #  the output must be that of the regular plan (--divcode-groups=0), and ICU's
 #  for rules files, for
@@ -39,7 +39,7 @@
 #  The kernels must be used (their names in the trace of the object cache).
 #  (Skipped without the CLDR transforms.)
 #
-#  By default (see tconv_test_mode.py) the test runs a selection: the codes of
+#  By default (see xlit_test_mode.py) the test runs a selection: the codes of
 #  a group (div32, with two external sets), and three rules files (strings,
 #  expansions and before contexts through them; stages; converted contexts at
 #  sparse dependent positions, also across segments of one stride with four
@@ -47,7 +47,7 @@
 #  files, the CLDR conversion groups, the eligibility reports and the
 #  comparisons with ICU only with --extended-testing.
 #
-#  tconv_divcode_test.py <tconv binary> [--extended-testing]
+#  xlit_divcode_test.py <xlit binary> [--extended-testing]
 
 import glob
 import json
@@ -57,7 +57,7 @@ import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 GROUPS = [
     ("Bopo-Latn", 1),                       # 3 blocks
@@ -279,22 +279,22 @@ DEFAULT_CONV_CONFIGS = [["-thread-num=4", "-segment-size=1"]]
 CODES_TEXT, DEFAULT_CODES_TEXT = 20000, 5000
 
 
-def run(tconv, args):
-    return subprocess.run([tconv] + args, capture_output=True)
+def run(xlit, args):
+    return subprocess.run([xlit] + args, capture_output=True)
 
 
 #  Each case returns (failures, the lines it reports), and writes its files in
 #  a directory of its own.
 
 
-def codes_case(tconv, tmp, name, group, shift):
+def codes_case(xlit, tmp, name, group, shift):
     failures, out = 0, []
     rnd = random.Random("%s %d %d" % (name, group, shift))
     path = os.path.join(tmp, "input.txt")
     # (The alphabet first, from a run on a small input.)
     with open(path, "w", encoding="utf-8") as f:
         f.write("a\n")
-    args = [tconv, "--divcode-codes=%d" % group, "--divcode-shift=%d" % shift, name, path]
+    args = [xlit, "--divcode-codes=%d" % group, "--divcode-shift=%d" % shift, name, path]
     r = subprocess.run(args, capture_output=True)
     if b"unknown transform" in r.stderr:
         return None, []
@@ -357,7 +357,7 @@ def codes_case(tconv, tmp, name, group, shift):
     return failures, out
 
 
-def translate_case(tconv, tmp, salt, aliases, name, group):
+def translate_case(xlit, tmp, salt, aliases, name, group):
     failures, out = 0, []
     path = os.path.join(tmp, "text.txt")
     test_data = os.path.expanduser("~/cldr/common/testData/transforms")
@@ -365,7 +365,7 @@ def translate_case(tconv, tmp, salt, aliases, name, group):
         rnd = random.Random("%s %d %d translate" % (name, group, shift))
         with open(path, "w", encoding="utf-8") as f:
             f.write("a\n")
-        r = run(tconv, ["--divcode-codes=%d" % group, "--divcode-shift=%d" % shift, name, path])
+        r = run(xlit, ["--divcode-codes=%d" % group, "--divcode-shift=%d" % shift, name, path])
         try:
             desc = json.loads(r.stderr.decode("utf-8").splitlines()[0])
         except (ValueError, IndexError):
@@ -390,8 +390,8 @@ def translate_case(tconv, tmp, salt, aliases, name, group):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(t)
             common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--divcode-shift=%d" % shift]
-            regular = run(tconv, common + ["--divcode-groups=0", "--utf8-mode=0", name, path])
-            divcode = run(tconv, common + TRACE + ["--divcode-groups=1", "--utf8-mode=" + mode, name, path])
+            regular = run(xlit, common + ["--divcode-groups=0", "--utf8-mode=0", name, path])
+            divcode = run(xlit, common + TRACE + ["--divcode-groups=1", "--utf8-mode=" + mode, name, path])
             what = "%s#%d s=%d %s %s" % (name, group, shift, "random" if i == 0 else "test data",
                                          "UTF-8" if b"_U8" in divcode.stderr else "Unicode")
             if regular.returncode or divcode.returncode:
@@ -411,7 +411,7 @@ def translate_case(tconv, tmp, salt, aliases, name, group):
     return failures, out
 
 
-def rules_case(tconv, tmp, salt, case, rules):
+def rules_case(xlit, tmp, salt, case, rules):
     failures, out = 0, []
     rnd = random.Random(case)
     rules_path = os.path.join(tmp, case + ".txt")
@@ -419,7 +419,7 @@ def rules_case(tconv, tmp, salt, case, rules):
     with open(rules_path, "w", encoding="utf-8") as f:
         f.write(rules + "\n")
     if EXTENDED:
-        report = run(tconv, ["--divcode-report", "--rules-file=" + rules_path])
+        report = run(xlit, ["--divcode-report", "--rules-file=" + rules_path])
         groups = [json.loads(l) for l in report.stdout.decode("utf-8").splitlines()]
         if not groups or not all(g["eligible"] for g in groups):
             return 1, ["FAIL rules %s: not eligible: %s" % (case, [g["problems"] for g in groups])]
@@ -453,15 +453,15 @@ def rules_case(tconv, tmp, salt, case, rules):
             f.write("".join(rnd.choice(alphabet) for _ in range(20000)))
     common = ["-object-cache-salt=" + salt, "--apply-shape-groups=0", "--rules-file=" + rules_path]
     long_chains = case.startswith("conv-long")
-    regular = run(tconv, common + ["--use-ICU=0", "--divcode-groups=0", "--utf8-mode=0", path])
+    regular = run(xlit, common + ["--use-ICU=0", "--divcode-groups=0", "--utf8-mode=0", path])
     # (Not compared with ICU by default: no ICU output, as without ICU.)
-    icu = run(tconv, common + ["--use-ICU=.*", path]) if EXTENDED else subprocess.CompletedProcess([], 1)
+    icu = run(xlit, common + ["--use-ICU=.*", path]) if EXTENDED else subprocess.CompletedProcess([], 1)
     configs = [[]]
     if case.startswith("conv"):
         configs += CONV_CONFIGS if EXTENDED else DEFAULT_CONV_CONFIGS
     for mode in ("1", "0"):
         for config in configs:
-            divcode = run(tconv, common + TRACE + config + ["--use-ICU=0", "--divcode-groups=1", "--utf8-mode=" + mode, path])
+            divcode = run(xlit, common + TRACE + config + ["--use-ICU=0", "--divcode-groups=1", "--utf8-mode=" + mode, path])
             what = "rules %s %s%s" % (case, "UTF-8" if b"_U8" in divcode.stderr else "Unicode", " " + " ".join(config) if config else "")
             if regular.returncode or divcode.returncode:
                 failures += 1
@@ -482,15 +482,15 @@ def rules_case(tconv, tmp, salt, case, rules):
 
 
 def main():
-    tconv = sys.argv[1]
-    salt = "tconv_divcode_test"
+    xlit = sys.argv[1]
+    salt = "xlit_divcode_test"
     groups = [(n, g, s) for n, g in GROUPS for s in (5, 6)] if EXTENDED else DEFAULT_GROUPS
     translate = TRANSLATE if EXTENDED else DEFAULT_TRANSLATE
     rules = RULES if EXTENDED else {case: RULES[case] for case in DEFAULT_RULES}
     with tempfile.TemporaryDirectory() as tmp:
         aliases = {}
         if translate:
-            for line in run(tconv, ["--list-transforms"]).stdout.decode("utf-8").splitlines():
+            for line in run(xlit, ["--list-transforms"]).stdout.decode("utf-8").splitlines():
                 fields = line.split("  ")
                 aliases[fields[0]] = [f for f in fields[1:] if not f.startswith("[")]
         jobs = []
@@ -500,15 +500,15 @@ def main():
             os.mkdir(d)
             return d
         for name, group, shift in groups:
-            jobs.append(lambda d, a=(name, group, shift): codes_case(tconv, d, *a))
+            jobs.append(lambda d, a=(name, group, shift): codes_case(xlit, d, *a))
         for name, group in translate:
-            jobs.append(lambda d, a=(name, group): translate_case(tconv, d, salt, aliases, *a))
+            jobs.append(lambda d, a=(name, group): translate_case(xlit, d, salt, aliases, *a))
         for case, text in rules.items():
-            jobs.append(lambda d, a=(case, text): rules_case(tconv, d, salt, *a))
+            jobs.append(lambda d, a=(case, text): rules_case(xlit, d, salt, *a))
         results = [job(directory(i)) for i, job in enumerate(jobs)]
     # (The codes of a group are first: none without the CLDR transforms.)
     if results and results[0][0] is None:
-        print("tconv_divcode_test: skipped (no CLDR transforms directory)")
+        print("xlit_divcode_test: skipped (no CLDR transforms directory)")
         return
     failures = 0
     for f, lines in results:
@@ -516,9 +516,9 @@ def main():
         for line in lines:
             print(line)
     if failures:
-        print("tconv_divcode_test: %d failures" % failures)
+        print("xlit_divcode_test: %d failures" % failures)
         sys.exit(1)
-    print("tconv_divcode_test: passed")
+    print("xlit_divcode_test: passed")
 
 
 if __name__ == "__main__":

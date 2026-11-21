@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: MultipleCaptureMultipleReplacement rules merged as the variants of
+#  xlit: MultipleCaptureMultipleReplacement rules merged as the variants of
 #  one set (ldml::MultipleCaptureMultipleReplacementSet::variants): rules of a
 #  conversion group differing only in the character at one position of a text
 #  (the selector) and in their results, as a function call on a capture of
@@ -13,14 +13,14 @@
 #  selector is at a fixed offset from the start.  The expected results are
 #  ICU's (createFromRules, each line a text).
 #
-#  tconv_capture_variants_test.py <tconv binary> [--extended-testing]
+#  xlit_capture_variants_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 TONES = "$vowel = [aAeEiIoOuUvV];\n$consonant = [[a-z A-Z] - [$vowel]];\n([aAeE]) ($vowel* $consonant*) 1 \u2192 $1 \u0304 $2 ;\n([aAeE]) ($vowel* $consonant*) 2 \u2192 $1 \u0301 $2 ;\n([aAeE]) ($vowel* $consonant*) 3 \u2192 $1 \u030c $2 ;\n([aAeE]) ($vowel* $consonant*) 4 \u2192 $1 \u0300 $2 ;\n([aAeE]) ($vowel* $consonant*) 5 \u2192 $1 $2 ;\n($vowel) ($consonant*) 1 \u2192 $1 \u0304 $2 ;\n($vowel) ($consonant*) 2 \u2192 $1 \u0301 $2 ;\n($vowel) ($consonant*) 3 \u2192 $1 \u030c $2 ;\n($vowel) ($consonant*) 4 \u2192 $1 \u0300 $2 ;\n($vowel) ($consonant*) 5 \u2192 $1 $2 ;\n[:Letter:] { 1 \u2192 \u0304 ;\n[:Letter:] { 2 \u2192 \u0301 ;\n[:Letter:] { 3 \u2192 \u030c ;\n[:Letter:] { 4 \u2192 \u0300 ;\n[:Letter:] { 5 \u2192 ;\n"
 
@@ -93,7 +93,7 @@ START_CASES = [
 ]
 
 
-def check(tconv, tmp, name, rules_text, cases):
+def check(xlit, tmp, name, rules_text, cases):
     failures = 0
     rules = os.path.join(tmp, name + ".rules")
     with open(rules, "w", encoding="utf-8") as f:
@@ -101,12 +101,12 @@ def check(tconv, tmp, name, rules_text, cases):
     input = os.path.join(tmp, name + ".txt")
     with open(input, "w", encoding="utf-8") as f:
         f.write("".join(line + "\n" for line, _ in cases))
-    plan = subprocess.run([tconv, "--plan", "--capture-strings=0", "--rules-file=" + rules, input], capture_output=True)
+    plan = subprocess.run([xlit, "--plan", "--capture-strings=0", "--rules-file=" + rules, input], capture_output=True)
     text = plan.stdout.decode("utf-8", "replace")
     if ": implementable" not in text.split("\n")[0] or "variants by" not in text:
         failures += 1
         print("FAIL %s: the rules are not planned as variants\n%s" % (name, text))
-    run = subprocess.run([tconv, "--use-ICU=0", "--capture-strings=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+    run = subprocess.run([xlit, "--use-ICU=0", "--capture-strings=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         failures += 1
         print("FAIL %s: exit status %d\n%s" % (name, run.returncode, run.stderr.decode("utf-8", "replace")))
@@ -120,10 +120,10 @@ def check(tconv, tmp, name, rules_text, cases):
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
-        failures = check(tconv, tmp, "tones", TONES, TONE_CASES)
-        failures += check(tconv, tmp, "starts", STARTS, START_CASES)
+        failures = check(xlit, tmp, "tones", TONES, TONE_CASES)
+        failures += check(xlit, tmp, "starts", STARTS, START_CASES)
     print("%d failures" % failures)
     return 1 if failures else 0
 

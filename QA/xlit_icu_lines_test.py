@@ -2,25 +2,25 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv --lines with the transforms or steps that ICU applies
+#  xlit --lines with the transforms or steps that ICU applies
 #  (doc/masked-transforms-plan.md, step 11): in one run, without a pipeline
 #  run (or a pipe) for each line.  A transform that ICU applies as a whole
-#  (Latn-Grek, a rules file tconv does not implement), and the built-ins ICU
+#  (Latn-Grek, a rules file xlit does not implement), and the built-ins ICU
 #  applies (Any-Name, Name-Any, Any-BreakInternal), are applied by ICU to each
 #  line as a text of its own, in the process (icuLinesRunner, as uconv -x
-#  does); a transform with ICU stages (Thai-Latn) has its tconv stages applied
+#  does); a transform with ICU stages (Thai-Latn) has its xlit stages applied
 #  once to all the lines (as regions) and its ICU stages line by line.  The
 #  expected results are ICU's (each line a text); the plan must say one run.
-#  Skipped if tconv is built without ICU.
+#  Skipped if xlit is built without ICU.
 #
-#  tconv_icu_lines_test.py <tconv binary> [--extended-testing]
+#  xlit_icu_lines_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (transform name or rules file text, input, expected output)
 CASES = [
@@ -39,12 +39,12 @@ if EXTENDED:
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
-        probe = subprocess.run([tconv, "Any-Name", os.devnull], capture_output=True)
+        probe = subprocess.run([xlit, "Any-Name", os.devnull], capture_output=True)
         if probe.returncode != 0:
-            print("skipped: tconv is built without ICU")
+            print("skipped: xlit is built without ICU")
             return 0
         for spec, text, want in CASES:
             path = os.path.join(tmp, "input.txt")
@@ -58,12 +58,12 @@ def main():
                 args.append("--rules-file=" + rules)
             else:
                 args.append(spec)
-            plan = subprocess.run([tconv, "--plan", "--lines"] + args, capture_output=True).stdout.decode("utf-8", "replace")
+            plan = subprocess.run([xlit, "--plan", "--lines"] + args, capture_output=True).stdout.decode("utf-8", "replace")
             verdict = [l for l in plan.split("\n") if "region scope" in l]
             if not verdict or "one run" not in verdict[0] or "ICU line by line" not in verdict[0]:
                 failures += 1
                 print("FAIL %r: %s" % (spec.split("\n")[0], verdict))
-            run = subprocess.run([tconv, "--lines"] + args + [path], capture_output=True)
+            run = subprocess.run([xlit, "--lines"] + args + [path], capture_output=True)
             got = run.stdout.decode("utf-8", "replace")
             if run.returncode != 0 or got != want:
                 failures += 1

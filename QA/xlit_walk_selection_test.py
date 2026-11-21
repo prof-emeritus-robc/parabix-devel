@@ -2,27 +2,27 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: MultipleCaptureMultipleReplacement rules whose matches may end within
+#  xlit: MultipleCaptureMultipleReplacement rules whose matches may end within
 #  another (see MultipleCaptureMultipleReplacementSet::walkStarts in
 #  include/ldml/transform_plan.h): their starts are found by the regular
 #  expression engine, and those that apply are selected from the left by the
 #  lengths of the branches of their possessive walks (an optional item, a set
 #  with a string of two characters, a run followed by a suffix), together with
 #  the matches of the other rules.  The rules file must be planned that way
-#  (tconv --plan), and its result must be ICU's (as given by its
+#  (xlit --plan), and its result must be ICU's (as given by its
 #  createFromRules on the same rules), including on runs longer than a block,
 #  with a rule leaving its text unchanged before (\, ([0-9]) → \, $1 ;), and
 #  at a character outside the filter (…, which ends ICU's text, where
 #  [^0-9\.] matches; the rules are compound, as those of the CLDR transforms).
 #
-#  tconv_walk_selection_test.py <tconv binary> [--extended-testing]
+#  xlit_walk_selection_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 LONG = 700
 
@@ -46,7 +46,7 @@ WANT = (",5 Xa X, xX .5 Y… Ya Y aQa abQa abQ xxyW xzW yxyWx mnR mnRnm mnnR mm\
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
@@ -55,12 +55,12 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write(TEXT)
-        plan = subprocess.run([tconv, "--plan", "--capture-strings=0", "--rules-file=" + rules], capture_output=True)
+        plan = subprocess.run([xlit, "--plan", "--capture-strings=0", "--rules-file=" + rules], capture_output=True)
         out = plan.stdout.decode("utf-8", "replace")
         if out.count("walk branches") != 4 or ": implementable" not in out:
             failures += 1
             print("FAIL: not planned with selection by walks\n%s" % out)
-        run = subprocess.run([tconv, "--capture-strings=0", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--capture-strings=0", "--rules-file=" + rules, input], capture_output=True)
         got = run.stdout.decode("utf-8", "replace")
         if run.returncode != 0 or got != WANT:
             failures += 1

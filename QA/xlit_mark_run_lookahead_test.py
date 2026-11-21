@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: mark run edits left in their group with a lookahead and a mark (see
+#  xlit: mark run edits left in their group with a lookahead and a mark (see
 #  ldml::RunEditMark).  A mark run edit P R* T → C | $1 that cannot be applied
 #  before the rest of its group (here h, which k̄h and kh cover, and the h of
 #  h → | k may begin; s, which z → | s revisits) stays in the group as
@@ -10,14 +10,14 @@
 #  are still applied before the group.  The expected results are ICU's
 #  (createFromRules, each line a text).
 #
-#  tconv_mark_run_lookahead_test.py <tconv binary> [--extended-testing]
+#  xlit_mark_run_lookahead_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, [(line, expected result)])
 GROUPS = [
@@ -36,7 +36,7 @@ GROUPS = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for rules_text, cases in GROUPS:
@@ -46,7 +46,7 @@ def main():
             input = os.path.join(tmp, "input.txt")
             with open(input, "w", encoding="utf-8") as f:
                 f.write("".join(line + "\n" for line, _ in cases))
-            run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+            run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
             if run.returncode != 0:
                 failures += 1
                 print("FAIL %r: exit status %d\n%s" % (rules_text, run.returncode, run.stderr.decode("utf-8", "replace")))

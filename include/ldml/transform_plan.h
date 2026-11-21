@@ -115,7 +115,7 @@ struct StringRule {
 };
 
 constexpr UCD::codepoint_t StringRuleKept = 0xFDD1;     // (a noncharacter)
-constexpr UCD::codepoint_t StringRuleDeleted = 0xD800;  // (the deletion mark of tconv)
+constexpr UCD::codepoint_t StringRuleDeleted = 0xD800;  // (the deletion mark of xlit)
 
 // A MultipleCaptureMultipleReplacement rule: a conversion rule
 //      before { T0 (B1) T1 (B2) ... (Bk) Tk } after → R0 $1 R1 $2 ... $k Rk ;
@@ -193,7 +193,7 @@ struct WalkBranch {
 };
 
 //  Whether planTransform merges rules as the variants of a set (see
-//  MultipleCaptureMultipleReplacementSet::variants); tconv --capture-variants.
+//  MultipleCaptureMultipleReplacementSet::variants); xlit --capture-variants.
 extern bool MergeCaptureVariants;
 
 struct MultipleCaptureMultipleReplacementSet {
@@ -205,7 +205,7 @@ struct MultipleCaptureMultipleReplacementSet {
     re::RE * engineAfter = nullptr;
     //  Whether engineBefore, matched against the text itself, is a before
     //  context on the converted text translated to the text (see
-    //  sourceBeforeContext in tconv).
+    //  sourceBeforeContext in xlit).
     bool sourceBefore = false;
     bool startsByFirst = false;
     //  If startsByFirst: the characters at which the matches begin (those of
@@ -227,8 +227,8 @@ struct MultipleCaptureMultipleReplacementSet {
     bool greedyStarts = false;
     //  With exactStarts, whether the captures (repeating sets with strings or
     //  sequences, not matched greedily) are matched possessively in the
-    //  lookahead, in a form that tconv checks the engine supports (see
-    //  lookaheadContextProblems in tconv).
+    //  lookahead, in a form that xlit checks the engine supports (see
+    //  lookaheadContextProblems in xlit).
     bool engineStarts = false;
     //  Where a match may end within another of the set (and the starts are not
     //  known by the first characters): the starts found by the engine (as with
@@ -479,7 +479,7 @@ struct TransformPlan {
 // position, are planned as string rules keeping the characters of their
 // captures (StringRule::kept), rather than MultipleCaptureMultipleReplacement
 // rules, so that their before contexts may be matched against the converted
-// text, or (tconv --capture-strings) so that they are matched in the fused
+// text, or (xlit --capture-strings) so that they are matched in the fused
 // kernels with the other string rules.  An optional set must be the last item
 // of the text.
 TransformPlan planTransform(const std::vector<Rule *> & rules, const std::set<const Rule *> * keptCaptures = nullptr);
@@ -571,7 +571,7 @@ re::RE * expandedContext(re::RE * context, const std::map<unsigned, UCD::Unicode
 // after resolving the repetitions possessively, as ICU matches them
 // (re::resolvePossessiveQuantifiers): the lookaheads of the starts of
 // MultipleCaptureMultipleReplacement rules are not among them; the others are
-// checked with the engine's preconditions (tconv).
+// checked with the engine's preconditions (xlit).
 bool repeatsStringsOrSequences(const re::RE * re);
 
 // The characters that the set items of a pattern (e.g. a context) may match,

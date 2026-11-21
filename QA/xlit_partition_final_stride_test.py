@@ -14,14 +14,14 @@
 #  No rule matches the input, so the output must equal it, at lengths with and
 #  without a partial final stride, in one thread and in four.
 #
-#  tconv_partition_final_stride_test.py <tconv binary> [--extended-testing]
+#  xlit_partition_final_stride_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 # (rules, extra arguments): a filter, and the line regions as a mask
 CASES = [
@@ -34,7 +34,7 @@ THREADS = [[], ["-thread-num=4", "-segment-size=1"]]
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
@@ -47,7 +47,7 @@ def main():
                 with open(input, "w", encoding="utf-8") as f:
                     f.write(text)
                 for threads in THREADS:
-                    args = [tconv, "--use-ICU=0"] + threads + extra + ["--rules-file=" + rules, input]
+                    args = [xlit, "--use-ICU=0"] + threads + extra + ["--rules-file=" + rules, input]
                     run = subprocess.run(args, capture_output=True)
                     got = run.stdout.decode("utf-8", "replace")
                     if run.returncode != 0 or got != text:

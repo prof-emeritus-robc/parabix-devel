@@ -1,9 +1,9 @@
-# DivCode kernels for the conversion groups of tconv: implementation plan
+# DivCode kernels for the conversion groups of xlit: implementation plan
 
 Status: plan, 2026-11-15. Nothing below is implemented. The analysis numbers come
-from `tconv --string-rule-chars` (an uncommitted, hidden report option in
-`tools/ldml/tconv.cpp`) over the 212 conversion groups with string rules in the
-151 CLDR transforms tconv implements.
+from `xlit --string-rule-chars` (an uncommitted, hidden report option in
+`tools/ldml/xlit.cpp`) over the 212 conversion groups with string rules in the
+151 CLDR transforms xlit implements.
 
 ## 1. Idea
 
@@ -77,7 +77,7 @@ New files `include/ldml/divcode_plan.h` and `lib/ldml/divcode_plan.cpp` (module
   - `leaves`: the anchor classes, with the rules in each.
   - `contentHash`: a hash of s, `blocks`, `externalSets` and the printed rules.
     It is used in kernel names.
-- `ldml::TransformStep` gains nothing. The plan is computed by tconv from the step,
+- `ldml::TransformStep` gains nothing. The plan is computed by xlit from the step,
   like the shape groups.
 
 `--string-rule-chars` becomes `--divcode-report`. Per group it reports eligibility
@@ -86,7 +86,7 @@ sizes, expanding rules, and the XOR bit counts.
 
 ## 4. Kernels and pipeline
 
-The Div32Code / Div64Code kernel is `kernel::DivCodeKernel` (`include/kernel/unicode/divcode.h`, module `kernel.unicode`); it depends only on the shift, the blocks and the basis. The kernels specific to the plans of conversion groups are in `tools/ldml/tconv.cpp`.
+The Div32Code / Div64Code kernel is `kernel::DivCodeKernel` (`include/kernel/unicode/divcode.h`, module `kernel.unicode`); it depends only on the shift, the blocks and the basis. The kernels specific to the plans of conversion groups are in `tools/ldml/xlit.cpp`.
 `RulePipelineBuilder::conversionGroup` calls `divCodeGroup(step, U21)` for an
 eligible group when `--divcode-groups` is on (off by default until measured). It
 uses `--divcode-shift=5|6` (default 5).
@@ -211,7 +211,7 @@ belongs to an expanding match that writes it.
 
 ## 5. Testing
 
-- `QA/tconv_divcode_test.py`: rules files (`--rules-file`) for each case, each run
+- `QA/xlit_divcode_test.py`: rules files (`--rules-file`) for each case, each run
   with `--divcode-groups` on and off and with ICU (`--use-ICU`), on generated and
   random strings:
   - literal strings
@@ -224,7 +224,7 @@ belongs to an expanding match that writes it.
   - expansions, deletions, and both in one group
   - filters
   - s = 5 and s = 6
-- CLDR: `tconv_coverage.py --test-data` with the option on and off; results must
+- CLDR: `xlit_coverage.py --test-data` with the option on and off; results must
   be identical for every eligible transform.
 - With `-EnableAsserts`, the translation kernel checks that the positions written
   after its expanding matches are exactly the gaps.
@@ -348,8 +348,8 @@ step 5 (each configuration alone, `-thread-num=4` for the cycles):
 
 ## 7. Results of step 1
 
-`tconv --divcode-report <transform>` (one JSON object per conversion group with
-string rules) over the 212 groups of the CLDR transforms tconv implements:
+`xlit --divcode-report <transform>` (one JSON object per conversion group with
+string rules) over the 212 groups of the CLDR transforms xlit implements:
 
 - **45 groups in 40 transforms are eligible** under both div32 and div64. They
   have 4,223 rules (string rules and mappings), or 4,445 after splitting (div32)
@@ -380,10 +380,10 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
 1. `divcode_plan` (eligibility, alphabet, splitting, rules, hash) and
    `--divcode-report`; check the eligible groups and the reasons for the rest.
 2. Div32Code/Div64Code kernel and external classes; a test that dumps the code
-   bixnum (done: `tconv --divcode-codes`, `QA/tconv_divcode_test.py`).
+   bixnum (done: `xlit --divcode-codes`, `QA/xlit_divcode_test.py`).
 3. Translation kernel without expansions (groups where m ≤ n everywhere), with
-   deletion; QA tests; the CLDR comparison. (Done: `tconv --divcode-groups`,
-   `DivCodeTranslate` in `tools/ldml/tconv.cpp`. The output is identical to the
+   deletion; QA tests; the CLDR comparison. (Done: `xlit --divcode-groups`,
+   `DivCodeTranslate` in `tools/ldml/xlit.cpp`. The output is identical to the
    regular plan's for the 16 eligible CLDR groups without expansions, on random
    text and their CLDR test data, under div32 and div64, and to the regular
    plan's and ICU's for 13 rules files of the cases. The kernels of these groups
@@ -402,7 +402,7 @@ string rules) over the 212 groups of the CLDR transforms tconv implements:
    - A single-character rule's coverage is applied at its anchor, before its
      changes are advanced to their offsets, which inserted positions may have.)
 5. Measurement (§6); choose the default s and whether `--divcode-groups` is on by
-   default. (Done: on by default, div32. With the default on, the other tconv
+   default. (Done: on by default, div32. With the default on, the other xlit
    suites showed that the end of a run of a global filter (`FilterRunEndMark`
    in a context set) also holds outside the filter's mask; the plan and the
    kernel now do so, and a text position with the mark is not eligible.)
@@ -506,7 +506,7 @@ of stages (initially 8) stay ineligible.
 2. **Kernels:** the stage loop in `DivCodeTranslate` (both modes, Count and
    Translate), with `Cover_s` between passes; groups without overlaps keep a
    single pass and the same code as now.
-3. **Tests** (`QA/tconv_divcode_test.py`):
+3. **Tests** (`QA/xlit_divcode_test.py`):
    - rules files:
      - a chain of 3 stages (`abcd > 1 ; bcd > 2 ; cd > 3 ;`)
      - the kana shape `kya > キャ ; ya > ヤ ;` with single-character rules
@@ -552,12 +552,12 @@ of stages (initially 8) stay ineligible.
     problem of 30)
   - two-way and self overlaps (61, the only problem of 20)
   - contexts with repetitions or alternatives (30)
-- **Tests** (`QA/tconv_divcode_test.py`): the 31 CLDR groups with stages or
+- **Tests** (`QA/xlit_divcode_test.py`): the 31 CLDR groups with stages or
   multi-item contexts, and 16 rules files of these cases, in both encodings,
   give the regular plan's output (and ICU's, for the rules files). None of the
-  other tconv suites has an eligible group with one-way overlaps. Four have
+  other xlit suites has an eligible group with one-way overlaps. Four have
   such groups, each blocked by another limit; Bopo-Latn in
-  `tconv_shape_groups_test` is now eligible.
+  `xlit_shape_groups_test` is now eligible.
 
 ### Measurements (step 4)
 
@@ -601,7 +601,7 @@ b9113b35f, described under "First implementation: rounds").
 
 ICU matches a before context against the text to the left of its cursor,
 which it has already converted (§3.1 of
-[ldml-tconv-coverage.md](ldml-tconv-coverage.md)). It looks through deleted
+[ldml-xlit-coverage.md](ldml-xlit-coverage.md)). It looks through deleted
 characters, sees the last character of a longer replacement, and sees the
 results of earlier rules of the same kind, so chains propagate (`a { b → a ;
 a { c → C` turns `abbbc` into `aaaaC`). `convertedContextMatters` flags a
@@ -611,7 +611,7 @@ changes the length of the text. The regular plan applies such rules in a
 correction kernel, in a fixed number of rounds (`--converted-context-rounds`,
 default 8), and so differs from ICU on longer chains.
 
-`tconv --divcode-report` describes these groups (field `converted`):
+`xlit --divcode-report` describes these groups (field `converted`):
 
 - 65 groups have such contexts; for 30 of them (4,013 rules) it is their only
   problem.
@@ -863,7 +863,7 @@ gets wrong.
 
 ### Which characters propagate
 
-The analysis (patch saved with the experiment; `tconv --divcode-report` with
+The analysis (patch saved with the experiment; `xlit --divcode-report` with
 `DIVCODE_PROPAGATION=1`) works per character c of the converted subgroups:
 
 - **States:** the cells of the partition of the characters by the item sets
@@ -920,7 +920,7 @@ the converted-context rules in rounds:
   and the translation kernels.
 - The output uses the last round's matches.
 
-The 21 CLDR groups and 6 rules files of `QA/tconv_divcode_test.py` match the
+The 21 CLDR groups and 6 rules files of `QA/xlit_divcode_test.py` match the
 regular plan, and the rules files also match ICU, in both modes. 97 of the 212
 string-rule groups are eligible, against 76 before. Chains longer than 8
 differ from ICU, as in the regular plan.
@@ -989,7 +989,7 @@ derived from the positive streams after spreading.
   - In the kernel: two rules with the same match and change gave `Or(v, x)`
     twice in a leaf, which the builder built once, dropping what was assigned
     in between. Each Var is now assigned once per leaf.
-- **Tests** (`QA/tconv_divcode_test.py`): results of different lengths at
+- **Tests** (`QA/xlit_divcode_test.py`): results of different lengths at
   dependent positions (`conv-reserve*`), chains up to 3000 long compared with
   ICU (`conv-long-*`), a dependent position at the start of a block before any
   other (`conv-sparse`, which fails without the sinking fix), and every
@@ -1036,7 +1036,7 @@ an extra pass over its few dependent positions.
 
 ### Scope
 
-`tconv --divcode-report` over the 453 CLDR transforms (2026-11-16):
+`xlit --divcode-report` over the 453 CLDR transforms (2026-11-16):
 
 - 36 groups have string rules whose before contexts are matched against the
   converted text ("string rules with before contexts matched against the
@@ -1136,7 +1136,7 @@ handles for Translate.
    match for covers, stages and priorities; `Dep` and `Ends` at families.
 4. **Converted:** the families' rules in the loop and the final pass, with
    multi-unit changes and the surplus deleted.
-5. **Tests** (QA/tconv_divcode_test.py): rules files of families with
+5. **Tests** (QA/xlit_divcode_test.py): rules files of families with
    results of different lengths, empty results (deletions seen through),
    chains through families' results, a family in a later stage, set positions
    in the text, UTF-8, sparse dependent positions, one thread and four threads
@@ -1362,7 +1362,7 @@ converted text (survey of 2026-11-17, `--plan` and a temporary
 ConjoiningJamo-Latin (E) has insertion rules and 170 converted contexts, of
 two items; it stays on the regular plan.
 
-Tests for each step: rules files of the shapes (QA/tconv_divcode_test.py,
+Tests for each step: rules files of the shapes (QA/xlit_divcode_test.py,
 one default case within the time limits), and the groups brought in, in
 `TRANSLATE` (extended). Checks for each step: only the transforms whose
 groups the step brings in, against ICU on their test data and random text

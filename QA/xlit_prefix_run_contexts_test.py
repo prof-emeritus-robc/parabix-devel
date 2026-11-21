@@ -2,20 +2,20 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: a prefix run that only deletes (t \u0361 → | t, A empty; see
+#  xlit: a prefix run that only deletes (t \u0361 → | t, A empty; see
 #  ldml::ComposeRevisits, prefixRunConflict), applied before its group although
 #  the after context of another rule (^ { t } t → X) may see its P: the last
 #  item of an after context sees the P that stays in place, as ICU does.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_prefix_run_contexts_test.py <tconv binary> [--extended-testing]
+#  xlit_prefix_run_contexts_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("^ { t } t \u2192 X ;\n"
          "t \\u0361 \u2192 | t ;\n"
@@ -37,7 +37,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -45,7 +45,7 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
     if run.returncode != 0:
         print("FAIL: exit status %d" % run.returncode + "\n" + run.stderr.decode("utf-8", "replace"))
         return 1

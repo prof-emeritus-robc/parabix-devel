@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv --lines with region scope (see regionScope in tools/ldml/tconv.cpp and
+#  xlit --lines with region scope (see regionScope in tools/ldml/xlit.cpp and
 #  doc/masked-transforms-plan.md, steps 3 and 4): a transform whose components
 #  all support it is applied in one run over the whole input, each line a
 #  region of a mask, and must give the output of one run per line (from the
@@ -15,14 +15,14 @@
 #  neighbouring line at both edges, empty lines and a last line without a line
 #  feed.
 #
-#  tconv_lines_regions_test.py <tconv binary> [--extended-testing]
+#  xlit_lines_regions_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 LINES = "b\nd\nbd\ndb\n\nax\ny\naxy\na\ne\nab\nxa\nbx\nt\n-t\n\n"
 CONVERTED = "xb\nx\nb\nab\na\nb\nxxb\nx\nxb\nyb\ny\nbb\n\nb\nbx\nqb\nq\nb"
@@ -109,7 +109,7 @@ EXPECTED = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for spec, text, expected in CASES:
@@ -123,7 +123,7 @@ def main():
                 transform = ["--rules-file=" + rules]
             else:
                 transform = [spec]
-            plan = subprocess.run([tconv, "--use-ICU=0", "--plan", "--lines"] + transform, capture_output=True)
+            plan = subprocess.run([xlit, "--use-ICU=0", "--plan", "--lines"] + transform, capture_output=True)
             verdict = [l for l in plan.stdout.decode("utf-8", "replace").split("\n") if "region scope" in l]
             got = None
             if verdict:
@@ -131,7 +131,7 @@ def main():
             if got != expected:
                 failures += 1
                 print("FAIL %r: region scope %r, expected %s" % (spec, verdict, expected))
-            run = subprocess.run([tconv, "--use-ICU=0", "--lines"] + transform + [path], capture_output=True)
+            run = subprocess.run([xlit, "--use-ICU=0", "--lines"] + transform + [path], capture_output=True)
             want = EXPECTED[CASES.index((spec, text, expected))]
             if run.returncode != 0 or run.stdout.decode("utf-8", "replace") != want:
                 failures += 1

@@ -47,7 +47,7 @@ with open(work + "/input.txt", "w", encoding="utf-8") as f:
 PY
 
 cd "$BUILD/tests/bin" && crash_report ./test_emptyprogram
-cd "$WORK" && crash_report "$BUILD/bin/tconv" --use-ICU=0 --lines --rules-file=rules.txt input.txt
+cd "$WORK" && crash_report "$BUILD/bin/xlit" --use-ICU=0 --lines --rules-file=rules.txt input.txt
 # The same, with the generated code checked
-cd "$WORK" && crash_report "$BUILD/bin/tconv" --use-ICU=0 --lines --rules-file=rules.txt -EnableAsserts -VerifyIR input.txt
+cd "$WORK" && crash_report "$BUILD/bin/xlit" --use-ICU=0 --lines --rules-file=rules.txt -EnableAsserts -VerifyIR input.txt
 rm -rf "$WORK"

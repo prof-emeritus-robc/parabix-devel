@@ -51,8 +51,8 @@ CASES = [
     ("csvcut", ["--columns=1,3"], CSV, False),
     ("csvgrep", ["--regex=Wash", "--columns=3"], CSV, False),
     ("csv2json", [], CSV, False),
-    ("tconv", ["Any-Lower"], TEXT, False),
-    ("tconv", ["Any-Hex"], TEXT, False),
+    ("xlit", ["Any-Lower"], TEXT, False),
+    ("xlit", ["Any-Hex"], TEXT, False),
     ("hexlines", [], TEXT, False),
     ("gb18030", [], b"plain ascii text\n" * 3000, False),
     ("nfc", [], TEXT, False),
@@ -70,7 +70,7 @@ CASES = [
 ]
 
 # The tools reading a single input (reporting one that cannot be read)
-SINGLE_INPUT = ["csvcut", "hexlines", "nfc", "nfd", "u8u16", "u32u8", "ufilter", "tconv"]
+SINGLE_INPUT = ["csvcut", "hexlines", "nfc", "nfd", "u8u16", "u32u8", "ufilter", "xlit"]
 
 
 def without_names(output, path):

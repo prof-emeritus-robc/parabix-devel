@@ -3,16 +3,17 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
-//  tconv: apply an LDML transform (UTS #35 Part 2) to a UTF-8 file.
+//  xlit: apply an LDML transform (UTS #35 Part 2) to a UTF-8 file.
+//  (Formerly named tconv.)
 //
-//  tconv [options] <transform name> <input file>
+//  xlit [options] <transform name> <input file>
 //      Write the transformed file to standard output.
-//  tconv [options] --rules-file=<rules file> <input file>
+//  xlit [options] --rules-file=<rules file> <input file>
 //      Parse and compile the LDML transform rules (plain tRule text, as
 //      ldml_trules reads without --xml) of <rules file>, as the forward
 //      rules of an ad hoc transform, and apply it in place of a named
 //      transform.
-//  tconv [options] --list-transforms
+//  xlit [options] --list-transforms
 //      List the known transforms: canonical name, aliases, defining file.
 //
 //  Transform names are the built-in transforms (Any-NFD, Any-Lower, ...)
@@ -38,7 +39,7 @@
 //      filters (:: [set] ;) and filtered transform rules (:: [set] ID ;):
 //      the filter is computed once, as a mask of the positions of the text
 //      where the transform may change characters (see RulePipelineBuilder).
-//  Any other known name is applied by ICU (if tconv is built with it, see
+//  Any other known name is applied by ICU (if xlit is built with it, see
 //  tools/ldml/CMakeLists.txt), or with --use-ICU=0 reported with its canonical
 //  name as not yet implemented.
 //
@@ -47,12 +48,12 @@
 //  transforms that its rules invoke (:: X ;), are applied by ICU where their
 //  names (canonical, alias, or as given) match it, and a rules file
 //  (--rules-file) where its path matches it; by default (and with a regular
-//  expression), so are those tconv does not implement; with 0, none.
-//  ICU makes a transform from the rules of its CLDR file, as tconv reads them,
+//  expression), so are those xlit does not implement; with 0, none.
+//  ICU makes a transform from the rules of its CLDR file, as xlit reads them,
 //  with the transforms its rules invoke from their files too (registered with
 //  ICU under the names by which they are invoked), and a built-in transform is
-//  ICU's own.  A transform whose own rules tconv implements, but not all the
-//  transforms they invoke, is applied in stages: the runs of its steps by tconv
+//  ICU's own.  A transform whose own rules xlit implements, but not all the
+//  transforms they invoke, is applied in stages: the runs of its steps by xlit
 //  pipelines, the transforms invoked by ICU, each on the output of the one
 //  before (through temporary files), on each run of the text within the
 //  transform's filter (as ICU applies all its steps to each run).  (Only the
@@ -141,92 +142,92 @@ using namespace kernel;
 using namespace llvm;
 using namespace pablo;
 
-static cl::OptionCategory TconvOptions("Transform Options", "LDML transform options.");
-static cl::opt<std::string> TransformName(cl::Positional, cl::desc("<transform name>"), cl::cat(TconvOptions));
-static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input file>"), cl::cat(TconvOptions));
+static cl::OptionCategory XlitOptions("Transform Options", "LDML transform options.");
+static cl::opt<std::string> TransformName(cl::Positional, cl::desc("<transform name>"), cl::cat(XlitOptions));
+static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input file>"), cl::cat(XlitOptions));
 static toolio::RegisterInputOptions InputOptions;
 static toolio::RegisterOutputOptions OutputOptions;
 static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory of CLDR transform files (default ~/cldr/common/transforms)"),
-                                          cl::init(""), cl::cat(TconvOptions));
+                                          cl::init(""), cl::cat(XlitOptions));
 static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML transform rules (plain tRule text) to parse and compile, applied "
                                                               "in place of a named transform"),
-                                      cl::init(""), cl::cat(TconvOptions));
+                                      cl::init(""), cl::cat(XlitOptions));
 static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known transform names and exit"),
-                                    cl::init(false), cl::cat(TconvOptions));
+                                    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::desc("Before contexts that the conversions of a group may change: matched against the converted text (resolved by "
              "the correction kernel's While loop, exact at any chain length) if nonzero, against the text itself if 0.  Also "
              "the rounds of the staged sequential selection of string rules with runs (exact for chains of up to this many)"),
-    cl::init(8), cl::cat(TconvOptions));
+    cl::init(8), cl::cat(XlitOptions));
 static cl::opt<bool> SequentialWhile("sequential-while",
     cl::desc("Select the string matches of a whole group selected sequentially (two-way or cyclic overlaps) in the correction "
              "kernel's While loop, where it can decide all the string rules, instead of in --converted-context-rounds staged "
              "rounds of matching, LeftmostMatches and applying kernels (doc/round-replacement.md step 6; default on)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
              "NFD_PipelineBuilder::NFD_Masked and NFC_Masked in UTF-8 mode), rather than with the characters outside the "
              "filter replaced by barriers (default on)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> U21NFC("u21-nfc",
     cl::desc("In Unicode mode, compose (NFC, NFKC, FCC) on the 21-bit basis (NFC_U21; within a filter with its mask), "
              "rather than by the conversion to UTF-8 and back (and barrier substitution within a filter) (default on)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> FusedPriority("fused-priority",
     cl::desc("Match the earlier rules that a rule yields to at the same position (see TransformStep::stringPriority) "
              "in the fused kernels, where their contexts are fused contexts (default on; 0: by the regular expression "
              "engine, a pipeline for each)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> CaseMapMarks("case-map-marks",
     cl::desc("Apply the case mappings that the function calls of a group's rules expand to (&Any-Lower($1), ...) at the "
              "positions marked where they apply, after the group, instead of as the changes of their characters "
              "(default on; Unicode mode, see CaseMapSplit)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> UCDPropertyKernels("ucd-property-kernels",
     cl::desc("Compute the Unicode properties of a group's rules each by a kernel of its own (UnicodePropertyKernelBuilder, "
              "shared and cached across transforms), and the classes of the fused kernels made of them from their streams, "
              "instead of compiling those classes from their characters (default on; Unicode mode)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool, true> CaptureVariants("capture-variants",
     cl::desc("Merge MultipleCaptureMultipleReplacement rules differing only in one character of a text and their results "
              "into one set, matched once (see ldml::MultipleCaptureMultipleReplacementSet::variants)"),
-    cl::location(ldml::MergeCaptureVariants), cl::init(true), cl::cat(TconvOptions));
+    cl::location(ldml::MergeCaptureVariants), cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> CaptureStrings("capture-strings",
     cl::desc("Plan the MultipleCaptureMultipleReplacement rules whose captures are fixed sequences of sets, with their "
              "results referring to them in order, as string rules keeping the characters of their captures "
              "(ldml::StringRule::kept), matched in the fused kernels with the other string rules, rather than one regular "
              "expression pipeline for each set (default on)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> AfterStreams("after-streams",
     cl::desc("Match a string rule whose after context the fused kernels cannot match, but whose before context they can, in "
              "the fused kernels, with its after context found by the engine (one stream for each distinct after context; "
              "FusedStringRule::afterMatch), rather than the whole rule by the engine (default on)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
     cl::desc("Rounds of applying the rules deferred after the BeforeCaptureCopy rules of a group, to the converted text "
              "(exact for chains of up to this many triggers whose before contexts reach back to each other)"),
-    cl::init(8), cl::cat(TconvOptions));
+    cl::init(8), cl::cat(XlitOptions));
 static cl::opt<bool> RevisitReport("revisit-report", cl::desc("Report each rule with text to revisit, how it is composed and the rules "
-                                   "applying to its text to revisit (one JSON object per line), and exit"), cl::cat(TconvOptions));
+                                   "applying to its text to revisit (one JSON object per line), and exit"), cl::cat(XlitOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit "
                                        "(with --apply-shape-groups, the plan chosen for each segment)"),
-                              cl::init(false), cl::cat(TconvOptions));
+                              cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> ShowShapeGroups("shape-groups",
                                      cl::desc("Report the conversion groups of the transform planned as search and replace "
                                               "passes by the shapes of their results (see ldml/shape_groups.h) and exit"),
-                                     cl::init(false), cl::cat(TconvOptions));
+                                     cl::init(false), cl::cat(XlitOptions));
 //  (Off by default: the boundaries keep the passes from running together,
 //  which slows them, see doc/ldml-shape-groups-report.md.)
 static cl::opt<bool> ShapePhaseBoundaries("shape-phase-boundaries",
                                           cl::desc("With --apply-shape-groups, a pipeline phase boundary after each pass"),
-                                          cl::init(false), cl::cat(TconvOptions));
+                                          cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> ApplyShapeGroups("apply-shape-groups",
                                       cl::desc("Apply each segment of a transform by the search and replace passes of its "
                                                "shape group plans (see --shape-groups) where they take fewer kernels than the "
                                                "regular plan, and a transform the regular plan does not implement by its shape "
                                                "groups, if they are implementable (default on; --apply-shape-groups=0 for the "
                                                "regular plan only)"),
-                                      cl::init(true), cl::cat(TconvOptions));
+                                      cl::init(true), cl::cat(XlitOptions));
 //  The two modes of rule pipelines: UTF-8 (the steps applied to the UTF-8 code
 //  units of the text, in their basis bits, one position per code unit) and
 //  Unicode (the steps applied to the 21 basis bits of the codepoints, one
@@ -235,42 +236,42 @@ static cl::opt<bool> ApplyShapeGroups("apply-shape-groups",
 static cl::opt<bool> UTF8Mode("utf8-mode",
                               cl::desc("Apply a transform to the UTF-8 code units of the text where it and the transforms "
                                        "it invokes can be (see --plan); otherwise, and with --utf8-mode=0, to its codepoints"),
-                              cl::init(true), cl::cat(TconvOptions));
+                              cl::init(true), cl::cat(XlitOptions));
 //  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
 //  are computed by kernels of their own, as the cost of compiling a kernel of
 //  classes of scattered characters grows faster than their number (for Hani-Latn,
 //  11 bits: 140s with the other classes, 33s in 3 kernels, 38s in 11).
 static cl::opt<unsigned> MuxClassKernels("mux-class-kernels",
     cl::desc("The number of kernels computing the classes of multiplexed mapping numbers (0: with the other classes)"),
-    cl::init(3), cl::cat(TconvOptions), cl::Hidden);
-static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied by ICU (if tconv is built with it): 0 for none, or "
+    cl::init(3), cl::cat(XlitOptions), cl::Hidden);
+static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied by ICU (if xlit is built with it): 0 for none, or "
                                    "a regular expression matching the names of transforms (the transform given, and those its rules "
-                                   "invoke), or the path of a rules file; the transforms tconv does not implement are "
+                                   "invoke), or the path of a rules file; the transforms xlit does not implement are "
                                    "applied by ICU, unless 0"),
-                                   cl::init(""), cl::cat(TconvOptions));
+                                   cl::init(""), cl::cat(XlitOptions));
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test "
                                              "data), in one run over the whole input, each line a region of a mask (region "
                                              "scope: see --plan --lines); the steps ICU applies, line by line"),
-                           cl::init(false), cl::cat(TconvOptions));
+                           cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> MixedModes("mixed-modes",
     cl::desc("In UTF-8 mode (--utf8-mode), apply the steps that need Unicode mode in segments of it, switching to it at the "
              "first such step and back to UTF-8 after the last of a run of them (doc/masked-transforms-plan.md step 13; "
              "default on; off: a transform with any such step wholly in Unicode mode)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> HybridGroups("hybrid-groups",
     cl::desc("In UTF-8 mode, apply the conversion groups of string rules that need Unicode mode in the hybrid of "
              "doc/masked-transforms-plan.md step 16 (option C): matched one position per character on classes of the bytes, "
              "with selectors applied to the bytes, without decoding the text (default on; --hybrid-groups=0 for Unicode "
              "segments)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> CheckUTF8Masks("check-utf8-masks",
     cl::desc("In UTF-8 mode, check that every mask gives all the bytes of a character the same bit (doc/masked-transforms-plan.md "
              "step 14) after each filter and each step, and report each mask that does not (exit status 3)"),
-    cl::init(false), cl::Hidden, cl::cat(TconvOptions));
+    cl::init(false), cl::Hidden, cl::cat(XlitOptions));
 static cl::opt<std::string> RegionSeparators("region-separators",
     cl::desc("With --lines, for testing that region scope relies only on the masks: the characters outside the regions, as "
              "hexadecimal code points separated by commas (default 0A, the line feed)"),
-    cl::init("0A"), cl::Hidden, cl::cat(TconvOptions));
+    cl::init("0A"), cl::Hidden, cl::cat(XlitOptions));
 //  The characters outside the regions of --lines (see RegionSeparators).
 static UCD::UnicodeSet regionSeparators() {
     UCD::UnicodeSet set;
@@ -282,37 +283,37 @@ static UCD::UnicodeSet regionSeparators() {
 }
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
-    cl::init(false), cl::cat(TconvOptions));
+    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> DisableEngineSearchReplace("disable-engine-search-replace",
                                                 cl::desc("Apply no conversion group by the search and replace of the regular "
                                                          "expression engine (see engineSearchReplace)"),
-                                                cl::init(false), cl::cat(TconvOptions));
+                                                cl::init(false), cl::cat(XlitOptions));
 static cl::opt<unsigned> DivCodeCodes("divcode-codes",
     cl::desc("Smoke test of the Div32Code/Div64Code kernels: replace each character of the input by U+10000 | (its external "
              "classes << 10) | its code, in the alphabet of the given conversion group (numbered from 1, as by "
              "--divcode-report) of the transform's own rules; the alphabet is described on the standard error"),
-    cl::init(0), cl::cat(TconvOptions), cl::Hidden);
+    cl::init(0), cl::cat(XlitOptions), cl::Hidden);
 static cl::opt<bool> DivCodeGroups("divcode-groups",
     cl::desc("Apply the conversion groups eligible for DivCode kernels (see --divcode-report) by them (see "
              "doc/ldml-divcode-plan.md; default on, --divcode-groups=0 for the regular plan)"),
-    cl::init(true), cl::cat(TconvOptions));
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool, true> DivCodeFamilies("divcode-families",
     cl::desc("Plan the families of string rules with before contexts matched against the converted text that cover "
              "their texts (doc/ldml-divcode-plan.md §11; default on, --divcode-families=0 keeps their groups on the "
              "regular plan)"),
-    cl::location(ldml::DivCodeFamilies), cl::init(true), cl::cat(TconvOptions));
+    cl::location(ldml::DivCodeFamilies), cl::init(true), cl::cat(XlitOptions));
 static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32, the default) "
                                       "or 6 (div64)"),
-                                      cl::init(5), cl::cat(TconvOptions));
+                                      cl::init(5), cl::cat(XlitOptions));
 static cl::opt<bool> DivCodeReport("divcode-report",
     cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
              "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
-    cl::init(false), cl::cat(TconvOptions));
+    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> KernelCounts("kernel-counts", cl::desc("Report the conversion groups of the transform (with their rules and "
                                   "kernels) and the kernels of its pipeline, built without compiling it, and exit"),
-                                  cl::init(false), cl::cat(TconvOptions));
+                                  cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
-                                  cl::init(false), cl::cat(TconvOptions));
+                                  cl::init(false), cl::cat(XlitOptions));
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -464,7 +465,7 @@ static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * 
         case Transform::HexPerl:
         case Transform::HexDecode:
         case Transform::Remove:
-            llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /XML10, /Perl) and Any-Remove are implemented by the rule pipeline");
+            llvm::report_fatal_error("xlit: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /XML10, /Perl) and Any-Remove are implemented by the rule pipeline");
     }
     return OutputBytes;
 }
@@ -625,12 +626,12 @@ static bool isImplementedBuiltIn(const std::string & canonicalName) {
                        [&](const std::pair<std::string, Transform> & p) {return p.first == canonicalName;});
 }
 
-//  The built-in transforms that tconv applies by ICU, whenever they are called
+//  The built-in transforms that xlit applies by ICU, whenever they are called
 //  for (by name, or as stages of the transforms whose rules invoke them), if
-//  tconv is built with ICU (unless --use-ICU=0): planned as implementable.
+//  xlit is built with ICU (unless --use-ICU=0): planned as implementable.
 static bool isICUBuiltIn(const std::string & canonicalName) {
     return (canonicalName == "Any-BreakInternal" || canonicalName == "Any-Name" || canonicalName == "Name-Any")
-           && UseICU != "0" && tconv::ICUTransform::available();
+           && UseICU != "0" && xlit::ICUTransform::available();
 }
 
 static std::string printCodepoints(const std::u32string & s) {
@@ -1634,7 +1635,7 @@ public:
         mMasks.insert(mMasks.begin(), t);
     }
     StreamSet * popTracked() {
-        if (mMasks.empty() || !mMasks.front().tracked) llvm::report_fatal_error("tconv: no stream tracked");
+        if (mMasks.empty() || !mMasks.front().tracked) llvm::report_fatal_error("xlit: no stream tracked");
         StreamSet * const positions = mMasks.front().apply;
         mMasks.erase(mMasks.begin());
         return positions;
@@ -2717,7 +2718,7 @@ static constexpr size_t FusedMaxAlternatives = 32;
 //  whole group (larger groups keep their before contexts matched against the text).
 static cl::opt<unsigned> FusedMaxWholeGroupRules("whole-group-rules", cl::desc("The most string rules (or subgroups) of a group "
                                                  "whose before contexts are matched against the converted text in one correction kernel"),
-                                                 cl::init(256), cl::cat(TconvOptions));
+                                                 cl::init(256), cl::cat(XlitOptions));
 
 namespace {
 
@@ -3157,7 +3158,7 @@ static bool divCodeApplies(const ldml::DivCodePlan & plan) {
     return plan.eligible();
 }
 
-//  The notes of tconv --plan on the before contexts of a conversion group that
+//  The notes of xlit --plan on the before contexts of a conversion group that
 //  its conversions may make match differently in the converted text, against
 //  which ICU matches them: those matched against the converted text (see
 //  FusedRules), and warnings for the others.
@@ -3195,7 +3196,7 @@ static bool groupLineBound(const ldml::TransformStep & step) {
     //  must match neither, so that the outermost cannot reach past it.  A
     //  lookaround (toward the outside of the context) of an item holds or fails
     //  on the line feed as beyond the end if the item matches both or neither.
-    //  No item may match a mark of tconv's (which can stand for a position
+    //  No item may match a mark of xlit's (which can stand for a position
     //  outside a filter, e.g. FilterRunEndMark) or the deletion mark.  Other
     //  constructs (e.g. anchors elsewhere) are not line-bound.
     static const UCD::UnicodeSet marks = UCD::UnicodeSet(0xD800, 0xDFFF) + UCD::UnicodeSet(0xFDD0, 0xFDEF);
@@ -5048,7 +5049,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
 }
 
 //  Whether the classes of a hybrid group's kernel are given as a multiplexed
-//  code (see FusedRulesConfig::classCodes): unless a set holds one of tconv's
+//  code (see FusedRulesConfig::classCodes): unless a set holds one of xlit's
 //  marks, whose classes are made with the streams of the filters and the
 //  deleted runs (WithRunEnds, notAfterDeletedRuns).
 static bool codedClasses(const std::vector<UCD::UnicodeSet> & sets) {
@@ -5065,7 +5066,7 @@ static bool codedClasses(const std::vector<UCD::UnicodeSet> & sets) {
 static std::pair<std::vector<UCD::UnicodeSet>, std::vector<UCD::UnicodeSet>> multiplexedClasses(const std::vector<UCD::UnicodeSet> & sets) {
     cc::CC_Set ccs;
     for (const UCD::UnicodeSet & s : sets) ccs.push_back(re::makeCC(s, &cc::Unicode));
-    std::unique_ptr<cc::MultiplexedAlphabet> mpx(cc::makeMultiplexedAlphabet("tconv_classes", ccs));
+    std::unique_ptr<cc::MultiplexedAlphabet> mpx(cc::makeMultiplexedAlphabet("xlit_classes", ccs));
     std::pair<std::vector<UCD::UnicodeSet>, std::vector<UCD::UnicodeSet>> result;
     for (const re::CC * bit : mpx->getMultiplexedCCs()) result.first.push_back(*bit);
     for (const re::CC * c : ccs) result.second.push_back(*mpx->transformCC(c));
@@ -7087,7 +7088,7 @@ void FusedRules::generatePabloMethod() {
             }
         } else {
             //  (Not built: see applyFused.)
-            llvm::report_fatal_error("tconv: a correction kernel neither staged nor resolved by the While loop");
+            llvm::report_fatal_error("xlit: a correction kernel neither staged nor resolved by the While loop");
         }
     }
 
@@ -9288,7 +9289,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Hex/Perl") return inStep(hexPerl(U21));
     if (const unsigned forms = hexDecodeForms(name)) return inStep(hexDecode(forms, U21));
     if (name == "Any-Remove") return inStep(remove(U21));
-    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
+    llvm::report_fatal_error(llvm::StringRef("xlit: built-in transform " + name + " is not implemented"));
 }
 
 //  Hex-Any (and its variants): the escapes decoded (within the filter, if any),
@@ -9709,7 +9710,7 @@ Staged RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UC
             for (unsigned i = 0; i < p->MaxUnicodeInsertLength(); i++) v.xfrms.push_back(p->GetBitTransformSets(i));
             v.insertion = p->GetUnicodeInsertLengthBixNumSets();
         } else {
-            llvm::report_fatal_error("tconv: not a codepoint or string override property");
+            llvm::report_fatal_error("xlit: not a codepoint or string override property");
         }
         insertionBits = std::max<unsigned>(insertionBits, v.insertion.size());
         maxLength = std::max(maxLength, v.xfrms.size());
@@ -9764,7 +9765,7 @@ Staged RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UC
     return Staged(result, std::move(positions));
 }
 
-//  The options of tconv's uses of the regular expression engine: without
+//  The options of xlit's uses of the regular expression engine: without
 //  matching by reversal, whose regions are limited in length (a text, or a
 //  line with -lines, is one region of any length).
 static RE_ModeOptions engineOptions() {
@@ -9783,10 +9784,10 @@ static re::RE * possessiveBefore(re::RE * engineBefore) {
 //  The name of the positions outside the global filter (see
 //  ldml::FilterRunEndMark) in the patterns of the engine: an external of the
 //  engine, the run ends of the active mask (TransformMasks::runEnds).
-static const std::string FilterRunEndName = "tconvFilterRunEnd";
-static const std::string DeletedRunEndName = "tconvDeletedRunEnd";
-static const std::string NotDeletedRunEndName = "tconvNotDeletedRunEnd";
-static const std::string DeletedRunAfterName = "tconvDeletedRunAfter";
+static const std::string FilterRunEndName = "xlitFilterRunEnd";
+static const std::string DeletedRunEndName = "xlitDeletedRunEnd";
+static const std::string NotDeletedRunEndName = "xlitNotDeletedRunEnd";
+static const std::string DeletedRunAfterName = "xlitDeletedRunAfter";
 
 //  A pattern with the sets including ldml::FilterRunEndMark matching the
 //  positions outside the filter (FilterRunEndName) instead, and those with
@@ -9964,11 +9965,11 @@ RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pa
     }
     const bool deleted = usesExternal(pattern, DeletedRunEndName), notDeleted = usesExternal(pattern, NotDeletedRunEndName);
     if (usesExternal(pattern, DeletedRunAfterName)) {
-        if (mDeletedRunAfter == nullptr) llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
+        if (mDeletedRunAfter == nullptr) llvm::report_fatal_error("xlit: blocking marks without the prefix runs before them");
         context.externals.emplace_back(DeletedRunAfterName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, mDeletedRunAfter});
     }
     if ((deleted || notDeleted) && mDeletedRunEnds == nullptr) {
-        llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
+        llvm::report_fatal_error("xlit: blocking marks without the prefix runs before them");
     }
     if (deleted) {
         context.externals.emplace_back(DeletedRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, mDeletedRunEnds});
@@ -10255,7 +10256,7 @@ void RulePipelineBuilder::classKernel(const std::vector<re::CC *> & ccs, StreamS
 
 StreamSet * RulePipelineBuilder::byteMatches(re::RE * pattern, StreamSet ** spans) {
     for (const std::string & name : {FilterRunEndName, DeletedRunEndName, NotDeletedRunEndName, DeletedRunAfterName}) {
-        if (usesExternal(pattern, name)) llvm::report_fatal_error(llvm::StringRef("tconv: a hybrid group with the external ") + name);
+        if (usesExternal(pattern, name)) llvm::report_fatal_error(llvm::StringRef("xlit: a hybrid group with the external ") + name);
     }
     const PreparedRE prepared = prepareRE(pattern, spans ? spanOptions() : engineOptions());
     StreamSet * matches = mP.CreateStreamSet(1);
@@ -10306,12 +10307,12 @@ StreamSet * RulePipelineBuilder::byteMatches(re::RE * pattern, StreamSet ** span
 //  or, with Unicode indexing, at the characters (their last bytes).
 void RulePipelineBuilder::byteStarts(re::RE * pattern, StreamSet * starts) {
     for (const std::string & name : {FilterRunEndName, DeletedRunEndName, NotDeletedRunEndName, DeletedRunAfterName}) {
-        if (usesExternal(pattern, name)) llvm::report_fatal_error(llvm::StringRef("tconv: a hybrid group with the external ") + name);
+        if (usesExternal(pattern, name)) llvm::report_fatal_error(llvm::StringRef("xlit: a hybrid group with the external ") + name);
     }
     const PreparedRE prepared = prepareRE(pattern, startsOptions());
     const std::vector<PreconditionFailure> failures = checkPreconditions(prepared, &cc::UTF8);
     if (!failures.empty()) {
-        llvm::report_fatal_error(llvm::StringRef("tconv: a hybrid group with starts the engine cannot find on the bytes: ")
+        llvm::report_fatal_error(llvm::StringRef("xlit: a hybrid group with starts the engine cannot find on the bytes: ")
                                  + Printer_RE::PrintRE(pattern));
     }
     RE_PipelineBuilder engine(mP, RE_context{&cc::UTF8, mBytes->basis, mBytes->regions.first, mBytes->regions.second});
@@ -10335,7 +10336,7 @@ void RulePipelineBuilder::byteStarts(re::RE * pattern, StreamSet * starts) {
 //  the positions beyond a shorter one are deleted), or StringRuleKept for a
 //  character kept (with characters inserted before or after it: the selector
 //  of a string that keeps it, see kernel::UTF8_SelectorKept).
-static_assert(kernel::UTF8_SelectorKept == static_cast<char32_t>(ldml::StringRuleKept), "the kept marks of tconv and the selectors");
+static_assert(kernel::UTF8_SelectorKept == static_cast<char32_t>(ldml::StringRuleKept), "the kept marks of xlit and the selectors");
 std::u32string RulePipelineBuilder::selectorReplacement(size_t n, const std::u32string & r, const std::vector<UCD::UnicodeSet> * text) {
     const size_t m = r.size();
     std::u32string out;
@@ -10363,7 +10364,7 @@ std::u32string RulePipelineBuilder::selectorReplacement(size_t n, const std::u32
         for (char32_t c : part) {
             if (c == static_cast<char32_t>(ldml::StringRuleKept)) kept++;
             if (c == static_cast<char32_t>(ldml::StringRuleDeleted) || kept > 1) {
-                llvm::report_fatal_error("tconv: a hybrid group with kept characters in an insertion");
+                llvm::report_fatal_error("xlit: a hybrid group with kept characters in an insertion");
             }
         }
         out.push_back(selectorFor(part));
@@ -10380,7 +10381,7 @@ StreamSet * RulePipelineBuilder::notAfterDeletedRuns(const std::vector<UCD::Unic
         if (ldml::marksDeletedRunAllow(sets[i])) allowed.push_back(static_cast<unsigned>(i));
     }
     if (blocked.empty() && allowed.empty()) return classes;
-    if (mDeletedRunEnds == nullptr) llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
+    if (mDeletedRunEnds == nullptr) llvm::report_fatal_error("xlit: blocking marks without the prefix runs before them");
     StreamSet * const result = mP.CreateStreamSet(classes->getNumElements());
     mP.CreateKernelCall<NotAfterDeletedRuns>(classes, mDeletedRunEnds, blocked, allowed, result);
     return result;
@@ -10780,7 +10781,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             const std::vector<ldml::PatternItem> text = ldml::patternItems(e->getSourceSide(ldml::Direction::Forward)->getText());
             return matchPositions(g.engineBefore, g.engineAfter, {text.front().chars}, U21);
         }
-        llvm::report_fatal_error("tconv: a rule yielded to is not in its group");
+        llvm::report_fatal_error("xlit: a rule yielded to is not in its group");
     };
     //  The first positions of the matches of a string rule, other than where an
     //  earlier rule it yields to matches (as ICU tries that rule first).
@@ -11046,7 +11047,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         std::string why;
         config.resolve = resolvableByWhile(config, &why);
         if (config.rounds > 0 && !config.staged && !config.matchOnly && !config.resolve) {
-            llvm::report_fatal_error(llvm::StringRef("tconv: before contexts matched against the converted text that the "
+            llvm::report_fatal_error(llvm::StringRef("xlit: before contexts matched against the converted text that the "
                                                      "correction kernel's While loop cannot resolve (" + why + "); "
                                                      "--converted-context-rounds=0 matches them against the text itself"));
         }
@@ -12117,7 +12118,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     //  positions themselves (no positions inserted or deleted).
     if (mBytes) {
         if (!inserting.empty() || changesAt.size() > 1 || !state.marks.empty()) {
-            llvm::report_fatal_error("tconv: a hybrid group with positions inserted");
+            llvm::report_fatal_error("xlit: a hybrid group with positions inserted");
         }
         if (changesAt.empty() || changesAt[0] == nullptr || mSelectorStrings.empty()) return Staged(nullptr);
         unsigned bits = 0;
@@ -12339,7 +12340,7 @@ static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformR
     choice.useShapes.assign(choice.shapeSegments.size(), false);
     if (!choice.aligned) return analyzer.mShapeChoices.emplace(entry->canonicalName, std::move(choice)).first->second;
     static std::unique_ptr<CPUDriver> counting;
-    if (!counting) counting = std::make_unique<CPUDriver>("tconv-counting");
+    if (!counting) counting = std::make_unique<CPUDriver>("xlit-counting");
     auto count = [&](const std::function<void (RulePipelineBuilder &, StreamSet *)> & build) {
         auto P = CreatePipeline(*counting, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
         StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
@@ -12570,7 +12571,7 @@ TransformAnalyzer::Mode TransformAnalyzer::modeOf(const TransformAnalysis & a) {
         }
     };
     if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) unicode("ill-formed UTF-8 aborting (--utf8-errors=abort-on-error)");
-    if (!a.implementable) unicode("not implemented by tconv's own rules");
+    if (!a.implementable) unicode("not implemented by xlit's own rules");
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (!m.utf8) break;
         if (step.kind == ldml::TransformStep::Kind::Transform) {
@@ -12603,16 +12604,16 @@ static bool gUTF8MaskViolation = false;
 static void reportUTF8MaskCheck(const uint64_t check, const uint64_t count) {
     if (count == 0) return;
     gUTF8MaskViolation = true;
-    llvm::errs() << "tconv: a UTF-8 mask not uniform over the bytes of " << count << " character(s): "
+    llvm::errs() << "xlit: a UTF-8 mask not uniform over the bytes of " << count << " character(s): "
                  << (check < gUTF8MaskChecks.size() ? gUTF8MaskChecks[check] : std::string("?")) << "\n";
 }
 
 //  (One callback per check, its index a template argument: a constant
 //  scalar given to a pipeline call crashes the pipeline compiler.)
-template <unsigned K> void tconv_utf8_mask_check(const uint64_t count) {reportUTF8MaskCheck(K, count);}
+template <unsigned K> void xlit_utf8_mask_check(const uint64_t count) {reportUTF8MaskCheck(K, count);}
 using UTF8MaskCheckFn = void (const uint64_t);
 template <unsigned... K> static constexpr std::array<UTF8MaskCheckFn *, sizeof...(K)> utf8MaskCheckFns(std::integer_sequence<unsigned, K...>) {
-    return {&tconv_utf8_mask_check<K>...};
+    return {&xlit_utf8_mask_check<K>...};
 }
 static const auto gUTF8MaskCheckFns = utf8MaskCheckFns(std::make_integer_sequence<unsigned, 64>{});
 
@@ -12695,7 +12696,7 @@ private:
             }
             return edges;
         }
-        llvm::report_fatal_error("tconv: bounded contexts in UTF-8 mode without regions");
+        llvm::report_fatal_error("xlit: bounded contexts in UTF-8 mode without regions");
     }
     std::map<StreamSet *, std::pair<StreamSet *, StreamSet *>> mRegionEdges;
     bool mInvokedWithFilter = false;
@@ -12725,7 +12726,7 @@ public:
             const size_t k = std::min(gUTF8MaskChecks.size(), gUTF8MaskCheckFns.size() - 1);
             gUTF8MaskChecks.push_back(label + ": " + what);
             if (k == gUTF8MaskCheckFns.size() - 1) gUTF8MaskChecks[k] = "one of the checks after the 63rd";
-            mP.CreateCall("tconv_utf8_mask_check" + std::to_string(k), *gUTF8MaskCheckFns[k], {count});
+            mP.CreateCall("xlit_utf8_mask_check" + std::to_string(k), *gUTF8MaskCheckFns[k], {count});
         };
         std::set<StreamSet *> seen;
         for (size_t i = 0; i < mMasks.size(); i++) {
@@ -12766,7 +12767,7 @@ private:
 //  positions of their texts (with correction kernels: before contexts matched
 //  against the converted text, as the strings of the selectors), and of
 //  MultipleCaptureMultipleReplacement rules whose captures stay in place, with no
-//  insertion rules, and no contexts that need the streams of tconv's marks (run
+//  insertion rules, and no contexts that need the streams of xlit's marks (run
 //  ends, deleted runs) in the engine.
 static std::string hybridProblem(const ldml::TransformStep & step) {
     if (step.kind != ldml::TransformStep::Kind::Conversion) return "not a conversion group";
@@ -12797,10 +12798,10 @@ static std::string hybridProblem(const ldml::TransformStep & step) {
             if (c == static_cast<char32_t>(ldml::StringRuleKept) && j + 1 != n) return "a kept character among inserted ones";
             if (c == static_cast<char32_t>(ldml::StringRuleDeleted) && j >= n) return "a deleted character among inserted ones";
         }
-        if (externals(r.engineBefore, r.engineAfter)) return "contexts with tconv's marks";
+        if (externals(r.engineBefore, r.engineAfter)) return "contexts with xlit's marks";
     }
     for (const ldml::CharMapSubgroup & g : step.subgroups) {
-        if (externals(g.engineBefore, g.engineAfter)) return "contexts with tconv's marks";
+        if (externals(g.engineBefore, g.engineAfter)) return "contexts with xlit's marks";
     }
     return "";
 }
@@ -13036,7 +13037,7 @@ StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         //  A group with string rules, by its DivCode plan on the UTF-8 code units.
         const ldml::DivCodePlan plan = utf8DivCodePlan(step);
         if ((mBounded && !groupLineBound(step)) || !DivCodeGroups || !divCodeApplies(plan)) {
-            if (!HybridGroups || !hybridProblem(step).empty()) llvm::report_fatal_error(llvm::StringRef("tconv: not in UTF-8 mode: ") + reason);
+            if (!HybridGroups || !hybridProblem(step).empty()) llvm::report_fatal_error(llvm::StringRef("xlit: not in UTF-8 mode: ") + reason);
             Basis = hybridGroup(step, Basis);
             if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
             return Basis;
@@ -13066,7 +13067,7 @@ StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * B
         return mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
     }
     if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
-    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " not in UTF-8 mode"));
+    llvm::report_fatal_error(llvm::StringRef("xlit: built-in transform " + name + " not in UTF-8 mode"));
 }
 
 //  The normalization forms, focused (as in the nfd, nfkd and nfc tools), from
@@ -13398,7 +13399,7 @@ StreamSet * RulePipelineBuilder::applyShapeStep(const TransformAnalyzer::ShapeSt
         RE_context context{&cc::Unicode, text};
         if (mask) {
             if (!step.failuresInFilter[i].empty()) {
-                llvm::report_fatal_error(llvm::StringRef("tconv: a pass of shape groups not applicable within a filter: ")
+                llvm::report_fatal_error(llvm::StringRef("xlit: a pass of shape groups not applicable within a filter: ")
                                          + step.failuresInFilter[i].front().reason);
             }
             context.textMask = mask;
@@ -13654,7 +13655,7 @@ Staged RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, St
         const ldml::PrefixRun * of = nullptr;
         for (const ldml::PrefixRun & pr : step.prefixRuns) {
             if (pr.first == firsts[f]) {
-                if (of && of->prefix != pr.prefix) llvm::report_fatal_error("tconv: prefix runs of the same P with different characters before it");
+                if (of && of->prefix != pr.prefix) llvm::report_fatal_error("xlit: prefix runs of the same P with different characters before it");
                 of = &pr;
             }
         }
@@ -14110,7 +14111,7 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
     return P.compile();
 }
 
-//  tconv --kernel-counts: the conversion groups of a transform (of its own
+//  xlit --kernel-counts: the conversion groups of a transform (of its own
 //  steps, not of the transforms it invokes) with their rules, and, if it is
 //  implementable, the kernels of each group and of the whole transform (all
 //  the kernels its rule pipeline adds between the decoding of the input to
@@ -14319,7 +14320,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
         return 2;
     }
     toolio::out().flush();   // (not to be written again by a process the driver forks)
-    CPUDriver driver("tconv");
+    CPUDriver driver("xlit");
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
@@ -14400,7 +14401,7 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 //  forms), Any-Remove and Any-Null; and conversion groups without revisits
 //  whose rules have line-bound contexts, if any.  The n characters of a match
 //  are all within the mask, and a context is line-bound if it has no anchors
-//  and none of its classes matches a line feed (or a mark of tconv's, such as
+//  and none of its classes matches a line feed (or a mark of xlit's, such as
 //  FilterRunEndMark, which can stand for one), so that it matches within the
 //  line as it does at the end of the line taken as a text.  The filters of the
 //  transform (within the mask) and the transforms it invokes are as well.  Each
@@ -14434,7 +14435,7 @@ static RegionScope regionScope(const ldml::TransformRegistry & registry, Transfo
     };
     //  (Applied by ICU as a whole, if it is available: line by line.)
     if (!a.implementable) {
-        if (UseICU != "0" && tconv::ICUTransform::available()) {
+        if (UseICU != "0" && xlit::ICUTransform::available()) {
             scope.icu = true;
             return scope;
         }
@@ -14532,7 +14533,7 @@ static void applyToInput(const std::function<void (int)> & fn, int fd) {
 }
 
 //  The transforms applied by ICU (see --use-ICU): those whose names match the
-//  pattern, and (unless --use-ICU=0) those that tconv does not implement.
+//  pattern, and (unless --use-ICU=0) those that xlit does not implement.
 struct ICUPolicy {
     bool off = false;
     std::optional<std::regex> pattern;
@@ -14588,13 +14589,13 @@ static void registerInvokedWithICU(const ldml::TransformRegistry & registry, Tra
         registerInvokedWithICU(registry, analyzer, used);
         std::string error;
         //  (If ICU cannot make it, its own transform of that name applies.)
-        tconv::ICUTransform::registerRules(id, ruleText(used), used->direction == ldml::TransformDirection::Backward, error);
+        xlit::ICUTransform::registerRules(id, ruleText(used), used->direction == ldml::TransformDirection::Backward, error);
     }
 }
 
 //  The ICU transform of a transform (by its entry, or else the name given),
 //  restricted to a filter (if any), or nullptr and the reason.
-static std::shared_ptr<tconv::ICUTransform> icuTransform(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+static std::shared_ptr<xlit::ICUTransform> icuTransform(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                                          const std::string & name, const ldml::TransformEntry * entry,
                                                          const UCD::UnicodeSet * filter, std::string & error) {
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
@@ -14602,9 +14603,9 @@ static std::shared_ptr<tconv::ICUTransform> icuTransform(const ldml::TransformRe
         for (const auto & r : *filter) ranges.emplace_back(r.first, r.second);
     }
     const auto * f = filter ? &ranges : nullptr;
-    if (entry == nullptr || entry->isBuiltIn()) return tconv::ICUTransform::fromName(entry ? entry->canonicalName : name, f, error);
+    if (entry == nullptr || entry->isBuiltIn()) return xlit::ICUTransform::fromName(entry ? entry->canonicalName : name, f, error);
     registerInvokedWithICU(registry, analyzer, entry);
-    return tconv::ICUTransform::fromRules(entry->canonicalName, ruleText(entry), entry->direction == ldml::TransformDirection::Backward,
+    return xlit::ICUTransform::fromRules(entry->canonicalName, ruleText(entry), entry->direction == ldml::TransformDirection::Backward,
                                           f, error);
 }
 
@@ -14631,7 +14632,7 @@ static void writeAll(int fd, const std::string & text) {
     }
 }
 
-//  The input of tconv, and the output: the standard output, which the
+//  The input of xlit, and the output: the standard output, which the
 //  transforms write (in stages through temporary redirections of it: see
 //  runOn and stagedRunner), redirected to the file of --output.
 static toolio::Input MainInput;
@@ -14655,7 +14656,7 @@ static int finishOutput() {
 }
 
 //  A compiled pipeline as a runner: the input it is given is mapped if it is
-//  the input of tconv and --mmap applies.
+//  the input of xlit and --mmap applies.
 static std::function<void (int)> pipelineRunner(TransformFunctionType fn) {
     return [fn](int in) {
         const bool useMMap = (in == MainInput.fd) && MainInput.useMMap;
@@ -14668,7 +14669,7 @@ static std::function<void (int)> pipelineRunner(TransformFunctionType fn) {
 //  contexts, as ICU sees them (its break iterators too).
 static const std::pair<std::string, std::string> * runSurroundings = nullptr;
 
-static Runner icuRunner(std::shared_ptr<tconv::ICUTransform> t) {
+static Runner icuRunner(std::shared_ptr<xlit::ICUTransform> t) {
     return [t](int fd) {
         const std::string text = readAll(fd);
         writeAll(STDOUT_FILENO, runSurroundings ? t->apply(runSurroundings->first, text, runSurroundings->second) : t->apply(text));
@@ -14679,7 +14680,7 @@ static Runner icuRunner(std::shared_ptr<tconv::ICUTransform> t) {
 //  of its own, in the process (as uconv -x does), the line feeds as they are;
 //  within a run of a filter (see filteredRunner), with its surroundings in its
 //  line.
-static Runner icuLinesRunner(std::shared_ptr<tconv::ICUTransform> t) {
+static Runner icuLinesRunner(std::shared_ptr<xlit::ICUTransform> t) {
     return [t](int fd) {
         const std::string text = readAll(fd);
         std::string out;
@@ -14699,7 +14700,7 @@ static Runner icuLinesRunner(std::shared_ptr<tconv::ICUTransform> t) {
 //  A temporary file (removed when closed).
 static int temporaryFile() {
     const char * dir = getenv("TMPDIR");
-    std::string path = std::string(dir && *dir ? dir : "/tmp") + "/tconvXXXXXX";
+    std::string path = std::string(dir && *dir ? dir : "/tmp") + "/xlitXXXXXX";
     const int fd = mkstemp(path.data());
     if (fd == -1) {
         llvm::errs() << "Error: cannot create a temporary file.\n";
@@ -14798,11 +14799,11 @@ static Runner stagedRunner(std::vector<Runner> stages) {
     };
 }
 
-//  The steps of a transform: the runs of those tconv applies (as a plan of
+//  The steps of a transform: the runs of those xlit applies (as a plan of
 //  those steps), and each of the transforms ICU applies (with the filter of
 //  the step), on each run of the text within the filter of the transform (if
 //  any; see filteredRunner); or false, and the reason.
-//  With lines (--lines): the stages of tconv applied once to all the lines, as
+//  With lines (--lines): the stages of xlit applied once to all the lines, as
 //  regions (each one run), and those of ICU to each line (icuLinesRunner).
 static RegionScope regionScope(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer, const TransformAnalysis & a);
 static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
@@ -14820,7 +14821,7 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
         part.implementable = true;
         const RegionScope scope = lines ? regionScope(registry, analyzer, part) : RegionScope();
         if (lines && !scope.supported()) {
-            error = "with --lines, the steps tconv applies are not supported in region scope: " + scope.problem;
+            error = "with --lines, the steps xlit applies are not supported in region scope: " + scope.problem;
             return;
         }
         const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part, lines, lines && scope.bounded);
@@ -14837,7 +14838,7 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
         std::optional<UCD::UnicodeSet> filter;
         if (step.filter) filter = step.filterSet;
         const std::string id = step.transform.getText();
-        std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, id, registry.lookup(id), filter ? &*filter : nullptr, error);
+        std::shared_ptr<xlit::ICUTransform> t = icuTransform(registry, analyzer, id, registry.lookup(id), filter ? &*filter : nullptr, error);
         if (!t) return false;
         stages.push_back(lines ? icuLinesRunner(t) : icuRunner(t));
     }
@@ -14850,7 +14851,7 @@ static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegis
 
 //  Whether a step invokes a built-in transform that ICU applies whenever it
 //  is called for (see isICUBuiltIn), or a transform whose rules invoke one
-//  (at any depth): applied by ICU, as tconv's pipelines do not include them.
+//  (at any depth): applied by ICU, as xlit's pipelines do not include them.
 static bool invokesICUBuiltIn(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                               const ldml::TransformStep & step, std::set<std::string> && seen = {}) {
     if (step.kind != ldml::TransformStep::Kind::Transform) return false;
@@ -16611,7 +16612,7 @@ static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::Tr
     desc += ", \"kernel\": \"" + DivCodeKernel::kernelName(plan.shift, plan.blocks, "U21") + "\"}";
     llvm::errs() << desc << "\n";
     if (!openInputAndOutput(inputFile)) return 1;
-    CPUDriver driver("tconv");
+    CPUDriver driver("xlit");
     auto P = CreatePipeline(driver, Input<uint32_t>("useMMap"), Input<uint32_t>("inputFileDescriptor"), Input<uint32_t>("outputFD"));
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), P.getInputScalar("inputFileDescriptor"), ByteStream);
@@ -16633,7 +16634,7 @@ int main(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&XlitOptions, &toolio::InputOutputOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     ldml::TransformRegistry registry;
     const std::string dir = TransformsDir.empty() ? ldml::defaultTransformDirectory() : TransformsDir;
@@ -16682,7 +16683,7 @@ static int run(int argc, char *argv[]) {
             return a.implementable ? 0 : 2;
         }
         //  Not implementable: applied by ICU (unless --use-ICU=0).
-        if (!a.implementable && (UseICU == "0" || !tconv::ICUTransform::available())) {
+        if (!a.implementable && (UseICU == "0" || !xlit::ICUTransform::available())) {
             llvm::errs() << "Rules file " << RulesFile << " is not implementable";
             if (!a.problems.empty()) {
                 llvm::errs() << ": " << a.problems.size() << " problems (see --plan), e.g.\n  " << a.problems.front();
@@ -16700,13 +16701,13 @@ static int run(int argc, char *argv[]) {
                 return 1;
             }
         }
-        if (selected && !tconv::ICUTransform::available()) {
-            llvm::errs() << "Error: rules file " << RulesFile << " selected by --use-ICU, but tconv was built without ICU\n";
+        if (selected && !xlit::ICUTransform::available()) {
+            llvm::errs() << "Error: rules file " << RulesFile << " selected by --use-ICU, but xlit was built without ICU\n";
             return 2;
         }
         if (!a.implementable || selected) {
             std::string error;
-            std::shared_ptr<tconv::ICUTransform> t = tconv::ICUTransform::fromRules("tconv-rules", readFile(RulesFile), false, nullptr, error);
+            std::shared_ptr<xlit::ICUTransform> t = xlit::ICUTransform::fromRules("xlit-rules", readFile(RulesFile), false, nullptr, error);
             if (!t) {
                 llvm::errs() << "Error: " << error << "\n";
                 return 2;
@@ -16716,7 +16717,7 @@ static int run(int argc, char *argv[]) {
             return finishOutput();
         }
         if (!openInputAndOutput(inputFile)) return 1;
-        CPUDriver driver("tconv");
+        CPUDriver driver("xlit");
         //  The built-ins ICU applies, as stages (see stagedTransformRunner).
         auto byICU = [&](const ldml::TransformStep & step) {return invokesICUBuiltIn(registry, analyzer, step);};
         if (std::any_of(a.plan.steps.begin(), a.plan.steps.end(), byICU)) {
@@ -16878,7 +16879,7 @@ static int run(int argc, char *argv[]) {
         return 2;
     };
     //  The transform applied by ICU (see --use-ICU): all of it, by its name or
-    //  as tconv does not implement its own rules, or only the transforms its
+    //  as xlit does not implement its own rules, or only the transforms its
     //  rules invoke that ICU applies (in stages with the rest).
     //  (With --apply-shape-groups, a transform the regular plan does not
     //  implement may be applied by its shape groups; one it does is applied
@@ -16904,13 +16905,13 @@ static int run(int argc, char *argv[]) {
         }
         if (!staged && !implemented) return notImplemented("");
     }
-    if ((wholeICU || staged) && !tconv::ICUTransform::available()) return notImplemented(" (and tconv was built without ICU)");
+    if ((wholeICU || staged) && !xlit::ICUTransform::available()) return notImplemented(" (and xlit was built without ICU)");
 
     if (!openInputAndOutput(InputFile)) return 1;
-    CPUDriver driver("tconv");
+    CPUDriver driver("xlit");
     if (wholeICU) {
         std::string error;
-        std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, TransformName, entry, nullptr, error);
+        std::shared_ptr<xlit::ICUTransform> t = icuTransform(registry, analyzer, TransformName, entry, nullptr, error);
         if (!t) {
             llvm::errs() << "Error: " << error << "\n";
             return 2;

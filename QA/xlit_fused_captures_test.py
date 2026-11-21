@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: MultipleCaptureMultipleReplacement rules whose captures are fixed
+#  xlit: MultipleCaptureMultipleReplacement rules whose captures are fixed
 #  sequences of sets, planned as string rules keeping the characters of their
 #  captures (--capture-strings, StringRule::kept), matched in the fused kernels
 #  rather than one regular expression pipeline for each rule (as am_FONIPA-am's
@@ -11,18 +11,18 @@
 #  MultipleCaptureMultipleReplacement rule: a kept string rule only takes an
 #  optional set at the end of its text (before, its absent form had the after
 #  context of the optional set, so that nqiqw gave nqiq5w).  The rules must be
-#  planned that way (tconv --plan), and their results must be ICU's (as given
+#  planned that way (xlit --plan), and their results must be ICU's (as given
 #  by its createFromRules on the same rules, each line a text), with and
 #  without --capture-strings, also on a line longer than a block.
 #
-#  tconv_fused_captures_test.py <tconv binary> [--extended-testing]
+#  xlit_fused_captures_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = r"""
 $V = [aeiou] ;
@@ -45,7 +45,7 @@ PLANNED = ["string rule: tq (j $V) q → t1 $1 2 ;", "string rule: ([ps]) qwa } 
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
@@ -54,12 +54,12 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules], capture_output=True).stdout.decode("utf-8", "replace")
+        plan = subprocess.run([xlit, "--plan", "--rules-file=" + rules], capture_output=True).stdout.decode("utf-8", "replace")
         if ": implementable" not in plan or any(p not in plan for p in PLANNED):
             failures += 1
             print("FAIL: not planned with the captures as string rules\n%s" % plan)
         for config in [[], ["--capture-strings=0"]]:
-            run = subprocess.run([tconv, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input], capture_output=True)
+            run = subprocess.run([xlit, "--use-ICU=0"] + config + ["--lines", "--rules-file=" + rules, input], capture_output=True)
             if run.returncode != 0:
                 failures += 1
                 print("FAIL %s: exit status %d\n%s" % (" ".join(config), run.returncode, run.stderr.decode("utf-8", "replace")))

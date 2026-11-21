@@ -2,20 +2,20 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: runs of sets with strings, [{i\u032f} i ɪ]+ → i (see
+#  xlit: runs of sets with strings, [{i\u032f} i ɪ]+ → i (see
 #  ldml::StringRule::runStrings), as ICU matches them: the longest string at
 #  each step, each mark U+032F in the run only after its i (or u).  The run
 #  rules are applied alone and selected with other string rules.  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
-#  tconv_run_strings_test.py <tconv binary> [--extended-testing]
+#  xlit_run_strings_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = ("[{i\u032f} i ɪ]+ → i ;\n"
          "[{u\u032f} u w]+ → u ;\n"
@@ -42,7 +42,7 @@ CASES = [
 ]
 
 
-def run(tconv, rules_text):
+def run(xlit, rules_text):
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
@@ -50,16 +50,16 @@ def run(tconv, rules_text):
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        return subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        return subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     #  (The run rules alone, and with the other rules: their matches then
     #  selected together.)
     for rules_text, cases in ((RULES.split("\n")[0] + "\n", None), (RULES, CASES)):
-        r = run(tconv, rules_text)
+        r = run(xlit, rules_text)
         if r.returncode != 0:
             print("FAIL: exit status %d\n%s" % (r.returncode, r.stderr.decode("utf-8", "replace")))
             return 1

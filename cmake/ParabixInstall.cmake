@@ -53,7 +53,7 @@
 
 # The default set: tools for general use.
 set(PARABIX_TOOLS_DEFAULT
-    icgrep wc base64 csvcut csvgrep csv2json tconv hexlines
+    icgrep wc base64 csvcut csvgrep csv2json xlit hexlines
     gb18030 nfc nfd nfkd u32u16 u32u8 u8u16 x8u16)
 # The dev set: developer tools and demonstrations.
 set(PARABIX_TOOLS_DEV

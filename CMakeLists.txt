@@ -916,239 +916,239 @@ add_test(
   COMMAND ${BIN_DIR}/ldml_trules --self-test)
 
 add_test(
-  NAME tconv_engine_test
+  NAME xlit_engine_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_engine_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_engine_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_prefix_runs_test
+  NAME xlit_prefix_runs_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_prefix_runs_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_prefix_runs_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_chain_revisits_test
+  NAME xlit_chain_revisits_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_chain_revisits_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_chain_revisits_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_mark_run_edits_test
+  NAME xlit_mark_run_edits_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_mark_run_edits_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_mark_run_edits_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_walk_selection_test
+  NAME xlit_walk_selection_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_walk_selection_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_walk_selection_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_fixed_captures_test
+  NAME xlit_fixed_captures_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_fixed_captures_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_fixed_captures_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_kept_captures_test
+  NAME xlit_kept_captures_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_kept_captures_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_kept_captures_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_icu_lines_test
+  NAME xlit_icu_lines_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_icu_lines_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_icu_lines_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_region_separators_test
+  NAME xlit_region_separators_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_region_separators_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_region_separators_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_fused_captures_test
+  NAME xlit_fused_captures_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_fused_captures_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_fused_captures_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_icu_test
+  NAME xlit_icu_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_icu_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_icu_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_possessive_lookahead_test
+  NAME xlit_possessive_lookahead_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_possessive_lookahead_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_possessive_lookahead_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_context_strings_test
+  NAME xlit_context_strings_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_context_strings_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_context_strings_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_text_anchors_test
+  NAME xlit_text_anchors_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_text_anchors_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_text_anchors_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_filter_run_end_test
+  NAME xlit_filter_run_end_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_filter_run_end_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_filter_run_end_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_blocking_marks_test
+  NAME xlit_blocking_marks_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_blocking_marks_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_blocking_marks_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_mark_run_lookahead_test
+  NAME xlit_mark_run_lookahead_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_mark_run_lookahead_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_mark_run_lookahead_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_insertion_fold_test
+  NAME xlit_insertion_fold_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_insertion_fold_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_insertion_fold_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_lookahead_strings_test
+  NAME xlit_lookahead_strings_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_lookahead_strings_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_lookahead_strings_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_capture_strings_test
+  NAME xlit_capture_strings_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_capture_strings_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_capture_strings_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_leading_runs_test
+  NAME xlit_leading_runs_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_leading_runs_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_leading_runs_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_run_contexts_test
+  NAME xlit_run_contexts_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_run_contexts_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_run_contexts_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_walk_runs_test
+  NAME xlit_walk_runs_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_walk_runs_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_walk_runs_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_split_runs_test
+  NAME xlit_split_runs_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_split_runs_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_split_runs_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_context_capture_strings_test
+  NAME xlit_context_capture_strings_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_context_capture_strings_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_context_capture_strings_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_run_strings_test
+  NAME xlit_run_strings_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_run_strings_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_front_letters_test
+  NAME xlit_front_letters_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_front_letters_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_front_letters_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_converted_star_contexts_test
+  NAME xlit_converted_star_contexts_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_converted_star_contexts_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_converted_star_contexts_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_converted_while_test
+  NAME xlit_converted_while_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_converted_while_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_converted_while_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_converted_strings_while_test
+  NAME xlit_converted_strings_while_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_converted_strings_while_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_converted_strings_while_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_converted_within_test
+  NAME xlit_converted_within_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_converted_within_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_converted_within_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_run_moves_test
+  NAME xlit_run_moves_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_run_moves_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_run_moves_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_deferred_chains_test
+  NAME xlit_deferred_chains_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_deferred_chains_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_deferred_chains_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_capture_variants_test
+  NAME xlit_capture_variants_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_capture_variants_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_capture_variants_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_insertion_revisit_test
+  NAME xlit_insertion_revisit_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_insertion_revisit_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_insertion_revisit_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_prefix_run_contexts_test
+  NAME xlit_prefix_run_contexts_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_prefix_run_contexts_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_prefix_run_contexts_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_prefix_run_exceptions_test
+  NAME xlit_prefix_run_exceptions_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_prefix_run_exceptions_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_prefix_run_exceptions_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_prefix_run_revisits_test
+  NAME xlit_prefix_run_revisits_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_prefix_run_revisits_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_prefix_run_revisits_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_repeated_captures_test
+  NAME xlit_repeated_captures_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_repeated_captures_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_repeated_captures_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_shape_groups_test
+  NAME xlit_shape_groups_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_shape_groups_test.py ${BIN_DIR}/tconv ${BIN_DIR}/icgrep)
+  COMMAND python3 xlit_shape_groups_test.py ${BIN_DIR}/xlit ${BIN_DIR}/icgrep)
 
 add_test(
-  NAME tconv_utf8_mode_test
+  NAME xlit_utf8_mode_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_utf8_mode_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_utf8_mode_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_utf8_masks_test
+  NAME xlit_utf8_masks_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_utf8_masks_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_utf8_masks_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_hybrid_test
+  NAME xlit_hybrid_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_hybrid_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_hybrid_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_divcode_test
+  NAME xlit_divcode_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_divcode_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_divcode_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_lines_regions_test
+  NAME xlit_lines_regions_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_lines_regions_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_lines_regions_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_partition_final_stride_test
+  NAME xlit_partition_final_stride_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_partition_final_stride_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_partition_final_stride_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME tconv_sequential_while_test
+  NAME xlit_sequential_while_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 tconv_sequential_while_test.py ${BIN_DIR}/tconv)
+  COMMAND python3 xlit_sequential_while_test.py ${BIN_DIR}/xlit)
 
 add_test(
   NAME u8u16_test

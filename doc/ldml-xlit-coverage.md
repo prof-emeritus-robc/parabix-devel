@@ -1,6 +1,6 @@
-# tconv: status of the LDML / CLDR transforms
+# xlit: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `239c4cfe4`: with rules with text
+*Status of `tools/ldml/xlit` on branch LDML at `239c4cfe4`: with rules with text
 to revisit composed at compile time, and prefix runs (`(P) S → A | $1`) applied
 by a kernel of their own (W6, §5), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
@@ -15,7 +15,7 @@ Any-Hex/XML10 and Any-Remove (§2.1),
 against CLDR `common/transforms` and `common/testData/transforms` at commit
 `7cdeb9e` (2026-10-09), with the local fixes of W7 (`~/cldr`). October 29, 2026.*
 
-*This is a full run of `tconv_coverage.py` (all 455 names planned, kernels
+*This is a full run of `xlit_coverage.py` (all 455 names planned, kernels
 counted and CLDR test files run, `--jobs 3`, on a 15 GB machine). Unlike the
 runs at `323305975` and `585ccdeba`, it uses the CLDR transforms with the local
 fixes of W7, so Latin-ug and ug-Latin are implementable, and Grek-Latn/UNGEGN
@@ -93,8 +93,8 @@ Name-Any and Any-BreakInternal applied by ICU whenever they are called for
 Any-BreakInternal`): Thai-Latn is implementable (413), W8 blocks nothing, and
 all 28 built-ins are implemented. The CLDR test file of am_Ethi-d0_Morse,
 `d0-morse-t-am-Ethi.txt`, is not matched to the transform by its name, so
-`tconv_coverage.py` does not run it; run by hand, its 613 cases pass, as one
-text and each line a text, and tconv agrees with ICU on 3,000 random lines of
+`xlit_coverage.py` does not run it; run by hand, its 613 cases pass, as one
+text and each line a text, and xlit agrees with ICU on 3,000 random lines of
 Ethiopic text with spaces and dashes. Thai-Latn has no CLDR test file: it
 agrees with ICU on 3,507 lines of Thai text (with Latin letters, digits and
 punctuation between runs). Then blocking marks for prefix runs that only
@@ -216,16 +216,16 @@ character to 3 bytes makes UTF-8 mode slower.*
 
 This report covers:
 
-- which transforms tconv implements, and how correct they are against the CLDR
+- which transforms xlit implements, and how correct they are against the CLDR
   test data;
-- how tconv implements them, including the fused rule kernels;
+- how xlit implements them, including the fused rule kernels;
 - pipeline size and speed;
 - the work needed for the transforms it does not implement, and a proposed order
   for it.
 
-The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
+The numbers can be regenerated with `tools/ldml/xlit_coverage.py` (see
 [Reproducing](#reproducing)). The per-transform table is in
-[ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md).
+[ldml-xlit-coverage-table.md](ldml-xlit-coverage-table.md).
 
 ## 1. Summary
 
@@ -240,7 +240,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
   Their 263,287 cases fail only in two files, where the test data disagrees with
   the rules and with ICU (§3): ka-ka_Latn/BGN (215 cases) and my-my_FONIPA (2).
-  The coverage script runs each case as a text of its own (`tconv --lines`
+  The coverage script runs each case as a text of its own (`xlit --lines`
   for the cases that fail in the text of all the cases), which removed 10,675
   spurious failures. The 8 files of the transforms made implementable by prefix
   runs (16,536 cases, two `_Geminate` files of 6,888 each among them) all pass,
@@ -453,7 +453,7 @@ ICU.
 **Any-FCC** (ICU's FCC: NFD, then composition of contiguous characters only).
 It differs from NFC where NFC composes a mark with a starter across another
 mark of a lower class: `1E0A 031B` (Ḋ and the horn) is NFC, and FCC
-`0044 031B 0307`. tconv applies NFD, then NFC in passes, each on the starters
+`0044 031B 0307`. xlit applies NFD, then NFC in passes, each on the starters
 and the characters just after them, the other characters replaced by barriers:
 NFC then composes only adjacent characters. A character that composes with the
 starter before it makes the next one adjacent to the composite, which the next
@@ -464,7 +464,7 @@ as in U+1F82 = α 0313 0300 0345). The cost is that of an NFD and three NFCs.
 **Verification.** `QA/Normalization/FCD` and `QA/Normalization/FCC` are the FCD
 and FCC of `NF-source` by ICU 78.3's Normalizer2 (the API: `uconv -x Any-NFD`
 and `-x Any-FCD` misorder combining marks in 73 lines of it, as noted in §3.3);
-tconv's results are identical to them. Against ICU 78.3:
+xlit's results are identical to them. Against ICU 78.3:
 
 - Any-FCD: 20,000 random strings (Hangul, singletons, ccc-1 marks, Tibetan and
   Kannada vowel parts, misordered marks) identical, also with segment sizes 1 and
@@ -480,10 +480,10 @@ tconv's results are identical to them. Against ICU 78.3:
 Not implemented: none.
 <!-- /coverage:builtins-missing -->
 
-`Any-Name`, `Name-Any` and `Any-BreakInternal` are applied by ICU (if tconv is
+`Any-Name`, `Name-Any` and `Any-BreakInternal` are applied by ICU (if xlit is
 built with it, and unless `--use-ICU=0`) wherever they are called for: by name,
 or as stages of the transforms whose rules invoke them, at any depth (and of
-rules files), between the pipelines of tconv's own steps (`0550a1483`). They
+rules files), between the pipelines of xlit's own steps (`0550a1483`). They
 are planned as implementable (`--plan` marks them "applied by ICU"), and
 `--kernel-counts` leaves them out. Within a global filter, an ICU stage
 transforms each run of the filter's characters with the text around the run
@@ -633,7 +633,7 @@ inserted) and Jamo-Latn (the same, decomposed) are identical, as is Han-Spacedha
 strings (with deletions and some contextual rules) is identical to ICU's
 `createFromRules`, with and without a filter. On 2,000 random lines of CJK
 characters, Hani-Latn differs from ICU 78.3 in 95 lines: in the 92 readings
-checked, tconv gives the reading of the CLDR rules (`緕` → `zī`, ICU `qi`), whose
+checked, xlit gives the reading of the CLDR rules (`緕` → `zī`, ICU `qi`), whose
 data is newer than ICU's; one is a fullwidth comma (§3.3).
 
 **Captures out of order.** Against ICU's `createFromRules`, all identical:
@@ -666,8 +666,8 @@ texts of two characters, conversions in the same group) are identical to ICU's
 lines only (through ICU it would use ICU's own Katakana-Latin), and Jpan-Latn
 was not run.
 
-**Prefix runs (W6, `71749b4e9`, `239c4cfe4`).** `QA/tconv_prefix_runs_test.py`
-(ctest `tconv_prefix_runs_test`) checks four rule sets against ICU's results:
+**Prefix runs (W6, `71749b4e9`, `239c4cfe4`).** `QA/xlit_prefix_runs_test.py`
+(ctest `xlit_prefix_runs_test`) checks four rule sets against ICU's results:
 captured and literal prefixes, replacements of zero to three characters, a
 filter, and a run of 600 (longer than a block). Six transforms with prefix runs
 are identical to ICU 78.3 on 408 random texts each, and a 15 MB file gives the
@@ -703,20 +703,20 @@ The fix to sets with strings in differences (below) changes no transform that
 was implementable before: instrumented, it applies in none of the 342.
 
 **Regression of the fused kernels.** The fused implementation was compared with
-the previous tconv on every implementable transform (205 names). Each ran on:
+the previous xlit on every implementable transform (205 names). Each ran on:
 
 - its CLDR test input;
 - a 2,000-line mixed-script corpus;
 - eight one-word inputs without a final newline.
 
 The output was identical on all 1,965 runs, other than ja_Hrkt-ja_Latn/BGN, where
-the previous tconv crashed. On 16 transforms the output was also identical with
+the previous xlit crashed. On 16 transforms the output was also identical with
 segment sizes 1 to 3, 1 to 3 threads, and `-EnableAsserts -VerifyIR`.
 
 **Regression of the converted-text contexts.** On the same 1,975 runs:
 
 - with `--converted-context-rounds=0` (the correction off), the output is
-  identical to the tconv before fusion, other than ja_Hrkt-ja_Latn/BGN;
+  identical to the xlit before fusion, other than ja_Hrkt-ja_Latn/BGN;
 - with the correction, 117 outputs change, in 25 transforms, and every one of
   them is identical to ICU 78.3.
 
@@ -725,17 +725,17 @@ On 8 corrected transforms, the output is also identical with segment sizes 1 to
 
 ## 3. Correctness: known failures and discrepancies
 
-The test files with failing cases (tconv's result differs from the expected one
+The test files with failing cases (xlit's result differs from the expected one
 and from ICU 78.3's):
 
 <!-- coverage:failing-tests -->
 No test file fails.
 <!-- /coverage:failing-tests -->
 
-**Discrepancies.** A case whose expected result differs from tconv's, where
-tconv's is ICU's (the transform ICU 78.3 makes from the same rules, `tconv
+**Discrepancies.** A case whose expected result differs from xlit's, where
+xlit's is ICU's (the transform ICU 78.3 makes from the same rules, `xlit
 --use-ICU`, each case a text of its own), is a discrepancy, not a failure: the
-test data disagrees with the rules, tconv and ICU.
+test data disagrees with the rules, xlit and ICU.
 
 <!-- coverage:discrepant-tests -->
 - ka-ka_Latn/BGN (ka-Latn-t-ka-m0-bgn-2009.txt: 215 of 682 cases)
@@ -749,9 +749,9 @@ test data disagrees with the rules, tconv and ICU.
 (Both were reported as failures before the discrepancies were told apart, at
 `a9e44f8d8`.)
 
-Each line of the test data is a separate text. `tconv_coverage.py` runs all the
+Each line of the test data is a separate text. `xlit_coverage.py` runs all the
 cases of a file as one text, one per line, and then runs the cases that fail
-again with `tconv --lines`, which applies the pipeline to each line as a text of
+again with `xlit --lines`, which applies the pipeline to each line as a text of
 its own (running all the cases that way would take hours, at about 30 ms per
 line). In one text, rules that depend on the start or end of the text (`[$]`)
 see the line breaks instead: the `*-chr` rules, which delete every character
@@ -762,7 +762,7 @@ accounted for 10,675 reported failures in 43 files.
 ### 3.1 Before contexts on converted text
 
 ICU scans left to right and matches a before context against the text to the
-left of the cursor, which it has already converted. tconv applies a conversion
+left of the cursor, which it has already converted. xlit applies a conversion
 group to all positions at once, so it originally matched before contexts against
 the input. The two differ wherever the conversion changes whether a context
 matches.
@@ -796,7 +796,7 @@ converted text if some conversion of its group:
 - or, for items beyond the one adjacent to the rule, changes the length of the
   text.
 
-This is `convertedContextMatters` in `tools/ldml/tconv.cpp`. `tconv --plan` lists
+This is `convertedContextMatters` in `tools/ldml/xlit.cpp`. `xlit --plan` lists
 these contexts ("before context matched against the converted text").
 
 **How.** These rules are applied by a correction kernel (`FusedRules`), after
@@ -892,7 +892,7 @@ complementary must be matched against the same text, or neither may apply
 (ky-ky_FONIPA left `к` unconverted in words like `бисидк` until its
 repetitions were matched too; Greek-Latin left a rough breathing after a
 deleted smooth breathing, `Υ̓̔`, until these after contexts were). Ten
-implementable transforms keep the warning of `tconv --plan`, for before
+implementable transforms keep the warning of `xlit --plan`, for before
 contexts that are not fused (more than one repetition, as lt-Title's
 `[:softdotted:] […]* […]*`, or several items beyond a repetition): Hans-Hant,
 Latin-InterIndic, Latn-Ethi/SERA, Latn-Grek/UNGEGN, Zawgyi-my, it-am, it-ja,
@@ -905,7 +905,7 @@ correction, between 108 and 1,853 of each 5,000 differ.
 
 ### 3.2 Robustness
 
-The limitations of tconv itself (not of the regular expression engine or the
+The limitations of xlit itself (not of the regular expression engine or the
 Parabix pipeline framework on which it runs):
 
 - **Jpan-Latn compiles slowly.** Its pipeline, with the deferred rules of
@@ -953,11 +953,11 @@ Parabix pipeline framework on which it runs):
   lt-, el-Title) do not use Any-Title: their rules call Any-Lower on captures,
   and they are identical to ICU 78.3 (§2.3).
 - **Hex-Any.** After a decoded surrogate pair or a deleted escape, ICU 78.3 skips
-  the next character, leaving it undecoded; tconv decodes it.
+  the next character, leaving it undecoded; xlit decodes it.
 - **Global filters.** ICU 74 ignores the global filter of a transform made of a
-  single rule set, with no `::` steps. tconv applies it, as UTS #35 specifies.
+  single rule set, with no `::` steps. xlit applies it, as UTS #35 specifies.
 - **Normalization.** On synthetic runs of many combining marks, ICU's `uconv`
-  output was not canonically ordered. tconv agrees with Python's `unicodedata`
+  output was not canonically ordered. xlit agrees with Python's `unicodedata`
   on those inputs, and so does ICU itself through its API: `Normalizer2`, and
   the transliterators created by `Transliterator::createInstance`, give exactly
   `QA/Normalization/NFD` and `NFC`, while `uconv -x Any-NFD` (and `-x Any-FCD`)
@@ -969,27 +969,27 @@ Parabix pipeline framework on which it runs):
   adding the literal text accumulated since the last reference to a capture. So:
   - for a result with references (or function calls), the cursor is placed after
     the last reference before `|`, or at the start of the result, and everything
-    after it is revisited (`X → A | $1` revisits `A $1`). tconv follows this
+    after it is revisited (`X → A | $1` revisits `A $1`). xlit follows this
     (§5, W6);
   - for a literal result, this happens only on the rule's first application in
     the life of the transliterator: `ca → PQR | X` first revisits `PQRX`, and
-    afterwards only `X`. tconv always places the cursor at `|`. When comparing
+    afterwards only `X`. xlit always places the cursor at `|`. When comparing
     with ICU on revisit rules, warm the transliterator up (apply it twice and
     take the second result).
 - **Insertion rules and filters.** Within a filter, ICU applies a compound
   transform to each run of the filtered characters, so an insertion rule inserts
   only before a filtered character, though its contexts see the whole text; a
   transform of a single group ignores the global filter (above), and inserts
-  anywhere. tconv does the same. Where an insertion would let an insertion rule
+  anywhere. xlit does the same. Where an insertion would let an insertion rule
   match again at the same position, ICU inserts repeatedly (dozens of times on
-  `[^.$] { } X → Y`); tconv rejects such rules.
+  `[^.$] { } X → Y`); xlit rejects such rules.
 - **A filtered first step.** In some cases ICU 78.3 applies the filter of a
   first step `::[set] X ;` to the following steps too: `::[x] Null ;
   ::fullwidth-halfwidth ;` leaves `．` (U+FF0E) unchanged, but with `[ax]` it
   converts it. Han-Spacedhan begins with `::[…] nfkc ;`, so ICU leaves fullwidth
-  punctuation that tconv converts. The rule has not been found.
+  punctuation that xlit converts. The rule has not been found.
 - **The order of the steps of a backward transform.** For Spacedhan-Han (the
-  backward direction of Han-Spacedhan), tconv reverses the steps, as UTS #35
+  backward direction of Han-Spacedhan), xlit reverses the steps, as UTS #35
   specifies: the conversion rules, then `halfwidth-fullwidth`, then NFKD. ICU 78.3
   applies the conversion rules last, after `halfwidth-fullwidth` has made the space
   U+3000, so that its rules deleting spaces between letters and ideographs never
@@ -999,7 +999,7 @@ Parabix pipeline framework on which it runs):
 
 ### 4.1 Overview
 
-tconv parses the rules (`lib/ldml`). It then restates them as forward rules,
+xlit parses the rules (`lib/ldml`). It then restates them as forward rules,
 composes the rules with text to revisit (W6, §5), removes trivial and nullable
 captures, expands finite texts (W3), and disambiguates the order of rules
 (`DisambiguateOrder`). Finally `ldml::planTransform` plans the transform as a
@@ -1183,7 +1183,7 @@ sort.
   normalizations between steps.
 
 **Kernels per transform.** The per-transform table gives, for each
-transform (from `tconv --kernel-counts`, which builds its pipeline without
+transform (from `xlit --kernel-counts`, which builds its pipeline without
 compiling it):
 
 - **groups, rules:** the conversion groups of its own rules (not of the
@@ -1295,7 +1295,7 @@ extracted:
   empty replacements are deleted. The Ethiopic gemination rules
   (`([ሀ-ሇ…]) $ጥበቅ → $ሀ | $1`) and ro_FONIPA-ja's `t͡ → | t` (A empty: the tie
   bars of a run are deleted) are prefix runs;
-  `tconv --revisit-report` lists every revisit rule with its outcome, and
+  `xlit --revisit-report` lists every revisit rule with its outcome, and
   `doc/ldml-revisit-classification.md` classifies them. Where the prefix runs
   only delete (A empty, no triggers), the last item of an after context may
   see their P, which stays in place (`19d0a02a2`). And a rule before such a
@@ -1443,7 +1443,7 @@ blocked by other items:
   overlaps (`$consonants { lh → $lh` and `hlh → …`, from `h → $ha | $virama`)
   and two self-overlapping three-character rules; Latin-ConjoiningJamo is left
   with `eo`/`oe`. Both are now implementable by sequential selection.
-- **Not composed** (`tconv --plan` gives the reason):
+- **Not composed** (`xlit --plan` gives the reason):
   - unbounded runs that are not prefix runs, because other rules interfere
     (it-am's `($consonant) ' → | $1`, fa-fa_FONIPA's `یّ`,
     pl's after contexts, ja_Latn-ru's `\~ } tsu → ;`) or P has two
@@ -1619,7 +1619,7 @@ them implementable too.
   mask (or the end of the text). In an after context, such a set's variant
   without a character is then the end of the text or `FilterRunEndMark`
   (U+FDD2, a position outside the filter), and its character variant is
-  restricted to the filter's characters; tconv matches the mark from the mask,
+  restricted to the filter's characters; xlit matches the mark from the mask,
   as an external stream of the engine (`RE_context.externals`) or in fused
   classes (`58ec782da`). This made am_Ethi-d0_Morse's `([.-])' '[$] → $1`
   implementable. A capture of such a set, the last item of a
@@ -1674,7 +1674,7 @@ it (`1230cb8e4`; `($L) ːwaː` of am_FONIPA-am).
   in the set could match instead (`a [{ab} b] { c` matched `abc`). They now do,
   with the set made unambiguous outward from the text, `w (?!t')` or `(?<!t')
   w`, in the engine's patterns and in the fused kernels (`22d03949b`,
-  `QA/tconv_context_strings_test.py`).
+  `QA/xlit_context_strings_test.py`).
 - The pipeline compiler enumerated every combination of the roots of its
   partitions (exponential in their number): NumericPinyin-Latin's pipeline
   spent over 10 minutes there. Beyond 4,096 combinations it now chooses each
@@ -1759,7 +1759,7 @@ outside it ends ICU's text, where a set with the text boundary matches (ICU's
 `[^0-9.]`), so such a set at the end of the pattern also matches it, and the
 result leaves it. (ICU differs for a single group of rules, where a rule before
 whose set has that character stops the matching there; the CLDR transforms are
-compound.) `tconv --lines` costs about 8 ms a line for my-Zawgyi, the cost of
+compound.) `xlit --lines` costs about 8 ms a line for my-Zawgyi, the cost of
 running a pipeline of 2,493 kernels, mostly the regular expression engines of its
 130 sets (129 of one rule) (0.3 s for 2,000 lines as one text).
 
@@ -1827,7 +1827,7 @@ counts it:
 
 **Converted-text contexts in large groups.** A group of more than 256 string
 rules or subgroups keeps its before contexts matched against the input text,
-where the conversions may change them (§3.1): `tconv --plan` warns about these.
+where the conversions may change them (§3.1): `xlit --plan` warns about these.
 Composition made some groups that large: 8 implementable transforms have the
 warning: Latin-InterIndic (31 rules, and so every Latin→Indic transform),
 Latn-Cyrl, Hans-Hant, und_FONIPA-ar, es-ar, es-fa, es_419-ar and es_419-fa. They matched ICU on the inputs
@@ -1840,7 +1840,7 @@ transform on such a capture, `&T($k)`, by rules for the characters of the
 capture grouped by the value of T on them: the capture is restricted to the
 group (or replaced by its set, if no longer referred to), and the call by the
 value, or by `$k` for the characters T leaves unchanged. It runs before revisits
-are composed. tconv evaluates Any-Lower, Any-Upper and Any-Title by the full case
+are composed. xlit evaluates Any-Lower, Any-Upper and Any-Title by the full case
 mappings, and other transforms through their plans, on single characters. This
 made az-, el-, lt- and tr-Title and Latn-Ethi/ALALOC and /SERA implementable, and
 removed W5 from the Pinyin transforms and my-Zawgyi.
@@ -1865,7 +1865,7 @@ a capture that the result never refers to, such as the grouping in
 renumbered. Seven rules of the CLDR transforms have such captures, in
 my-my_FONIPA, my-t-my-d0-zawgyi, my-t-my-s0-zawgyi and si-si_FONIPA. The three
 capture simplifications (with trivial and nullable capture elimination) are on
-by default; `--disable-capture-simplification` turns them off (in tconv and
+by default; `--disable-capture-simplification` turns them off (in xlit and
 `ldml_trules`, whose `--eliminate-trivial-captures` and
 `--eliminate-nullable-captures` it replaces). Zawgyi-my no longer needs W5.
 
@@ -1922,9 +1922,9 @@ revisits, §5).
 the longest string at each step, which the greedy form does not
 (`yw } $cons* [^bdm$]` on `ywm̥`). The regular expression engine now resolves
 such a repetition as ICU does (`2276cddd3`: the strings of the set made
-unambiguous, the longest taken), and tconv checks the engine's preconditions
+unambiguous, the longest taken), and xlit checks the engine's preconditions
 on the lookaheads that a rule's pipeline builds (`0e561c416`): the `yw` string
-rules of cy-cy_FONIPA are planned, and QA/tconv_possessive_lookahead_test.py
+rules of cy-cy_FONIPA are planned, and QA/xlit_possessive_lookahead_test.py
 checks such rules against ICU. The engine does not support these forms in a
 lookahead of variable length without a unique prefix: the `y { } $cons* …`
 single-character rules (whose after contexts are matched alone, as
@@ -1943,13 +1943,13 @@ assertions before the end of the text that hold there are dropped, and a
 final (?=$) is $. A chain's externals are compiled as its kernels are made, so
 that names it does not use leave no unread kernel. The capture rules whose
 captures repeat such sets have their exact starts found with possessive
-captures in a lookahead (engineStarts), which tconv checks the engine
+captures in a lookahead (engineStarts), which xlit checks the engine
 supports. cy-cy_FONIPA's stress rules `$end $cons* { ($vowel+ $cons*) } $end
 → ˈ $1` have before contexts that the insertions of their group cannot
 change (every match ends at the end of the text), matched against the text
 itself (unchangedBeforeContext). cy-cy_FONIPA is implementable.
 
-Two bugs of the engine's search and replace (by which tconv applies groups of
+Two bugs of the engine's search and replace (by which xlit applies groups of
 one rule) were found with it: a position after the text was kept (a NUL after
 each text, with Unicode code units and the text not extended), and
 EndOfTextMark did not mark the end of an empty text. (getSpan's last resort,
@@ -1972,16 +1972,16 @@ transforms as blocked by W7.)
 dictionary word break (its Thai-ThaiLogical step is implemented); ICU now
 applies it, as a stage (§2.1), and W8 blocks nothing. Jpan-Latn,
 which needed Hira-Latn and Kana-Latn, is implementable, and W9 blocks nothing:
-the Han transforms compile (§4.3). (`tconv_coverage.py` counted Jpan-Latn's
+the Han transforms compile (§4.3). (`xlit_coverage.py` counted Jpan-Latn's
 `::Hira-Latin ;` as an unknown transform; it now resolves names that mix the
-forms of the scripts of a transform's names, as tconv does.)
+forms of the scripts of a transform's names, as xlit does.)
 
 The per-transform table lists the problem classes of every transform.
 
 ## 6. Recommended order
 
 1. **Correctness first.**
-   - In `tconv_coverage.py`, record exit status, carry warnings over to invoking
+   - In `xlit_coverage.py`, record exit status, carry warnings over to invoking
      transforms, and report "implementable but failing its tests" separately.
    - Report the ka-ka_Latn/BGN test data (§3) to CLDR, and the backward step
      order of ICU (§3.3) to ICU.
@@ -2004,14 +2004,14 @@ The per-transform table lists the problem classes of every transform.
    do not compound).
 6. **Built-ins and pipeline size.**
    - Built-ins: `Any-Name`, `Name-Any` and `Any-BreakInternal` are applied by
-     ICU; implementing them in tconv (a names table, a dictionary word break)
+     ICU; implementing them in xlit (a names table, a dictionary word break)
      would remove the dependence on ICU.
    - Pipeline size: a single-kernel sort network, or sharing normalizations
      between steps.
 
 At each step, run the CLDR test files of the newly implementable transforms. For
 any change to the conversion-group pipeline, also compare against the previous
-tconv on every implementable transform.
+xlit on every implementable transform.
 
 ## 7. History
 
@@ -2043,7 +2043,7 @@ tconv on every implementable transform.
 | `1bc9ef253` | MultipleCaptureMultipleReplacement rules; negated properties hold at the text boundary: 326 |
 | `2aa931ad1`, `7223645cd` | regular expression engine: `grepOffset` as the compiler places the match marker; UTF-8 characters factored by `toUTF8` in indexed mode |
 | `08c303c30` | identity rules; starts by the first set of B1: 327 |
-| `3b6ee29fa` | W4 insertion rules in groups of their own; `tconv --lines`, failing test cases rerun per line (10,892 → 217): 331 |
+| `3b6ee29fa` | W4 insertion rules in groups of their own; `xlit --lines`, failing test cases rerun per line (10,892 → 217): 331 |
 | `4f26e7d02` | W4 insertion rules with single-character rules: 334 |
 | `a3a64eda2` | repetitions in the before contexts of insertion rules: 338 |
 | `02e77ee59` | multiplexed mappings: Han-Latin compiles (46+ min → about a minute) |
@@ -2053,7 +2053,7 @@ tconv on every implementable transform.
 | `a090553b4` | captures of variable lengths referred to out of order (MoveRegions) |
 | `89e922e4f` | Any-CaseFold: 344 (without the local W7 fixes) |
 | `e2554e7f1` | Any-FCD (`FCD_RegionMask`); `QA/Normalization/FCD` |
-| `86f6ad53d` | `tconv_coverage.py --update`: incremental coverage updates |
+| `86f6ad53d` | `xlit_coverage.py --update`: incremental coverage updates |
 | `42df6910a` | Any-FCC (NFC in passes on adjacent characters); `QA/Normalization/FCC`: 23 of 30 built-ins |
 | `81816aedb`, `61225fd63` | (master) room for a consumer's provisional stride; the partial sums of a terminated popcount kernel: no assertion failures in NFC |
 | `c3e3fe5b1`, `96fa4766f` | BixNum division of narrow dividends; Any-Hex/XML10 (`XMLDecimalPipeline`): 24 of 30 built-ins |
@@ -2063,9 +2063,9 @@ tconv on every implementable transform.
 | `d2411817d`, `1230cb8e4` | partition roots no longer all enumerated; exact starts of MultipleCaptureMultipleReplacement sets, sets with strings kept: NumericPinyin-Latin, Bopo-Latn |
 | `03e837f5f` | string rules and MultipleCaptureMultipleReplacement rules selected together: am_FONIPA-am and 18 `*-am` |
 | `323305975` | captures of finitely many lengths expanded: am-am_FONIPA, am-ar, am-chr, am-fa: 372 |
-| `07794b04b`, `585ccdeba` | `tconv --kernel-counts`; kernel columns in the per-transform table: 371 on 15 GB (Jpan-Latn's analysis exceeds the memory) |
+| `07794b04b`, `585ccdeba` | `xlit --kernel-counts`; kernel columns in the per-transform table: 371 on 15 GB (Jpan-Latn's analysis exceeds the memory) |
 | `0684aaa5b`, `308aad759` | deferred rules' positions inserted once; large mappings planned without quadratic set unions: Jpan-Latn compiles, 374 with the local W7 fixes (`9cebbc6aa`) |
-| `b77584f46` | `tconv --revisit-report`; classification of the CLDR revisit rules (`doc/ldml-revisit-classification.md`) |
+| `b77584f46` | `xlit --revisit-report`; classification of the CLDR revisit rules (`doc/ldml-revisit-classification.md`) |
 | `71749b4e9` | W6 prefix runs, `(P) S → A \| $1`, applied by a kernel of their own |
 | `fa7352b10` | JIT compile threads with 8 MB stacks: am_Ethi-am_Ethi/Geminate no longer crashes in its first compilation |
 | `239c4cfe4` | prefix runs with replacements of other than one character, by mask, insertion and fill: the Ethi-Latn romanizations, ro-ja, ro_FONIPA-ja: 386 |
@@ -2106,15 +2106,15 @@ tconv on every implementable transform.
 git clone --filter=blob:none --sparse https://github.com/unicode-org/cldr.git
 (cd cldr && git sparse-checkout set common/transforms common/testData/transforms && git checkout 7cdeb9e)
 
-# tconv
-mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make tconv && cd ..
+# xlit
+mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make xlit && cd ..
 
-python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
+python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
     --transforms-dir cldr/common/transforms \
-    --test-data cldr/common/testData/transforms --jobs 1 --out tconv-coverage
+    --test-data cldr/common/testData/transforms --jobs 1 --out xlit-coverage
 ```
 
-- `tconv-coverage/coverage.md` has the summary tables and the per-transform
+- `xlit-coverage/coverage.md` has the summary tables and the per-transform
   table; `coverage.json` has the same data for scripting.
 - Analyzing the Han transforms took 8–14 GB each before `planTransform` kept
   the characters of each subgroup as it adds rules (and the multiplexed sets
@@ -2122,12 +2122,12 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   Hani-Latn and Hant-Latn, `--kernel-counts`). (Runs have used `--jobs 4` on
   64 GB; a full run takes about 35 minutes, mostly rerunning failing cases per
   line.)
-- When comparing tconv versions, give each run its own `-object-cache-salt`.
+- When comparing xlit versions, give each run its own `-object-cache-salt`.
 - **Interrupted runs.** The results of each transform (plan, kernel counts,
   test files) are saved as they are computed, in `<out>/progress.jsonl`; running
-  the same command again (with the same tconv binary, directories and selection)
+  the same command again (with the same xlit binary, directories and selection)
   resumes the run, computing only the rest. `--no-resume` starts it afresh.
-- **Kernel counts.** Each transform's `tconv --kernel-counts` output is kept in
+- **Kernel counts.** Each transform's `xlit --kernel-counts` output is kept in
   `kernels/`, and gives the groups, rules, group kernels and kernels columns of
   the per-transform table. With `--update`, the kernels of the transforms
   planned again are counted again, with those of all the transforms using
@@ -2136,26 +2136,26 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   without the local W7 fixes; the run at `239c4cfe4` used `~/cldr`, with them
   (`--transforms-dir ~/cldr/common/transforms --test-data
   ~/cldr/common/testData/transforms --jobs 3`, about two hours on 15 GB).
-- **Incremental updates.** After a change to tconv, update the results instead of
+- **Incremental updates.** After a change to xlit, update the results instead of
   a full run: `--update` keeps the previous results in `--out` and plans (and
   tests) only the selected transforms (`--only NAME …`, `--builtins`,
   `--blocked`), then the transforms using one whose status changed. It refuses
   other `--transforms-dir` or `--test-data` than the previous results'
-  (`coverage-meta.json` records them, and the tconv commit), and writes
+  (`coverage-meta.json` records them, and the xlit commit), and writes
   `changes.md`, the differences from the previous results. Then
-  `--table-doc doc/ldml-tconv-coverage-table.md` regenerates the per-transform
+  `--table-doc doc/ldml-xlit-coverage-table.md` regenerates the per-transform
   table (with `--note` and `--cldr-note` for its header), and
-  `--report-doc doc/ldml-tconv-coverage.md` the blocks of this report between
+  `--report-doc doc/ldml-xlit-coverage.md` the blocks of this report between
   `<!-- coverage:NAME -->` markers (summary, chart, builtins-missing,
   work-items, failing-tests, discrepant-tests); the rest of the report is edited by hand, from `changes.md`. For
   Any-FCD and Any-FCC:
 
   ```
-  python3 tools/ldml/tconv_coverage.py --tconv build18/bin/tconv \
+  python3 tools/ldml/xlit_coverage.py --xlit build18/bin/xlit \
       --transforms-dir ~/cldr/common/transforms --test-data ~/cldr/common/testData/transforms \
-      --out tools/ldml/tconv-coverage --update --only Any-FCD Any-FCC \
-      --table-doc doc/ldml-tconv-coverage-table.md --report-doc doc/ldml-tconv-coverage.md \
+      --out tools/ldml/xlit-coverage --update --only Any-FCD Any-FCC \
+      --table-doc doc/ldml-xlit-coverage-table.md --report-doc doc/ldml-xlit-coverage.md \
       --note '…' --cldr-note 'with the local fixes of W7'
   ```
 
-  `tools/ldml/tconv-coverage/` is ignored by git (`tools/ldml/.gitignore`).
+  `tools/ldml/xlit-coverage/` is ignored by git (`tools/ldml/.gitignore`).

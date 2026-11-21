@@ -2,7 +2,7 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: front-letter revisits (ldml::FrontLetterRevisits), Greek-Latin's
+#  xlit: front-letter revisits (ldml::FrontLetterRevisits), Greek-Latin's
 #  rough breathing: the rules writing H or h before a run of vowels and
 #  revisiting it, applied again while they match (all the letters before the
 #  run), with the rules marking a vowel before the iota subscript and the
@@ -11,14 +11,14 @@
 #  uppercase letter).  The rules are Greek-Latin's main group, reduced.  The
 #  expected results are ICU's (createFromRules, each line a text).
 #
-#  tconv_front_letters_test.py <tconv binary> [--extended-testing]
+#  xlit_front_letters_test.py <xlit binary> [--extended-testing]
 
 import os
 import subprocess
 import sys
 import tempfile
 
-from tconv_test_mode import EXTENDED
+from xlit_test_mode import EXTENDED
 
 RULES = (
     ":: NFD (NFC) ;\n"
@@ -117,7 +117,7 @@ CASES = [
 
 
 def main():
-    tconv = sys.argv[1]
+    xlit = sys.argv[1]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         rules = os.path.join(tmp, "rules.txt")
@@ -126,11 +126,11 @@ def main():
         input = os.path.join(tmp, "input.txt")
         with open(input, "w", encoding="utf-8") as f:
             f.write("".join(line + "\n" for line, _ in CASES))
-        plan = subprocess.run([tconv, "--plan", "--rules-file=" + rules, input], capture_output=True)
+        plan = subprocess.run([xlit, "--plan", "--rules-file=" + rules, input], capture_output=True)
         if b"front-letter revisits" not in plan.stdout:
             failures += 1
             print("FAIL: the rules are not planned as front-letter revisits\n%s" % plan.stdout.decode("utf-8", "replace"))
-        run = subprocess.run([tconv, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
+        run = subprocess.run([xlit, "--use-ICU=0", "--lines", "--rules-file=" + rules, input], capture_output=True)
         if run.returncode != 0:
             failures += 1
             print("FAIL: exit status %d\n%s" % (run.returncode, run.stderr.decode("utf-8", "replace")))

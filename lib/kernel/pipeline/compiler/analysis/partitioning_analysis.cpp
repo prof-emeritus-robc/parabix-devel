@@ -209,7 +209,12 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
 
     unsigned nextRateId = numOfPhases;
 
-    std::map<std::tuple<BitSet, size_t, size_t>, size_t> L;
+    // (Keyed by the rates of the inputs, the stride, the lookahead, and whether the kernel is a
+    // provisional stride kernel: kernels with the same lookahead make the same items available
+    // only if they also process their strides alike.  A provisional kernel's outputs lag
+    // differently than an ordinary one's, and a partition of the consumers of both lets its
+    // root dictate strides over items one of them has not produced; issue #45.)
+    std::map<std::tuple<BitSet, size_t, size_t, bool>, size_t> L;
     flat_set<size_t> LookAheadIds;
 
     std::vector<unsigned> potentiallyMergable;
@@ -414,12 +419,12 @@ found_rate_change:
                             const auto stride = node.Kernel->getStride() * rate.getRate();
                             assert (stride.denominator() == 1);
 
-                            const auto m = L.find(std::make_tuple(V, stride.numerator(), fixedLookAhead));
+                            const auto m = L.find(std::make_tuple(V, stride.numerator(), fixedLookAhead, isProvisional));
                             size_t rateId = 0;
                             if (m == L.end()) {
                                 assert (nextRateId < n);
                                 rateId = nextRateId++;
-                                L.emplace(std::make_tuple(V, stride.numerator(), fixedLookAhead), rateId);
+                                L.emplace(std::make_tuple(V, stride.numerator(), fixedLookAhead, isProvisional), rateId);
                             } else {
                                 rateId = m->second;
                             }

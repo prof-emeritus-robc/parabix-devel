@@ -13,6 +13,7 @@
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/stream_select.h>
 #include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/utf8_support.h>
 #include <pablo/pablo.h>
 #include <re/adt/re_cc.h>
 #include <re/alphabet/alphabet.h>
@@ -269,6 +270,156 @@ private:
     const Plan mPlan;
 };
 
+
+//  The positions with a selector (a number other than 0).
+class SelectorsPresent final : public PabloKernel {
+public:
+    SelectorsPresent(LLVMTypeSystemInterface & ts, StreamSet * Selectors, StreamSet * Present)
+    : PabloKernel(ts, "SelectorsPresent" + std::to_string(Selectors->getNumElements()),
+                  {Binding{"selectors", Selectors}}, {Binding{"present", Present}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * any = pb.createZeroes();
+        for (PabloAST * b : getInputStreamSet("selectors")) any = pb.createOr(any, b);
+        writeOutputStreamSet("present", std::vector<PabloAST *>{any});
+    }
+};
+
+//  The selector form of a map (see UTF8_SelectorPipeline): at the last byte of
+//  each character with a selector s (Selectors, a number there; 0: none), the
+//  first byte of string s is assigned (not XORed: it does not depend on the
+//  character replaced), the character's other bytes (Spans, all the bytes of
+//  the characters with a selector) are deleted, or all of them for an empty
+//  string, and the rest of the string is inserted after it (the bits of its
+//  length, then of the number of its tail, at the last byte).
+class UTF8_SelectorApply final : public PabloKernel {
+public:
+    UTF8_SelectorApply(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Selectors, StreamSet * Spans,
+                       std::vector<std::string> strings, std::vector<unsigned> tailOf, Plan plan,
+                       StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts)
+    : PabloKernel(ts, "UTF8_SelectorApply_" + getStringHash(signature(strings, plan)) + "_" + std::to_string(Selectors->getNumElements()) +
+                      (Keep ? "_k" : "") + (Inserts ? "_i" : ""),
+                  {Binding{"basis", Basis}, Binding{"selectors", Selectors}, Binding{"spans", Spans}},
+                  outputs(Translated, Keep, Inserts)),
+      mStrings(std::move(strings)), mTailOf(std::move(tailOf)), mPlan(std::move(plan)), mKeep(Keep != nullptr), mInserts(Inserts != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        const std::vector<PabloAST *> sel = getInputStreamSet("selectors");
+        PabloAST * const spans = getInputStreamSet("spans")[0];
+        PabloAST * changed = pb.createZeroes();
+        for (PabloAST * b : sel) changed = pb.createOr(changed, b);
+        std::vector<PabloAST *> assigned(8, pb.createZeroes());
+        PabloAST * emptied = pb.createZeroes();
+        std::vector<PabloAST *> counts(mPlan.insertBits, pb.createZeroes()), tails(mPlan.tailBits, pb.createZeroes());
+        for (unsigned s = 1; s <= mStrings.size(); s++) {
+            const std::string & str = mStrings[s - 1];
+            PabloAST * const at = numberAt(pb, sel, s);
+            if (str.empty()) {
+                emptied = pb.createOr(emptied, at);
+                continue;
+            }
+            for (unsigned b = 0; b < 8; b++) {
+                if ((static_cast<unsigned char>(str[0]) >> b) & 1) assigned[b] = pb.createOr(assigned[b], at);
+            }
+            const unsigned len = static_cast<unsigned>(str.size() - 1);
+            for (unsigned k = 0; k < mPlan.insertBits; k++) if ((len >> k) & 1) counts[k] = pb.createOr(counts[k], at);
+            const unsigned t = mTailOf[s - 1];
+            for (unsigned k = 0; k < mPlan.tailBits; k++) if ((t >> k) & 1) tails[k] = pb.createOr(tails[k], at);
+        }
+        for (unsigned b = 0; b < 8; b++) basis[b] = pb.createOr(pb.createAnd(basis[b], pb.createNot(changed)), assigned[b]);
+        writeOutputStreamSet("translated", basis);
+        if (mKeep) {
+            //  (Deleted: the bytes of a character with a selector but its last, and
+            //  the last too for an empty string.)
+            PabloAST * const deleted = pb.createOr(pb.createAnd(spans, pb.createNot(changed)), emptied);
+            writeOutputStreamSet("keep", std::vector<PabloAST *>{pb.createInFile(pb.createNot(deleted))});
+        }
+        if (mInserts) {
+            std::vector<PabloAST *> inserts = counts;
+            inserts.insert(inserts.end(), tails.begin(), tails.end());
+            writeOutputStreamSet("inserts", inserts);
+        }
+    }
+private:
+    static Bindings outputs(StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts) {
+        Bindings b{Binding{"translated", Translated}};
+        if (Keep) b.emplace_back("keep", Keep);
+        if (Inserts) b.emplace_back("inserts", Inserts);
+        return b;
+    }
+    static std::string signature(const std::vector<std::string> & strings, const Plan & plan) {
+        std::string s = plan.signature() + "|";
+        for (const std::string & str : strings) {
+            for (const char c : str) {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02X", static_cast<unsigned char>(c));
+                s += buf;
+            }
+            s += ".";
+        }
+        return s;
+    }
+    const std::vector<std::string> mStrings;
+    const std::vector<unsigned> mTailOf;
+    const Plan mPlan;
+    const bool mKeep;
+    const bool mInserts;
+};
+
+//  The rest of a map, from the text changed in place: the bytes deleted (Keep)
+//  and the tails inserted (Inserts), with the masks kept in step.
+StreamSet * finishMap(PipelineBuilder & P, const Plan & plan, StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts,
+                      const bool deletes, const bool inserts, std::vector<StreamSet *> * Masks) {
+    SHOW_BIXNUM(Translated);
+    StreamSet * Basis = Translated;
+    if (deletes) {
+        SHOW_STREAM(Keep);
+        StreamSet * const KeptBasis = P.CreateStreamSet(8);
+        FilterByMask(P, Keep, Basis, KeptBasis);
+        Basis = KeptBasis;
+        if (Inserts) {
+            StreamSet * const KeptInserts = P.CreateStreamSet(Inserts->getNumElements());
+            FilterByMask(P, Keep, Inserts, KeptInserts);
+            Inserts = KeptInserts;
+        }
+        if (Masks) for (StreamSet *& m : *Masks) {
+            StreamSet * const kept = P.CreateStreamSet(1);
+            FilterByMask(P, Keep, m, kept);
+            m = kept;
+        }
+    }
+    if (!inserts) return Basis;
+    // The insertions: the positions inserted after the last bytes, and the
+    // bytes of the tails written there.
+    std::vector<unsigned> countBits;
+    for (unsigned k = 0; k < plan.insertBits; k++) countBits.push_back(k);
+    StreamSet * const Counts = P.CreateStreamSet(plan.insertBits);
+    P.CreateKernelCall<StreamSelect>(Counts, Select(Inserts, countBits));
+    StreamSet * const SpreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, Counts, SpreadMask, InsertPosition::After);
+    SHOW_STREAM(SpreadMask);
+    StreamSet * const SpreadBasis = P.CreateStreamSet(8);
+    SpreadByMask(P, SpreadMask, Basis, SpreadBasis);
+    StreamSet * const SpreadTails = P.CreateStreamSet(plan.tailBits);
+    SpreadByMask(P, SpreadMask, Inserts, SpreadTails, plan.insertBits);
+    unsigned longestTail = 0;
+    for (const std::string & t : plan.tails) longestTail = std::max(longestTail, static_cast<unsigned>(t.size()));
+    if (Masks) for (StreamSet *& m : *Masks) {
+        StreamSet * const spread = P.CreateStreamSet(1);
+        SpreadByMask(P, SpreadMask, m, spread);
+        StreamSet * const inherited = P.CreateStreamSet(1);
+        P.CreateKernelCall<UTF8_InheritMask>(SpreadMask, spread, longestTail, inherited);
+        m = inherited;
+    }
+    StreamSet * const Result = P.CreateStreamSet(8);
+    P.CreateKernelCall<UTF8_CharMapTails>(SpreadBasis, SpreadTails, plan, Result);
+    SHOW_BIXNUM(Result);
+    return Result;
+}
+
 }
 
 StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis,
@@ -346,51 +497,48 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
     StreamSet * Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
     StreamSet * const Within = (Masks && !Masks->empty()) ? Masks->back() : nullptr;
     P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, Applies, Within, plan, Translated, Keep, Inserts);
-    SHOW_BIXNUM(Translated);
-    Basis = Translated;
-    if (deletes) {
-        SHOW_STREAM(Keep);
-        StreamSet * const KeptBasis = P.CreateStreamSet(8);
-        FilterByMask(P, Keep, Basis, KeptBasis);
-        Basis = KeptBasis;
-        if (Inserts) {
-            StreamSet * const KeptInserts = P.CreateStreamSet(Inserts->getNumElements());
-            FilterByMask(P, Keep, Inserts, KeptInserts);
-            Inserts = KeptInserts;
+    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Masks);
+}
+
+StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u32string> & strings, StreamSet * Basis,
+                                  StreamSet * Selectors, std::vector<StreamSet *> * Masks) {
+    Plan plan;
+    std::vector<std::string> bytes;
+    std::vector<unsigned> tailOf;
+    std::map<std::string, unsigned> tailNumber;
+    unsigned maxTail = 0;
+    bool deletes = false;
+    for (const std::u32string & str : strings) {
+        bytes.push_back(utf8(str));
+        const std::string & b = bytes.back();
+        unsigned t = 0;
+        if (b.empty()) {
+            deletes = true;
+        } else if (b.size() > 1) {
+            auto f = tailNumber.emplace(b.substr(1), static_cast<unsigned>(plan.tails.size() + 1));
+            if (f.second) plan.tails.push_back(b.substr(1));
+            t = f.first->second;
+            maxTail = std::max(maxTail, static_cast<unsigned>(b.size() - 1));
         }
-        if (Masks) for (StreamSet *& m : *Masks) {
-            StreamSet * const kept = P.CreateStreamSet(1);
-            FilterByMask(P, Keep, m, kept);
-            m = kept;
-        }
+        tailOf.push_back(t);
     }
-    if (!inserts) return Basis;
-    // The insertions: the positions inserted after the last bytes, and the
-    // bytes of the tails written there.
-    std::vector<unsigned> countBits;
-    for (unsigned k = 0; k < plan.insertBits; k++) countBits.push_back(k);
-    StreamSet * const Counts = P.CreateStreamSet(plan.insertBits);
-    P.CreateKernelCall<StreamSelect>(Counts, Select(Inserts, countBits));
-    StreamSet * const SpreadMask = P.CreateStreamSet(1);
-    InsertionSpreadMask(P, Counts, SpreadMask, InsertPosition::After);
-    SHOW_STREAM(SpreadMask);
-    StreamSet * const SpreadBasis = P.CreateStreamSet(8);
-    SpreadByMask(P, SpreadMask, Basis, SpreadBasis);
-    StreamSet * const SpreadTails = P.CreateStreamSet(plan.tailBits);
-    SpreadByMask(P, SpreadMask, Inserts, SpreadTails, plan.insertBits);
-    unsigned longestTail = 0;
-    for (const std::string & t : plan.tails) longestTail = std::max(longestTail, static_cast<unsigned>(t.size()));
-    if (Masks) for (StreamSet *& m : *Masks) {
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, SpreadMask, m, spread);
-        StreamSet * const inherited = P.CreateStreamSet(1);
-        P.CreateKernelCall<UTF8_InheritMask>(SpreadMask, spread, longestTail, inherited);
-        m = inherited;
-    }
-    StreamSet * const Result = P.CreateStreamSet(8);
-    P.CreateKernelCall<UTF8_CharMapTails>(SpreadBasis, SpreadTails, plan, Result);
-    SHOW_BIXNUM(Result);
-    return Result;
+    plan.tailBits = bitsFor(static_cast<unsigned>(plan.tails.size()));
+    plan.insertBits = bitsFor(maxTail);
+    // The bytes of the characters with a selector (marked at their last bytes).
+    StreamSet * const Index = P.CreateStreamSet(1);
+    P.CreateKernelCall<UTF8_index>(Basis, Index);
+    StreamSet * const Changed = P.CreateStreamSet(1);
+    P.CreateKernelCall<SelectorsPresent>(Selectors, Changed);
+    StreamSet * const Spans = P.CreateStreamSet(1);
+    P.CreateKernelCall<U8Spans>(Changed, Index, Spans, BitMovementMode::LookAhead);
+    // (Bytes are deleted wherever a multi-byte character has a selector, or a string is empty.)
+    deletes = true;
+    const bool inserts = !plan.tails.empty();
+    StreamSet * const Translated = P.CreateStreamSet(8);
+    StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
+    StreamSet * const Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
+    P.CreateKernelCall<UTF8_SelectorApply>(Basis, Selectors, Spans, bytes, tailOf, plan, Translated, Keep, Inserts);
+    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Masks);
 }
 
 }

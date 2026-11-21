@@ -47,4 +47,15 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
                                  const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * Applies = nullptr,
                                  std::vector<StreamSet *> * Masks = nullptr);
 
+//  A map by selectors (doc/masked-transforms-plan.md, step 16): Selectors give
+//  a number at the last byte of each character (0: the character is copied;
+//  s: it is replaced by strings[s - 1], empty to delete it), as computed
+//  elsewhere (e.g. by the rules of a transform matched one position per
+//  character, and spread back to the bytes).  The replacement does not depend
+//  on the character replaced: the first byte of the string is written at the
+//  character's last byte, its other bytes deleted, and the rest of the string
+//  inserted after it.  Masks as for UTF8_CharMapPipeline.
+StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u32string> & strings, StreamSet * Basis,
+                                  StreamSet * Selectors, std::vector<StreamSet *> * Masks = nullptr);
+
 }

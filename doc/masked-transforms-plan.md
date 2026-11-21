@@ -673,6 +673,109 @@ contexts see the characters outside the runs.
     the fused kernels on UTF-8 code units. Worth it only where the switches
     cost more than the segment.
 
+    **Goal (2026-11-20): UTF-8 support for every component.** Survey and
+    profile (2026-11-20):
+
+    | Reason for a Unicode segment (290 CLDR test transforms, own steps) | Transforms | Segments |
+    |---|--:|--:|
+    | a conversion group with string rules DivCode cannot plan | 44 | 67 |
+    | characters of several subgroups | 9 | 10 |
+    | prefix runs | 9 | 10 |
+    | rules with captures | 5 | 8 |
+    | single-character rules with before contexts matched against the converted text | 5 | 5 |
+    | a transform applied by its shape groups (am-am_FONIPA) | 3 | 3 |
+    | single-character rules with before contexts that are not sequences of sets | 3 | 3 |
+    | insertion rules | 2 | 2 |
+    | deferred rules | 1 | 1 |
+    | with `--lines`: a bounded DivCode group (step 15) | 65 | |
+
+    (Own steps only: the segments of the transforms a transform invokes are
+    counted under those, so the table is a lower bound; 66 have segments of
+    their own, 183 in all with `--lines`.)
+
+    Where a segment's time goes: el-Latn-t-el-m0-bgn (one segment, a group of
+    string rules; 2 MB of Greek, one thread, cycles by kernel):
+
+    | Part | Share |
+    |---|--:|
+    | decoding: `UTF8_Decoder`, and the 21-bit basis filtered to one position per character | 7.7% |
+    | encoding: deposit masks and assembly | 6% |
+    | applying the replacements on 21 streams (expand, deposit, fill) | 15% |
+    | the fused kernel's matching and selection (`FusedRules`) | 30% |
+
+    The text has 2.2 M bytes and 1.2 M characters. So the switches cost about
+    14%, but the same kernels run over the bytes would do about 1.8 times the
+    work for this script: a direct port of the fused kernels to UTF-8 code
+    units (option B below) would be slower than the switches for non-Latin
+    scripts, and faster only for mostly-ASCII text.
+
+    Options:
+    - **A. DivCode for each problem** (overlaps, runs, kept characters,
+      captures, converted contexts): stays on the bytes, but each problem is
+      a new feature of a decision-tree design, and runs and captures fit it
+      poorly.
+    - **B. The fused kernels on UTF-8 code units** (positions are bytes,
+      characters stepped by `IndexedAdvance` over `UTF8_index`): one port
+      covers every problem the fused kernels handle, at a cost proportional
+      to the bytes (see above), and their outputs (changes as XOR against the
+      21 bits of each position) become per byte.
+    - **C. Decisions in character space, text in byte space.** The matching
+      and selection run as now, one position per character, but on the class
+      streams they need (computed on the bytes, marked at each character's
+      final byte, and compressed by `UTF8_index`: a few streams instead of
+      the 21-bit basis), and their result is a selector per position (which
+      rule, which replacement applies), spread back to the bytes, where the
+      replacements are written as UTF-8 (as the UTF-8 character maps and
+      DivCode write theirs). No decoding of the text and no encoding; the
+      analyses stay as they are. The fused kernels need a selector output
+      instead of XOR changes, and components that move text (captures,
+      revisits) need byte-level moves of variable-length characters.
+
+    Recommended: C, as one mechanism for all components, adopted component
+    by component (string-rule groups first, then several subgroups, prefix
+    runs, converted before contexts, insertions, captures, deferred rules,
+    shape groups), each kept only where it measures faster than its Unicode
+    segment on Latin and non-Latin text. **Chosen (2026-11-20): C.**
+
+    **Design of C.** The Unicode-mode group builder
+    (`RulePipelineBuilder::conversionGroup`) reads the text through a few
+    helpers, which become those of a *character source*: the 21-bit text
+    (Unicode mode), or the UTF-8 bytes with `UTF8_index` (the hybrid).
+    - `classes(sets, …)`: on the bytes, the class kernel in Advance mode
+      (each character marked at its final byte), then compressed by
+      `UTF8_index` to one position per character. One stream per class,
+      instead of the 21-bit basis.
+    - The engine's matches (`matchPositions`, `matchStarts`,
+      `matchPattern`): the engine on the bytes (its UTF-8 modes), its marks at
+      the final bytes, compressed likewise. The masks (filters, regions) are
+      compressed as for a Unicode segment (`unicodeMasks`).
+    - `TextPositions`: the compressed index (all ones, one per character).
+    - The fused kernels write *selectors* instead of changes as XOR against
+      the 21 bits (`FusedRulesConfig::absolute`): before the kernels are
+      generated, each rule's replacement is rewritten to one selector per
+      position of its match, the id of the UTF-8 string that position becomes
+      (the part of the replacement the position writes, as the kernels divide
+      a replacement among the positions: the last position takes the rest of
+      a longer one, and the positions beyond a shorter one become empty); a
+      position the rule keeps (its text unchanged) has no selector. So the
+      kernels insert and delete no positions, and read no basis.
+    - The application, on the bytes (a selector variant of
+      `UTF8_CharMapApply`): at the first byte of each character with a
+      selector, the first byte of its string is assigned (not XORed, so it
+      does not depend on the character replaced), the character's other bytes
+      are deleted, and the rest of the string is inserted after it, by the
+      tails machinery of `UTF8_CharMapPipeline`; an empty string deletes the
+      first byte too. The selectors are spread from the characters to their
+      first bytes by the complement of the continuation bytes.
+
+    Slices: (1) string-rule groups of the fused kernels without correction
+    kernels, captures, insertion rules or case-map marks; (2) correction
+    kernels (the converted text in selectors: the classes of a selector's
+    string are static); (3) captures (bytes moved by character); (4) the
+    other components. Each slice is checked against Unicode mode on the CLDR
+    test data of the transforms it moves, and measured (cycles, Greek and
+    Latin text) against its Unicode segment.
+
 Order: steps 10 to 12 first (the per-line runs removed, in Unicode mode, which
 every component already has); then 14 and 13 (mixed modes); then 15 and 16,
 which move work from Unicode segments to UTF-8 segments.

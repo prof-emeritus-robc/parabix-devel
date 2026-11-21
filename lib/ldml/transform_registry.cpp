@@ -291,6 +291,13 @@ const TransformEntry * TransformRegistry::lookup(const std::string & name) const
 }
 
 std::string defaultTransformDirectory() {
+    const char * cldr = std::getenv("PARABIX_CLDR_DIR");
+    if (cldr && *cldr) return std::string(cldr) + "/common/transforms";
+#ifdef PARABIX_SOURCE_CLDR_DIR
+    const std::string source = std::string(PARABIX_SOURCE_CLDR_DIR) + "/common/transforms";
+    boost::system::error_code ec;
+    if (boost::filesystem::is_directory(source, ec)) return source;
+#endif
     const char * home = std::getenv("HOME");
     return std::string(home ? home : ".") + "/cldr/common/transforms";
 }

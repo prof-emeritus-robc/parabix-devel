@@ -17,7 +17,8 @@
 #  xlit_ct.py bisect   ID [--good COMMIT] [--bad COMMIT] [--jobs N]
 #
 #  Common options: --state DIR (default ~/.parabix/xlit-ct), --cldr DIR
-#  (default ~/cldr/common/testData/transforms).
+#  (default $PARABIX_CLDR_DIR/common/testData/transforms, else
+#  third_party/cldr/common/testData/transforms of this repository).
 
 import argparse
 import hashlib
@@ -37,7 +38,8 @@ from covering import covering_array  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 DEFAULT_STATE = os.path.expanduser("~/.parabix/xlit-ct")
-DEFAULT_CLDR = os.path.expanduser("~/cldr/common/testData/transforms")
+DEFAULT_CLDR = os.path.join(os.environ.get("PARABIX_CLDR_DIR") or os.path.join(REPO, "third_party", "cldr"),
+                            "common", "testData", "transforms")
 RUN_TIMEOUT = 600
 
 # The parameters and their values.  "class" (the class of the transform, by

@@ -2102,17 +2102,18 @@ xlit on every implementable transform.
 ## Reproducing
 
 ```
-# CLDR data (transforms and their test data)
-git clone --filter=blob:none --sparse https://github.com/unicode-org/cldr.git
-(cd cldr && git sparse-checkout set common/transforms common/testData/transforms && git checkout 7cdeb9e)
-
 # xlit
 mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make xlit && cd ..
 
 python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
-    --transforms-dir cldr/common/transforms \
-    --test-data cldr/common/testData/transforms --jobs 1 --out xlit-coverage
+    --transforms-dir third_party/cldr/common/transforms \
+    --test-data third_party/cldr/common/testData/transforms --jobs 1 --out xlit-coverage
 ```
+
+- The CLDR data is in `third_party/cldr` (see its `UPSTREAM.md`): CLDR
+  `7cdeb9e` (release-49-beta4), with the local fixes of W7 as `cldr-local:`
+  commits (`git diff cldr-upstream -- third_party/cldr`). It is the same data
+  as `~/cldr` of the runs below.
 
 - `xlit-coverage/coverage.md` has the summary tables and the per-transform
   table; `coverage.json` has the same data for scripting.
@@ -2141,7 +2142,9 @@ python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
   tests) only the selected transforms (`--only NAME …`, `--builtins`,
   `--blocked`), then the transforms using one whose status changed. It refuses
   other `--transforms-dir` or `--test-data` than the previous results'
-  (`coverage-meta.json` records them, and the xlit commit), and writes
+  (`coverage-meta.json` records them, and the xlit commit; results recorded
+  with `~/cldr` need `--force` once to move to `third_party/cldr`, which holds
+  the same files), and writes
   `changes.md`, the differences from the previous results. Then
   `--table-doc doc/ldml-xlit-coverage-table.md` regenerates the per-transform
   table (with `--note` and `--cldr-note` for its header), and
@@ -2152,7 +2155,7 @@ python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
 
   ```
   python3 tools/ldml/xlit_coverage.py --xlit build18/bin/xlit \
-      --transforms-dir ~/cldr/common/transforms --test-data ~/cldr/common/testData/transforms \
+      --transforms-dir third_party/cldr/common/transforms --test-data third_party/cldr/common/testData/transforms \
       --out tools/ldml/xlit-coverage --update --only Any-FCD Any-FCC \
       --table-doc doc/ldml-xlit-coverage-table.md --report-doc doc/ldml-xlit-coverage.md \
       --note '…' --cldr-note 'with the local fixes of W7'

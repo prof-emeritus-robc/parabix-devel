@@ -34,3 +34,8 @@ DEPS
     unicode.data
     slaballocator
 )
+
+#  The CLDR data of the source tree (third_party/cldr, imported from CLDR by
+#  scripts/CLDR/import_cldr.sh): the default transform directory.
+target_compile_definitions(ldml.transforms PRIVATE
+    PARABIX_SOURCE_CLDR_DIR="${PROJECT_SOURCE_DIR}/third_party/cldr")

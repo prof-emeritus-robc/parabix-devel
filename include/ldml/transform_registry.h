@@ -70,7 +70,9 @@ private:
     std::map<std::string, size_t> mScriptIndex;   // name with scripts as lower-cased codes -> entry
 };
 
-// The default location of the CLDR transform files: $HOME/cldr/common/transforms.
+// The default location of the CLDR transform files: $PARABIX_CLDR_DIR/common/transforms
+// if that variable is set, else third_party/cldr/common/transforms of the source tree
+// the tool was built from (if it is there), else $HOME/cldr/common/transforms.
 std::string defaultTransformDirectory();
 
 }

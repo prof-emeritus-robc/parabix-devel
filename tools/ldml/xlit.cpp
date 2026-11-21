@@ -18,7 +18,9 @@
 //
 //  Transform names are the built-in transforms (Any-NFD, Any-Lower, ...)
 //  and the names and aliases of the transforms defined by the CLDR files in
-//  the --transforms-dir directory (default ~/cldr/common/transforms).
+//  the --transforms-dir directory (default: $PARABIX_CLDR_DIR/common/transforms,
+//  else third_party/cldr/common/transforms of the source tree, else
+//  ~/cldr/common/transforms).
 //  Names are matched ignoring case, and a name without a source means the
 //  Any source ("NFD" is "Any-NFD").
 //
@@ -147,7 +149,8 @@ static cl::opt<std::string> TransformName(cl::Positional, cl::desc("<transform n
 static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input file>"), cl::cat(XlitOptions));
 static toolio::RegisterInputOptions InputOptions;
 static toolio::RegisterOutputOptions OutputOptions;
-static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory of CLDR transform files (default ~/cldr/common/transforms)"),
+static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory of CLDR transform files (default $PARABIX_CLDR_DIR/common/transforms, "
+                                                   "else third_party/cldr/common/transforms of the source tree)"),
                                           cl::init(""), cl::cat(XlitOptions));
 static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML transform rules (plain tRule text) to parse and compile, applied "
                                                               "in place of a named transform"),

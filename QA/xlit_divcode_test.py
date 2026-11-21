@@ -360,7 +360,9 @@ def codes_case(xlit, tmp, name, group, shift):
 def translate_case(xlit, tmp, salt, aliases, name, group):
     failures, out = 0, []
     path = os.path.join(tmp, "text.txt")
-    test_data = os.path.expanduser("~/cldr/common/testData/transforms")
+    test_data = os.path.join(os.environ.get("PARABIX_CLDR_DIR") or
+                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "third_party", "cldr"),
+                             "common", "testData", "transforms")
     for shift, mode in ((5, "1"), (5, "0"), (6, "1")):
         rnd = random.Random("%s %d %d translate" % (name, group, shift))
         with open(path, "w", encoding="utf-8") as f:

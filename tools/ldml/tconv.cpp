@@ -12741,14 +12741,13 @@ private:
         mMasks.keepInStep(s.positions);
         return s.text;
     }
-    //  kernel::UTF8_CharMapPipeline within the masks, which it keeps in step
-    //  itself (the bytes inserted after a character have its mask).
+    //  kernel::UTF8_CharMapPipeline within the active mask, the masks kept in
+    //  step by its position map.
     StreamSet * charMap(const kernel::UTF8_CharMap & map, StreamSet * Basis,
                         const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * applies = nullptr) {
-        std::vector<StreamSet *> masks = mMasks.applyStreams();
-        StreamSet * const result = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextual, applies, masks.empty() ? nullptr : &masks);
-        mMasks.setApplyStreams(masks);
-        return result;
+        PositionMap positions;
+        StreamSet * const result = kernel::UTF8_CharMapPipeline(mP, map, Basis, contextual, applies, mMasks.active(), &positions);
+        return inStep(Staged(result, std::move(positions)));
     }
     TransformMasks mMasks;
     //  The conversion group being applied, for the names of kernels.
@@ -13023,10 +13022,9 @@ StreamSet * UTF8PipelineBuilder::hybridGroup(const ldml::TransformStep & step, S
     if (selectors == nullptr) return Basis;
     StreamSet * const atBytes = mP.CreateStreamSet(selectors->getNumElements());
     SpreadByMask(mP, index, selectors, atBytes);
-    std::vector<StreamSet *> streams = mMasks.applyStreams();
-    Basis = UTF8_SelectorPipeline(mP, strings, Basis, atBytes, streams.empty() ? nullptr : &streams);
-    mMasks.setApplyStreams(streams);
-    return Basis;
+    PositionMap positions;
+    Basis = UTF8_SelectorPipeline(mP, strings, Basis, atBytes, &positions);
+    return inStep(Staged(Basis, std::move(positions)));
 }
 
 StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count) {

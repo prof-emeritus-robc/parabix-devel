@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include <kernel/streamutils/position_map.h>
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,13 +41,14 @@ using UTF8_CharMap = std::vector<std::pair<UCD::UnicodeSet, std::u32string>>;
 //  contexts) are mapped only where Applies marks their last bytes: the matches
 //  of the rules with their contexts, as the regular expression engine marks
 //  them on UTF-8 code units.
-//  Within filters (Masks: the bytes of the characters of each filter in effect,
-//  the innermost last), the characters are mapped only within the innermost,
-//  and the masks are kept in step with the text: the bytes inserted after a
-//  character have its mask.
+//  Within a filter (Within: the bytes of its characters), the characters are
+//  mapped only within it.  The bytes deleted and inserted are added to
+//  Positions (the bytes inserted after a character in its run, see
+//  PositionMap::Inserted::Inherit), by which the caller keeps its other streams
+//  of one bit per byte (as the masks of its filters) in step with the text.
 StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis,
                                  const UCD::UnicodeSet & contextual = UCD::UnicodeSet(), StreamSet * Applies = nullptr,
-                                 std::vector<StreamSet *> * Masks = nullptr);
+                                 StreamSet * Within = nullptr, PositionMap * Positions = nullptr);
 
 //  A map by selectors (doc/masked-transforms-plan.md, step 16): Selectors give
 //  a number at the last byte of each character (0: the character is copied;
@@ -56,10 +59,11 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
 //  character's last byte, its other bytes deleted, and the rest of the string
 //  inserted after it.  A string with UTF8_SelectorKept keeps the character
 //  (its bytes unchanged), with the part of the string before the mark inserted
-//  before it, and the part after inserted after it.  Masks as for
-//  UTF8_CharMapPipeline (the bytes inserted before a character have its mask).
+//  before it, and the part after inserted after it.  Positions as for
+//  UTF8_CharMapPipeline (the bytes inserted before a character in its run,
+//  PositionMap::Inserted::InheritNext).
 constexpr char32_t UTF8_SelectorKept = 0xFDD1;     // (a noncharacter)
 StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u32string> & strings, StreamSet * Basis,
-                                  StreamSet * Selectors, std::vector<StreamSet *> * Masks = nullptr);
+                                  StreamSet * Selectors, PositionMap * Positions = nullptr);
 
 }

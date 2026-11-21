@@ -237,26 +237,6 @@ private:
     const bool mWithin;
 };
 
-//  A mask after positions are inserted (where SpreadMask is 0, the mask spread
-//  by it): each run of positions inserted after a position (of at most Run)
-//  has the value of the mask there.
-class UTF8_InheritMask final : public PabloKernel {
-public:
-    UTF8_InheritMask(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Spread, unsigned run, StreamSet * Inherited)
-    : PabloKernel(ts, "UTF8_InheritMask" + std::to_string(run),
-                  {Binding{"spreadMask", SpreadMask}, Binding{"spread", Spread}}, {Binding{"inherited", Inherited}}),
-      mRun(run) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const inserted = pb.createNot(getInputStreamSet("spreadMask")[0]);
-        PabloAST * m = getInputStreamSet("spread")[0];
-        for (unsigned i = 0; i < mRun; i++) m = pb.createOr(m, pb.createAnd(inserted, pb.createAdvance(m, 1)));
-        writeOutputStreamSet("inherited", std::vector<PabloAST *>{pb.createInFile(m)});
-    }
-private:
-    const unsigned mRun;
-};
 
 //  The bytes of the tails written at the positions inserted (zeroes) after
 //  the last bytes of the characters, given the numbers of the tails there.
@@ -499,32 +479,6 @@ private:
     const PrefixPlan mPlan;
 };
 
-//  The masks of the bytes inserted before a character (zeroes of SpreadMask
-//  before a one), from the character: within a run of at most Run.
-class UTF8_InheritMaskBefore final : public PabloKernel {
-public:
-    UTF8_InheritMaskBefore(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Spread, unsigned run, StreamSet * Inherited)
-    : PabloKernel(ts, "UTF8_InheritMaskBefore" + std::to_string(run),
-                  {Binding{"spreadMask", SpreadMask, FixedRate(1), LookAhead(run)}, Binding{"spread", Spread, FixedRate(1), LookAhead(run)}},
-                  {Binding{"inherited", Inherited}}),
-      mRun(run) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const spreadMask = getInputStreamSet("spreadMask")[0];
-        PabloAST * const spread = getInputStreamSet("spread")[0];
-        PabloAST * m = spread;
-        //  (Inserted at each position up to j - 1 ahead, and the character j ahead.)
-        PabloAST * inserted = pb.createNot(spreadMask);
-        for (unsigned j = 1; j <= mRun; j++) {
-            m = pb.createOr(m, pb.createAnd(inserted, pb.createLookahead(spread, j)));
-            inserted = pb.createAnd(inserted, pb.createNot(pb.createLookahead(spreadMask, j)));
-        }
-        writeOutputStreamSet("inherited", std::vector<PabloAST *>{pb.createInFile(m)});
-    }
-private:
-    const unsigned mRun;
-};
 
 //  The bytes of the prefixes written at the positions inserted (zeroes) before
 //  the first bytes of the characters, given the numbers of the prefixes there:
@@ -562,9 +516,10 @@ private:
 };
 
 //  The prefixes inserted before the characters whose selectors have them:
-//  returns the basis with them, the selectors and the masks kept in step.
+//  returns the basis with them, and the selectors kept in step; the positions
+//  inserted (each in the run of the character after it) added to Positions.
 StreamSet * insertPrefixes(PipelineBuilder & P, const PrefixPlan & plan, StreamSet * Basis, StreamSet *& Selectors,
-                           std::vector<StreamSet *> * Masks) {
+                           PositionMap * Positions) {
     StreamSet * const Prefixes = P.CreateStreamSet(plan.countBits + plan.numberBits);
     P.CreateKernelCall<UTF8_SelectorPrefixes>(Basis, Selectors, plan, Prefixes);
     std::vector<unsigned> countBits;
@@ -581,13 +536,7 @@ StreamSet * insertPrefixes(PipelineBuilder & P, const PrefixPlan & plan, StreamS
     Selectors = SpreadSelectors;
     StreamSet * const Numbers = P.CreateStreamSet(plan.numberBits);
     SpreadByMask(P, SpreadMask, Prefixes, Numbers, plan.countBits);
-    if (Masks) for (StreamSet *& m : *Masks) {
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, SpreadMask, m, spread);
-        StreamSet * const inherited = P.CreateStreamSet(1);
-        P.CreateKernelCall<UTF8_InheritMaskBefore>(SpreadMask, spread, plan.longest(), inherited);
-        m = inherited;
-    }
+    if (Positions) Positions->insert(SpreadMask, PositionMap::Inserted::InheritNext, plan.longest());
     StreamSet * const Result = P.CreateStreamSet(8);
     P.CreateKernelCall<UTF8_SelectorPrefixWrite>(SpreadBasis, Numbers, plan, Result);
     SHOW_BIXNUM(Result);
@@ -595,9 +544,10 @@ StreamSet * insertPrefixes(PipelineBuilder & P, const PrefixPlan & plan, StreamS
 }
 
 //  The rest of a map, from the text changed in place: the bytes deleted (Keep)
-//  and the tails inserted (Inserts), with the masks kept in step.
+//  and the tails inserted (Inserts), added to Positions (each byte inserted in
+//  the run of the character before it).
 StreamSet * finishMap(PipelineBuilder & P, const Plan & plan, StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts,
-                      const bool deletes, const bool inserts, std::vector<StreamSet *> * Masks) {
+                      const bool deletes, const bool inserts, PositionMap * Positions) {
     SHOW_BIXNUM(Translated);
     StreamSet * Basis = Translated;
     if (deletes) {
@@ -610,11 +560,7 @@ StreamSet * finishMap(PipelineBuilder & P, const Plan & plan, StreamSet * Transl
             FilterByMask(P, Keep, Inserts, KeptInserts);
             Inserts = KeptInserts;
         }
-        if (Masks) for (StreamSet *& m : *Masks) {
-            StreamSet * const kept = P.CreateStreamSet(1);
-            FilterByMask(P, Keep, m, kept);
-            m = kept;
-        }
+        if (Positions) Positions->remove(Keep);
     }
     if (!inserts) return Basis;
     // The insertions: the positions inserted after the last bytes, and the
@@ -630,15 +576,7 @@ StreamSet * finishMap(PipelineBuilder & P, const Plan & plan, StreamSet * Transl
     SpreadByMask(P, SpreadMask, Basis, SpreadBasis);
     StreamSet * const SpreadTails = P.CreateStreamSet(plan.tailBits);
     SpreadByMask(P, SpreadMask, Inserts, SpreadTails, plan.insertBits);
-    unsigned longestTail = 0;
-    for (const std::string & t : plan.tails) longestTail = std::max(longestTail, static_cast<unsigned>(t.size()));
-    if (Masks) for (StreamSet *& m : *Masks) {
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, SpreadMask, m, spread);
-        StreamSet * const inherited = P.CreateStreamSet(1);
-        P.CreateKernelCall<UTF8_InheritMask>(SpreadMask, spread, longestTail, inherited);
-        m = inherited;
-    }
+    if (Positions) Positions->insert(SpreadMask, PositionMap::Inserted::Inherit);
     StreamSet * const Result = P.CreateStreamSet(8);
     P.CreateKernelCall<UTF8_CharMapTails>(SpreadBasis, SpreadTails, plan, Result);
     SHOW_BIXNUM(Result);
@@ -648,7 +586,8 @@ StreamSet * finishMap(PipelineBuilder & P, const Plan & plan, StreamSet * Transl
 }
 
 StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis,
-                                 const UCD::UnicodeSet & contextual, StreamSet * Applies, std::vector<StreamSet *> * Masks) {
+                                 const UCD::UnicodeSet & contextual, StreamSet * Applies, StreamSet * Within,
+                                 PositionMap * Positions) {
     if (map.empty()) return Basis;
     // Each character mapped: the changes of its bytes in place, the number of
     // bytes to delete, and the tail inserted.
@@ -720,13 +659,12 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
     StreamSet * const Translated = P.CreateStreamSet(8);
     StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
     StreamSet * Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
-    StreamSet * const Within = (Masks && !Masks->empty()) ? Masks->back() : nullptr;
     P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, Applies, Within, plan, Translated, Keep, Inserts);
-    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Masks);
+    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Positions);
 }
 
 StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u32string> & strings, StreamSet * Basis,
-                                  StreamSet * Selectors, std::vector<StreamSet *> * Masks) {
+                                  StreamSet * Selectors, PositionMap * Positions) {
     Plan plan;
     std::vector<std::string> bytes;
     std::vector<unsigned> tailOf;
@@ -771,7 +709,7 @@ StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u3
     plan.insertBits = bitsFor(maxTail);
     if (!prefixes.prefixes.empty()) {
         prefixes.numberBits = bitsFor(static_cast<unsigned>(prefixes.prefixes.size()));
-        Basis = insertPrefixes(P, prefixes, Basis, Selectors, Masks);
+        Basis = insertPrefixes(P, prefixes, Basis, Selectors, Positions);
     }
     // The bytes of the characters with a selector (marked at their last bytes).
     StreamSet * const Index = P.CreateStreamSet(1);
@@ -787,7 +725,7 @@ StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u3
     StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
     StreamSet * const Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
     P.CreateKernelCall<UTF8_SelectorApply>(Basis, Selectors, Spans, bytes, tailOf, plan, Translated, Keep, Inserts);
-    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Masks);
+    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Positions);
 }
 
 }

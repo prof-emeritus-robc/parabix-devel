@@ -26,7 +26,12 @@
 //  Lookup ignores case, and an ID without a source ("NFD", "Lower") means
 //  the Any source ("Any-NFD", "Any-Lower"), as in ICU.  Also as in ICU, a
 //  Unicode script name or code may stand for any other name or code of the
-//  same script ("Hira-Latin" finds Hira-Latn).
+//  same script ("Hira-Latin" finds Hira-Latn).  A BCP 47 transform ID (an
+//  alias such as und-Latn-t-und-ethi-m0-betamets) is also found with the
+//  registered aliases of its field values (m0-beta-metsehaf for m0-betamets,
+//  as CLDR's registry of the t extension gives them), and, as CLDR names a
+//  test file, with a d0 or s0 field before -t- (d0-morse-t-am-Ethi for
+//  am-Ethi-t-d0-morse).
 
 namespace ldml {
 

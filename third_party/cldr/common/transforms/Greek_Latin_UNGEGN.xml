@@ -77,10 +77,10 @@ $iotasub → ;
 οΥ ↔ oU ;
 $fmaker = [aeiAEI] $under ? ;
 $shiftForwardVowels = [[:Mn:]-[̈]]; # note: a diaeresis keeps the items separate
-$fmaker { υ ( $shiftForwardVowels )* } $softener → $1 v $under ;
-υ $1 ← ( $shiftForwardVowels )* v $under ;
-$fmaker { υ ( $shiftForwardVowels )* } → $1 f $under;
-υ $1 ← ( $shiftForwardVowels )* f $under ;
+$fmaker { υ ( $shiftForwardVowels* ) } $softener → $1 v $under ;
+υ $1 ← ( $shiftForwardVowels* ) v $under ;
+$fmaker { υ ( $shiftForwardVowels* ) } → $1 f $under;
+υ $1 ← ( $shiftForwardVowels* ) f $under ;
 $fmaker { Υ } $softener ↔ V $under ;
 $fmaker { Υ ↔ U $under ;
 υ ↔ y ;

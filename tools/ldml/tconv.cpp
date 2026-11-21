@@ -81,6 +81,7 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/position_map.h>
 #include <kernel/streamutils/sorting.h>
 #include <kernel/streamutils/stream_shift.h>
 #include <kernel/streamutils/run_index.h>
@@ -1533,26 +1534,6 @@ private:
     const unsigned mShifts;
 };
 
-//  The mask of the positions after insertions (see ExpandFilter): Spread is the
-//  mask spread by the spread mask, and each inserted position (not in the spread
-//  mask) inherits the mask of the character it follows.
-class InheritMask : public pablo::PabloKernel {
-public:
-    InheritMask(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Spread, StreamSet * Inherited)
-    : PabloKernel(ts, "InheritMask",
-                  {Binding{"SpreadMask", SpreadMask}, Binding{"Spread", Spread}}, {Binding{"Inherited", Inherited}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
-        PabloAST * const spread = getInputStreamSet("Spread")[0];
-        //  The runs of inserted positions after the characters of the mask.
-        PabloAST * const follow = pb.createAnd(pb.createAdvance(spread, 1), inserted);
-        PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, inserted), inserted);
-        writeOutputStreamSet("Inherited", std::vector<PabloAST *>{pb.createOr(spread, runs)});
-    }
-};
-
 //  The starts and follows of the regions of a mask (its runs of 1 bits): the
 //  first positions of the runs, and the positions after them (outside the
 //  mask), as the regular expression engine takes regions (RE_context::
@@ -1604,26 +1585,7 @@ struct TransformMask {
     StreamSet * bounds = nullptr;
 };
 
-//  The changes a stage makes to the positions of a text, in order: positions
-//  deleted (keep: 1 at the positions kept), or inserted (spread: 0 at the
-//  positions inserted, as by InsertionSpreadMask).  An inserted position is
-//  within a mask if the position before it is (Inherit: it belongs to the run
-//  of the character it follows), or always (In), or never (Out).  The caller
-//  keeps its other streams in step with the text by the map.
-struct PositionMap {
-    enum class Inserted {Inherit, In, Out};
-    struct Edit {
-        StreamSet * keep = nullptr;
-        StreamSet * spread = nullptr;
-        Inserted inserted = Inserted::Inherit;
-    };
-    std::vector<Edit> edits;
-    void remove(StreamSet * keep) {edits.push_back(Edit{keep, nullptr, Inserted::Inherit});}
-    void insert(StreamSet * spread, Inserted inserted = Inserted::Inherit) {edits.push_back(Edit{nullptr, spread, inserted});}
-    void append(const PositionMap & m) {edits.insert(edits.end(), m.edits.begin(), m.edits.end());}
-    bool empty() const {return edits.empty();}
-};
-
+//  (The changes a stage makes to the positions of a text: kernel::PositionMap.)
 //  The text produced by a stage, and the changes to its positions.
 struct Staged {
     StreamSet * text = nullptr;
@@ -1639,7 +1601,7 @@ struct Staged {
 //  the update of the masks after it share their kernels.
 class TransformMasks {
 public:
-    explicit TransformMasks(PipelineBuilder & P) : mP(P) {}
+    explicit TransformMasks(PipelineBuilder & P) : mP(P), mMapper(P) {}
     bool empty() const {return mMasks.empty();}
     size_t size() const {return mMasks.size();}
     const TransformMask & operator[](size_t i) const {return mMasks[i];}
@@ -1705,19 +1667,9 @@ public:
     //  each run of a filter; nullptr without a mask.
     StreamSet * runEnds() {return mMasks.empty() ? nullptr : complement(mMasks.back().apply);}
     //  The complement of a stream of one bit per position (cached).
-    StreamSet * complement(StreamSet * s) {
-        StreamSet *& c = mCache[{s, nullptr, Complement}];
-        if (c == nullptr) {
-            c = mP.CreateStreamSet(1);
-            Invert(mP, s, c);
-        }
-        return c;
-    }
-    //  A mask (of one bit per position) after the changes of a map.
-    StreamSet * mapped(StreamSet * mask, const PositionMap & map) {
-        for (const PositionMap::Edit & e : map.edits) mask = mapped(mask, e);
-        return mask;
-    }
+    StreamSet * complement(StreamSet * s) {return mMapper.complement(s);}
+    //  A mask (of one bit per position) after the changes of a map (cached).
+    StreamSet * mapped(StreamSet * mask, const PositionMap & map) {return mMapper.mapped(mask, map);}
     void keepInStep(const PositionMap & map) {
         for (TransformMask & m : mMasks) {
             m.apply = mapped(m.apply, map);
@@ -1725,40 +1677,15 @@ public:
                 for (const PositionMap::Edit & e : map.edits) {
                     PositionMap::Edit b = e;
                     if (b.inserted == PositionMap::Inserted::Out) b.inserted = PositionMap::Inserted::Inherit;
-                    m.bounds = mapped(m.bounds, b);
+                    m.bounds = mMapper.mapped(m.bounds, b);
                 }
             }
         }
     }
 private:
-    enum Op {Complement, Filter, Inherit, In, Out};
-    StreamSet * mapped(StreamSet * mask, const PositionMap::Edit & e) {
-        const Op op = e.keep ? Filter : e.inserted == PositionMap::Inserted::Inherit ? Inherit
-                    : e.inserted == PositionMap::Inserted::In ? In : Out;
-        StreamSet * const by = e.keep ? e.keep : e.spread;
-        auto f = mCache.find({mask, by, op});
-        if (f != mCache.end()) return f->second;
-        StreamSet * result = mP.CreateStreamSet(1);
-        if (op == Filter) {
-            FilterByMask(mP, e.keep, mask, result);
-        } else {
-            SpreadByMask(mP, e.spread, mask, result);
-            if (op == Inherit) {
-                StreamSet * const inherited = mP.CreateStreamSet(1);
-                mP.CreateKernelCall<InheritMask>(e.spread, result, inherited);
-                result = inherited;
-            } else if (op == In) {
-                StreamSet * const combined = mP.CreateStreamSet(1);
-                OrCombine(mP, result, complement(e.spread), combined);
-                result = combined;
-            }
-        }
-        mCache[{mask, by, op}] = result;
-        return result;
-    }
     PipelineBuilder & mP;
     std::vector<TransformMask> mMasks;
-    std::map<std::tuple<StreamSet *, StreamSet *, Op>, StreamSet *> mCache;
+    PositionMapper mMapper;
 };
 
 //  The positions where the single-character rules of a conversion group may

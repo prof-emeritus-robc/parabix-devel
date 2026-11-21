@@ -16,8 +16,8 @@ Originally prepared by Waris Abdukerim Janbaz <oyghan@gmail.com> of the Uyghur C
 :: NFD (NFC) ;
 $lsuVowels = [aAeEoOuUöÖüÜéÉiI’'] ;
 $disambig =  ̱ ;
-[:Separator:]* → ' ';
-$space = [:Separator:]*;
+[:Separator:]+ → ' ';
+$space = [:Separator:]+;
 ٫ ↔ ',' $disambig ; # ARABIC DECIMAL SEPARATOR
 ، ↔ ',' ; # ARABIC COMMA
 ؛ ↔ ';' ; # ARABIC SEMICOLON

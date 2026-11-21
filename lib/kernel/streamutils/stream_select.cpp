@@ -39,8 +39,17 @@ static std::string to_string(SelectOperation const & selop) {
         s += "_";
         s += to_string(binding.first, index);
         s += ":";
-        for (auto idx : binding.second) {
-            s += std::to_string(idx);
+        //  The indices, separated (so that the names of different selections
+        //  differ) and runs of consecutive ones as ranges (so that the name of a
+        //  selection of many streams stays short enough for a file name).
+        const auto & idx = binding.second;
+        for (size_t i = 0; i < idx.size(); ) {
+            size_t j = i;
+            while (j + 1 < idx.size() && idx[j + 1] == idx[j] + 1) j++;
+            if (i) s += ",";
+            s += std::to_string(idx[i]);
+            if (j > i) s += "-" + std::to_string(idx[j]);
+            i = j + 1;
         }
         s += "_";
         index++;

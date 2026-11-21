@@ -1558,14 +1558,20 @@ protected:
 class RegionEdges : public pablo::PabloKernel {
 public:
     RegionEdges(LLVMTypeSystemInterface & ts, StreamSet * Regions, StreamSet * Starts, StreamSet * Follows)
-    : PabloKernel(ts, "RegionEdges", {Binding{"Regions", Regions}}, {Binding{"Starts", Starts}, Binding{"Follows", Follows}}) {}
+    : PabloKernel(ts, "RegionEdges_eof", {Binding{"Regions", Regions}},
+                  {Binding{"Starts", Starts}, Binding{"Follows", Follows, FixedRate(), Add1()}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * const r = getInputStreamSet("Regions")[0];
         PabloAST * const before = pb.createAdvance(r, 1);
         writeOutputStreamSet("Starts", std::vector<PabloAST *>{pb.createAnd(r, pb.createNot(before))});
-        writeOutputStreamSet("Follows", std::vector<PabloAST *>{pb.createInFile(pb.createAnd(before, pb.createNot(r)))});
+        //  (One position longer than the text: a region that reaches the end of
+        //  the text is followed by the position after it, as the engine's match
+        //  regions require, like grep's unterminated last line.)
+        PabloAST * const follows = pb.createInFile(pb.createAnd(before, pb.createNot(r)));
+        PabloAST * const atEnd = pb.createAnd(before, pb.createAtEOF(pb.createOnes()));
+        writeOutputStreamSet("Follows", std::vector<PabloAST *>{pb.createOr(follows, atEnd)});
     }
 };
 

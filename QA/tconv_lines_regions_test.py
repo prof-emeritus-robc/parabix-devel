@@ -45,6 +45,9 @@ CASES = [
     ("b } [$ x] \u2192 Z ;\nb \u2192 Y ;\n", LINES, BOUNDED),
     ("a } [^d] [^e] \u2192 Q ;\na \u2192 R ;\n", "a\nd\nad\na\ndx\na\nb\n", BOUNDED),
     ("[$ \\-] { t \u2192 T ;\n", LINES, BOUNDED),
+    # The end of the text on a last line without a line feed (the engine's
+    # regions, in UTF-8 mode: the follow of a region at the end of the text)
+    ("b } [$] \u2192 Z ;\nb \u2192 Y ;\n", "b\nab\nbd\nb", BOUNDED),
     # Before contexts matched against the converted text, bounded (correction
     # kernels): items that would see the previous line's converted text
     ("x \u2192 a ;\n[^a] [^a] { b \u2192 N ;\n", CONVERTED, BOUNDED),
@@ -73,7 +76,8 @@ CASES = [
 ]
 
 # The outputs of each case, from the last build with per-line runs (one run
-# per line, --lines-regions=0), which one run must give (step 12).
+# per line, --lines-regions=0), which one run must give (step 12); for the
+# cases added since, from ICU applied to each line (--use-ICU).
 EXPECTED = [
     '\nd\nd\nd\n\nax\ny\naxy\na\ne\nX\nxa\nx\nt\n-t\n\na',
     'b\nd\nbd\ndb\n\nax\ny\naxy\na\ne\nX\nxa\nbx\nt\n-t\n\n',
@@ -83,6 +87,7 @@ EXPECTED = [
     'Z\nd\nYd\ndZ\n\nax\ny\naxy\na\ne\naZ\nxa\nZx\nt\n-t\n\n',
     'Q\nd\nRd\nQ\ndx\nQ\nb\n',
     'b\nd\nbd\ndb\n\nax\ny\naxy\na\ne\nab\nxa\nbx\nT\n-T\n\n',
+    'Z\naZ\nYd\nZ',
     'ab\na\nN\nab\na\nN\naab\na\nab\nyN\ny\nNN\n\nN\nNa\nqN\nq\nN',
     'ab\na\nB\nab\na\nB\naab\na\nab\nxb\nx\nBb\n\nB\nBa\nqb\nq\nB',
     'aB\na\nB\naB\na\nB\naaB\na\naB\nyb\ny\nBb\n\nB\nBa\nqb\nq\nB',

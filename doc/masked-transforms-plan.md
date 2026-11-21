@@ -495,18 +495,27 @@ contexts see the characters outside the runs.
     (Grek-Latn, Grek-Latn/UNGEGN); with `--region-separators` taken from each
     transform's alphabet, one run equals each region as a text of its own
     (`QA/tconv_region_separators_test.py`).
-11. **ICU under `--lines`.** ICU's `uconv -x` already gives `--lines`
-    semantics in one process: it transliterates each line as a text (checked
-    with ICU 78.3's `uconv`, the version tconv links,
-    `/opt/homebrew/opt/icu4c@78/bin/uconv`: `[a\u000A] { b > X ;` leaves the
-    `b` after a line feed, and `[$] { b > X ;` matches at the start of each
-    line). So a transform applied by ICU as a whole is applied by one
-    `uconv -f utf-8 -t utf-8 -x <rules>` over the input. `-x` takes a
-    transform ID, which uses ICU's own CLDR data rather than the checkout's
-    rules (which carry local fixes), or rule text applied forward, so a
-    backward transform of an XML file cannot be passed to it as it is. Such a
-    transform, and any where `uconv` is not available, is applied by tconv's
-    own `ICUTransform` (the same transliterator) line by line in the process,
+11. **ICU under `--lines`.** ICU's `uconv -x` does not give `--lines`
+    semantics. It transliterates the input a line at a time, but each line's
+    text includes its line feed (checked with ICU 78.3's `uconv`, the version
+    tconv links, `/opt/homebrew/opt/icu4c@78/bin/uconv`):
+    - the start of a line is the start of a text: `[a\u000A] { b > X ;`
+      leaves the `b` after a line feed, and `[$] { b > X ;` matches at the
+      start of each line;
+    - the end of a line is not the end of a text: `b } [$] > X ;` matches only
+      on a last line without a line feed, and `b } \u000A > Z ;` matches
+      before each line feed.
+
+    So rules that look at the end of a text, or at a line feed after it,
+    differ from the CLDR test data, which takes each line as a text without
+    its line feed: my-my_FONIPA drops a word-final `a̰` at the end of 57 of its
+    1,228 test lines under uconv (`က` gives `k` instead of `ka̰`). (Nor could
+    `-x` take every transform as tconv has it: a transform ID uses ICU's own
+    CLDR data rather than the checkout's rules, which carry local fixes, and
+    rule text is applied forward, so a backward transform of an XML file
+    cannot be passed as it is.) A transform applied by ICU is therefore
+    applied to each line as a text of its own, in the process, by tconv's own
+    `ICUTransform` (the same transliterator, from the checkout's rules),
     without the pipe and thread of `applyToInput`. A transform with ICU stages
     (`stagedTransformRunner`) runs each tconv stage once over all the lines,
     in region scope, and each ICU stage likewise on the intermediate text.

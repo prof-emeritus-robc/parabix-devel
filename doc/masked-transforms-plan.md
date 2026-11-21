@@ -642,6 +642,30 @@ contexts see the characters outside the runs.
       now switch wholly to Unicode mode; with region bounds in the UTF-8
       character maps' contextual groups and in DivCode (both modes), they stay
       in UTF-8 mode.
+    **Partly done (2026-11-20).** Bounded contexts in the UTF-8 character
+    maps: a contextual group whose contexts are not line-bound is matched by
+    the regular expression engine on the bytes with the regions as its match
+    regions (`utf8Applies`, the starts and follows of the region mask, as grep
+    gives the engine its lines), so with `--lines` it stays in UTF-8 mode
+    (`utf8StepProblem` sends a bounded group to Unicode mode only if it needs
+    DivCode). Checked with contexts that match the line feed but not the end of
+    a text (`a } [\u000A c] → A ;`): the same output as Unicode mode, with no
+    decoding. Fixed on the way: `--plan --lines` printed the mode as without
+    `--lines` (`printMode` took no bounds), so it showed none of the Unicode
+    segments of bounded groups. With that fixed, the survey of the 290 CLDR
+    test transforms with `--lines`: 65 have Unicode segments for bounded
+    groups; the character maps' bounds remove one segment from 2 of them
+    (zh-t-es-fonipa, zh-t-ru); the others' bounded groups are DivCode groups.
+    Not done, by measurement:
+    - **Bounded contexts in DivCode.** The segments they would remove cost
+      little: zh-t-es-fonipa, on 2 MB with one thread, takes 0.33 s with
+      `--lines` (three bounded groups in Unicode segments) and 0.40 s without
+      (all in UTF-8 mode). Left to step 16.
+    - **Run ends in UTF-8 mode.** No CLDR test transform has a Unicode
+      segment for it ("single-character rules with contexts at the end of a
+      filtered run"): the engine on the bytes would need externals of the
+      client (the positions outside the mask), which it supports for Unicode
+      sources only.
 16. **More components in UTF-8 mode** (optional, by measurement). The string-rule
     groups that DivCode cannot plan (186 transforms through them) run in a
     Unicode segment after step 13. Reducing that set means either DivCode

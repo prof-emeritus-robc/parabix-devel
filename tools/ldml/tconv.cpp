@@ -12008,8 +12008,12 @@ static bool utf8CharMap(const ldml::TransformStep & step, kernel::UTF8_CharMap &
 //  The positions where the single-character rules with contexts of a group
 //  apply (see utf8CharMap): their matches with their contexts, by the regular
 //  expression engine on the UTF-8 code units (in its UTF-8 modes), marked at
-//  the last byte of each character.
-static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml::CharMapSubgroup *> & contextual, StreamSet * Basis) {
+//  the last byte of each character.  With regions (bounded contexts, see
+//  RulePipelineBuilder::boundRegions), the engine's match regions: their first
+//  bytes (starts) and the first bytes after them (follows), so that the
+//  contexts match within each region as within a text.
+static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml::CharMapSubgroup *> & contextual, StreamSet * Basis,
+                               std::pair<StreamSet *, StreamSet *> regions = {nullptr, nullptr}) {
     StreamSet * applies = nullptr;
     for (const ldml::CharMapSubgroup * g : contextual) {
         //  (The characters the subgroup changes, as in the map: a character it
@@ -12026,7 +12030,7 @@ static StreamSet * utf8Applies(PipelineBuilder & P, const std::vector<const ldml
         const PreparedRE prepared = prepareRE(contextPattern(g->engineBefore, g->engineAfter, {re::makeCC(chars, &cc::Unicode)}),
                                               engineOptions());
         StreamSet * matches = P.CreateStreamSet(1);
-        RE_PipelineBuilder engine(P, RE_context{&cc::UTF8, Basis});
+        RE_PipelineBuilder engine(P, RE_context{&cc::UTF8, Basis, regions.first, regions.second});
         engine.matchSearchPipeline(prepared, matches);
         //  (The marks as the engine places them, see RE_Plan: matchOffset
         //  positions after the last unit, of code units or, with Unicode
@@ -12216,6 +12220,23 @@ private:
     }
     std::unique_ptr<RulePipelineBuilder> mUnicode;
     bool mBounded = false;
+    //  The starts and follows of the regions (of the mask of region scope, as
+    //  it stands), for the engine's match regions (see utf8Applies).
+    std::pair<StreamSet *, StreamSet *> regionEdges() {
+        for (size_t i = 0; i < mMasks.size(); i++) {
+            if (mMasks[i].scope != ContextScope::Region) continue;
+            StreamSet * const regions = mMasks[i].bounds ? mMasks[i].bounds : mMasks[i].apply;
+            auto & edges = mRegionEdges[regions];
+            if (edges.first == nullptr) {
+                edges.first = mP.CreateStreamSet(1);
+                edges.second = mP.CreateStreamSet(1);
+                mP.CreateKernelCall<RegionEdges>(regions, edges.first, edges.second);
+            }
+            return edges;
+        }
+        llvm::report_fatal_error("tconv: bounded contexts in UTF-8 mode without regions");
+    }
+    std::map<StreamSet *, std::pair<StreamSet *, StreamSet *>> mRegionEdges;
     bool mInvokedWithFilter = false;
     unsigned mSegments = 0;
     StreamSet * builtIn(const std::string & name, StreamSet * Basis);
@@ -12292,7 +12313,6 @@ static std::string utf8StepProblem(const ldml::TransformRegistry & registry, Tra
         if (ApplyShapeGroups && shapeChoice(registry, analyzer, used).any()) return used->canonicalName + " by its shape groups";
         return "";
     }
-    if (bounded && !groupLineBound(step)) return "a group whose contexts are bounded by the lines";
     if (!step.prefixRuns.empty()) return "prefix runs";
     if (!step.deferred.empty() || !step.copyCaptures.empty()) return "deferred rules";
     if (!step.chainRevisitRules.empty()) return "chain revisits";
@@ -12300,7 +12320,11 @@ static std::string utf8StepProblem(const ldml::TransformRegistry & registry, Tra
     if (step.hasFrontLetters || step.frontLettersEnd) return "front-letter revisits";
     kernel::UTF8_CharMap map;
     std::string why;
-    if (utf8CharMap(step, map, why) || (DivCodeGroups && divCodeApplies(utf8DivCodePlan(step)))) return "";
+    //  (A character map bounds its contexts by the regions, see utf8Applies;
+    //  DivCode does not.)
+    if (utf8CharMap(step, map, why)) return "";
+    if (bounded && !groupLineBound(step)) return "a group whose contexts are bounded by the lines";
+    if (DivCodeGroups && divCodeApplies(utf8DivCodePlan(step))) return "";
     return "a conversion group with " + why;
 }
 
@@ -12474,7 +12498,10 @@ StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         return Basis;
     }
-    StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(mP, contextual, Basis);
+    //  (Contexts bounded by the regions, unless the group's are line-bound.)
+    std::pair<StreamSet *, StreamSet *> regions{nullptr, nullptr};
+    if (!contextual.empty() && mBounded && !groupLineBound(step)) regions = regionEdges();
+    StreamSet * const applies = contextual.empty() ? nullptr : utf8Applies(mP, contextual, Basis, regions);
     Basis = charMap(map, Basis, contextualChars, applies);
     if (count && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
     return Basis;
@@ -14304,17 +14331,25 @@ static int run(int argc, char *argv[]);
 //  and the transformed text go to the output: the standard output, or the
 //  file of --output.
 //  The mode of a transform (see TransformAnalyzer::mode), for --plan.
-static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+//  (bounded: with --lines, the contexts bounded by the lines, which some
+//  groups of UTF-8 mode do not support, see utf8StepProblem.)
+static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry * entry, bool bounded) {
     const TransformAnalyzer::Mode & m = analyzer.mode(entry);
+    bool unicodeSteps = !m.utf8;
+    if (bounded && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
+        for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+            if (!utf8StepProblem(analyzer.registry(), analyzer, step, true).empty()) unicodeSteps = true;
+        }
+    }
     //  Mixed modes (step 13): the steps of the transform's own plan in UTF-8
     //  mode, and the segments in Unicode mode with the reason of their first step.
-    if (UTF8Mode && MixedModes && !m.utf8 && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
+    if (UTF8Mode && MixedModes && unicodeSteps && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
         const std::vector<ldml::TransformStep> & steps = analyzer.analyze(entry).plan.steps;
         toolio::out() << "  mode: mixed:";
         for (size_t i = 0; i < steps.size(); ) {
-            const std::string problem = utf8StepProblem(analyzer.registry(), analyzer, steps[i], false);
+            const std::string problem = utf8StepProblem(analyzer.registry(), analyzer, steps[i], bounded);
             size_t j = i + 1;
-            while (j < steps.size() && utf8StepProblem(analyzer.registry(), analyzer, steps[j], false).empty() == problem.empty()) j++;
+            while (j < steps.size() && utf8StepProblem(analyzer.registry(), analyzer, steps[j], bounded).empty() == problem.empty()) j++;
             toolio::out() << (i ? ";" : "") << (j > i + 1 ? " steps " : " step ") << (i + 1) << (j > i + 1 ? "-" + std::to_string(j) : "")
                          << (problem.empty() ? " UTF-8" : " Unicode (" + problem + ")");
             i = j;
@@ -16268,7 +16303,7 @@ static int run(int argc, char *argv[]) {
             if (a.implementable) {
                 printPlan(label, a, &shapeChoice(registry, analyzer, entry), note);
                 if (!groups.applicable) toolio::out() << "  (not entirely by shape groups: " << groups.reason << ")\n";
-                printMode(analyzer, entry);
+                printMode(analyzer, entry, Lines && regionScope(registry, analyzer, entry).bounded);
                 if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
                 return 0;
             }
@@ -16278,7 +16313,7 @@ static int run(int argc, char *argv[]) {
             return 2;
         }
         printPlan(label, a);
-        if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry);
+        if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry, Lines && regionScope(registry, analyzer, entry).bounded);
         if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
         return a.implementable ? 0 : 2;
     }

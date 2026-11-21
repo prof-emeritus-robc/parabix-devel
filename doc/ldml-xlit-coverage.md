@@ -749,6 +749,12 @@ test data disagrees with the rules, xlit and ICU.
 (Both were reported as failures before the discrepancies were told apart, at
 `a9e44f8d8`.)
 
+*Update (November 21, 2026):* both test files are corrected locally in
+`third_party/cldr` (`6868d41bf`, `2cc3c72b9`: `cldr-local:` commits, see
+`git diff cldr-upstream -- third_party/cldr`) to the output of the rules, ICU
+and xlit, which agree on every case. A run against `third_party/cldr` reports
+no discrepant tests; the list above is from the run against `~/cldr`.
+
 Each line of the test data is a separate text. `xlit_coverage.py` runs all the
 cases of a file as one text, one per line, and then runs the cases that fail
 again with `xlit --lines`, which applies the pipeline to each line as a text of

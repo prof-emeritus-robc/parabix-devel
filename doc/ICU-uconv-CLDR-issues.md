@@ -278,9 +278,14 @@ its own.
   rules write the right single quotation mark `’` (U+2019; the file has no
   U+02BC). For example `ყოველ`: expected `qʼovel`, `uconv`, ICU through xlit
   and xlit all give `q’ovel`. The test data or the rules need changing.
+  *Fixed locally* (2026-11-21, `6868d41bf`): the test file in
+  `third_party/cldr` now expects U+2019, as the rules, ICU and xlit give
+  (`git diff cldr-upstream -- third_party/cldr`).
 
 - **`my-fonipa-t-my.txt` has two expected outputs with a trailing space.**
   `နန်းယွန်းမြို့` expects `náɴ.jʊ́ɴ.mjo̰ ` and `မင်းဘူးမြို့` expects
   `mɪ́ɴ.bú.mjo̰ `; `my-my_FONIPA.xml` gives `náɴ.jʊ́ɴ.mjo̰` and `mɪ́ɴ.bú.mjo̰`
   (ICU through xlit and xlit agree; `uconv` too, apart from the issue above).
   The space is presumably an artifact of the test file.
+  *Fixed locally* (2026-11-21, `2cc3c72b9`): the two expected results in
+  `third_party/cldr` no longer end with a space.

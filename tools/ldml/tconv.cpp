@@ -90,6 +90,7 @@
 #include <kernel/unicode/normalization/normalization.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_charmap.h>
+#include <re/alphabet/multiplex_CCs.h>
 #include <kernel/unicode/utf8_wellformed.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
@@ -4334,6 +4335,12 @@ struct FusedRulesConfig {
     //  With absolute results, the selector of the empty string, written where
     //  the run following a string rule's text is deleted (see FusedStringRule::run).
     UCD::codepoint_t deletionSelector = 0;
+    //  The classes as codes (the hybrid, see RulePipelineBuilder::selectorGroup):
+    //  if not empty, Classes holds the bits of a multiplexed code of the classes
+    //  of fusedClassSets (the exclusive sets of their characters, see
+    //  cc::MultiplexedAlphabet), and classCodes the codes of each class, by
+    //  which the kernel compiles it from the bits.
+    std::vector<UCD::UnicodeSet> classCodes;
 };
 
 //  The text of a replacement of a fused kernel: with absolute results, the
@@ -5107,6 +5114,31 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
     return sets;
 }
 
+//  Whether the classes of a hybrid group's kernel are given as a multiplexed
+//  code (see FusedRulesConfig::classCodes): unless a set holds one of tconv's
+//  marks, whose classes are made with the streams of the filters and the
+//  deleted runs (WithRunEnds, notAfterDeletedRuns).
+static bool codedClasses(const std::vector<UCD::UnicodeSet> & sets) {
+    for (const UCD::UnicodeSet & s : sets) {
+        if (ldml::marksFilterRunEnd(s) || ldml::marksFilterRunOutside(s) || ldml::marksDeletedRunBlock(s)
+                || ldml::marksDeletedRunAllow(s)) return false;
+    }
+    return !sets.empty();
+}
+
+//  A multiplexed code of classes (cc::MultiplexedAlphabet): the classes of its
+//  bits (each the characters whose exclusive set's code has the bit), and the
+//  codes of each class.
+static std::pair<std::vector<UCD::UnicodeSet>, std::vector<UCD::UnicodeSet>> multiplexedClasses(const std::vector<UCD::UnicodeSet> & sets) {
+    cc::CC_Set ccs;
+    for (const UCD::UnicodeSet & s : sets) ccs.push_back(re::makeCC(s, &cc::Unicode));
+    std::unique_ptr<cc::MultiplexedAlphabet> mpx(cc::makeMultiplexedAlphabet("tconv_classes", ccs));
+    std::pair<std::vector<UCD::UnicodeSet>, std::vector<UCD::UnicodeSet>> result;
+    for (const re::CC * bit : mpx->getMultiplexedCCs()) result.first.push_back(*bit);
+    for (const re::CC * c : ccs) result.second.push_back(*mpx->transformCC(c));
+    return result;
+}
+
 //  The Unicode properties of a conversion group's rules, each computed by a
 //  kernel of its own (UnicodePropertyKernelBuilder: named by the property, so
 //  shared, and cached, across transforms), from whose streams the classes of the
@@ -5453,6 +5485,10 @@ private:
         if (c.region) s += "Rg";
         if (c.absolute) {
             s += "Ab" + std::to_string(c.deletionSelector);
+            if (!c.classCodes.empty()) {
+                s += "Mx";
+                for (const UCD::UnicodeSet & codes : c.classCodes) s += setKey(codes) + ";";
+            }
             for (const std::u32string & w : c.selectorStrings) {
                 s += "s";
                 for (char32_t ch : w) s += std::to_string(ch) + ",";
@@ -5556,10 +5592,28 @@ void FusedRules::generatePabloMethod() {
 
     //  The class of a set (in Classes, within the text) at an offset after the
     //  position.
+    //  (With classCodes: compiled from the code bits, looked ahead by the offset,
+    //  once for each class and offset.)
+    std::map<unsigned, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> codeCompilers;
+    std::map<std::pair<unsigned, unsigned>, PabloAST *> codeClasses;
     auto classAt = [&](unsigned offset, const UCD::UnicodeSet & set) -> PabloAST * {
         if (set.empty()) return zeroes;
         const auto f = mClassIndex.find(setKey(set));
         if (LLVM_UNLIKELY(f == mClassIndex.end())) llvm::report_fatal_error("FusedRules: a class not in fusedClassSets");
+        if (!mConfig.classCodes.empty()) {
+            PabloAST *& c = codeClasses[{offset, f->second}];
+            if (c) return c;
+            const UCD::UnicodeSet & codes = mConfig.classCodes[f->second];
+            if (codes.empty()) return c = zeroes;
+            auto & compiler = codeCompilers[offset];
+            if (!compiler) {
+                std::vector<PabloAST *> bits;
+                for (PabloAST * b : getInputStreamSet("Classes")) bits.push_back(offset ? pb.createLookahead(b, offset) : b);
+                bits.resize(std::max<size_t>(bits.size(), 21), zeroes);
+                compiler = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
+            }
+            return c = compiler->compileCC(re::makeCC(codes, &cc::Unicode), pb);
+        }
         PabloAST * const c = getInputStreamSet("Classes")[f->second];
         return offset ? pb.createLookahead(c, offset) : c;
     };
@@ -9085,6 +9139,11 @@ private:
         }
         //  (A correction kernel reads the strings of the selectors.)
         if (c.absolute && c.rounds > 0) c.selectorStrings = mSelectorStrings;
+        //  (The classes as codes, see FusedRulesConfig::classCodes and classCodes.)
+        if (c.absolute) {
+            const std::vector<UCD::UnicodeSet> sets = fusedClassSets(c);
+            if (codedClasses(sets)) c.classCodes = multiplexedClasses(sets).second;
+        }
         return c;
     }
     const ByteSource * mBytes = nullptr;
@@ -10829,6 +10888,16 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     auto fusedClasses = [&](const FusedRulesConfig & config) -> StreamSet * {
         const std::vector<UCD::UnicodeSet> sets = fusedClassSets(absolutely(config));
         if (sets.empty()) return nullptr;
+        //  The hybrid (see selectorGroup): the bits of a multiplexed code of the
+        //  classes, from which the kernel compiles them (FusedRulesConfig::
+        //  classCodes), computed on the bytes and compressed.
+        if (mBytes && codedClasses(sets)) {
+            std::vector<re::CC *> bits;
+            for (const UCD::UnicodeSet & b : multiplexedClasses(sets).first) bits.push_back(re::makeCC(b, &cc::Unicode));
+            StreamSet * const codes = P.CreateStreamSet(bits.size());
+            classKernel(bits, U21, codes);
+            return codes;
+        }
         //  The classes of the multiplexed mapping numbers in kernels of their own
         //  (see MuxClassKernels), the others in one.
         std::set<std::string> muxKeys;

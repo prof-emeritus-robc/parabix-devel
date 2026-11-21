@@ -1126,6 +1126,11 @@ add_test(
   COMMAND python3 tconv_utf8_masks_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_hybrid_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_hybrid_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_divcode_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_divcode_test.py ${BIN_DIR}/tconv)

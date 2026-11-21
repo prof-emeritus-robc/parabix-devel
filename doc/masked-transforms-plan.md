@@ -776,6 +776,21 @@ contexts see the characters outside the runs.
     test data of the transforms it moves, and measured (cycles, Greek and
     Latin text) against its Unicode segment.
 
+    *Done (2026-11-20), behind `--hybrid-groups` (off by default):* slices 1
+    and 2. Slice 2: the correction kernels (staged rounds and the While loop)
+    read the converted text from the selectors (`FusedRulesConfig::
+    selectorStrings`: the length and the classes of each slot are classes of
+    the selector values), and groups of single-character rules only are taken
+    too. `--plan --hybrid-groups` gives the hybrid's reason where it does not
+    apply. On the CLDR test transforms it removes 21 of the 67 Unicode
+    segments of string-rule groups and all 5 of single-character rules with
+    converted before contexts; outputs equal Unicode mode's on the CLDR data
+    of eight of the transforms moved, as a text and with `--lines`
+    (`QA/tconv_hybrid_test.py` has small cases). What still keeps string-rule
+    groups out (segments): sequential selection (29), captures (14), contexts
+    with tconv's marks (5), a kept character with inserted ones (4),
+    insertion rules (1). Not yet measured against the Unicode segments.
+
 Order: steps 10 to 12 first (the per-line runs removed, in Unicode mode, which
 every component already has); then 14 and 13 (mixed modes); then 15 and 16,
 which move work from Unicode segments to UTF-8 segments.

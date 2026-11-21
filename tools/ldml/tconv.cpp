@@ -4297,10 +4297,29 @@ struct FusedRulesConfig {
     //  not bound).  The targets are then selectors (ids of the UTF-8 strings the
     //  positions become, see RulePipelineBuilder::selectorFor), 0 for a position
     //  unchanged.  Not with the results that need the text itself: a character
-    //  kept within a replacement (keep), captures written from their index
-    //  sets, or the converted text of a correction kernel.
+    //  kept within a replacement (keep), or captures written from their index
+    //  sets.  The converted text of a correction kernel is that of the strings
+    //  selected (selectorStrings[s - 1], static: the classes of its characters
+    //  are those of the selector values).
     bool absolute = false;
+    std::vector<std::u32string> selectorStrings;
 };
+
+//  The text of a replacement of a fused kernel: with absolute results, the
+//  strings of its selectors (a kept character as it is).
+static std::u32string selectedText(const FusedRulesConfig & c, const std::u32string & r) {
+    if (!c.absolute) return r;
+    std::u32string text;
+    for (char32_t ch : r) {
+        if (ch == static_cast<char32_t>(ldml::StringRuleKept)) {
+            text.push_back(ch);
+        } else {
+            assert (ch >= 1 && ch <= c.selectorStrings.size());
+            text += c.selectorStrings[ch - 1];
+        }
+    }
+    return text;
+}
 
 //  The results of the rules of a conversion group, accumulated by its fused
 //  kernels: the changes at each position i of the replacements (21 bits each;
@@ -4908,7 +4927,7 @@ struct SubgroupOutcomes {
     UCD::UnicodeSet literalAll;
     std::set<unsigned> lengths;     // of either
 };
-static SubgroupOutcomes subgroupOutcomes(const FusedSubgroup & g);
+static SubgroupOutcomes subgroupOutcomes(const FusedRulesConfig & c, const FusedSubgroup & g);
 
 //  The same for case mapping p (of any character, see CaseMapSplit).
 static UCD::UnicodeSet caseMapItemChars(unsigned p, const ResolvedItem & x, unsigned l, unsigned j, int outcome) {
@@ -4929,12 +4948,14 @@ static UCD::UnicodeSet caseMapItemChars(unsigned p, const ResolvedItem & x, unsi
     return chars;
 }
 
-static SubgroupOutcomes subgroupOutcomes(const FusedSubgroup & g) {
+//  (With absolute results, the literal mappings to the strings selected.)
+static SubgroupOutcomes subgroupOutcomes(const FusedRulesConfig & c, const FusedSubgroup & g) {
     SubgroupOutcomes o;
     const CaseMapSplit split = caseMapSplit(g);
     o.literal = g;
     o.literal.caseMaps = false;
     o.literal.mappings = split.literal;
+    for (ldml::CharMapping & m : o.literal.mappings) m.replacement = selectedText(c, m.replacement);
     o.caseMap = split.caseMap;
     o.literalAll = split.literalAll;
     o.lengths = mappingLengths(o.literal);
@@ -5036,7 +5057,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         const std::vector<ResolvedItem> items = resolvedItems(c);
         for (const FusedSubgroup & g : c.subgroups) {
             if (!g.converted) continue;
-            const SubgroupOutcomes o = subgroupOutcomes(g);
+            const SubgroupOutcomes o = subgroupOutcomes(c, g);
             if (o.caseMap >= 0) add(o.literalAll);
             for (unsigned l : o.lengths) {
                 add(mappingLengthChars(o.literal, l));
@@ -5399,7 +5420,13 @@ private:
         }
         if (c.coverage) s += "V";
         if (c.region) s += "Rg";
-        if (c.absolute) s += "Ab";
+        if (c.absolute) {
+            s += "Ab";
+            for (const std::u32string & w : c.selectorStrings) {
+                s += "s";
+                for (char32_t ch : w) s += std::to_string(ch) + ",";
+            }
+        }
         if (Mask) s += "K" + std::to_string(l.maskLookahead);
         if (Allowed) s += "A";
         s += "L" + std::to_string(l.lookahead) + "S";
@@ -5957,37 +5984,87 @@ void FusedRules::generatePabloMethod() {
     if (correction) {
         PabloAST * const firstPosition = beforeStart(1);
         const UCD::UnicodeSet replaced = mConfig.replacementChars - UCD::UnicodeSet(DeletionMark);
+        //  The converted text given by results, at each position: its length (0 if
+        //  deleted, or 1 + the positions inserted after it: insert, by count) and
+        //  its characters (slot 0, the character itself where changed0 is not set,
+        //  and the slots inserted after it), whose classes are given by slotClass.
+        //  With absolute results, the strings of the selectors at slot 0 (see
+        //  FusedRulesConfig::absolute): the classes of the selector values whose
+        //  strings have a length, or a character in a set at an index.
+        struct ConvertedSlots {
+            unsigned maxInsert = 0;
+            PabloAST * anyInsert = nullptr;
+            PabloAST * changed0 = nullptr;
+            std::map<unsigned, PabloAST *> insert;
+            std::function<PabloAST * (unsigned, const UCD::UnicodeSet &)> slotClass;
+        };
+        auto convertedSlots = [&](const Results & res) {
+            ConvertedSlots cs;
+            cs.anyInsert = zeroes;
+            cs.changed0 = zeroes;
+            for (unsigned b = 0; b < 21; b++) cs.changed0 = pb.createOr(cs.changed0, res.changes[0][b]);
+            if (mConfig.absolute) {
+                const std::vector<std::u32string> & strings = mConfig.selectorStrings;
+                auto compiler = std::make_shared<cc::Parabix_CC_Compiler_Builder>(res.changes[0]);
+                auto selectors = [=, &pb](const std::function<bool (const std::u32string &)> & which) -> PabloAST * {
+                    UCD::UnicodeSet set;
+                    for (size_t k = 0; k < strings.size(); k++) {
+                        if (which(strings[k])) set.insert(static_cast<UCD::codepoint_t>(k + 1));
+                    }
+                    if (set.empty()) return pb.createZeroes();
+                    return pb.createInFile(compiler->compileCC(re::makeCC(set, &cc::Unicode), pb));
+                };
+                for (const std::u32string & w : strings) cs.maxInsert = std::max<unsigned>(cs.maxInsert, w.empty() ? 0 : w.size() - 1);
+                for (unsigned k = 1; k <= cs.maxInsert; k++) {
+                    PabloAST * const v = selectors([k](const std::u32string & w) {return w.size() == k + 1;});
+                    cs.insert[k] = v;
+                    cs.anyInsert = pb.createOr(cs.anyInsert, v);
+                }
+                //  (The deletion mark at slot 0: the empty strings.)
+                cs.slotClass = [selectors](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                    return selectors([i, &set](const std::u32string & w) {
+                        if (i < w.size()) return set.contains(static_cast<UCD::codepoint_t>(w[i]));
+                        return i == 0 && w.empty() && set.contains(DeletionMark);
+                    });
+                };
+                return cs;
+            }
+            cs.insert = res.insert;
+            for (const auto & k : res.insert) {
+                cs.maxInsert = std::max(cs.maxInsert, k.first);
+                cs.anyInsert = pb.createOr(cs.anyInsert, k.second);
+            }
+            auto slotCompiler = std::make_shared<std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>>>();
+            for (unsigned i = 0; i <= cs.maxInsert; i++) {
+                std::vector<PabloAST *> slot(21);
+                for (unsigned b = 0; b < 21; b++) {
+                    if (i == 0) {
+                        slot[b] = pb.createXor(basis[b], res.changes[0][b]);
+                    } else {
+                        PabloAST * const c = i < res.changes.size() ? res.changes[i][b] : zeroes;
+                        slot[b] = ((DeletionMark >> b) & 1) ? pb.createNot(c) : c;
+                    }
+                }
+                slotCompiler->push_back(std::make_unique<cc::Parabix_CC_Compiler_Builder>(slot));
+            }
+            cs.slotClass = [slotCompiler, &pb](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                if (set.empty()) return pb.createZeroes();
+                return pb.createInFile((*slotCompiler)[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
+            };
+            return cs;
+        };
         //  The before contexts of the rules matched against the converted text
         //  given by results (with no results, the text itself).
         auto matchConverted = [&](const Results & res, const Results & base) {
-            needsBasis("before contexts matched against the converted text");
+            if (!mConfig.insertions.empty()) needsBasis("insertion rules matched against the converted text");
             //  The converted text at each position: its length (0 if deleted, or
             //  1 + the positions inserted after it) and its characters (slot 0, the
             //  character itself, and the slots inserted after it).
-            unsigned maxInsert = 0;
-            PabloAST * anyInsert = zeroes;
-            for (const auto & k : res.insert) {
-                maxInsert = std::max(maxInsert, k.first);
-                anyInsert = pb.createOr(anyInsert, k.second);
-            }
-            std::vector<std::vector<PabloAST *>> slot(maxInsert + 1, std::vector<PabloAST *>(21));
-            PabloAST * changed0 = zeroes;
-            for (unsigned b = 0; b < 21; b++) {
-                slot[0][b] = pb.createXor(basis[b], res.changes[0][b]);
-                changed0 = pb.createOr(changed0, res.changes[0][b]);
-            }
-            for (unsigned i = 1; i <= maxInsert; i++) {
-                for (unsigned b = 0; b < 21; b++) {
-                    PabloAST * const c = i < res.changes.size() ? res.changes[i][b] : zeroes;
-                    slot[i][b] = ((DeletionMark >> b) & 1) ? pb.createNot(c) : c;
-                }
-            }
-            std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> slotCompiler(maxInsert + 1);
-            for (unsigned i = 0; i <= maxInsert; i++) slotCompiler[i] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(slot[i]);
-            auto slotClass = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
-                if (set.empty()) return zeroes;
-                return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
-            };
+            const ConvertedSlots slots = convertedSlots(res);
+            const unsigned maxInsert = slots.maxInsert;
+            PabloAST * const anyInsert = slots.anyInsert;
+            PabloAST * const changed0 = slots.changed0;
+            const auto & slotClass = slots.slotClass;
             //  (The positions marked for case mappings: their outcomes those of the
             //  case mappings, see CaseMapSplit.)
             PabloAST * marked = zeroes;
@@ -6014,7 +6091,7 @@ void FusedRules::generatePabloMethod() {
             PabloAST * const kept = pb.createInFile(pb.createNot(deleted));
             std::vector<PabloAST *> length(std::max(maxInsert + 2, markedLength + 1), zeroes);     // length[l]: the converted text has l characters
             length[1] = pb.createAnd(kept, pb.createNot(anyInsert));
-            for (const auto & k : res.insert) length[k.first + 1] = pb.createOr(length[k.first + 1], k.second);
+            for (const auto & k : slots.insert) length[k.first + 1] = pb.createOr(length[k.first + 1], k.second);
             if (marked != zeroes) {
                 for (unsigned l = 1; l < length.size(); l++) {
                     PabloAST * v = pb.createAnd(length[l], unmarked);
@@ -6359,6 +6436,7 @@ void FusedRules::generatePabloMethod() {
                     //  (A character of the text deleted, see ldml::StringRule::kept: with
                     //  the rest of the replacement after it at the last position.)
                     if (!sc.result.empty() && sc.result[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) sc.result.erase(0, 1);
+                    sc.result = selectedText(mConfig, sc.result);
                     sc.cand = o ? pb.createAdvance(candS[r], o) : candS[r];
                     sc.notCand = pb.createNot(sc.cand);
                     if (o) {
@@ -6383,31 +6461,12 @@ void FusedRules::generatePabloMethod() {
             //  its length and its characters.
             Results base = stateIn();
             addResults(base, firstOf, atBase);
-            needsBasis("the outcomes of a correction kernel");
-            unsigned maxInsert = 0;
-            PabloAST * anyInsert = zeroes;
-            for (const auto & k : base.insert) {
-                maxInsert = std::max(maxInsert, k.first);
-                anyInsert = pb.createOr(anyInsert, k.second);
-            }
-            std::vector<std::vector<PabloAST *>> slot(maxInsert + 1, std::vector<PabloAST *>(21));
-            PabloAST * changed0 = zeroes;
-            for (unsigned b = 0; b < 21; b++) {
-                slot[0][b] = pb.createXor(basis[b], base.changes[0][b]);
-                changed0 = pb.createOr(changed0, base.changes[0][b]);
-            }
-            for (unsigned i = 1; i <= maxInsert; i++) {
-                for (unsigned b = 0; b < 21; b++) {
-                    PabloAST * const c = i < base.changes.size() ? base.changes[i][b] : zeroes;
-                    slot[i][b] = ((DeletionMark >> b) & 1) ? pb.createNot(c) : c;
-                }
-            }
-            std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> slotCompiler(maxInsert + 1);
-            for (unsigned i = 0; i <= maxInsert; i++) slotCompiler[i] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(slot[i]);
-            auto slotClass = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
-                if (set.empty()) return zeroes;
-                return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
-            };
+            if (numIns) needsBasis("insertion rules in the While loop");
+            const ConvertedSlots slots = convertedSlots(base);
+            const unsigned maxInsert = slots.maxInsert;
+            PabloAST * const anyInsert = slots.anyInsert;
+            PabloAST * const changed0 = slots.changed0;
+            const auto & slotClass = slots.slotClass;
             //  (The positions marked for case mappings: their outcomes those of the
             //  case mappings, see CaseMapSplit.)
             PabloAST * marked = zeroes;
@@ -6422,7 +6481,7 @@ void FusedRules::generatePabloMethod() {
                                                         pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark)))));
             std::vector<PabloAST *> baseLength(std::max(maxInsert + 2, markedLength + 1), zeroes);     // [l]: l characters (l >= 1)
             baseLength[1] = pb.createAnd(pb.createAnd(inText, pb.createNot(baseDeleted)), pb.createNot(anyInsert));
-            for (const auto & k : base.insert) baseLength[k.first + 1] = pb.createOr(baseLength[k.first + 1], k.second);
+            for (const auto & k : slots.insert) baseLength[k.first + 1] = pb.createOr(baseLength[k.first + 1], k.second);
             if (marked != zeroes) {
                 for (unsigned l = 1; l < baseLength.size(); l++) {
                     PabloAST * v = pb.createAnd(baseLength[l], unmarked);
@@ -6787,7 +6846,7 @@ void FusedRules::generatePabloMethod() {
                 std::vector<SubgroupOutcomes> outcomesOf;
                 std::vector<PabloAST *> notLiteral;
                 for (size_t c = 0; c < numClasses; c++) {
-                    outcomesOf.push_back(subgroupOutcomes(mConfig.subgroups[classes[c].front()]));
+                    outcomesOf.push_back(subgroupOutcomes(mConfig, mConfig.subgroups[classes[c].front()]));
                     const SubgroupOutcomes & o = outcomesOf.back();
                     notLiteral.push_back(o.caseMap < 0 ? nullptr : o.literalAll.empty() ? ones : wb.createNot(classAt(0, o.literalAll)));
                 }
@@ -8969,6 +9028,8 @@ private:
     }
     FusedRulesConfig absolutely(FusedRulesConfig c) const {
         c.absolute = mBytes != nullptr;
+        //  (A correction kernel reads the strings of the selectors.)
+        if (c.absolute && c.rounds > 0) c.selectorStrings = mSelectorStrings;
         return c;
     }
     const ByteSource * mBytes = nullptr;
@@ -12494,13 +12555,13 @@ private:
 
 //  The hybrid of UTF-8 mode (doc/masked-transforms-plan.md step 16, option C;
 //  RulePipelineBuilder::selectorGroup): why a conversion group cannot be applied
-//  by it, or "".  Its first slice: groups of string rules whose results are
-//  written at the positions of their texts, with no correction kernels (no
-//  before context matched against the converted text), and no contexts that need
-//  the streams of tconv's marks (run ends, deleted runs) in the engine.
+//  by it, or "".  Groups of string rules whose results are written at the
+//  positions of their texts (with correction kernels: before contexts matched
+//  against the converted text, as the strings of the selectors), with no
+//  insertion rules, and no contexts that need the streams of tconv's marks (run
+//  ends, deleted runs) in the engine.
 static std::string hybridProblem(const ldml::TransformStep & step) {
     if (step.kind != ldml::TransformStep::Kind::Conversion) return "not a conversion group";
-    if (step.stringRules.empty()) return "no string rules";
     if (!step.captureReplacements.empty()) return "rules with captures";
     if (!step.insertions.empty()) return "insertion rules";
     if (!step.deferred.empty() || !step.copyCaptures.empty()) return "deferred rules";
@@ -12509,11 +12570,6 @@ static std::string hybridProblem(const ldml::TransformStep & step) {
     if (!step.markRunEditRules.empty()) return "mark run edits";
     if (step.hasFrontLetters || step.frontLettersEnd) return "front-letter revisits";
     if (step.sequentialSelection) return "sequential selection";
-    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
-    auto converted = [&](re::RE * before) {
-        FusedContexts b;
-        return before != nullptr && fusedContexts(before, true, b, true) && convertedContextMatters(b, outcomes);
-    };
     auto externals = [&](re::RE * before, re::RE * after) {
         re::RE * const p = contextPattern(before, after, {re::makeCC(UCD::UnicodeSet(0, 0x10FFFF), &cc::Unicode)});
         for (const std::string & name : {FilterRunEndName, DeletedRunEndName, NotDeletedRunEndName, DeletedRunAfterName}) {
@@ -12529,11 +12585,9 @@ static std::string hybridProblem(const ldml::TransformStep & step) {
             if (c == static_cast<char32_t>(ldml::StringRuleKept) && !(j + 1 == n && m == n)) return "a kept character with inserted ones";
             if (c == static_cast<char32_t>(ldml::StringRuleDeleted) && j >= n) return "a deleted character among inserted ones";
         }
-        if (converted(r.engineBefore)) return "before contexts matched against the converted text";
         if (externals(r.engineBefore, r.engineAfter)) return "contexts with tconv's marks";
     }
     for (const ldml::CharMapSubgroup & g : step.subgroups) {
-        if (converted(g.engineBefore)) return "before contexts matched against the converted text";
         if (externals(g.engineBefore, g.engineAfter)) return "contexts with tconv's marks";
     }
     return "";
@@ -12568,7 +12622,8 @@ static std::string utf8StepProblem(const ldml::TransformRegistry & registry, Tra
     if (bounded && !groupLineBound(step)) return hybrid ? "" : "a group whose contexts are bounded by the lines";
     if (DivCodeGroups && divCodeApplies(utf8DivCodePlan(step))) return "";
     if (hybrid) return "";
-    return "a conversion group with " + why;
+    //  (With --hybrid-groups, why the hybrid does not apply either.)
+    return "a conversion group with " + why + (HybridGroups ? "; hybrid: " + hybridProblem(step) : std::string());
 }
 
 StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * Basis) {

@@ -167,6 +167,14 @@ static cl::opt<bool> SequentialWhile("sequential-while",
              "kernel's While loop, where it can decide all the string rules, instead of in --converted-context-rounds staged "
              "rounds of matching, LeftmostMatches and applying kernels (doc/round-replacement.md step 6; default on)"),
     cl::init(true), cl::cat(XlitOptions));
+static cl::opt<bool> NormalizationPeephole("normalization-peephole",
+    cl::desc("Omit a normalization step (NFD or NFC) whose result the next step normalizes again (NFD, NFC, NFKD or NFKC, "
+             "over the same characters or more, a set closed under canonical equivalence), across the transforms invoked: "
+             "N2(N1(x)) = N2(x), as N1 keeps the text canonically equivalent (default on)"),
+    cl::init(true), cl::cat(XlitOptions));
+static cl::opt<bool> ShowNormalizationPeephole("show-normalization-peephole",
+    cl::desc("Report each normalization step omitted by --normalization-peephole on the standard error"),
+    cl::init(false), cl::Hidden, cl::cat(XlitOptions));
 static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
              "NFD_PipelineBuilder::NFD_Masked and NFC_Masked in UTF-8 mode), rather than with the characters outside the "
@@ -8926,10 +8934,137 @@ private:
     const char32_t mLower, mUpper;
 };
 
+static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                                          const ldml::TransformEntry * entry);
+
+//  Whether a set is closed under canonical equivalence: a character is in it
+//  if and only if all the characters of its canonical decomposition are.
+static bool canonicallyClosed(const UCD::UnicodeSet & set) {
+    static const std::vector<std::pair<UCD::codepoint_t, std::u32string>> decompositions = [] {
+        using namespace UCD;
+        auto * const dt = llvm::cast<EnumeratedPropertyObject>(getPropertyObject(property_t::dt));
+        const UnicodeSet mapped = dt->GetCodepointSet(DT_ns::Can) + UnicodeSet(0xAC00, 0xD7A3);   // (Hangul syllables)
+        NFD_Engine engine(NFD);
+        std::vector<std::pair<codepoint_t, std::u32string>> d;
+        for (const auto & range : mapped) {
+            for (codepoint_t cp = range.first; cp <= range.second; cp++) d.emplace_back(cp, engine.decompose(std::u32string(1, cp)));
+        }
+        return d;
+    }();
+    for (const auto & d : decompositions) {
+        bool all = true;
+        for (char32_t c : d.second) all = all && set.contains(c);
+        if (all != set.contains(d.first)) return false;
+    }
+    return true;
+}
+
+//  The normalization peephole (--normalization-peephole).  A normalization
+//  step N1 (NFD or NFC) is omitted when the next step to change the text is a
+//  normalization N2 (NFD, NFC, NFKD or NFKC) over a set S2 of characters (its
+//  filters and those it is applied within) that includes N1's set S1 and is
+//  closed under canonical equivalence (canonicallyClosed).  N1 replaces each
+//  run of S1 with a canonically equivalent text, whose characters are in S2,
+//  within the same run of S2: the runs of S2 are canonically equivalent, and
+//  so N2(N1(x)) = N2(x).  The next step is found across the transforms
+//  invoked: the remaining steps of the plans being applied (the frames, shared
+//  by the builders of UTF-8 and Unicode modes), and the first steps of the
+//  transforms they invoke; only Null is passed over, and anything not applied
+//  by the regular plan (shape groups, ICU, a transform not implementable)
+//  ends the search, as does the end of the plans of the pipeline.
+struct NormalizationFrames {
+    struct Frame {
+        const std::vector<ldml::TransformStep> * steps;
+        size_t next;                    // the step after the one being applied
+        UCD::UnicodeSet scope;          // the characters the plan's steps apply to
+        UCD::UnicodeSet stepScope;      // those of the step being applied
+        const ldml::TransformStep * builtIn = nullptr;   // that step, if it invokes a built-in directly
+    };
+    std::vector<Frame> frames;
+
+    static UCD::UnicodeSet all() {return UCD::UnicodeSet(0, 0x10FFFF);}
+    void enter(const TransformAnalysis & a) {
+        UCD::UnicodeSet scope = frames.empty() ? all() : frames.back().stepScope;
+        if (a.plan.filter) scope = scope & a.plan.filterSet;
+        frames.push_back(Frame{&a.plan.steps, 0, scope, scope, nullptr});
+    }
+    void exit() {frames.pop_back();}
+    //  Before the steps [i, j) are applied (one step, or a segment of them).
+    void begin(size_t i, size_t j, const ldml::TransformRegistry & registry) {
+        Frame & f = frames.back();
+        f.next = j;
+        f.stepScope = f.scope;
+        f.builtIn = nullptr;
+        if (j != i + 1) return;
+        const ldml::TransformStep & step = (*f.steps)[i];
+        if (step.kind != ldml::TransformStep::Kind::Transform) return;
+        if (step.filter) f.stepScope = f.scope & step.filterSet;
+        const ldml::TransformEntry * const e = registry.lookup(step.transform.getText());
+        if (e && e->isBuiltIn()) f.builtIn = &step;
+    }
+    void end() {frames.back().builtIn = nullptr;}
+
+    enum class Probe {Opaque, Transparent, Found};
+    static bool normalization(const std::string & name) {
+        return name == "Any-NFD" || name == "Any-NFC" || name == "Any-NFKD" || name == "Any-NFKC";
+    }
+    //  A step applied to the characters of base: Found if it is a normalization
+    //  that makes the one over s1 redundant, Transparent if it leaves the text
+    //  as it is (Null), Opaque otherwise.
+    static Probe probe(const ldml::TransformStep & step, const UCD::UnicodeSet & base, const UCD::UnicodeSet & s1,
+                       const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer, std::set<std::string> & seen) {
+        if (step.kind != ldml::TransformStep::Kind::Transform) return Probe::Opaque;
+        const ldml::TransformEntry * const e = registry.lookup(step.transform.getText());
+        if (e == nullptr) return Probe::Opaque;
+        const UCD::UnicodeSet scope = step.filter ? base & step.filterSet : base;
+        if (e->isBuiltIn()) {
+            if (e->canonicalName == "Any-Null") return Probe::Transparent;
+            if (!normalization(e->canonicalName)) return Probe::Opaque;
+            return ((s1 - scope).empty() && canonicallyClosed(scope)) ? Probe::Found : Probe::Opaque;
+        }
+        if (!seen.insert(e->canonicalName).second) return Probe::Opaque;
+        const TransformAnalysis & a = analyzer.analyze(e);
+        if (!a.implementable || (ApplyShapeGroups && shapeChoice(registry, analyzer, e).any())) return Probe::Opaque;
+        const UCD::UnicodeSet inner = a.plan.filter ? scope & a.plan.filterSet : scope;
+        for (const ldml::TransformStep & s : a.plan.steps) {
+            const Probe p = probe(s, inner, s1, registry, analyzer, seen);
+            if (p != Probe::Transparent) return p;
+        }
+        return Probe::Transparent;
+    }
+    //  Whether the built-in name, about to be applied by the step being applied
+    //  directly, may be omitted.
+    bool omit(const std::string & name, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer) const {
+        if (!NormalizationPeephole || frames.empty() || (name != "Any-NFD" && name != "Any-NFC")) return false;
+        const Frame & top = frames.back();
+        if (top.builtIn == nullptr) return false;
+        const ldml::TransformEntry * const e = registry.lookup(top.builtIn->transform.getText());
+        if (e == nullptr || e->canonicalName != name) return false;
+        std::set<std::string> seen;
+        for (size_t k = frames.size(); k-- > 0; ) {
+            const Frame & f = frames[k];
+            for (size_t i = f.next; i < f.steps->size(); i++) {
+                switch (probe((*f.steps)[i], f.scope, top.stepScope, registry, analyzer, seen)) {
+                    case Probe::Found:
+                        if (ShowNormalizationPeephole) llvm::errs() << "xlit: " << name << " omitted (normalized again by a later step)\n";
+                        return true;
+                    case Probe::Opaque: return false;
+                    case Probe::Transparent: break;
+                }
+            }
+        }
+        return false;
+    }
+};
+
 class RulePipelineBuilder {
 public:
-    RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P) {}
+    RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                        std::shared_ptr<NormalizationFrames> frames = nullptr)
+    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P),
+      mFrames(frames ? std::move(frames) : std::make_shared<NormalizationFrames>()) {}
+    //  The plans being applied (see NormalizationFrames).
+    std::shared_ptr<NormalizationFrames> mFrames;
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
     StreamSet * applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21);
@@ -9334,6 +9469,7 @@ Staged RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::ve
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null" || (mOmitICUBuiltIns && isICUBuiltIn(name))) return U21;
+    if (mFrames->omit(name, mRegistry, mAnalyzer)) return U21;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
         return activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
     }
@@ -12716,6 +12852,8 @@ public:
                         std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
     : mMasks(P), mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
+    //  The plans being applied, shared with the builder of Unicode mode (see NormalizationFrames).
+    std::shared_ptr<NormalizationFrames> mFrames = std::make_shared<NormalizationFrames>();
     //  The lines as regions, as in Unicode mode (see RulePipelineBuilder::pushRegions).
     void pushRegions(StreamSet * Basis) {
         assert (mMasks.empty());
@@ -12750,7 +12888,7 @@ private:
     void utf8Masks(std::vector<TransformMask> && masks, StreamSet * Basis);
     RulePipelineBuilder & unicode() {
         if (!mUnicode) {
-            mUnicode = std::make_unique<RulePipelineBuilder>(mP, mRegistry, mAnalyzer);
+            mUnicode = std::make_unique<RulePipelineBuilder>(mP, mRegistry, mAnalyzer, mFrames);
             if (mBounded) mUnicode->boundRegions();
         }
         return *mUnicode;
@@ -13046,15 +13184,19 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
         mMasks.insertAnywhere();
     }
     size_t group = 0;
+    mFrames->enter(a);
     for (size_t i = 0; i < a.plan.steps.size(); ) {
         const ldml::TransformStep & step = a.plan.steps[i];
         if (MixedModes && !utf8Step(step)) {
             const size_t j = segmentEnd(a, i);
+            mFrames->begin(i, j, mRegistry);
             Basis = unicodeSegment(name + "U" + std::to_string(++mSegments), a, i, j, Basis);
+            mFrames->end();
             checkMasks(name + ": after the Unicode segment of steps " + std::to_string(i + 1) + "-" + std::to_string(j), Basis);
             i = j;
             continue;
         }
+        mFrames->begin(i, i + 1, mRegistry);
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, Basis);
             mInvokedWithFilter = step.filter != nullptr;
@@ -13065,9 +13207,11 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
             mGroupLabel = name + "G" + std::to_string(++group);
             Basis = conversionGroup(step, Basis, outermost);
         }
+        mFrames->end();
         checkMasks(name + ": after step " + std::to_string(i + 1), Basis);
         i++;
     }
+    mFrames->exit();
     if (a.plan.filter) popFilter();
     mDepth--;
     return Basis;
@@ -13138,6 +13282,7 @@ static bool utf8BuiltIn(const std::string & name) {
 
 StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
     if (name == "Any-Null") return Basis;
+    if (mFrames->omit(name, mRegistry, mAnalyzer)) return Basis;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
         return mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
     }
@@ -14110,7 +14255,10 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     size_t segment = 0;
     size_t group = 0;
     std::vector<bool> applied(choice ? choice->useShapes.size() : 0, false);
+    mFrames->enter(a);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        const size_t i = static_cast<size_t>(&step - a.plan.steps.data());
+        mFrames->begin(i, i + 1, mRegistry);
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             segment++;
         } else if (choice && choice->useShapes[segment]) {
@@ -14157,7 +14305,9 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (step.frontLettersEnd) U21 = frontLettersEnd(step, U21);
             if (outermost && groupRules(step) > 0) mGroupCounts.push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         }
+        mFrames->end();
     }
+    mFrames->exit();
     if (a.plan.filter) popFilter();
     mShapeChoice = choice;
     mDeletedRunEnds = deletedRunEnds;

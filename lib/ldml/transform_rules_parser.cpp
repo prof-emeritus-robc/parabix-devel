@@ -232,8 +232,9 @@ bool isSetOperand(const RE * re) {
 class RuleTextParser {
 public:
     RuleTextParser(const std::u32string & text, std::map<std::string, Name *> & variables,
-                   std::set<std::string> * failedVariables = nullptr)
-    : mText(text), mPos(0), mVariables(variables), mFailedVariables(failedVariables) {}
+                   std::set<std::string> * failedVariables = nullptr,
+                   std::map<std::string, char32_t> * charVariables = nullptr)
+    : mText(text), mPos(0), mVariables(variables), mFailedVariables(failedVariables), mCharVariables(charVariables) {}
 
     // Parse the next rule, or return nullptr at the end of the text.
     Rule * parseRule();
@@ -338,6 +339,32 @@ private:
     size_t mPos;
     std::map<std::string, Name *> & mVariables;
     std::set<std::string> * const mFailedVariables;
+    // The variables defined as a single character (TransformRuleParser::mCharVariables).
+    std::map<std::string, char32_t> * const mCharVariables;
+    // The character of the item last parsed by parseSequence, if it is a single
+    // character (a literal, an escape, a quoted string or a variable of one
+    // character, not quantified), or NONE.
+    char32_t mLastItemChar = NONE;
+
+    // The character of a variable defined as a single character, or NONE.
+    char32_t charVariable(const RE * re) const {
+        const Name * n = dyn_cast<Name>(re);
+        if (n == nullptr || mCharVariables == nullptr) return NONE;
+        const auto f = mCharVariables->find(n->getName());
+        return f == mCharVariables->end() ? NONE : f->second;
+    }
+    // At "$name" within a UnicodeSet: if the variable is defined as a single
+    // character, skip the reference and return the character; otherwise NONE.
+    char32_t acceptCharVariable() {
+        skipSetWhiteSpace();
+        if (mCharVariables == nullptr || !at('$') || !isIdStart(peek())) return NONE;
+        const size_t start = mPos;
+        mPos++;
+        const auto f = mCharVariables->find(parseVariableName());
+        if (f != mCharVariables->end()) return f->second;
+        mPos = start;
+        return NONE;
+    }
 
     // State for the conversion rule side being parsed.
     std::vector<Capture *> mCaptures;
@@ -498,7 +525,9 @@ Rule * RuleTextParser::parseVariableDefinition(const std::string & name) {
     }
     Name * variable = makeName(name, makeSeq(items.begin(), items.end()));
     mVariables.emplace(name, variable);
-    return VariableDefinitionRule::Create(variable);
+    const bool character = items.size() == 1 && mLastItemChar != NONE;
+    if (mCharVariables && character) mCharVariables->emplace(name, mLastItemChar);
+    return VariableDefinitionRule::Create(variable, items.size() == 1 && !character && isSetOperand(items[0]));
 }
 
 Direction RuleTextParser::parseOperator() {
@@ -671,6 +700,7 @@ void RuleTextParser::parseSequence(std::vector<RE *> & items, const SeqMode mode
             const int ub = (c == '?') ? 1 : Rep::UNBOUNDED_REP;
             // Quantifiers may be stacked, as in x*?
             items[quantifiable] = makeRep(items[quantifiable], lb, ub);
+            mLastItemChar = NONE;
             continue;
         }
         if (c == ';' || c == '{' || c == '}' || c == '|' || c == '@' || c == '=' || c == '<' || c == '>' || c == ')' || isArrow(c)) {
@@ -681,10 +711,12 @@ void RuleTextParser::parseSequence(std::vector<RE *> & items, const SeqMode mode
         }
         RE * item = nullptr;
         bool canQuantify = true;
+        char32_t itemChar = NONE;
         if (c == '\'' || c == '"') {
             std::u32string s;
             parseQuotedString(s);
             if (s.empty()) continue;
+            if (s.size() == 1) itemChar = s[0];
             std::vector<RE *> chars;
             for (const char32_t q : s) chars.push_back(makeCC(q));
             item = (chars.size() == 1) ? chars[0] : makeSeq(chars.begin(), chars.end());
@@ -696,6 +728,7 @@ void RuleTextParser::parseSequence(std::vector<RE *> & items, const SeqMode mode
             const std::u32string chars = parseEscape();
             for (size_t i = 0; i + 1 < chars.size(); i++) items.push_back(makeCC(chars[i]));
             item = makeCC(chars.back());
+            itemChar = chars.back();
         } else if (c == '.') {
             mPos++;
             item = makeDotSet();
@@ -703,6 +736,7 @@ void RuleTextParser::parseSequence(std::vector<RE *> & items, const SeqMode mode
             if (isIdStart(peek())) {
                 mPos++;
                 item = parseVariableReference();
+                itemChar = charVariable(item);
             } else if (peek() >= '1' && peek() <= '9') {
                 if (mode == SeqMode::Variable) ParseFailure("Segment references are not allowed in variable definitions");
                 mPos++;
@@ -727,12 +761,14 @@ void RuleTextParser::parseSequence(std::vector<RE *> & items, const SeqMode mode
         } else if (isLiteralChar(c)) {
             mPos++;
             item = makeCC(c);
+            itemChar = c;
         } else {
             std::string msg = "Unquoted syntax character '";
             appendUTF8(msg, c);
             ParseFailure(msg + "'");
         }
         items.push_back(item);
+        mLastItemChar = itemChar;
         quantifiable = canQuantify ? static_cast<int>(items.size()) - 1 : -1;
     }
 }
@@ -958,6 +994,16 @@ RE * RuleTextParser::parseBracketSet() {
         if (op == SetOp::None && (at('-') || at('&')) && (!members.empty() || boundary)) {
             const bool difference = at('-');
             mPos++;
+            if (difference && lastChar != NONE) {
+                // A range to a variable of one character ([a-$v], [$u-$v]).
+                const char32_t hi = acceptCharVariable();
+                if (hi != NONE) {
+                    if (hi < lastChar) ParseFailure("Invalid range: end precedes start");
+                    members.back() = makeCC(lastChar, hi);
+                    lastChar = NONE;
+                    continue;
+                }
+            }
             if (atOperand()) {
                 op = difference ? SetOp::Difference : SetOp::Intersection;
                 lastChar = NONE;
@@ -987,8 +1033,15 @@ RE * RuleTextParser::parseBracketSet() {
         } else if (at('$') && isIdStart(peek())) {
             mPos++;
             item = parseVariableReference();
-            isSet = isSetOperand(item);
-            if (!isSet) ParseFailure("Variables in a UnicodeSet must be sets");
+            // A variable of one character is that character (it may begin a
+            // range, [$u-z], [$u-$v]), except as an operand of - or &.
+            const char32_t ch = (op == SetOp::None) ? charVariable(item) : NONE;
+            if (ch != NONE) {
+                single = ch;
+            } else {
+                isSet = isSetOperand(item);
+                if (!isSet) ParseFailure("Variables in a UnicodeSet must be sets");
+            }
         } else if (accept('$')) {
             if (op != SetOp::None) ParseFailure("Expected a set operand");
             boundary = true;
@@ -1085,7 +1138,7 @@ TransformRuleParseErrors::TransformRuleParseErrors(std::vector<TransformRulePars
 
 std::vector<Rule *> TransformRuleParser::parse(const std::string & rules) {
     const std::u32string text = decodeUTF8(rules);
-    RuleTextParser parser(text, mVariables, &mFailedVariables);
+    RuleTextParser parser(text, mVariables, &mFailedVariables, &mCharVariables);
     std::vector<Rule *> parsed;
     std::vector<TransformRuleParseError> errors;
     for (;;) {
@@ -1106,7 +1159,7 @@ std::vector<Rule *> TransformRuleParser::parse(const std::string & rules) {
 
 RE * TransformRuleParser::parseUnicodeSet(const std::string & set) {
     const std::u32string text = decodeUTF8(set);
-    RuleTextParser parser(text, mVariables);
+    RuleTextParser parser(text, mVariables, nullptr, &mCharVariables);
     return parser.parseCompleteSet();
 }
 

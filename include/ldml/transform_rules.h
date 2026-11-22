@@ -218,14 +218,21 @@ public:
     re::Name * getVariable() const {return mVariable;}
     std::string getName() const;
     re::RE * getDefinition() const;
-    static VariableDefinitionRule * Create(re::Name * variable) {
-        return new VariableDefinitionRule(variable);
+    //  Whether the definition is written as a UnicodeSet ($v = [b] ;), not as
+    //  text ($v = b ;).  The two differ within a UnicodeSet when the value is a
+    //  single character: there, as in ICU, a variable defined as a character is
+    //  that character, so [$u-$v] is a range of two such variables, and a
+    //  difference of two sets.
+    bool isSet() const {return mIsSet;}
+    static VariableDefinitionRule * Create(re::Name * variable, bool isSet = false) {
+        return new VariableDefinitionRule(variable, isSet);
     }
     LDML_RULE_SUBTYPE(VariableDefinition)
 private:
-    VariableDefinitionRule(re::Name * variable)
-    : Rule(ClassTypeId::VariableDefinition), mVariable(variable) {}
+    VariableDefinitionRule(re::Name * variable, bool isSet)
+    : Rule(ClassTypeId::VariableDefinition), mVariable(variable), mIsSet(isSet) {}
     re::Name * const mVariable;
+    const bool mIsSet;
 };
 
 VariableDefinitionRule * makeVariableDefinitionRule(const std::string & name, re::RE * definition);

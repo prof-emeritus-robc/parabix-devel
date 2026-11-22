@@ -231,6 +231,14 @@ static const TestCase testCases[] = {
     // (Within a text, the text boundary of a negated set is dropped.)
     {"\\p{Script=Greek} → x ; [:^gc=Lu:] → y ;", "[:script=Greek:] → x ;\n[^[:gc=Lu:]$] → y ;\n"},
     {"$v = [aeiou] ; [$v y] → V ;", "$v = [aeiou] ;\n[$v y] → V ;\n"},
+    // A variable of one character is a character in a set, as in ICU: [$u-$v]
+    // is a range (Latin-InterIndic's [$ka-$ha]), not a difference.
+    {"$u = b ; $v = \\u0064 ; [$u-$v] → x ;", "$u = b ;\n$v = d ;\n[b-d] → x ;\n"},
+    {"$u = b ; [a-$u] → x ;", "$u = b ;\n[ab] → x ;\n"},
+    {"$u = b ; [$u-d] → x ;", "$u = b ;\n[b-d] → x ;\n"},
+    {"$u = [b] ; $v = [d] ; [$u-$v] → x ;", "$u = [b] ;\n$v = [d] ;\n[$u-$v] → x ;\n"},
+    {"$u = b ; [^$u] → x ; [$u c] → y ;", "$u = b ;\n[^$u$] → x ;\n[$u c] → y ;\n"},
+    {"$u = d ; $v = b ; [$u-$v] → x ;", nullptr},
     {"[a\\-z] → x ;", "[\\-az] → x ;\n"},
     {"$mac = M [aA] [cC] ;", "$mac = M [Aa] [Cc] ;\n"},
     {"$space = [:Separator:]* ; high $space school → 'H.S.' ;",

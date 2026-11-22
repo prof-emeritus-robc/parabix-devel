@@ -89,6 +89,10 @@ private:
     std::map<std::string, re::Name *> mVariables;
     // Variables whose definitions have errors (their uses are reported as such).
     std::set<std::string> mFailedVariables;
+    // Variables defined as a single character (not a set): within a UnicodeSet
+    // such a variable is that character, as in ICU, which substitutes the
+    // variable's text, so [$a-$b] is a range.
+    std::map<std::string, char32_t> mCharVariables;
     std::vector<Rule *> mRules;
 };
 

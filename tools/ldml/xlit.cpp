@@ -3156,6 +3156,62 @@ static bool convertedBeforeContext(const ldml::TransformStep & step, re::RE * en
     return !fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step));
 }
 
+//  The DivCode plan of a conversion group (ldml::planDivCodeGroup), with the
+//  before contexts of convertedBeforeContext, cached.  A run plans the same
+//  group several times (for its mode, in utf8StepProblem, for its pipeline,
+//  and in the trial pipelines of shapeChoice), and planning a large group
+//  takes seconds (the overlaps of its string rules above all), often of copies
+//  of the step (as in the shape choice's segments).  The key is the options,
+//  and a fingerprint of what the planning reads of the step: its kind and
+//  flags, the sizes of its rule lists, the addresses of its rules and contexts
+//  (rules and regular expressions are never freed, so their addresses
+//  identify them, and the mappings and replacements of a group follow from
+//  its rules), and the sizes of its sets.  A step changed after it was planned
+//  (its priorities, set after planning) differs in its fingerprint, and is
+//  planned again.
+static const ldml::DivCodePlan & cachedDivCodePlan(const ldml::TransformStep & step, const ldml::DivCodeOptions & options) {
+    std::vector<uintptr_t> key;
+    auto add = [&key](uintptr_t v) {key.push_back(v);};
+    auto ptr = [&key](const void * p) {key.push_back(reinterpret_cast<uintptr_t>(p));};
+    auto set = [&key](const UCD::UnicodeSet & s) {key.push_back(s.count()); key.push_back(s.size());};
+    add(options.shift); add(options.maxSetBlocks); add(options.maxCodeBits); add(options.utf8);
+    add(options.maxStages); add(options.convertedContexts);
+    //  (The two clients pass convertedBeforeContext.)
+    add(static_cast<bool>(options.convertedBefore));
+    add(static_cast<uintptr_t>(step.kind));
+    add(step.captureReplacements.size()); add(step.insertions.size()); add(step.deferred.size());
+    add(step.prefixRuns.size()); add(step.chainRevisitRules.size()); add(step.markRunEditRules.size());
+    add(step.hasFrontLetters); add(step.frontLettersEnd);
+    add(step.rules.size());
+    for (const ldml::ConversionRule * r : step.rules) ptr(r);
+    add(step.stringRules.size());
+    for (const ldml::StringRule & s : step.stringRules) {
+        ptr(s.rule); ptr(s.before); ptr(s.after); ptr(s.engineBefore); ptr(s.engineAfter);
+        add(s.text.size());
+        for (const UCD::UnicodeSet & t : s.text) set(t);
+        add(s.replacement.size()); add(s.selfOverlapping); add(s.kept);
+        set(s.run); set(s.runSingles); add(s.runStrings.size());
+    }
+    add(step.subgroups.size());
+    for (const ldml::CharMapSubgroup & g : step.subgroups) {
+        ptr(g.before); ptr(g.after); ptr(g.engineBefore); ptr(g.engineAfter);
+        add(g.mappings.size()); add(g.rules); set(g.kept); set(g.all);
+        add(g.sourceRules.size());
+        for (const ldml::ConversionRule * r : g.sourceRules) ptr(r);
+    }
+    for (const auto * priorities : {&step.stringPriority, &step.subgroupPriority}) {
+        add(priorities->size());
+        for (const auto & p : *priorities) {
+            add(p.size());
+            for (const ldml::ConversionRule * r : p) ptr(r);
+        }
+    }
+    static std::map<std::vector<uintptr_t>, ldml::DivCodePlan> plans;
+    auto f = plans.find(key);
+    if (f == plans.end()) f = plans.emplace(std::move(key), ldml::planDivCodeGroup(step, options)).first;
+    return f->second;
+}
+
 //  Whether the DivCode kernels apply a plan (an eligible one).
 static bool divCodeApplies(const ldml::DivCodePlan & plan) {
     return plan.eligible();
@@ -10543,7 +10599,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
         options.convertedContexts = ConvertedContextRounds > 0;
-        const ldml::DivCodePlan plan = ldml::planDivCodeGroup(step, options);
+        const ldml::DivCodePlan & plan = cachedDivCodePlan(step, options);
         if (divCodeApplies(plan)) return divCodeGroup(plan, U21);
     }
     if (insertionsOnly(step)) return insertionGroup(step, U21);
@@ -12532,7 +12588,7 @@ static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
     options.convertedBefore = convertedBeforeContext;
     options.convertedContexts = ConvertedContextRounds > 0;
     options.utf8 = true;
-    return ldml::planDivCodeGroup(step, options);
+    return cachedDivCodePlan(step, options);
 }
 static Staged DivCodeGroupPipeline(PipelineBuilder & P, const ldml::DivCodePlan & plan, const std::string & label,
                                    StreamSet * Basis, TransformMasks & Masks,

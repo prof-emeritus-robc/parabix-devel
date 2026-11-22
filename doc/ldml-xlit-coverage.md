@@ -2316,7 +2316,7 @@ python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
   python3 tools/ldml/xlit_perf_survey.py --xlit build/bin/xlit --out tools/ldml/xlit-coverage/perf corpora
   python3 tools/ldml/xlit_perf_survey.py --xlit build/bin/xlit --out tools/ldml/xlit-coverage/perf run
   python3 tools/ldml/xlit_perf_survey.py --out tools/ldml/xlit-coverage/perf report \
-      --table-doc doc/ldml-xlit-coverage-table.md
+      --table-doc doc/ldml-xlit-coverage-table.md --csv doc/ldml-xlit-coverage-perf.csv
   ```
 
   Run nothing else meanwhile: the timings use the four performance cores.

@@ -21,9 +21,10 @@
 #               the warm time.
 #      Results are appended to <dir>/results.jsonl as they are computed; a run
 #      interrupted resumes from there (transforms already in it are skipped).
-#  xlit_perf_survey.py --out <dir> report [--table-doc PATH]
+#  xlit_perf_survey.py --out <dir> report [--table-doc PATH] [--csv PATH]
 #      Prints the summary, and with --table-doc writes the per-transform table
-#      between <!-- perf:table --> and <!-- /perf:table --> of PATH.
+#      between <!-- perf:table --> and <!-- /perf:table --> of PATH, and with
+#      --csv PATH the same table as CSV (times unrounded to the millisecond).
 #
 #  Run one at a time, with nothing else running: the timings use the four
 #  performance cores.
@@ -474,7 +475,45 @@ def report(args):
         doc = doc[:m.start()] + block + doc[m.end():] if m else doc.rstrip('\n') + '\n\n' + block + '\n'
         with open(args.table_doc, 'w', encoding='utf-8') as f:
             f.write(doc)
+    if args.csv:
+        write_csv(args, rows)
     summary(rows)
+
+
+#  The table of --table-doc as CSV, with the times in seconds unrounded to the
+#  millisecond and the MB/s computed for every run; the note of each mode says
+#  where a run did not finish, failed, or is within the noise of the measurement.
+def write_csv(args, rows):
+    import csv
+    head = ['transform', 'builtin', 'internal', 'status', 'icu_steps', 'utf8_mode', 'plan_mode', 'lines_scope',
+            'input', 'kernels']
+    for suffix in ('', '_lines'):
+        head += [k + suffix for k in ('cold_s', 'warm_s', 'run_s', 'mb_per_s', 'note')]
+    with open(args.csv, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(head)
+        for r in sorted(rows, key=lambda r: (r['builtin'], r['name'].lower())):
+            row = [r['name'], int(r['builtin']), int(r['internal']), 'ok' if r['plan_rc'] == 0 else 'blocked',
+                   int(bool(r.get('icu'))), utf8_label(r.get('mode'), r) if r['plan_rc'] == 0 else '',
+                   r.get('mode') or '', (r.get('scope_lines') or '') if r['plan_rc'] == 0 else '',
+                   re.sub(r'CLDR test sources of (\S+) \((\d+) distinct\)', r'CLDR tests of \1 (\2 words)', r['input']),
+                   '' if r.get('kernels') is None else r['kernels']]
+            for mode in ('std', 'lines'):
+                m = r.get(mode, {})
+                run = m.get('run')
+                note = ''
+                if 'error' in m and m.get('full') is None:
+                    if 'timeout' in m['error'] and m.get('warm') is not None:
+                        note = 'run longer than %d s' % args.run_timeout
+                    elif 'warm' not in m:
+                        note = 'compilation failed: ' + m['error']
+                    else:
+                        note = 'run failed: ' + m['error']
+                elif run is not None and run < 0.02:
+                    note = 'run within measurement noise'
+                t = lambda k: '' if m.get(k) is None else '%.3f' % m[k]
+                row += [t('cold'), t('warm'), t('run'), ('%.1f' % (SIZE / 1e6 / run)) if run else '', note]
+            w.writerow(row)
 
 
 def median(xs):
@@ -507,6 +546,7 @@ def main():
     ap.add_argument('--run-timeout', type=int, default=300, help='for the 20 MB runs (s)')
     ap.add_argument('--only', nargs='+')
     ap.add_argument('--table-doc')
+    ap.add_argument('--csv', help='report: write the per-transform table as CSV')
     ap.add_argument('command', choices=['corpora', 'run', 'report'])
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)

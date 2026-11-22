@@ -510,7 +510,8 @@ static StreamSet * applyNFC(PipelineBuilder & P, StreamSet * U21_focus) {
 // applyNFKC — compatibility decomposition + canonical composition.
 // Unicode defines NFKC(x) = NFC(NFKD(x))
 static StreamSet * applyNFKC(PipelineBuilder & P, StreamSet * U21_focus) {
-    return applyNFC(P, applyNFKD(P, U21_focus));
+    // (The NFKD is in NFKD: NFC skips the decomposition and ordering stages.)
+    return NFC_U21(P, applyNFKD(P, U21_focus), nullptr, nullptr, true, NormalizationInput::InputIsNFKD);
 }
 
 // applyOneNormalization — dispatch a single mode in U21 space.

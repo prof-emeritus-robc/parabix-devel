@@ -451,11 +451,9 @@ static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * 
         case Transform::NFC:
             OutputBytes = NFC_Bytes(P, ByteStream, BasisBits);
             break;
-        case Transform::NFKC: {
-            StreamSet * const NFKD_Bytes_ = NFKD_Bytes(P, NFD_builder, ByteStream, BasisBits);
-            OutputBytes = NFC_Bytes(P, NFKD_Bytes_, BasisOf(P, NFKD_Bytes_));
+        case Transform::NFKC:
+            OutputBytes = NFKC_Bytes(P, NFD_builder, NormalizationFocusOptions(), ByteStream, BasisBits);
             break;
-        }
         case Transform::Lower:
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::lc, BasisBits));
             break;
@@ -9207,7 +9205,7 @@ private:
     Staged barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask);
     Staged fcc(StreamSet * U21, StreamSet * mask = nullptr);
     Staged fcd(StreamSet * U21);
-    Staged maskedNFC(StreamSet * U21, StreamSet * selected);
+    Staged maskedNFC(StreamSet * U21, StreamSet * selected, NormalizationInput input = NormalizationInput::Any);
     Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -9537,10 +9535,15 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
     if (name == "Any-NFD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFD, U21, nullptr, nullptr, focus);
     if (name == "Any-NFKD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
     if (name == "Any-FCC") return fcc(U21).text;
-    if (name == "Any-NFKC") U21 = mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
-    if (U21NFC) return NFC_U21(P, U21);
+    //  (NFKC: the NFC of the NFKD, which is in NFKD.)
+    NormalizationInput input = NormalizationInput::Any;
+    if (name == "Any-NFKC") {
+        U21 = mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
+        input = NormalizationInput::InputIsNFKD;
+    }
+    if (U21NFC) return NFC_U21(P, U21, nullptr, nullptr, true, input);
     StreamSet * const basis = UTF8_Of(P, U21);
-    StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
+    StreamSet * const composed = NFC_FocusedTransform(NormalizationFocusOptions(), input).build(P, BytesOf(P, basis), basis);
     return U21_Of(P, BasisOf(P, composed));
 }
 
@@ -9572,7 +9575,7 @@ Staged RulePipelineBuilder::maskedNormalization(const std::string & name, Stream
         if (name != "Any-NFKC") return Staged(Result, std::move(positions));
         //  NFKC: the masked NFC of the masked NFKD, with the selection in step.
         if (U21NFC) {
-            Staged composed = maskedNFC(Result, mMasks.mapped(selected, positions));
+            Staged composed = maskedNFC(Result, mMasks.mapped(selected, positions), NormalizationInput::InputIsNFKD);
             positions.append(composed.positions);
             return Staged(composed.text, std::move(positions));
         }
@@ -9588,9 +9591,9 @@ Staged RulePipelineBuilder::maskedNormalization(const std::string & name, Stream
 //  NFC within the selected characters (each run by itself, see NFC_U21): as a
 //  position map, the selected characters deleted and the composed ones
 //  (OutMask) inserted between the others, within the masks (as barrierNormalization).
-Staged RulePipelineBuilder::maskedNFC(StreamSet * U21, StreamSet * selected) {
+Staged RulePipelineBuilder::maskedNFC(StreamSet * U21, StreamSet * selected, NormalizationInput input) {
     StreamSet * const OutMask = mP.CreateStreamSet(1);
-    StreamSet * const Result = NFC_U21(mP, U21, selected, OutMask);
+    StreamSet * const Result = NFC_U21(mP, U21, selected, OutMask, true, input);
     if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
     PositionMap positions;
     positions.remove(mMasks.complement(selected));
@@ -13298,10 +13301,7 @@ StreamSet * UTF8PipelineBuilder::normalization(const std::string & name, StreamS
     StreamSet * bytes = BytesOf(P, Basis);
     if (name == "Any-NFD") return BasisOf(P, NFD_Bytes(P, NFD_builder, bytes, Basis));
     if (name == "Any-NFKD") return BasisOf(P, NFKD_Bytes(P, NFD_builder, bytes, Basis));
-    if (name == "Any-NFKC") {
-        bytes = NFKD_Bytes(P, NFD_builder, bytes, Basis);
-        Basis = BasisOf(P, bytes);
-    }
+    if (name == "Any-NFKC") return BasisOf(P, NFKC_Bytes(P, NFD_builder, NormalizationFocusOptions(), bytes, Basis));
     return BasisOf(P, NFC_Bytes(P, bytes, Basis));
 }
 
@@ -13435,7 +13435,8 @@ Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, Stream
             mask = OutMask;
         }
         StreamSet * const OutMask = P.CreateStreamSet(1);
-        bytes = NFC_Masked(P, NormalizationFocusOptions(), bytes, Basis, mask, OutMask);
+        bytes = NFC_Masked(P, NormalizationFocusOptions(), bytes, Basis, mask, OutMask,
+                           name == "Any-NFKC" ? NormalizationInput::InputIsNFKD : NormalizationInput::Any);
         PositionMap composed;
         composed.remove(mMasks.complement(mask));
         composed.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);

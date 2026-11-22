@@ -43,6 +43,16 @@ using codepoint_t = UCD::codepoint_t;
 
 namespace {
 
+//  The kernel name suffix of an input mode.
+std::string modeSuffix(NormalizationInput mode) {
+    switch (mode) {
+        case NormalizationInput::Any: return "";
+        case NormalizationInput::InputIsNFD: return "+inNFD";
+        case NormalizationInput::InputIsNFKD: return "+inNFKD";
+    }
+    return "";
+}
+
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 
@@ -247,10 +257,11 @@ PabloAST * u8Span(BixNumCompiler & bnc, PabloBuilder & pb, const std::vector<Pab
 //  The insertion amounts of the NFC working space (NFC_Initial_Insertion).
 class NFC_InsertionKernel final : public PabloKernel {
 public:
-    NFC_InsertionKernel(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask)
-    : PabloKernel(ts, "NFC_Insertion" + Basis->shapeString() + (WorkMask ? "+wkmsk" : "") + nameSuffix(),
+    NFC_InsertionKernel(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask,
+                        NormalizationInput mode)
+    : PabloKernel(ts, "NFC_Insertion" + Basis->shapeString() + (WorkMask ? "+wkmsk" : "") + modeSuffix(mode) + nameSuffix(),
                   {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}}, {Binding{"InsertionBixNum", InsertionBixNum}}),
-      mHasWorkMask(WorkMask != nullptr), mBits(InsertionBixNum->getNumElements()) {
+      mHasWorkMask(WorkMask != nullptr), mBits(InsertionBixNum->getNumElements()), mMode(mode) {
         addAttribute(kernel::LocalCarries());
         if (WorkMask) mInputStreamSets.push_back(Binding{"WorkMask", WorkMask});
     }
@@ -258,7 +269,10 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         std::vector<UnicodeSet> bitSets;
+        //  (Only for the characters that may occur in the input.)
+        const UnicodeSet possible = NormalizationInputSet(mMode);
         for (const auto & e : tables().max_insert_map) {
+            if (!possible.contains(e.first)) continue;
             for (unsigned i = 0; (1u << i) <= e.second; i++) {
                 if (e.second & (1u << i)) {
                     if (bitSets.size() <= i) bitSets.resize(i + 1);
@@ -281,6 +295,7 @@ protected:
 private:
     const bool mHasWorkMask;
     const unsigned mBits;
+    const NormalizationInput mMode;
 };
 
 //  A character-to-string stage (the singletons, the excluded composites): each
@@ -727,17 +742,21 @@ protected:
 //  The candidates of NFC, and the characters that need expansion (NFC_CandidateClass).
 class CandidateClassKernel final : public PabloKernel {
 public:
-    CandidateClassKernel(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * candidates)
-    : PabloKernel(ts, "NFC_CandidateClass" + Basis->shapeString() + nameSuffix(),
-                  {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}}, {Binding{"candidates", candidates}}) {}
+    CandidateClassKernel(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * candidates, NormalizationInput mode)
+    : PabloKernel(ts, "NFC_CandidateClass" + Basis->shapeString() + modeSuffix(mode) + nameSuffix(),
+                  {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}}, {Binding{"candidates", candidates}}), mMode(mode) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         UTF::UTF_Compiler compiler(getInputStreamVar("Basis"), pb, BitMovementMode::LookAhead);
         std::vector<Var *> targets = {pb.createVar("candidates", pb.createZeroes()), pb.createVar("expandfirst", pb.createZeroes())};
-        compiler.compile(targets, {tables().candidate_class, tables().expansion_required_class});
+        //  (No character of an NFD input needs expansion.)
+        const UnicodeSet expansion = mMode == NormalizationInput::Any ? tables().expansion_required_class : UnicodeSet();
+        compiler.compile(targets, {tables().candidate_class, expansion});
         writeOutputStreamSet("candidates", targets);
     }
+private:
+    const NormalizationInput mMode;
 };
 
 //  ---- NFC on the 21-bit basis (doc/masked-nfc-plan.md, A U21 mode of NFC) ----
@@ -1081,8 +1100,11 @@ protected:
 
 //  The insertion amounts of the working space (see u21Insertions), at the
 //  characters of restriction (if any), or nullptr if none are needed.
-StreamSet * u21InsertionBixNum(PipelineBuilder & P, StreamSet * U21, StreamSet * restriction) {
-    const std::map<codepoint_t, unsigned> ins = u21Insertions();
+StreamSet * u21InsertionBixNum(PipelineBuilder & P, StreamSet * U21, StreamSet * restriction, NormalizationInput mode) {
+    std::map<codepoint_t, unsigned> ins = u21Insertions();
+    //  (Only for the characters that may occur in the input.)
+    const UnicodeSet possible = NormalizationInputSet(mode);
+    for (auto i = ins.begin(); i != ins.end(); ) i = possible.contains(i->first) ? std::next(i) : ins.erase(i);
     unsigned maxIns = 0;
     for (const auto & e : ins) maxIns = std::max(maxIns, e.second);
     unsigned bits = 0;
@@ -1105,8 +1127,16 @@ StreamSet * u21InsertionBixNum(PipelineBuilder & P, StreamSet * U21, StreamSet *
 
 }
 
-void NFC_InitialInsertion(PipelineBuilder & P, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask) {
-    P.CreateKernelCall<NFC_InsertionKernel>(Basis, InsertionBixNum, WorkMask);
+UnicodeSet NormalizationInputSet(NormalizationInput mode) {
+    if (mode == NormalizationInput::Any) return UnicodeSet(0, 0x10FFFF);
+    const UCD::property_t qc = mode == NormalizationInput::InputIsNFD ? UCD::NFD_QC : UCD::NFKD_QC;
+    //  (Y is the first value of NFD_QC and of NFKD_QC.)
+    return cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(qc))->GetCodepointSet(UCD::NFD_QC_ns::Y);
+}
+
+void NFC_InitialInsertion(PipelineBuilder & P, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask,
+                          NormalizationInput mode) {
+    P.CreateKernelCall<NFC_InsertionKernel>(Basis, InsertionBixNum, WorkMask, mode);
 }
 
 void NFC_ExcludedComposites(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask) {
@@ -1161,20 +1191,24 @@ void NFC_LongComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * ccc
     }
 }
 
-void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates) {
-    P.CreateKernelCall<CandidateClassKernel>(Basis, Candidates);
+void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates, NormalizationInput mode) {
+    P.CreateKernelCall<CandidateClassKernel>(Basis, Candidates, mode);
 }
 
 //  NFC of a 21-bit basis in its working space: the result (compressed and
-//  sorted), and Valid, the positions of the working space that remain.
-static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask, StreamSet *& Valid) {
+//  sorted), and Valid, the positions of the working space that remain.  With an
+//  input in NFD (or NFKD), the decomposition stages and the canonical ordering
+//  are skipped (see NormalizationInput).
+static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask, StreamSet *& Valid,
+                                 NormalizationInput mode) {
     const NFC_Tables & T = tables();
+    const bool decomposed = mode != NormalizationInput::Any;
     //  The working space: room for the decompositions and the marks of overrides
     //  (within the mask).
     StreamSet * Working = U21;
     StreamSet * SpreadMask = nullptr;
     StreamSet * WorkingMask = Mask;
-    if (StreamSet * const InsertBixNum = u21InsertionBixNum(P, U21, Mask)) {
+    if (StreamSet * const InsertBixNum = u21InsertionBixNum(P, U21, Mask, mode)) {
         SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
         Working = P.CreateStreamSet(21, 1);
@@ -1188,8 +1222,11 @@ static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet
             OrCombine(P, spread, inserted, WorkingMask);
         }
     }
-    StreamSet * const EC = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<CharacterStage21>("NFC21_ExcludedComposites", T.excluded_composite_map, Working, EC, WorkingMask);
+    StreamSet * EC = Working;
+    if (!decomposed) {
+        EC = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<CharacterStage21>("NFC21_ExcludedComposites", T.excluded_composite_map, Working, EC, WorkingMask);
+    }
     //  The starters (not the positions inserted), and with a mask the positions
     //  outside it, which block the long compositions.
     auto * cccObj = cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
@@ -1207,8 +1244,11 @@ static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet
         blocking = P.CreateStreamSet(1);
         OrCombine(P, ccc_NR, outside, blocking);
     }
-    StreamSet * input = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<CharacterStage21>("NFC21_Singletons", singletonStrings(), EC, input, WorkingMask);
+    StreamSet * input = EC;
+    if (!decomposed) {
+        input = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<CharacterStage21>("NFC21_Singletons", singletonStrings(), EC, input, WorkingMask);
+    }
     for (unsigned pass = 0; pass < T.short_pass_count; pass++) {
         StreamSet * const output = P.CreateStreamSet(21, 1);
         if (static_cast<int>(pass) == T.self_composable_pass_no) {
@@ -1251,10 +1291,12 @@ static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet
     StreamSet * const Compressed = P.CreateStreamSet(21, 1);
     FilterByMask(P, Valid, Translated, Compressed);
     StreamSet * CompressedMask = nullptr;
-    if (WorkingMask) {
+    if (WorkingMask && (OutputMask || !decomposed)) {
         CompressedMask = OutputMask ? OutputMask : P.CreateStreamSet(1);
         FilterByMask(P, Valid, WorkingMask, CompressedMask);
     }
+    //  (From an NFD input, composition leaves the marks that remain in canonical order.)
+    if (decomposed) return Compressed;
     //  The canonical ordering (within the mask).
     StreamSet * const CCC_Basis = P.CreateStreamSet(cccObj->GetEnumerationBasisSets().size(), 1);
     P.CreateKernelCall<UnicodePropertyBasis>(cccObj, Compressed, CCC_Basis);
@@ -1276,11 +1318,14 @@ static StreamSet * U21_Transform(PipelineBuilder & P, StreamSet * U21, StreamSet
 //  compose across their seams), placed in the output as NFC_WorkPlacement
 //  places the UTF-8 work: the source expanded by the same insertions at the
 //  work, with the valid positions of the working space at the work.
-StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask, bool focus) {
+StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, StreamSet * OutputMask, bool focus,
+                    NormalizationInput mode) {
     StreamSet * Valid = nullptr;
-    if (!focus) return U21_Transform(P, U21, Mask, OutputMask, Valid);
+    if (!focus) return U21_Transform(P, U21, Mask, OutputMask, Valid, mode);
     StreamSet * const Candidates = P.CreateStreamSet(2);
-    std::vector<re::CC *> ccs{re::makeCC(tables().candidate_class, &cc::Unicode), re::makeCC(tables().expansion_required_class, &cc::Unicode)};
+    //  (No character of an NFD input needs expansion.)
+    const UnicodeSet expansion = mode == NormalizationInput::Any ? tables().expansion_required_class : UnicodeSet();
+    std::vector<re::CC *> ccs{re::makeCC(tables().candidate_class, &cc::Unicode), re::makeCC(expansion, &cc::Unicode)};
     if (Mask) {
         P.CreateKernelCall<CharClassesKernel>(ccs, U21, StreamMask{Mask, MaskKind::Zeroing}, Candidates);
     } else {
@@ -1297,7 +1342,7 @@ StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, Stre
         FilterByMask(P, Work, Mask, FocusedMask);
     }
     StreamSet * const TransformedMask = OutputMask ? P.CreateStreamSet(1) : nullptr;
-    StreamSet * const Transformed = U21_Transform(P, Focused, FocusedMask, TransformedMask, Valid);
+    StreamSet * const Transformed = U21_Transform(P, Focused, FocusedMask, TransformedMask, Valid, mode);
     //  The placement of the transformed characters in the output.
     StreamSet * restriction = Work;
     if (Mask) {
@@ -1305,7 +1350,7 @@ StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask, Stre
         AndCombine(P, Work, Mask, restriction);
     }
     StreamSet * ExpandedWork = Work;
-    if (StreamSet * const InsertBixNum = u21InsertionBixNum(P, U21, restriction)) {
+    if (StreamSet * const InsertBixNum = u21InsertionBixNum(P, U21, restriction, mode)) {
         StreamSet * const SourceExpansion = P.CreateStreamSet(1);
         InsertionSpreadMask(P, InsertBixNum, SourceExpansion, kernel::InsertPosition::After);
         ExpandedWork = P.CreateStreamSet(1);

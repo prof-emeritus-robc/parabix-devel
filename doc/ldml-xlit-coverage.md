@@ -1323,8 +1323,46 @@ run at 100–200 MB/s, 124 at 20–100 MB/s, and 12 below 20 MB/s:
   Hant-Hans 2.6 and 3.1 s, and Han-Latin/Names, Hani-Latn and Hant-Latn 2.2 s.
   The Latin→Indic transforms take 1.3 s, and most of the `*-ar` and `*-am`
   transforms 0.5–1.2 s. As the kernels are cached, this is the analysis of the rules and
-  the construction of the pipeline, repeated by every run; it is not yet
-  measured by phase.
+  the construction of the pipeline, repeated by every run.
+
+  **Where the time goes** (Ethi-Latn/ALALOC_Geminate, 27.3 s warm): the
+  analysis of the rules (`--plan`) 20.5 s, the construction of the pipeline
+  6.5 s, and loading the cached kernels and the run under 1 s. Sampled, most
+  of it is the same analyses made several times: the overlaps of the group's
+  string rules (`analyzeStringRuleOverlaps`, about 5 s each) three times, in
+  `planTransform` and in the DivCode plan of the group for its mode
+  (`utf8StepProblem`) and again for its pipeline (`conversionGroup`). For
+  und_FONIPA-chr (3.2 s), the DivCode plan of its group (about 0.7 s) was
+  made four times.
+
+  **Cached** (after the survey): the DivCode plans of conversion groups, by
+  the options and a fingerprint of what the planning reads of the step
+  (`cachedDivCodePlan` in `xlit.cpp`), and the string rule overlaps of a
+  group, by the rules and the sets of their texts
+  (`ldml::analyzeStringRuleOverlaps`). The plans, kernel counts and outputs
+  are unchanged. Warm starts (best of three):
+
+  | transform | before | cached |
+  |---|---:|---:|
+  | Ethi-Latn/ALALOC_Geminate | 27.3 s | 15.6 s |
+  | und_FONIPA-chr | 3.2 s | 2.4 s |
+  | Latn-Deva | 1.38 s | 0.89 s |
+  | Hans-Hant | 2.65 s | 2.63 s |
+
+  The rest is not repeated work:
+  - Ethi-Latn/ALALOC_Geminate: one overlap analysis (about 5 s), the order
+    disambiguation of `analyzeRules` (about 2.5 s), the shape group analysis
+    (about 4.5 s, the rules of two transforms parsed and disambiguated again
+    for their shape groups) and one DivCode plan;
+  - und_FONIPA-chr: three different DivCode plans of about 0.7 s each: the
+    group's UTF-8 plan, its Unicode plan in the trial pipeline of the regular
+    plan that `shapeChoice` builds to count kernels, and the plan of its shape
+    group in the other trial pipeline. Avoiding the last two means changing
+    how `shapeChoice` chooses, for example not building the trial pipelines of
+    a transform in UTF-8 mode;
+  - Hans-Hant: not yet profiled.
+
+  The table's warm times are those of the survey, before the caching.
 - **`--lines`.** Every implementable transform supports it, in one run over
   the input (252 with contexts bounded by the lines, 4 with ICU steps applied
   line by line). It costs about the same as the standard mode for most: of the

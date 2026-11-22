@@ -224,6 +224,15 @@ supports `--lines`. Jpan-Latn, implementable by its plan, fails to compile
 (LLVM runs out of virtual address space after about 4 minutes), and
 Thai-Latn's 20 MB runs, which include an ICU step, take more than 300 s.*
 
+*Update (November 22, 2026): the analyses that warm starts repeated are
+cached (`1d5a940fe`: Ethi-Latn/ALALOC_Geminate 27.3 → 15.6 s warm), and the
+pipeline compiler expects variable rates at 1.5 times their minimum rather
+than at the middle of their range (`895372d12`), so the buffers of pipelines
+of many insertion steps no longer grow to terabytes: Jpan-Latn runs (§4.5).
+Its output differs from ICU's at fullwidth punctuation, through Han-Spacedhan,
+where ICU does not follow the rules (§4.5, and
+[ICU-uconv-CLDR-issues.md](ICU-uconv-CLDR-issues.md)).*
+
 This report covers:
 
 - which transforms xlit implements, and how correct they are against the CLDR
@@ -943,7 +952,10 @@ Parabix pipeline framework on which it runs):
   Consecutive runs of iteration marks that reach back to each other may need
   more rounds than the default, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
   ("failed to allocate virtual address space", or a Z3 error at the default
-  of 4 then), and its analysis exceeded 13 GB.
+  of 4 then), and its analysis exceeded 13 GB. With the default of 8 rounds
+  it failed again ("failed to allocate virtual address space", in the survey
+  of §4.5) until the pipeline compiler's expected rates were changed
+  (`895372d12`): its buffers had grown to 67 TB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 8): a chain of more triggers whose before
   contexts reach back to each other leaves the last ones unchanged, unless it is
@@ -1277,7 +1289,8 @@ each run alone. The per-transform results are in the table document,
 
 Cold starts: 95 under 2 s, 206 of 2–10 s, 131 of 10–30 s, 13 of 30–60 s and
 7 of a minute or more (standard mode); about 0.04 s per kernel at the median.
-The longest: Jpan-Latn (fails, below), Zawgyi-my 91 s (1,722 kernels),
+The longest: Jpan-Latn (failed in the survey; since `895372d12`, 259 s,
+below), Zawgyi-my 91 s (1,722 kernels),
 Han-Latin/Names 79 s, Hant-Latn 69 s, Hani-Latn 67 s, my-Zawgyi 66 s, Hira-Latn
 64 s (1,631 kernels), and the four Ethi-Latn `_Geminate` romanizations 50–54 s.
 The transforms of the table in §4.4 (measured differently there, on a
@@ -1297,6 +1310,7 @@ run at 100–200 MB/s, 124 at 20–100 MB/s, and 12 below 20 MB/s:
 | fa-fa_FONIPA | fa Wikibooks | 6.6 | 6.7 |
 | cs_FONIPA-ko | CLDR tests of cs_FONIPA | 5.3 | 5.4 |
 | hy_AREVMDA-ar | CLDR tests of hy_AREVMDA | 0.42 | 10.3 |
+| Jpan-Latn (at `895372d12`) | ja Wikibooks | 3.09 | 3.14 |
 | Hira-Latn | ja Wikibooks | 1.34 | 1.35 |
 | Latn-Jamo, Latn-Hang, Latin-ConjoiningJamo | English | 1.0–1.2 | 1.0–1.2 |
 | Grek-Latn, Hang-Latn | el, ko Wikibooks | 1.0 | 1.0–1.1 |
@@ -1304,11 +1318,42 @@ run at 100–200 MB/s, 124 at 20–100 MB/s, and 12 below 20 MB/s:
 
 **Findings:**
 
-- **Jpan-Latn does not run.** Its plan is implementable (3,092 kernels, the
-  largest pipeline), but its compilation ends, after 253 s (283 s with
-  `--lines`), with `LLVM ERROR: failed to allocate virtual address space`.
-  Not yet investigated: whether it depends on `--compile-threads=3`, the cold
-  cache or the size of one of its kernels.
+- **Jpan-Latn did not run** (fixed by `895372d12`). Its plan is implementable
+  (3,092 kernels, the largest pipeline), but its runs ended, after 253 s of
+  compilation (283 s with `--lines`), with `LLVM ERROR: failed to allocate
+  virtual address space`.
+  - **Not the JIT.** The kernels compile and are cached (535 objects); a run
+    from the cache fails in 4 s, in `make_circular_buffer`
+    (`lib/kernel/core/streamset.cpp`), when the pipeline allocates its
+    stream buffers: 1,643 buffers of 67 TB in all, the largest 3 TB.
+  - **Why.** The buffers are sized by the stream sets' expected rates
+    relative to the input (`RelativeIORate`), which took each variable rate at
+    the middle of its range. The ranges of two kernels multiply along the
+    pipeline: the insertion spread masks of xlit's conversion groups
+    (`InsertionSpreadMaskKernel`, `BoundedRate(1, 2^bits)`: ×2.5, ×8.5 or
+    ×16.5) and the UTF-8 deposit masks (`u8depositMask`, ×4, then filtered at
+    ½). In Hira-Latin's pipeline (`-PrintPipelineGraph`), 19 of the one and 16
+    of the other compound to 626,703 times the input: 1,367 buffers of about
+    1 TB (the largest 19 GB), which run only because macOS reserves address
+    space without memory; Kana-Latin after it (Jpan-Latn) multiplies them
+    about 65 times more.
+  - **The fix** (`895372d12`, `dataflow_analysis.cpp`): a variable rate with
+    a positive minimum is expected at 1.5 times its minimum (at most its
+    maximum); fixed rates are exact, and rates with a minimum of 0
+    (`PopcountOf`) keep the middle of their range. Hira-Latin's buffers are
+    80 MB in all (the largest 0.8 MB), and the runs are equal or faster
+    (20 MB: Hira-Latn 1.34 → 1.07 s, Kana-Latn 0.52 → 0.45 s, xh-am 1.27 →
+    1.09 s, Latn-Hang 1.15 → 1.09 s, Deva-Latn 0.17 → 0.16 s).
+  - **Jpan-Latn now:** cold 259 s (293 s with `--lines`), warm 4.0 s, 20 MB of
+    Japanese in 3.1 s (6.5 MB/s), in both modes.
+  - **Against ICU:** on the first 2,000 lines of its input, Jpan-Latn differs
+    from ICU's `createFromRules` on 405, all at fullwidth punctuation, digits
+    or U+3000 (`，（）！：１`), which xlit makes ASCII and ICU keeps. They come
+    from Han-Spacedhan's `:: [set] nfkc ; :: fullwidth-halfwidth ;`, whose
+    filter ICU applies to fullwidth-halfwidth as well, unlike the rules
+    ([ICU-uconv-CLDR-issues.md](ICU-uconv-CLDR-issues.md)); Hira-Latn and
+    Kana-Latn agree with ICU on them. Hani-Latn, Hant-Latn and
+    Han-Latin/Names, which invoke Han-Spacedhan too, differ the same way.
 - **ICU on one large text.** The steps xlit leaves to ICU (Any-Name,
   Name-Any, Any-BreakInternal, and Thai-Latn's Any-BreakInternal step) are
   very slow on a 20 MB text without line ends to split it: Any-BreakInternal
@@ -2281,6 +2326,9 @@ xlit on every implementable transform.
 | `3471879aa`, `65350b3ce` | front-letter revisits (the rough breathing); before contexts with repetitions matched against the converted text with their after contexts matched by the engine: Grek-Latn: 423 |
 | `53121b04a` | run moves with marks (the shadda after a vowel); deferred deletions through runs in one round: fa-fa_FONIPA: 424 |
 | `d97c03f75` | capture rules of a group differing in one text character merged as variants: NumericPinyin-Latin 2,355 → 848 kernels |
+| `51986d9cc` | compile and run times of all transforms (§4.5) |
+| `1d5a940fe` | DivCode plans and string rule overlaps cached: warm starts of Ethi-Latn/ALALOC_Geminate 27.3 → 15.6 s |
+| `895372d12` | pipeline compiler: variable rates expected at 1.5 times their minimum: Jpan-Latn runs (its buffers had grown to 67 TB) |
 
 ## Reproducing
 

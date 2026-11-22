@@ -84,7 +84,15 @@ public:
     //  The status of the forward rules of a transform; the transforms it
     //  invokes are looked up in the registry.
     NFD_StatusReport Determine_NFD_Status(const std::vector<Rule *> & forwardRules);
+    //  For each transform rule of the forward rules of a transform, in order,
+    //  the status of the text before it: Always if it is then in NFD whatever
+    //  the input of the transform (a step before it is Always, and the steps
+    //  after that one preserve NFD), Preserving if it is in NFD when the input
+    //  is, NotGuaranteed otherwise.
+    std::vector<NFD_Status> StatusBeforeTransformRules(const std::vector<Rule *> & forwardRules);
 private:
+    std::vector<NFD_StatusReport> stepStatuses(const std::vector<Rule *> & forwardRules, std::vector<size_t> * transformSteps);
+    static NFD_StatusReport combine(const std::vector<NFD_StatusReport> & steps, size_t n);
     NFD_StatusReport builtIn(const TransformEntry * entry);
     NFD_StatusReport invoked(const TransformID & id);
     const TransformRegistry & mRegistry;

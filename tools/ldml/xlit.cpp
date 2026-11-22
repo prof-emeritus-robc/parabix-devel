@@ -175,6 +175,14 @@ static cl::opt<bool> NormalizationPeephole("normalization-peephole",
 static cl::opt<bool> ShowNormalizationPeephole("show-normalization-peephole",
     cl::desc("Report each normalization step omitted by --normalization-peephole on the standard error"),
     cl::init(false), cl::Hidden, cl::cat(XlitOptions));
+static cl::opt<bool> NFC_InputNFD("nfc-input-nfd",
+    cl::desc("Compose (Any-NFC) with NormalizationInput::InputIsNFD where the text is known to be in NFD: an NFD stage "
+             "(a step or a transform of NFD status Always) comes before it in the transform, or in the transforms "
+             "invoking it, and every stage after that one preserves NFD (see ldml::NFD_StatusAnalyzer) (default on)"),
+    cl::init(true), cl::cat(XlitOptions));
+static cl::opt<bool> ShowNFC_InputNFD("show-nfc-input-nfd",
+    cl::desc("Report each Any-NFC composed with InputIsNFD by --nfc-input-nfd on the standard error"),
+    cl::init(false), cl::Hidden, cl::cat(XlitOptions));
 static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
              "NFD_PipelineBuilder::NFD_Masked and NFC_Masked in UTF-8 mode), rather than with the characters outside the "
@@ -616,6 +624,8 @@ private:
                           std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
                           UCD::UnicodeSet & unchanged, std::string & reason);
     const ldml::TransformRegistry & mRegistry;
+    //  The NFD status of the transforms invoked (see setNFD_Before).
+    ldml::NFD_StatusAnalyzer mNFD_Status{mRegistry};
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
     std::map<std::string, ShapeGroups> mShapeGroups;
@@ -1083,11 +1093,29 @@ static void attachFrontLetters(ldml::TransformPlan & plan, const ldml::FrontLett
     }
 }
 
+//  The NFD status of the text before each transform step of a plan (see
+//  ldml::TransformStep::nfdBefore), from the forward rules of the transform as
+//  extracted.  The rewriting passes keep the transform rules in order and only
+//  insert :: Null ; (the steps not matched, which keep NotGuaranteed).
+static void setNFD_Before(ldml::TransformPlan & plan, const std::vector<ldml::Rule *> & extracted, ldml::NFD_StatusAnalyzer & status) {
+    const std::vector<ldml::NFD_Status> before = status.StatusBeforeTransformRules(extracted);
+    std::vector<const ldml::TransformRule *> rules;
+    for (const ldml::Rule * r : extracted) if (const auto * t = llvm::dyn_cast<ldml::TransformRule>(r)) rules.push_back(t);
+    size_t k = 0;
+    for (ldml::TransformStep & step : plan.steps) {
+        if (step.kind != ldml::TransformStep::Kind::Transform) continue;
+        if (k < rules.size() && rules[k]->getForwardID().getText() == step.transform.getText()) {
+            step.nfdBefore = before[k++];
+        }
+    }
+}
+
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
     try {
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        const std::vector<ldml::Rule *> extracted = rules;
         rules = ldml::MoveTextAnchors(rules);
         rules = ldml::EnumerateRepeatedCaptures(rules);
         //  (Set aside before revisits are composed: see ldml::FrontLetterRevisits.)
@@ -1151,6 +1179,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
             }
         }
         attachFrontLetters(a.plan, frontLetters);
+        setNFD_Before(a.plan, extracted, mNFD_Status);
         //  The pairs left to priority by DisambiguateOrder, as string rules of
         //  the same group (see ldml::TransformStep::stringPriority).
         for (const auto & pr : dstats.prioritized) {
@@ -8977,20 +9006,41 @@ struct NormalizationFrames {
         UCD::UnicodeSet scope;          // the characters the plan's steps apply to
         UCD::UnicodeSet stepScope;      // those of the step being applied
         const ldml::TransformStep * builtIn = nullptr;   // that step, if it invokes a built-in directly
+        bool inputNFD = false;          // whether the input of the plan is known to be in NFD
+        size_t current = 0;             // the (first) step being applied
+        bool segment = false;           // whether a segment of steps is being applied
     };
     std::vector<Frame> frames;
+    //  An NFD omitted (see omit): the next normalization, which makes it
+    //  redundant, does not have the NFD input it would have given.
+    mutable bool omittedDecomposition = false;
+
+    //  Is the text in NFD, given the status before a step and whether the input is?
+    static bool knownNFD(ldml::NFD_Status before, bool inputNFD) {
+        return before == ldml::NFD_Status::Always || (before == ldml::NFD_Status::Preserving && inputNFD);
+    }
 
     static UCD::UnicodeSet all() {return UCD::UnicodeSet(0, 0x10FFFF);}
     void enter(const TransformAnalysis & a) {
         UCD::UnicodeSet scope = frames.empty() ? all() : frames.back().stepScope;
         if (a.plan.filter) scope = scope & a.plan.filterSet;
-        frames.push_back(Frame{&a.plan.steps, 0, scope, scope, nullptr});
+        //  The input of the plan: that of a segment of the plan applying it, or
+        //  the text before the step invoking it.
+        bool inputNFD = false;
+        if (!frames.empty()) {
+            const Frame & p = frames.back();
+            inputNFD = p.segment ? p.inputNFD
+                                 : (p.current < p.steps->size() && knownNFD((*p.steps)[p.current].nfdBefore, p.inputNFD));
+        }
+        frames.push_back(Frame{&a.plan.steps, 0, scope, scope, nullptr, inputNFD, 0, false});
     }
     void exit() {frames.pop_back();}
     //  Before the steps [i, j) are applied (one step, or a segment of them).
     void begin(size_t i, size_t j, const ldml::TransformRegistry & registry) {
         Frame & f = frames.back();
         f.next = j;
+        f.current = i;
+        f.segment = j != i + 1;
         f.stepScope = f.scope;
         f.builtIn = nullptr;
         if (j != i + 1) return;
@@ -9045,6 +9095,7 @@ struct NormalizationFrames {
                 switch (probe((*f.steps)[i], f.scope, top.stepScope, registry, analyzer, seen)) {
                     case Probe::Found:
                         if (ShowNormalizationPeephole) llvm::errs() << "xlit: " << name << " omitted (normalized again by a later step)\n";
+                        if (name == "Any-NFD") omittedDecomposition = true;
                         return true;
                     case Probe::Opaque: return false;
                     case Probe::Transparent: break;
@@ -9052,6 +9103,21 @@ struct NormalizationFrames {
             }
         }
         return false;
+    }
+    //  The input mode of the normalization name, about to be applied (not
+    //  omitted) by the step being applied directly: InputIsNFD for Any-NFC if
+    //  the text before the step is known to be in NFD (--nfc-input-nfd).
+    NormalizationInput input(const std::string & name, const ldml::TransformRegistry & registry) {
+        if (!normalization(name)) return NormalizationInput::Any;
+        const bool omitted = omittedDecomposition;
+        omittedDecomposition = false;
+        if (!NFC_InputNFD || name != "Any-NFC" || omitted || frames.empty()) return NormalizationInput::Any;
+        const Frame & top = frames.back();
+        if (top.builtIn == nullptr || !knownNFD(top.builtIn->nfdBefore, top.inputNFD)) return NormalizationInput::Any;
+        const ldml::TransformEntry * const e = registry.lookup(top.builtIn->transform.getText());
+        if (e == nullptr || e->canonicalName != name) return NormalizationInput::Any;
+        if (ShowNFC_InputNFD) llvm::errs() << "xlit: Any-NFC with InputIsNFD\n";
+        return NormalizationInput::InputIsNFD;
     }
 };
 
@@ -9206,6 +9272,8 @@ private:
     Staged fcc(StreamSet * U21, StreamSet * mask = nullptr);
     Staged fcd(StreamSet * U21);
     Staged maskedNFC(StreamSet * U21, StreamSet * selected, NormalizationInput input = NormalizationInput::Any);
+    //  The input mode of the Any-NFC being applied (see NormalizationFrames::input).
+    NormalizationInput mNFC_Input = NormalizationInput::Any;
     Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -9469,7 +9537,10 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Null" || (mOmitICUBuiltIns && isICUBuiltIn(name))) return U21;
     if (mFrames->omit(name, mRegistry, mAnalyzer)) return U21;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
-        return activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
+        mNFC_Input = mFrames->input(name, mRegistry);
+        StreamSet * const result = activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
+        mNFC_Input = NormalizationInput::Any;
+        return result;
     }
     if (name == "Any-FCD") return inStep(fcd(U21));
     if (name == "Any-Lower" || name == "Any-Upper") {
@@ -9536,7 +9607,7 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
     if (name == "Any-NFKD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
     if (name == "Any-FCC") return fcc(U21).text;
     //  (NFKC: the NFC of the NFKD, which is in NFKD.)
-    NormalizationInput input = NormalizationInput::Any;
+    NormalizationInput input = name == "Any-NFC" ? mNFC_Input : NormalizationInput::Any;
     if (name == "Any-NFKC") {
         U21 = mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
         input = NormalizationInput::InputIsNFKD;
@@ -9582,7 +9653,7 @@ Staged RulePipelineBuilder::maskedNormalization(const std::string & name, Stream
     }
     //  (NFC and FCC on the 21-bit basis within the selection.)
     if (MaskedNormalization && U21NFC) {
-        if (name == "Any-NFC") return maskedNFC(U21, selected);
+        if (name == "Any-NFC") return maskedNFC(U21, selected, mNFC_Input);
         if (name == "Any-FCC") return fcc(U21, selected);
     }
     return barrierNormalization(name, U21, selected);
@@ -12920,6 +12991,8 @@ private:
     StreamSet * builtIn(const std::string & name, StreamSet * Basis);
     StreamSet * normalization(const std::string & name, StreamSet * Basis);
     Staged maskedNormalization(const std::string & name, StreamSet * Basis);
+    //  The input mode of the Any-NFC being applied (see NormalizationFrames::input).
+    NormalizationInput mNFC_Input = NormalizationInput::Any;
     StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
     //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
     //  masks of the filters in effect (the innermost last, within the ones
@@ -13287,7 +13360,10 @@ StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * B
     if (name == "Any-Null") return Basis;
     if (mFrames->omit(name, mRegistry, mAnalyzer)) return Basis;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
-        return mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
+        mNFC_Input = mFrames->input(name, mRegistry);
+        StreamSet * const result = mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
+        mNFC_Input = NormalizationInput::Any;
+        return result;
     }
     if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
     llvm::report_fatal_error(llvm::StringRef("xlit: built-in transform " + name + " not in UTF-8 mode"));
@@ -13302,7 +13378,7 @@ StreamSet * UTF8PipelineBuilder::normalization(const std::string & name, StreamS
     if (name == "Any-NFD") return BasisOf(P, NFD_Bytes(P, NFD_builder, bytes, Basis));
     if (name == "Any-NFKD") return BasisOf(P, NFKD_Bytes(P, NFD_builder, bytes, Basis));
     if (name == "Any-NFKC") return BasisOf(P, NFKC_Bytes(P, NFD_builder, NormalizationFocusOptions(), bytes, Basis));
-    return BasisOf(P, NFC_Bytes(P, bytes, Basis));
+    return BasisOf(P, NFC_FocusedTransform(NormalizationFocusOptions(), mNFC_Input).build(P, bytes, Basis));
 }
 
 //  The bytes of the characters marked at their first bytes (Firsts), within
@@ -13436,7 +13512,7 @@ Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, Stream
         }
         StreamSet * const OutMask = P.CreateStreamSet(1);
         bytes = NFC_Masked(P, NormalizationFocusOptions(), bytes, Basis, mask, OutMask,
-                           name == "Any-NFKC" ? NormalizationInput::InputIsNFKD : NormalizationInput::Any);
+                           name == "Any-NFKC" ? NormalizationInput::InputIsNFKD : mNFC_Input);
         PositionMap composed;
         composed.remove(mMasks.complement(mask));
         composed.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);

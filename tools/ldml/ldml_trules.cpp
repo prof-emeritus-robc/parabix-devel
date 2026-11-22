@@ -58,7 +58,9 @@
 //      Report the NFD status of each named transform (see ldml/nfd_status.h),
 //      of the registry of the default transform directory, or of all its
 //      transforms if none are named: Always, Preserving or NotGuaranteed,
-//      whether it is filter safe, and the reason.
+//      whether it is filter safe, the numbers of its Any-NFC steps whose input
+//      is always in NFD and in NFD if the transform's input is (of all its
+//      Any-NFC steps: NFC a+p/n), and the reason.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 //  With --output=<file>, the reports are written to the file (- for the
@@ -505,8 +507,35 @@ static int reportNFD_Status(const std::vector<std::string> & names) {
         }
         const NFD_StatusReport r = analyzer.Determine_NFD_Status(n);
         counts[NFD_StatusName(r.status)]++;
+        //  The Any-NFC steps of the transform, and those with an input in NFD
+        //  (Always before them).
+        unsigned nfc = 0, nfdInput = 0, nfdIfInput = 0;
+        const TransformEntry * const entry = registry.lookup(n);
+        if (!entry->isBuiltIn()) {
+            try {
+                const std::vector<Rule *> parsed = parseTransformRules(extractTRules(readFile(entry->file)));
+                const std::vector<Rule *> rules = entry->direction == TransformDirection::Forward ? ExtractForwardRules(parsed)
+                                                                                                  : ExtractReverseBackwardRules(parsed);
+                const std::vector<NFD_Status> before = analyzer.StatusBeforeTransformRules(rules);
+                size_t k = 0;
+                for (const Rule * rule : rules) {
+                    const TransformRule * const t = llvm::dyn_cast<TransformRule>(rule);
+                    if (t == nullptr) continue;
+                    const TransformEntry * const e = registry.lookup(t->getForwardID().getText());
+                    if (e && e->canonicalName == "Any-NFC") {
+                        nfc++;
+                        nfdInput += before[k] == NFD_Status::Always;
+                        nfdIfInput += before[k] == NFD_Status::Preserving;
+                    }
+                    k++;
+                }
+            } catch (const std::exception &) {}
+        }
+        counts["NFC steps"] += nfc;
+        counts["NFC steps with NFD input"] += nfdInput;
+        counts["NFC steps with NFD input if the transform's is"] += nfdIfInput;
         toolio::stream() << n << "\t" << NFD_StatusName(r.status) << (r.filterSafe ? "\tfilter-safe" : "\t-")
-                         << (r.reason.empty() ? "" : "\t" + r.reason) << "\n";
+                         << "\tNFC " << nfdInput << "+" << nfdIfInput << "/" << nfc << (r.reason.empty() ? "" : "\t" + r.reason) << "\n";
     }
     if (names.empty()) {
         for (const auto & c : counts) toolio::stream() << "Total " << c.first << ": " << c.second << "\n";

@@ -493,7 +493,8 @@ NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const TransformEntry *
     return mCache[entry] = r;
 }
 
-NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::vector<Rule *> & forwardRules) {
+std::vector<NFD_StatusReport> NFD_StatusAnalyzer::stepStatuses(const std::vector<Rule *> & forwardRules,
+                                                                std::vector<size_t> * transformSteps) {
     CharSetAnalysis sets;
     //  The global filter, and the filter carried through a block of transform
     //  rules (see nfd_status.h).
@@ -519,7 +520,7 @@ NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::vector<Rule
             if (!fr->isInverse()) global.reset(new UnicodeSet(sets.setOf(fr->getFilterSet(), true)));
         } else if (const TransformRule * tr = dyn_cast<TransformRule>(rule)) {
             endGroup();
-            if (!tr->hasForward()) continue;
+            if (transformSteps) transformSteps->push_back(steps.size());
             std::unique_ptr<UnicodeSet> filter;
             if (tr->getForwardFilter()) {
                 filter.reset(new UnicodeSet(sets.setOf(tr->getForwardFilter(), true)));
@@ -531,7 +532,8 @@ NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::vector<Rule
             if (global) {
                 if (filter) *filter = *filter & *global; else filter.reset(new UnicodeSet(*global));
             }
-            NFD_StatusReport r = withinFilter(invoked(tr->getForwardID()), filter.get());
+            NFD_StatusReport r = tr->hasForward() ? withinFilter(invoked(tr->getForwardID()), filter.get())
+                                                  : report(NFD_Status::Preserving, true, "Null");
             r.reason = "step " + std::to_string(steps.size() + 1) + " (" + tr->getForwardID().getText() + "): " + r.reason;
             steps.push_back(r);
         } else if (isa<ConversionRule>(rule)) {
@@ -539,18 +541,36 @@ NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::vector<Rule
         }
     }
     endGroup();
+    return steps;
+}
+
+//  The status of the text after the first n steps.
+NFD_StatusReport NFD_StatusAnalyzer::combine(const std::vector<NFD_StatusReport> & steps, size_t n) {
     //  The last step that is Always, and the first step after it that is
     //  NotGuaranteed.
-    size_t lastAlways = steps.size();
-    for (size_t i = 0; i < steps.size(); i++) if (steps[i].status == NFD_Status::Always) lastAlways = i;
-    const size_t from = lastAlways == steps.size() ? 0 : lastAlways + 1;
+    size_t lastAlways = n;
+    for (size_t i = 0; i < n; i++) if (steps[i].status == NFD_Status::Always) lastAlways = i;
+    const size_t from = lastAlways == n ? 0 : lastAlways + 1;
     bool safe = true;
-    for (const NFD_StatusReport & r : steps) safe = safe && r.status != NFD_Status::NotGuaranteed && r.filterSafe;
-    for (size_t i = from; i < steps.size(); i++) {
+    for (size_t i = 0; i < n; i++) safe = safe && steps[i].status != NFD_Status::NotGuaranteed && steps[i].filterSafe;
+    for (size_t i = from; i < n; i++) {
         if (steps[i].status == NFD_Status::NotGuaranteed) return report(NFD_Status::NotGuaranteed, false, steps[i].reason);
     }
-    if (lastAlways != steps.size()) return report(NFD_Status::Always, safe, steps[lastAlways].reason);
+    if (lastAlways != n) return report(NFD_Status::Always, safe, steps[lastAlways].reason);
     return report(NFD_Status::Preserving, safe, "");
+}
+
+NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::vector<Rule *> & forwardRules) {
+    const std::vector<NFD_StatusReport> steps = stepStatuses(forwardRules, nullptr);
+    return combine(steps, steps.size());
+}
+
+std::vector<NFD_Status> NFD_StatusAnalyzer::StatusBeforeTransformRules(const std::vector<Rule *> & forwardRules) {
+    std::vector<size_t> at;
+    const std::vector<NFD_StatusReport> steps = stepStatuses(forwardRules, &at);
+    std::vector<NFD_Status> before;
+    for (size_t n : at) before.push_back(combine(steps, n).status);
+    return before;
 }
 
 }

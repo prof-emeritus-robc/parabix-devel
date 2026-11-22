@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 #include <ldml/transform_rules.h>
+#include <ldml/nfd_status.h>
 #include <ucd/core/unicode_set.h>
 
 namespace ldml {
@@ -460,6 +461,11 @@ struct TransformStep {
     TransformID transform;
     re::RE * filter = nullptr;
     UCD::UnicodeSet filterSet;
+    // For a transform rule, the NFD status of the text before it, from the
+    // start of the transform (see NFD_StatusAnalyzer::StatusBeforeTransformRules;
+    // set by the client after planning): Always if it is in NFD, Preserving if
+    // it is when the input of the transform is.
+    NFD_Status nfdBefore = NFD_Status::NotGuaranteed;
 };
 
 struct TransformPlan {

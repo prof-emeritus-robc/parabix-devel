@@ -2756,7 +2756,7 @@ static constexpr size_t FusedMaxAlternatives = 32;
 //  whole group (larger groups keep their before contexts matched against the text).
 static cl::opt<unsigned> FusedMaxWholeGroupRules("whole-group-rules", cl::desc("The most string rules (or subgroups) of a group "
                                                  "whose before contexts are matched against the converted text in one correction kernel"),
-                                                 cl::init(256), cl::cat(XlitOptions));
+                                                 cl::init(512), cl::cat(XlitOptions));
 
 namespace {
 
@@ -3864,6 +3864,57 @@ static void translateCaptureContexts(ldml::TransformPlan & plan) {
             }
         }
     }
+}
+
+//  A group with string rules whose before contexts its conversions may make
+//  match differently in the converted text (against which ICU matches them),
+//  and which must be selected (an overlap order) or whose coverage other rules
+//  need, is applied by one correction kernel with all its rules (see wholeGroup
+//  in RulePipelineBuilder::conversionGroup).  Where that cannot be (too many
+//  rules for --whole-group-rules, MultipleCaptureMultipleReplacement rules
+//  selected with them, or subgroups yielding to earlier rules), the contexts
+//  are matched against the text itself, which may give another result: the
+//  pipeline then warns (see RulePipelineBuilder::conversionGroup), with this
+//  reason, the first such rule and why the group cannot be in one kernel.
+static std::string wholeGroupProblem(const ldml::TransformStep & step) {
+    if (ConvertedContextRounds == 0 || step.stringRules.empty()) return "";
+    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
+    bool changing = false;
+    for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
+        for (const ldml::CharMapping & m : subgroup.mappings) {
+            UCD::UnicodeSet chars = m.chars;
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
+            changing |= !chars.empty();
+        }
+    }
+    const bool needCoverage = (step.coverStringRules || hasConvertedSubgroup(step, outcomes)) && changing;
+    if (step.stringOrder.empty() && !needCoverage) return "";
+    const ldml::ConversionRule * converted = nullptr;
+    for (size_t r = 0; r < step.stringRules.size() && converted == nullptr; r++) {
+        const ldml::StringRule & rule = step.stringRules[r];
+        if (r < step.stringPriority.size() && !step.stringPriority[r].empty()) continue;
+        bool emptyText = rule.text.empty();
+        for (const UCD::UnicodeSet & chars : rule.text) emptyText |= chars.empty();
+        if (emptyText) continue;
+        FusedContexts before, after;
+        if (fusedContexts(rule.engineAfter, false, after) && fusedContexts(rule.engineBefore, true, before, true)
+                && convertedContextMatters(before, outcomes)) converted = rule.rule;
+    }
+    if (converted == nullptr) return "";
+    std::string why;
+    if (step.stringRules.size() > FusedMaxWholeGroupRules || step.subgroups.size() > FusedMaxWholeGroupRules) {
+        why = "its group has " + std::to_string(step.stringRules.size()) + " string rules and " + std::to_string(step.subgroups.size()) +
+              " subgroups, more than --whole-group-rules=" + std::to_string(FusedMaxWholeGroupRules);
+    } else if (!step.captureReplacements.empty() && (step.jointSelection || step.sequentialSelection || !needCoverage)) {
+        why = "MultipleCaptureMultipleReplacement rules are selected with the string rules of its group";
+    } else {
+        for (size_t g = 0; g < step.subgroups.size() && why.empty(); g++) {
+            if (g < step.subgroupPriority.size() && !step.subgroupPriority[g].empty()) why = "a subgroup of its group yields to earlier rules";
+        }
+    }
+    if (why.empty()) return "";
+    return ldml::printRule(converted) + "  (its before context may match differently in the converted text, where ICU matches "
+           "it, and it cannot be matched there with all the rules of its group in one kernel: " + why + ")";
 }
 
 static std::string captureSpanProblem(const ldml::MultipleCaptureMultipleReplacementSet & set, const cc::Alphabet * encoding);
@@ -11890,6 +11941,16 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  yield to string rules known to the kernel, see yields.)
         if (!step.captureReplacements.empty() && (step.jointSelection || step.sequentialSelection || !needCoverage)) wholeGroup = false;
         for (size_t g = 0; g < step.subgroups.size(); g++) wholeGroup &= !yields(g);
+        //  (Otherwise the contexts are matched against the text itself, which may
+        //  give another result than ICU's: not silently, see wholeGroupProblem.)
+        bool anyConvertible = false;
+        for (size_t r = 0; r < numStringRules; r++) anyConvertible |= convertible[r];
+        if (anyConvertible && !wholeGroup) {
+            std::string why = wholeGroupProblem(step);
+            if (why.empty()) why = "(a string rule of its group)";
+            llvm::errs() << "xlit: warning: " << mTransformLabel << ": a before context matched against the text itself, "
+                         << "where ICU matches it against the converted text: " << why << "\n";
+        }
     }
     if (wholeGroup) {
         FusedRulesConfig config;

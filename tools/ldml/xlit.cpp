@@ -9136,7 +9136,10 @@ private:
         }
         return result;
     }
-    FusedRulesConfig absolutely(FusedRulesConfig c) {
+    //  (classesOf: the config of the classes stream the kernel reads, if it is
+    //  not the kernel's own, as the matching kernel of a sequential selection,
+    //  whose classes are a part of those of the stream.)
+    FusedRulesConfig absolutely(FusedRulesConfig c, const FusedRulesConfig * classesOf = nullptr) {
         c.absolute = mBytes != nullptr;
         if (c.absolute) {
             for (const FusedStringRule & r : c.strings) {
@@ -9146,9 +9149,22 @@ private:
         //  (A correction kernel reads the strings of the selectors.)
         if (c.absolute && c.rounds > 0) c.selectorStrings = mSelectorStrings;
         //  (The classes as codes, see FusedRulesConfig::classCodes and classCodes.)
+        //  The codes are those of the multiplexed code of the stream's classes
+        //  (see fusedClasses in RulePipelineBuilder::conversionGroup), for each of
+        //  the kernel's classes.
         if (c.absolute) {
             const std::vector<UCD::UnicodeSet> sets = fusedClassSets(c);
-            if (codedClasses(sets)) c.classCodes = multiplexedClasses(sets).second;
+            const std::vector<UCD::UnicodeSet> streamSets = classesOf ? fusedClassSets(absolutely(*classesOf)) : sets;
+            if (codedClasses(streamSets)) {
+                const std::vector<UCD::UnicodeSet> codes = multiplexedClasses(streamSets).second;
+                std::map<std::string, size_t> at;
+                for (size_t i = 0; i < streamSets.size(); i++) at.emplace(setKey(streamSets[i]), i);
+                for (const UCD::UnicodeSet & set : sets) {
+                    const auto f = at.find(setKey(set));
+                    if (LLVM_UNLIKELY(f == at.end())) llvm::report_fatal_error("absolutely: a class not in the classes stream");
+                    c.classCodes.push_back(codes[f->second]);
+                }
+            }
         }
         return c;
     }
@@ -11775,7 +11791,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
                 const FusedState none;
                 matching.region = regions != nullptr;
-                P.CreateKernelCall<FusedRules>(absolutely(std::move(matching)), U21, classes, inText, mask, nullptr, previous, none, starts);
+                P.CreateKernelCall<FusedRules>(absolutely(std::move(matching), &config), U21, classes, inText, mask, nullptr, previous, none, starts);
                 StreamSet * const selected = P.CreateStreamSet(1);
                 P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
                 FusedRulesConfig applying = config;
@@ -11786,7 +11802,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
                 for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
                 applying.region = regions != nullptr;
-                P.CreateKernelCall<FusedRules>(absolutely(std::move(applying)), U21, classes, inText, mask, nullptr, previous, out, nullptr);
+                P.CreateKernelCall<FusedRules>(absolutely(std::move(applying), &config), U21, classes, inText, mask, nullptr, previous, out, nullptr);
                 previous = out;
             }
             state = previous;

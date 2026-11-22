@@ -113,6 +113,9 @@ Observed with ICU 78.3 (`Transliterator::createFromRules`, as `xlit
     first, which makes the space U+3000, and the inverse rules, which delete
     only U+0020, leave it: `乏 U+0020 乬` gives `乏 U+3000 乬`, xlit `乏乬`.
 
+  The others agree with ICU on the same decomposed words: their rules give
+  the same results whether NFC is applied before or after them.
+
 - **The filter of a `::` transform also applies to the `::` transforms that
   follow it directly.** ICU makes consecutive `::` transforms one element of
   the compound, with the filter of the first written before all of them:
@@ -124,8 +127,49 @@ Observed with ICU 78.3 (`Transliterator::createFromRules`, as `xlit
   ldml-xlit-coverage.md, "A filtered first step": `::[x] Null ;
   ::fullwidth-halfwidth ;` leaves `．` U+FF0E unchanged.)
 
-  The others agree with ICU on the same decomposed words: their rules give
-  the same results whether NFC is applied before or after them.
+  **Which rules** (minimal rules through `createFromRules`, `xlit --use-ICU`
+  with `--rules-file`, ICU 78.3, 2026-11-22; on `a。，b`):
+
+  ```
+  rules                                     ICU     per the rules (xlit)
+  :: [a] Null ; :: Any-Upper ;              A。，b   A。，B
+  :: [a] Null ; :: Null ; :: Any-Upper ;    A。，b   A。，B
+  :: [a] Any-Upper ; :: Any-Upper ;         A。，b   A。，B
+  x > y ; :: [a] Null ; :: Any-Upper ;      A。，b   A。，B
+  :: Null ; :: [a] Null ; :: Any-Upper ;    A。，B   A。，B
+  :: [b] ; :: [a] Null ; :: Any-Upper ;     a。，B   a。，B
+  :: [a] Null ; b > Z ;                     a。，Z   a。，Z
+  :: [。] nfkc ; :: fullwidth-halfwidth ;   a｡，b   a｡,b
+  ```
+
+  So the filter carries to the rest of a block of `::` transforms when the
+  filtered transform is the first of its block (at the start of the rules or
+  after a rule set), and not when it follows another `::` transform of the
+  block; a global filter before it prevents it; and the rule sets after the
+  block are not affected. `uconv -x '[a] Null; Any-Upper'` gives the same
+  `A。，b`: in ICU's compound IDs a filter at the start is the global filter
+  of the compound, so the block's ID, written with the first transform's
+  filter in front, reads as filtered as a whole (presumably; not checked in
+  ICU's source).
+
+  **CLDR.** In both directions, `Han-Spacedhan.xml` is the only CLDR file with
+  a block of `::` transforms that begins with a filtered transform. Its
+  `fullwidth-halfwidth` then applies only to its NFKC set (CJK punctuation,
+  the ideographs and Han), so the fullwidth forms of ASCII stay as they are
+  in ICU, while xlit makes them ASCII, as the rules say:
+
+  ```
+  input                  ICU (createFromRules, and uconv -x Han-Spacedhan)   xlit
+  a，i（u）e！１ U+3000 o：  a， i （u） e！１ U+3000 o：                       a, i (u) e!1 o:
+  ```
+
+  `Fullwidth-Halfwidth` alone converts them in ICU too (`uconv -x
+  Fullwidth-Halfwidth`). Han-Spacedhan is invoked by Hani-Latn (Han-Latin),
+  Hant-Latn, Han-Latin/Names and Jpan-Latn: on the first 2,000 lines of the
+  Japanese Wikibooks text of the survey (ldml-xlit-coverage.md, §4.5),
+  Jpan-Latn's output differs from ICU's on 405, all at fullwidth punctuation,
+  digits or U+3000 (`，（）！：１`). Hira-Latn and Kana-Latn, its other steps,
+  agree with ICU on them. No CLDR test file has such characters.
 
 ## uconv
 

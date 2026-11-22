@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <ldml/transform_rules_printer.h>
@@ -2441,7 +2442,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
     return plan;
 }
 
-StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
+static StringRuleOverlaps computeStringRuleOverlaps(const TransformStep & step) {
     StringRuleOverlaps result;
     const size_t n = step.stringRules.size();
     //  within[a][b]: rule b may match within the text of rule a.  Quick checks
@@ -2615,6 +2616,38 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
             }
         }
     }
+    return result;
+}
+
+//  The overlaps of the string rules of a group, cached: the analysis of a large
+//  group takes seconds, and a run makes it several times for the same rules (in
+//  planTransform, and in planDivCodeGroup for each mode and pipeline).  The
+//  analysis reads only the rule and the text of each string rule; the key is
+//  the rule's address (rules are never freed, so their addresses identify
+//  them) and the intervals of the sets of its text.
+StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
+    std::vector<uintptr_t> key;
+    for (const StringRule & r : step.stringRules) {
+        key.push_back(reinterpret_cast<uintptr_t>(r.rule));
+        key.push_back(r.text.size());
+        for (const UCD::UnicodeSet & t : r.text) {
+            key.push_back(t.size());
+            for (const auto & range : t) {
+                key.push_back(range.first);
+                key.push_back(range.second);
+            }
+        }
+    }
+    static std::mutex lock;
+    static std::map<std::vector<uintptr_t>, StringRuleOverlaps> cache;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        auto f = cache.find(key);
+        if (f != cache.end()) return f->second;
+    }
+    StringRuleOverlaps result = computeStringRuleOverlaps(step);
+    std::lock_guard<std::mutex> guard(lock);
+    cache.emplace(std::move(key), result);
     return result;
 }
 

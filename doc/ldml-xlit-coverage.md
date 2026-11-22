@@ -214,6 +214,25 @@ transforms measured (ldml-divcode-plan.md, §6 and §9), most by 45–80% in UTF
 mode. The exception is Halfwidth-Fullwidth, whose expansion of every ASCII
 character to 3 bytes makes UTF-8 mode slower.*
 
+*Update (November 21, 2026): a survey of compile and run times of all 453
+transform names at `a15e2d140` (§4.5; per transform, in the table document's
+"Compile and run times"), by `tools/ldml/xlit_perf_survey.py`. The status is
+unchanged: 424 of the 425 CLDR-defined transforms and the 28 built-ins are
+implementable by their plans (Latn-Grek remains blocked). Of the 424, 183 run
+wholly in UTF-8 mode and 241 in mixed modes; every implementable transform
+supports `--lines`. Jpan-Latn, implementable by its plan, fails to compile
+(LLVM runs out of virtual address space after about 4 minutes), and
+Thai-Latn's 20 MB runs, which include an ICU step, take more than 300 s.*
+
+*Update (November 22, 2026): the analyses that warm starts repeated are
+cached (`1d5a940fe`: Ethi-Latn/ALALOC_Geminate 27.3 → 15.6 s warm), and the
+pipeline compiler expects variable rates at 1.5 times their minimum rather
+than at the middle of their range (`895372d12`), so the buffers of pipelines
+of many insertion steps no longer grow to terabytes: Jpan-Latn runs (§4.5).
+Its output differs from ICU's at fullwidth punctuation, through Han-Spacedhan,
+where ICU does not follow the rules (§4.5, and
+[ICU-uconv-CLDR-issues.md](ICU-uconv-CLDR-issues.md)).*
+
 This report covers:
 
 - which transforms xlit implements, and how correct they are against the CLDR
@@ -237,6 +256,13 @@ The numbers can be regenerated with `tools/ldml/xlit_coverage.py` (see
 | …of which public (not `visibility="internal"`) | 393 | 392 (100%) |
 <!-- /coverage:summary -->
 
+- **Compile and run times** (§4.5, November 21, 2026): over the 452
+  implementable transforms, the cold start (JIT compilation of every kernel,
+  `--compile-threads=3`) has a median of 8.6 s (90% within 22 s; 7 take a
+  minute or more), the warm start (kernels cached) 0.09 s (32 take 2 s or
+  more), and a 20 MB run in the transform's source script 0.08 s at
+  `-thread-num=4` (about 250 MB/s; 12 transforms are below 20 MB/s). `--lines`
+  costs about the same, with exceptions in both directions (§4.5).
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
   Their 263,287 cases fail only in two files, where the test data disagrees with
   the rules and with ICU (§3): ka-ka_Latn/BGN (215 cases) and my-my_FONIPA (2).
@@ -926,7 +952,10 @@ Parabix pipeline framework on which it runs):
   Consecutive runs of iteration marks that reach back to each other may need
   more rounds than the default, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
   ("failed to allocate virtual address space", or a Z3 error at the default
-  of 4 then), and its analysis exceeded 13 GB.
+  of 4 then), and its analysis exceeded 13 GB. With the default of 8 rounds
+  it failed again ("failed to allocate virtual address space", in the survey
+  of §4.5) until the pipeline compiler's expected rates were changed
+  (`895372d12`): its buffers had grown to 67 TB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 8): a chain of more triggers whose before
   contexts reach back to each other leaves the last ones unchanged, unless it is
@@ -1210,6 +1239,199 @@ rules, 2,206 kernels) and Latin-ASCII (847 rules, 650 kernels). Over all the
 transforms, 331 conversion groups have 74,326 rules. A group of prefix runs
 takes 5 kernels (ro_FONIPA-ja) to 12 (the Ethiopic romanizations, whose
 replacements have one to three characters).
+
+### 4.5 Compile and run times
+
+A survey of every transform name xlit knows (453: the 425 CLDR-defined and
+the 28 built-ins), at `a15e2d140` (November 21, 2026), on an Apple M3 (4
+performance and 4 efficiency cores, 24 GB), the Release build with LLVM 22,
+each run alone. The per-transform results are in the table document,
+"Compile and run times".
+
+**Method** (`tools/ldml/xlit_perf_survey.py`):
+
+- **Status, mode and kernels:** `xlit --plan` (implementable or not, and its
+  last line, the mode: UTF-8, mixed or Unicode), `--plan --lines` (the region
+  scope of `--lines`), and `--kernel-counts`.
+- **Cold:** a run on one line of the input, with an object cache of its own,
+  empty (`-object-cache-dir`), and `--compile-threads=3`: the analysis of the
+  rules, the construction of the pipeline and the JIT compilation of every
+  kernel, including those of the normalizations and of the transforms
+  invoked.
+- **Warm:** the same run again, all kernels cached: the analysis, the
+  construction of the pipeline and the loading of the cached objects.
+- **Run:** the 20 MB input with the cache warm, at `-thread-num=4`, output to
+  `/dev/null`, less the warm time (the best of two runs where under 10 s).
+  Times under about 0.02 s are within the noise of the measurement.
+- **`--lines`:** the three again with `--lines`, in another empty cache.
+- **Inputs:** 20,000,000 bytes of text in the transform's source, chosen in
+  this order: natural text of its language or script (Twain for Latin and
+  English; the Wikibooks dumps of `~/Wikibooks`, the article text without
+  templates, tables and link markup, for de, es, fi, fr, id, tr, vi, ar, fa, el,
+  ru, ja, ko, th and zh; a mix of them all for the Any- built-ins); the source
+  sides of the CLDR test files of the transforms with that source, shuffled
+  and joined into lines of about 70 characters (281 transforms, e.g. the
+  Indic and Ethiopic scripts, Myanmar, Sinhala and the FONIPA sources); natural
+  text of a related language (Cyrillic languages: Russian); text produced by
+  another transform (Deva-InterIndic for InterIndic, Any-NFD of Korean for
+  Jamo, Han-Latin for pinyin, each Any-Hex variant for its Hex-Any, Any-Name
+  for Name-Any, Latn-X of English for scripts without test data, such as
+  Armenian, Georgian and Thaana). Each is repeated or cut, at a line end, to
+  20 MB. The input of each transform is named in the table.
+
+**Results** (implementable transforms; standard mode, then `--lines`):
+
+| | median | 90% | max | total |
+|---|---:|---:|---:|---:|
+| cold, s | 8.6 / 8.8 | 22 / 29 | 91 / 116 (Zawgyi-my) | 4,950 / 5,860 |
+| warm, s | 0.09 / 0.09 | 1.2 / 1.1 | 29 / 28 | 314 / 310 |
+| 20 MB run, s | 0.08 / 0.09 | 0.63 / 0.67 | 115 / 10 | |
+
+Cold starts: 95 under 2 s, 206 of 2–10 s, 131 of 10–30 s, 13 of 30–60 s and
+7 of a minute or more (standard mode); about 0.04 s per kernel at the median.
+The longest: Jpan-Latn (failed in the survey; since `895372d12`, 259 s,
+below), Zawgyi-my 91 s (1,722 kernels),
+Han-Latin/Names 79 s, Hant-Latn 69 s, Hani-Latn 67 s, my-Zawgyi 66 s, Hira-Latn
+64 s (1,631 kernels), and the four Ethi-Latn `_Geminate` romanizations 50–54 s.
+The transforms of the table in §4.4 (measured differently there, on a
+one-line input with the default compile threads): Deva-Latn 9.8 s, Latn-Cans
+0.8 s, el-el_Latn/BGN 5.0 s, ru_Latn-ru/BGN 5.5 s, Arab-Latn 10.5 s.
+
+Run times, 20 MB: 259 transforms take 0.1 s or less (200 MB/s or more), 53
+run at 100–200 MB/s, 124 at 20–100 MB/s, and 12 below 20 MB/s:
+
+| transform | input | run, s | `--lines`, s |
+|---|---|---:|---:|
+| Thai-Latn | th Wikibooks | > 300 | > 300 |
+| Any-Name, Name-Any | mix; its Any-Name | > 300 | 2.4, 2.1 |
+| Any-BreakInternal | mix | 115 | 0.36 |
+| Latin-ug | English | 9.8 | 9.8 |
+| cs-ko | CLDR tests of cs | 7.1 | 7.2 |
+| fa-fa_FONIPA | fa Wikibooks | 6.6 | 6.7 |
+| cs_FONIPA-ko | CLDR tests of cs_FONIPA | 5.3 | 5.4 |
+| hy_AREVMDA-ar | CLDR tests of hy_AREVMDA | 0.42 | 10.3 |
+| Jpan-Latn (at `895372d12`) | ja Wikibooks | 3.09 | 3.14 |
+| Hira-Latn | ja Wikibooks | 1.34 | 1.35 |
+| Latn-Jamo, Latn-Hang, Latin-ConjoiningJamo | English | 1.0–1.2 | 1.0–1.2 |
+| Grek-Latn, Hang-Latn | el, ko Wikibooks | 1.0 | 1.0–1.1 |
+| xh-am | CLDR tests of xh | 1.27 | 1.41 |
+
+**Findings:**
+
+- **Jpan-Latn did not run** (fixed by `895372d12`). Its plan is implementable
+  (3,092 kernels, the largest pipeline), but its runs ended, after 253 s of
+  compilation (283 s with `--lines`), with `LLVM ERROR: failed to allocate
+  virtual address space`.
+  - **Not the JIT.** The kernels compile and are cached (535 objects); a run
+    from the cache fails in 4 s, in `make_circular_buffer`
+    (`lib/kernel/core/streamset.cpp`), when the pipeline allocates its
+    stream buffers: 1,643 buffers of 67 TB in all, the largest 3 TB.
+  - **Why.** The buffers are sized by the stream sets' expected rates
+    relative to the input (`RelativeIORate`), which took each variable rate at
+    the middle of its range. The ranges of two kernels multiply along the
+    pipeline: the insertion spread masks of xlit's conversion groups
+    (`InsertionSpreadMaskKernel`, `BoundedRate(1, 2^bits)`: ×2.5, ×8.5 or
+    ×16.5) and the UTF-8 deposit masks (`u8depositMask`, ×4, then filtered at
+    ½). In Hira-Latin's pipeline (`-PrintPipelineGraph`), 19 of the one and 16
+    of the other compound to 626,703 times the input: 1,367 buffers of about
+    1 TB (the largest 19 GB), which run only because macOS reserves address
+    space without memory; Kana-Latin after it (Jpan-Latn) multiplies them
+    about 65 times more.
+  - **The fix** (`895372d12`, `dataflow_analysis.cpp`): a variable rate with
+    a positive minimum is expected at 1.5 times its minimum (at most its
+    maximum); fixed rates are exact, and rates with a minimum of 0
+    (`PopcountOf`) keep the middle of their range. Hira-Latin's buffers are
+    80 MB in all (the largest 0.8 MB), and the runs are equal or faster
+    (20 MB: Hira-Latn 1.34 → 1.07 s, Kana-Latn 0.52 → 0.45 s, xh-am 1.27 →
+    1.09 s, Latn-Hang 1.15 → 1.09 s, Deva-Latn 0.17 → 0.16 s).
+  - **Jpan-Latn now:** cold 259 s (293 s with `--lines`), warm 4.0 s, 20 MB of
+    Japanese in 3.1 s (6.5 MB/s), in both modes.
+  - **Against ICU:** on the first 2,000 lines of its input, Jpan-Latn differs
+    from ICU's `createFromRules` on 405, all at fullwidth punctuation, digits
+    or U+3000 (`，（）！：１`), which xlit makes ASCII and ICU keeps. They come
+    from Han-Spacedhan's `:: [set] nfkc ; :: fullwidth-halfwidth ;`, whose
+    filter ICU applies to fullwidth-halfwidth as well, unlike the rules
+    ([ICU-uconv-CLDR-issues.md](ICU-uconv-CLDR-issues.md)); Hira-Latn and
+    Kana-Latn agree with ICU on them. Hani-Latn, Hant-Latn and
+    Han-Latin/Names, which invoke Han-Spacedhan too, differ the same way.
+- **ICU on one large text.** The steps xlit leaves to ICU (Any-Name,
+  Name-Any, Any-BreakInternal, and Thai-Latn's Any-BreakInternal step) are
+  very slow on a 20 MB text without line ends to split it: Any-BreakInternal
+  115 s, but 0.36 s with `--lines`, where ICU is applied line by line;
+  Any-Name and Name-Any more than 300 s, but about 2 s with `--lines`.
+  Thai-Latn's 20 MB runs take more than 300 s in both modes; how its time
+  divides between the ICU step and the xlit steps is not yet measured.
+- **Warm starts.** The warm start is 0.09 s at the median, but 32 transforms
+  take 2 s or more with every kernel cached: the five `_Geminate` Ethiopic
+  transforms 27–29 s (the four Ethi-Latn ones and am_Ethi-am_Ethi/Geminate),
+  the 22 `*-chr` transforms 3.2 s (und_FONIPA-chr and the 21 through it), Hans-Hant and
+  Hant-Hans 2.6 and 3.1 s, and Han-Latin/Names, Hani-Latn and Hant-Latn 2.2 s.
+  The Latin→Indic transforms take 1.3 s, and most of the `*-ar` and `*-am`
+  transforms 0.5–1.2 s. As the kernels are cached, this is the analysis of the rules and
+  the construction of the pipeline, repeated by every run.
+
+  **Where the time goes** (Ethi-Latn/ALALOC_Geminate, 27.3 s warm): the
+  analysis of the rules (`--plan`) 20.5 s, the construction of the pipeline
+  6.5 s, and loading the cached kernels and the run under 1 s. Sampled, most
+  of it is the same analyses made several times: the overlaps of the group's
+  string rules (`analyzeStringRuleOverlaps`, about 5 s each) three times, in
+  `planTransform` and in the DivCode plan of the group for its mode
+  (`utf8StepProblem`) and again for its pipeline (`conversionGroup`). For
+  und_FONIPA-chr (3.2 s), the DivCode plan of its group (about 0.7 s) was
+  made four times.
+
+  **Cached** (after the survey): the DivCode plans of conversion groups, by
+  the options and a fingerprint of what the planning reads of the step
+  (`cachedDivCodePlan` in `xlit.cpp`), and the string rule overlaps of a
+  group, by the rules and the sets of their texts
+  (`ldml::analyzeStringRuleOverlaps`). The plans, kernel counts and outputs
+  are unchanged. Warm starts (best of three):
+
+  | transform | before | cached |
+  |---|---:|---:|
+  | Ethi-Latn/ALALOC_Geminate | 27.3 s | 15.6 s |
+  | und_FONIPA-chr | 3.2 s | 2.4 s |
+  | Latn-Deva | 1.38 s | 0.89 s |
+  | Hans-Hant | 2.65 s | 2.63 s |
+
+  The rest is not repeated work:
+  - Ethi-Latn/ALALOC_Geminate: one overlap analysis (about 5 s), the order
+    disambiguation of `analyzeRules` (about 2.5 s), the shape group analysis
+    (about 4.5 s, the rules of two transforms parsed and disambiguated again
+    for their shape groups) and one DivCode plan;
+  - und_FONIPA-chr: three different DivCode plans of about 0.7 s each: the
+    group's UTF-8 plan, its Unicode plan in the trial pipeline of the regular
+    plan that `shapeChoice` builds to count kernels, and the plan of its shape
+    group in the other trial pipeline. Avoiding the last two means changing
+    how `shapeChoice` chooses, for example not building the trial pipelines of
+    a transform in UTF-8 mode;
+  - Hans-Hant: not yet profiled.
+
+  The table's warm times are those of the survey, before the caching.
+- **`--lines`.** Every implementable transform supports it, in one run over
+  the input (252 with contexts bounded by the lines, 4 with ICU steps applied
+  line by line). It costs about the same as the standard mode for most: of the
+  189 transforms whose 20 MB runs take 0.1 s or more, 175 run within ±40% of
+  the standard mode, and 424 of the 452 cold starts are within ±40%. The
+  largest differences:
+  - hy_AREVMDA-ar runs 24 times slower with `--lines` (0.42 s → 10.3 s);
+  - am-am_FONIPA compiles 12 times longer (3.0 s → 35 s), and so the `am-*`
+    transforms through it (am-ar, am-fa, am-chr: about 19 s → 62–65 s), and
+    ru-zh, es-zh, es_419-zh and NumericPinyin-Latin 1.7–2.3 times longer;
+  - ru-zh, pl-ja and am-am_FONIPA run about twice as long with `--lines`,
+    Any-BreakInternal (above) and Ethi-Latn/ALALOC_Geminate (0.68 → 0.31 s)
+    shorter;
+  - The plans of 25 transforms change with `--lines` (`--plan --lines`): a
+    group whose contexts are bounded by the lines is applied in Unicode mode
+    (e.g. hy-hy_Latn/BGN, Thai-ThaiLogical, it-am).
+  `xlit --kernel-counts --lines` gives the same counts as without `--lines`,
+  so the table has one kernel count.
+- **UTF-8 mode.** Of the 424 implementable CLDR-defined transforms, 183 run
+  wholly on the UTF-8 code units and 241 in mixed modes (some steps in Unicode
+  mode, in segments, see [xlit-utf8-mode.md](xlit-utf8-mode.md)); none
+  wholly in Unicode mode. Of the 28 built-ins, 7 have UTF-8 pipelines (Any-Null,
+  the four normalizations, Any-Lower and Any-Upper), 18 Unicode pipelines,
+  and 3 are applied by ICU.
 
 ## 5. What is not covered
 
@@ -2104,6 +2326,9 @@ xlit on every implementable transform.
 | `3471879aa`, `65350b3ce` | front-letter revisits (the rough breathing); before contexts with repetitions matched against the converted text with their after contexts matched by the engine: Grek-Latn: 423 |
 | `53121b04a` | run moves with marks (the shadda after a vowel); deferred deletions through runs in one round: fa-fa_FONIPA: 424 |
 | `d97c03f75` | capture rules of a group differing in one text character merged as variants: NumericPinyin-Latin 2,355 → 848 kernels |
+| `51986d9cc` | compile and run times of all transforms (§4.5) |
+| `1d5a940fe` | DivCode plans and string rule overlaps cached: warm starts of Ethi-Latn/ALALOC_Geminate 27.3 → 15.6 s |
+| `895372d12` | pipeline compiler: variable rates expected at 1.5 times their minimum: Jpan-Latn runs (its buffers had grown to 67 TB) |
 
 ## Reproducing
 
@@ -2168,3 +2393,16 @@ python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
   ```
 
   `tools/ldml/xlit-coverage/` is ignored by git (`tools/ldml/.gitignore`).
+- **Compile and run times** (§4.5): `tools/ldml/xlit_perf_survey.py` builds
+  the 20 MB inputs, then measures every transform, one run at a time (about 4
+  hours; it resumes from `results.jsonl` if interrupted), and writes the table
+  between the `<!-- perf:table -->` markers of the table document:
+
+  ```
+  python3 tools/ldml/xlit_perf_survey.py --xlit build/bin/xlit --out tools/ldml/xlit-coverage/perf corpora
+  python3 tools/ldml/xlit_perf_survey.py --xlit build/bin/xlit --out tools/ldml/xlit-coverage/perf run
+  python3 tools/ldml/xlit_perf_survey.py --out tools/ldml/xlit-coverage/perf report \
+      --table-doc doc/ldml-xlit-coverage-table.md --csv doc/ldml-xlit-coverage-perf.csv
+  ```
+
+  Run nothing else meanwhile: the timings use the four performance cores.

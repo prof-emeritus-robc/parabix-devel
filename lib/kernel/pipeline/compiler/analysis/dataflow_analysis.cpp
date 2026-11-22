@@ -554,6 +554,21 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
         return;
     }
 
+    // The expected items per stride of a port, from which the relative I/O rates
+    // (and so the initial buffer sizes) are computed.  A variable rate with a
+    // positive minimum is expected at 1.5 times its minimum (at most its
+    // maximum), not at the midpoint of its range: the midpoints of the bounds
+    // of expanding kernels (e.g. BoundedRate(1, 16) of an insertion spread mask,
+    // 8.5) multiply along a pipeline of such steps, to buffers of terabytes,
+    // while most of their positions expand by little or nothing.  Fixed rates
+    // are exact, and rates whose minimum is 0 (as PopcountOf) keep the midpoint.
+    auto expectedRate = [](const Rational & min, const Rational & max) -> Rational {
+        if (min == max || min.numerator() == 0) {
+            return (min + max) * Rational{1, 2};
+        }
+        return std::min(min * Rational{3, 2}, max);
+    };
+
     using NonFixedTaintGraph = adjacency_list<hash_setS, vecS, bidirectionalS, boost::dynamic_bitset<size_t>>;
 
     using Graph = adjacency_list<hash_setS, vecS, undirectedS>;
@@ -618,7 +633,7 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
                 // cannot be predicted), reads whatever is written
                 const auto readsAll = iRate.isGreedy() || iRate.isUnknown();
                 if (LLVM_LIKELY(!readsAll)) {
-                    const auto expectedInput = (port.Minimum + port.Maximum) * Rational{1, 2};
+                    const auto expectedInput = expectedRate(port.Minimum, port.Maximum);
                     assert (expectedInput.numerator() > 0);
                     Equations.push_back(RatioEquation{consPartId, R.Node, (expectedInput * StrideRepetitionVector[kernel]) / R.Factor,
                                                       R.Fixed && port.Minimum == port.Maximum});
@@ -642,7 +657,7 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
                 // we cannot predict how much data will be passed to a pipeline
                 Rate[streamSet] = StreamSetRate{unpredictableRateNode(streamSet), Rational{1}, false};
             } else {
-                const auto expectedOutput = (port.Minimum + port.Maximum) * Rational{1, 2};
+                const auto expectedOutput = expectedRate(port.Minimum, port.Maximum);
                 assert (expectedOutput.numerator() > 0);
                 Rate[streamSet] = StreamSetRate{KernelPartitionId[kernel], expectedOutput * StrideRepetitionVector[kernel],
                                                 port.Minimum == port.Maximum};

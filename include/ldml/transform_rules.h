@@ -1245,6 +1245,49 @@ struct FunctionCallStats {
 std::vector<Rule *> ExpandFunctionCalls(const std::vector<Rule *> & rules, const FunctionEvaluator & evaluate,
                                         FunctionCallStats * stats = nullptr);
 
+//  NFD preservation of a conversion group: whether the group's output is in
+//  NFD whenever its input is, by a conservative, rule-by-rule check.  The
+//  group is the forward conversion rules between two transform rules (as
+//  ExtractForwardRules or ExtractReverseBackwardRules gives them; other rules
+//  are ignored).  A text is in NFD when none of its characters has a
+//  canonical decomposition (NFD_QC=Y) and no mark follows a mark of a higher
+//  canonical combining class (ccc; a starter has ccc 0).  The check shows that
+//  each application of a rule keeps the whole text in NFD: the text L M R,
+//  with the match M, becomes L S R, with the result S.  Then:
+//  - The literal characters of S are NFD_QC=Y and in canonical order among
+//    themselves; a copy of a capture ($n) is a part of the text, in NFD, and
+//    begins and ends with characters the capture may begin and end with.  A
+//    function call (&T(...)) is not analysed: the group then fails the check
+//    (ExpandFunctionCalls may remove it first).
+//  - The character before S (the last of L) may be bounded: by the last item
+//    of the before context, when that item matches a character (not empty, not
+//    the text boundary); and, when every character with which M may begin is
+//    a mark, by the highest ccc among them, as L M is in NFD.  Likewise the
+//    character after S (the first of R): by the first item of the after
+//    context, or, when every character with which M may end is a mark, by the
+//    lowest ccc among them.
+//  - S begins with a starter or with marks of ccc at least that bound before
+//    it, and ends with a starter or with marks of ccc at most the bound after
+//    it.  Where S may be empty (a deletion), the bound before must not exceed
+//    the bound after, unless M consists of marks only (deleting marks from an
+//    ordered run leaves it ordered).
+//  The cursor and the revisiting of results do not matter: each application,
+//  revisits included, keeps the text in NFD.  Filters do not matter either:
+//  characters outside them are unchanged, and the bounds from the contexts
+//  hold whether or not the contexts see past the filter (a context item that
+//  matches a character matches the adjacent one).  A text boundary in a
+//  context gives no bound.  Is_NFD_Preserving returns false with the first
+//  rule that fails and the reason, in failure, if given.
+struct NFD_PreservationFailure {
+    const ConversionRule * rule = nullptr;
+    std::string reason;
+};
+bool Is_NFD_Preserving(const std::vector<Rule *> & group, NFD_PreservationFailure * failure = nullptr);
+
+//  The conversion groups of a list of forward rules (separated by the transform
+//  rules), in order, each as the list of its conversion rules.
+std::vector<std::vector<Rule *>> ConversionGroups(const std::vector<Rule *> & rules);
+
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.
 std::vector<re::Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated = false);

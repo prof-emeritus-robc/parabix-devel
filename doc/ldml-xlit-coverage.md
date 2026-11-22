@@ -214,6 +214,16 @@ transforms measured (ldml-divcode-plan.md, §6 and §9), most by 45–80% in UTF
 mode. The exception is Halfwidth-Fullwidth, whose expansion of every ASCII
 character to 3 bytes makes UTF-8 mode slower.*
 
+*Update (November 21, 2026): a survey of compile and run times of all 453
+transform names at `a15e2d140` (§4.5; per transform, in the table document's
+"Compile and run times"), by `tools/ldml/xlit_perf_survey.py`. The status is
+unchanged: 424 of the 425 CLDR-defined transforms and the 28 built-ins are
+implementable by their plans (Latn-Grek remains blocked). Of the 424, 183 run
+wholly in UTF-8 mode and 241 in mixed modes; every implementable transform
+supports `--lines`. Jpan-Latn, implementable by its plan, fails to compile
+(LLVM runs out of virtual address space after about 4 minutes), and
+Thai-Latn's 20 MB runs, which include an ICU step, take more than 300 s.*
+
 This report covers:
 
 - which transforms xlit implements, and how correct they are against the CLDR
@@ -237,6 +247,13 @@ The numbers can be regenerated with `tools/ldml/xlit_coverage.py` (see
 | …of which public (not `visibility="internal"`) | 393 | 392 (100%) |
 <!-- /coverage:summary -->
 
+- **Compile and run times** (§4.5, November 21, 2026): over the 452
+  implementable transforms, the cold start (JIT compilation of every kernel,
+  `--compile-threads=3`) has a median of 8.6 s (90% within 22 s; 7 take a
+  minute or more), the warm start (kernels cached) 0.09 s (32 take 2 s or
+  more), and a 20 MB run in the transform's source script 0.08 s at
+  `-thread-num=4` (about 250 MB/s; 12 transforms are below 20 MB/s). `--lines`
+  costs about the same, with exceptions in both directions (§4.5).
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
   Their 263,287 cases fail only in two files, where the test data disagrees with
   the rules and with ICU (§3): ka-ka_Latn/BGN (215 cases) and my-my_FONIPA (2).
@@ -1211,6 +1228,128 @@ transforms, 331 conversion groups have 74,326 rules. A group of prefix runs
 takes 5 kernels (ro_FONIPA-ja) to 12 (the Ethiopic romanizations, whose
 replacements have one to three characters).
 
+### 4.5 Compile and run times
+
+A survey of every transform name xlit knows (453: the 425 CLDR-defined and
+the 28 built-ins), at `a15e2d140` (November 21, 2026), on an Apple M3 (4
+performance and 4 efficiency cores, 24 GB), the Release build with LLVM 22,
+each run alone. The per-transform results are in the table document,
+"Compile and run times".
+
+**Method** (`tools/ldml/xlit_perf_survey.py`):
+
+- **Status, mode and kernels:** `xlit --plan` (implementable or not, and its
+  last line, the mode: UTF-8, mixed or Unicode), `--plan --lines` (the region
+  scope of `--lines`), and `--kernel-counts`.
+- **Cold:** a run on one line of the input, with an object cache of its own,
+  empty (`-object-cache-dir`), and `--compile-threads=3`: the analysis of the
+  rules, the construction of the pipeline and the JIT compilation of every
+  kernel, including those of the normalizations and of the transforms
+  invoked.
+- **Warm:** the same run again, all kernels cached: the analysis, the
+  construction of the pipeline and the loading of the cached objects.
+- **Run:** the 20 MB input with the cache warm, at `-thread-num=4`, output to
+  `/dev/null`, less the warm time (the best of two runs where under 10 s).
+  Times under about 0.02 s are within the noise of the measurement.
+- **`--lines`:** the three again with `--lines`, in another empty cache.
+- **Inputs:** 20,000,000 bytes of text in the transform's source, chosen in
+  this order: natural text of its language or script (Twain for Latin and
+  English; the Wikibooks dumps of `~/Wikibooks`, the article text without
+  templates, tables and link markup, for de, es, fi, fr, id, tr, vi, ar, fa, el,
+  ru, ja, ko, th and zh; a mix of them all for the Any- built-ins); the source
+  sides of the CLDR test files of the transforms with that source, shuffled
+  and joined into lines of about 70 characters (281 transforms, e.g. the
+  Indic and Ethiopic scripts, Myanmar, Sinhala and the FONIPA sources); natural
+  text of a related language (Cyrillic languages: Russian); text produced by
+  another transform (Deva-InterIndic for InterIndic, Any-NFD of Korean for
+  Jamo, Han-Latin for pinyin, each Any-Hex variant for its Hex-Any, Any-Name
+  for Name-Any, Latn-X of English for scripts without test data, such as
+  Armenian, Georgian and Thaana). Each is repeated or cut, at a line end, to
+  20 MB. The input of each transform is named in the table.
+
+**Results** (implementable transforms; standard mode, then `--lines`):
+
+| | median | 90% | max | total |
+|---|---:|---:|---:|---:|
+| cold, s | 8.6 / 8.8 | 22 / 29 | 91 / 116 (Zawgyi-my) | 4,950 / 5,860 |
+| warm, s | 0.09 / 0.09 | 1.2 / 1.1 | 29 / 28 | 314 / 310 |
+| 20 MB run, s | 0.08 / 0.09 | 0.63 / 0.67 | 115 / 10 | |
+
+Cold starts: 95 under 2 s, 206 of 2–10 s, 131 of 10–30 s, 13 of 30–60 s and
+7 of a minute or more (standard mode); about 0.04 s per kernel at the median.
+The longest: Jpan-Latn (fails, below), Zawgyi-my 91 s (1,722 kernels),
+Han-Latin/Names 79 s, Hant-Latn 69 s, Hani-Latn 67 s, my-Zawgyi 66 s, Hira-Latn
+64 s (1,631 kernels), and the four Ethi-Latn `_Geminate` romanizations 50–54 s.
+The transforms of the table in §4.4 (measured differently there, on a
+one-line input with the default compile threads): Deva-Latn 9.8 s, Latn-Cans
+0.8 s, el-el_Latn/BGN 5.0 s, ru_Latn-ru/BGN 5.5 s, Arab-Latn 10.5 s.
+
+Run times, 20 MB: 259 transforms take 0.1 s or less (200 MB/s or more), 53
+run at 100–200 MB/s, 124 at 20–100 MB/s, and 12 below 20 MB/s:
+
+| transform | input | run, s | `--lines`, s |
+|---|---|---:|---:|
+| Thai-Latn | th Wikibooks | > 300 | > 300 |
+| Any-Name, Name-Any | mix; its Any-Name | > 300 | 2.4, 2.1 |
+| Any-BreakInternal | mix | 115 | 0.36 |
+| Latin-ug | English | 9.8 | 9.8 |
+| cs-ko | CLDR tests of cs | 7.1 | 7.2 |
+| fa-fa_FONIPA | fa Wikibooks | 6.6 | 6.7 |
+| cs_FONIPA-ko | CLDR tests of cs_FONIPA | 5.3 | 5.4 |
+| hy_AREVMDA-ar | CLDR tests of hy_AREVMDA | 0.42 | 10.3 |
+| Hira-Latn | ja Wikibooks | 1.34 | 1.35 |
+| Latn-Jamo, Latn-Hang, Latin-ConjoiningJamo | English | 1.0–1.2 | 1.0–1.2 |
+| Grek-Latn, Hang-Latn | el, ko Wikibooks | 1.0 | 1.0–1.1 |
+| xh-am | CLDR tests of xh | 1.27 | 1.41 |
+
+**Findings:**
+
+- **Jpan-Latn does not run.** Its plan is implementable (3,092 kernels, the
+  largest pipeline), but its compilation ends, after 253 s (283 s with
+  `--lines`), with `LLVM ERROR: failed to allocate virtual address space`.
+  Not yet investigated: whether it depends on `--compile-threads=3`, the cold
+  cache or the size of one of its kernels.
+- **ICU on one large text.** The steps xlit leaves to ICU (Any-Name,
+  Name-Any, Any-BreakInternal, and Thai-Latn's Any-BreakInternal step) are
+  very slow on a 20 MB text without line ends to split it: Any-BreakInternal
+  115 s, but 0.36 s with `--lines`, where ICU is applied line by line;
+  Any-Name and Name-Any more than 300 s, but about 2 s with `--lines`.
+  Thai-Latn's 20 MB runs take more than 300 s in both modes; how its time
+  divides between the ICU step and the xlit steps is not yet measured.
+- **Warm starts.** The warm start is 0.09 s at the median, but 32 transforms
+  take 2 s or more with every kernel cached: the five `_Geminate` Ethiopic
+  transforms 27–29 s (the four Ethi-Latn ones and am_Ethi-am_Ethi/Geminate),
+  the 22 `*-chr` transforms 3.2 s (und_FONIPA-chr and the 21 through it), Hans-Hant and
+  Hant-Hans 2.6 and 3.1 s, and Han-Latin/Names, Hani-Latn and Hant-Latn 2.2 s.
+  The Latin→Indic transforms take 1.3 s, and most of the `*-ar` and `*-am`
+  transforms 0.5–1.2 s. As the kernels are cached, this is the analysis of the rules and
+  the construction of the pipeline, repeated by every run; it is not yet
+  measured by phase.
+- **`--lines`.** Every implementable transform supports it, in one run over
+  the input (252 with contexts bounded by the lines, 4 with ICU steps applied
+  line by line). It costs about the same as the standard mode for most: of the
+  189 transforms whose 20 MB runs take 0.1 s or more, 175 run within ±40% of
+  the standard mode, and 424 of the 452 cold starts are within ±40%. The
+  largest differences:
+  - hy_AREVMDA-ar runs 24 times slower with `--lines` (0.42 s → 10.3 s);
+  - am-am_FONIPA compiles 12 times longer (3.0 s → 35 s), and so the `am-*`
+    transforms through it (am-ar, am-fa, am-chr: about 19 s → 62–65 s), and
+    ru-zh, es-zh, es_419-zh and NumericPinyin-Latin 1.7–2.3 times longer;
+  - ru-zh, pl-ja and am-am_FONIPA run about twice as long with `--lines`,
+    Any-BreakInternal (above) and Ethi-Latn/ALALOC_Geminate (0.68 → 0.31 s)
+    shorter;
+  - The plans of 25 transforms change with `--lines` (`--plan --lines`): a
+    group whose contexts are bounded by the lines is applied in Unicode mode
+    (e.g. hy-hy_Latn/BGN, Thai-ThaiLogical, it-am).
+  `xlit --kernel-counts --lines` gives the same counts as without `--lines`,
+  so the table has one kernel count.
+- **UTF-8 mode.** Of the 424 implementable CLDR-defined transforms, 183 run
+  wholly on the UTF-8 code units and 241 in mixed modes (some steps in Unicode
+  mode, in segments, see [xlit-utf8-mode.md](xlit-utf8-mode.md)); none
+  wholly in Unicode mode. Of the 28 built-ins, 7 have UTF-8 pipelines (Any-Null,
+  the four normalizations, Any-Lower and Any-Upper), 18 Unicode pipelines,
+  and 3 are applied by ICU.
+
 ## 5. What is not covered
 
 Table 1: work items, by the number of transforms that need them (own problems and
@@ -2168,3 +2307,16 @@ python3 tools/ldml/xlit_coverage.py --xlit build/bin/xlit \
   ```
 
   `tools/ldml/xlit-coverage/` is ignored by git (`tools/ldml/.gitignore`).
+- **Compile and run times** (§4.5): `tools/ldml/xlit_perf_survey.py` builds
+  the 20 MB inputs, then measures every transform, one run at a time (about 4
+  hours; it resumes from `results.jsonl` if interrupted), and writes the table
+  between the `<!-- perf:table -->` markers of the table document:
+
+  ```
+  python3 tools/ldml/xlit_perf_survey.py --xlit build/bin/xlit --out tools/ldml/xlit-coverage/perf corpora
+  python3 tools/ldml/xlit_perf_survey.py --xlit build/bin/xlit --out tools/ldml/xlit-coverage/perf run
+  python3 tools/ldml/xlit_perf_survey.py --out tools/ldml/xlit-coverage/perf report \
+      --table-doc doc/ldml-xlit-coverage-table.md
+  ```
+
+  Run nothing else meanwhile: the timings use the four performance cores.

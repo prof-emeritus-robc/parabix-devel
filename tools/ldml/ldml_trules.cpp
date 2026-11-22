@@ -54,12 +54,19 @@
 //      extracted forward rules) preserves NFD (see Is_NFD_Preserving): for
 //      each group that may not, the first rule that fails and the reason
 //      (unless --quiet), and the counts of each file and in total.
+//  ldml_trules --nfd-status [transform ...]
+//      Report the NFD status of each named transform (see ldml/nfd_status.h),
+//      of the registry of the default transform directory, or of all its
+//      transforms if none are named: Always, Preserving or NotGuaranteed,
+//      whether it is filter safe, and the reason.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 //  With --output=<file>, the reports are written to the file (- for the
 //  standard output); the messages go to the standard error.
 
 #include <ldml/transform_rules.h>
+#include <ldml/nfd_status.h>
+#include <ldml/transform_registry.h>
 #include <toolchain/toolio.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
@@ -478,6 +485,35 @@ struct OverlapCounts {
     size_t overlaps = 0;
 };
 
+static int reportNFD_Status(const std::vector<std::string> & names) {
+    TransformRegistry registry;
+    std::vector<std::string> warnings;
+    if (!registry.loadDirectory(defaultTransformDirectory(), warnings)) {
+        std::cerr << "cannot read " << defaultTransformDirectory() << "\n";
+        return 2;
+    }
+    NFD_StatusAnalyzer analyzer(registry);
+    std::vector<std::string> all = names;
+    if (all.empty()) for (const TransformEntry & e : registry.entries()) all.push_back(e.canonicalName);
+    std::map<std::string, unsigned> counts;
+    int status = 0;
+    for (const std::string & n : all) {
+        if (registry.lookup(n) == nullptr) {
+            std::cerr << n << ": unknown transform\n";
+            status = 1;
+            continue;
+        }
+        const NFD_StatusReport r = analyzer.Determine_NFD_Status(n);
+        counts[NFD_StatusName(r.status)]++;
+        toolio::stream() << n << "\t" << NFD_StatusName(r.status) << (r.filterSafe ? "\tfilter-safe" : "\t-")
+                         << (r.reason.empty() ? "" : "\t" + r.reason) << "\n";
+    }
+    if (names.empty()) {
+        for (const auto & c : counts) toolio::stream() << "Total " << c.first << ": " << c.second << "\n";
+    }
+    return status;
+}
+
 struct NFD_Counts {
     unsigned groups = 0;
     unsigned preserving = 0;
@@ -736,6 +772,36 @@ static const NFD_TestCase nfdTestCases[] = {
     {"$v = \\u0301 ; x } [:L:] → y $v ;", true},
     {"x → 가 ;", false},                              // Hangul syllables decompose
     {"x → ᄀ ᅡ ;", true},
+};
+
+//  The NFD status of the forward rules of a transform invoking built-ins.
+struct NFD_StatusTestCase {
+    const char * rules;
+    NFD_Status status;
+    bool filterSafe;
+};
+
+static const NFD_StatusTestCase nfdStatusTestCases[] = {
+    {":: NFD ; a → b ;", NFD_Status::Always, true},
+    {":: NFD ; x → y \\u0301 ;", NFD_Status::NotGuaranteed, false},
+    {":: NFD ; a → b ; :: NFC ;", NFD_Status::NotGuaranteed, false},
+    {":: NFC ; a → b ; :: NFD ;", NFD_Status::Always, false},
+    {"a → b ;", NFD_Status::Preserving, true},
+    {":: [:Latin:] ; :: NFD ;", NFD_Status::Preserving, true},
+    {":: [a-z] NFD ;", NFD_Status::Preserving, true},
+    {":: [a-z] NFKD ;", NFD_Status::NotGuaranteed, false},
+    {":: [[a-z][:M:]] NFKD ;", NFD_Status::Preserving, false},
+    {":: NFKD ;", NFD_Status::Always, false},
+    {":: NFKD ; :: [a-z] Upper ;", NFD_Status::Always, false},
+    {":: Any-Hex ;", NFD_Status::Always, true},
+    {":: Any-Hex/XML ; :: Null ;", NFD_Status::Always, true},
+    {":: Hex-Any ;", NFD_Status::NotGuaranteed, false},
+    {":: Null ;", NFD_Status::Preserving, true},
+    {":: NFD ; :: Lower ; :: Upper ; :: CaseFold ;", NFD_Status::Always, true},
+    {":: [a-z] Null ; :: NFD ;", NFD_Status::Preserving, true},     // (ICU carries [a-z] to NFD)
+    {":: Null ; :: [a-z] Null ; :: NFD ;", NFD_Status::Always, true},
+    {":: NFD ; :: Unknown-Transform ;", NFD_Status::NotGuaranteed, false},
+    {":: NFD ; :: Any-Remove ;", NFD_Status::Always, false},
 };
 
 static const EliminationTestCase partitionTestCases[] = {
@@ -1727,6 +1793,24 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
         }
     }
+    {
+        TransformRegistry builtIns;
+        NFD_StatusAnalyzer analyzer(builtIns);
+        for (const NFD_StatusTestCase & t : nfdStatusTestCases) {
+            count++;
+            try {
+                const NFD_StatusReport r = analyzer.Determine_NFD_Status(ExtractForwardRules(parseTransformRules({t.rules})));
+                if (r.status != t.status || r.filterSafe != t.filterSafe) {
+                    failures++;
+                    std::cerr << "FAIL (NFD status): " << t.rules << "\n  expected: " << NFD_StatusName(t.status) << " " << t.filterSafe
+                              << " actual: " << NFD_StatusName(r.status) << " " << r.filterSafe << " (" << r.reason << ")\n";
+                }
+            } catch (const TransformRuleParseError & e) {
+                failures++;
+                std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
+            }
+        }
+    }
     for (const NFD_TestCase & t : nfdTestCases) {
         count++;
         try {
@@ -1901,6 +1985,13 @@ static int run(int argc, char * argv[]) {
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--self-test") return runSelfTest();
+        if (arg == "--nfd-status") {
+            std::vector<std::string> names;
+            for (int j = i + 1; j < argc; j++) {
+                if (std::string(argv[j]).compare(0, 9, "--output=") != 0) names.push_back(argv[j]);
+            }
+            return reportNFD_Status(names);
+        }
         else if (arg == "--xml") xml = true;
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--forward") e = Extract::Forward;
@@ -1929,6 +2020,7 @@ static int run(int argc, char * argv[]) {
                   << "       " << argv[0] << " [--xml] --classify-after-contexts file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --classify-rules file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --nfd-preserving file ...\n"
+                  << "       " << argv[0] << " --nfd-status [transform ...]\n"
                   << "       " << argv[0] << " --self-test\n"
                   << "       (and --output=<file> for the reports)\n";
         return 2;

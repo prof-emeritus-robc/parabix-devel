@@ -3,11 +3,18 @@
  *  SPDX-License-Identifier: OSL-3.0
  *
  *  NFD preservation of conversion groups (see Is_NFD_Preserving in
- *  include/ldml/transform_rules.h).
+ *  include/ldml/transform_rules.h), and the NFD status of transforms (see
+ *  include/ldml/nfd_status.h).
  */
 
 #include <ldml/transform_rules.h>
+#include <ldml/nfd_status.h>
+#include <ldml/transform_rules_parser.h>
+#include <ldml/transform_rules_printer.h>
 #include "charset_analysis.h"
+#include <fstream>
+#include <memory>
+#include <sstream>
 #include <algorithm>
 #include <iterator>
 #include <llvm/Support/Casting.h>
@@ -346,6 +353,204 @@ std::vector<std::vector<Rule *>> ConversionGroups(const std::vector<Rule *> & ru
         }
     }
     return groups;
+}
+
+}
+
+namespace ldml {
+
+const char * NFD_StatusName(NFD_Status s) {
+    switch (s) {
+        case NFD_Status::Always: return "Always";
+        case NFD_Status::Preserving: return "Preserving";
+        case NFD_Status::NotGuaranteed: return "NotGuaranteed";
+    }
+    return "?";
+}
+
+namespace {
+
+NFD_StatusReport report(NFD_Status s, bool filterSafe, std::string reason) {
+    NFD_StatusReport r;
+    r.status = s;
+    r.filterSafe = filterSafe;
+    r.reason = std::move(reason);
+    return r;
+}
+
+//  Does a full case mapping (a string override property) keep NFD (see
+//  nfd_status.h)?  If not, the reason.
+bool caseMappingPreserves(UCD::property_t p, std::string & reason) {
+    const CombiningClasses & C = CombiningClasses::get();
+    auto * const obj = cast<UCD::StringOverridePropertyObject>(UCD::getPropertyObject(p));
+    const UnicodeSet mapped = (UnicodeSet(0, UCD::UNICODE_MAX) - obj->GetReflexiveSet()) & C.nfdStable;
+    auto cccOf = [&](UCD::codepoint_t c) {return C.maxMark(UnicodeSet(c, c));};
+    for (const auto & range : mapped) {
+        for (UCD::codepoint_t c = range.first; c <= range.second; c++) {
+            const std::u32string m = obj->GetU32StringValue(c);
+            const std::string at = "the mapping of " + hexCodepoint(c);
+            unsigned prev = 0;
+            for (char32_t x : m) {
+                if (!C.nfdStable.contains(x)) {
+                    reason = at + " has " + hexCodepoint(x) + ", which has a canonical decomposition";
+                    return false;
+                }
+                const unsigned k = cccOf(x);
+                if (k != 0 && prev > k) {
+                    reason = at + " is not in canonical order";
+                    return false;
+                }
+                prev = k;
+            }
+            if (m.empty()) continue;
+            const unsigned k = cccOf(c);
+            const unsigned first = cccOf(m.front());
+            const unsigned last = cccOf(m.back());
+            const bool ok = k == 0 ? (first == 0 && last == 0) : ((first == 0 || first >= k) && (last == 0 || last <= k));
+            if (!ok) {
+                reason = at + " (ccc " + std::to_string(k) + ") begins or ends with a mark of another class";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+//  A step's status within a filter (nullptr: none).
+NFD_StatusReport withinFilter(NFD_StatusReport r, const UnicodeSet * filter) {
+    if (filter == nullptr || r.status == NFD_Status::NotGuaranteed) return r;
+    const CombiningClasses & C = CombiningClasses::get();
+    if (r.filterSafe || C.maxMark(UnicodeSet(0, UCD::UNICODE_MAX) - *filter) == 0) {
+        r.status = NFD_Status::Preserving;
+        return r;
+    }
+    return report(NFD_Status::NotGuaranteed, false, "within a filter that leaves out marks: " + r.reason);
+}
+
+std::string readFile(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+}
+
+NFD_StatusReport NFD_StatusAnalyzer::builtIn(const TransformEntry * entry) {
+    const std::string & n = entry->canonicalName;
+    if (n == "Any-NFD") return report(NFD_Status::Always, true, "Any-NFD");
+    if (n == "Any-NFKD") return report(NFD_Status::Always, false, "Any-NFKD");
+    if (n == "Any-Remove") return report(NFD_Status::Always, false, "Any-Remove");
+    if (n == "Any-Name" || n.compare(0, 8, "Any-Hex/") == 0 || n == "Any-Hex") {
+        return report(NFD_Status::Always, true, n + " (ASCII)");
+    }
+    if (n == "Any-Null" || n == "Any-FCD") return report(NFD_Status::Preserving, true, n);
+    std::vector<UCD::property_t> mappings;
+    if (n == "Any-Lower") mappings = {UCD::lc};
+    else if (n == "Any-Upper") mappings = {UCD::uc};
+    else if (n == "Any-Title") mappings = {UCD::tc, UCD::lc};
+    else if (n == "Any-CaseFold") mappings = {UCD::cf};
+    if (!mappings.empty()) {
+        for (UCD::property_t p : mappings) {
+            std::string why;
+            if (!caseMappingPreserves(p, why)) return report(NFD_Status::NotGuaranteed, false, n + ": " + why);
+        }
+        return report(NFD_Status::Preserving, true, n);
+    }
+    return report(NFD_Status::NotGuaranteed, false, n);
+}
+
+NFD_StatusReport NFD_StatusAnalyzer::invoked(const TransformID & id) {
+    const TransformEntry * const entry = mRegistry.lookup(id.getText());
+    if (entry == nullptr) return report(NFD_Status::NotGuaranteed, false, id.getText() + " (unknown)");
+    NFD_StatusReport r = Determine_NFD_Status(entry);
+    if (!entry->isBuiltIn()) r.reason = entry->canonicalName + (r.reason.empty() ? "" : ": " + r.reason);
+    return r;
+}
+
+NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::string & name) {
+    const TransformEntry * const entry = mRegistry.lookup(name);
+    if (entry == nullptr) return report(NFD_Status::NotGuaranteed, false, name + " (unknown)");
+    return Determine_NFD_Status(entry);
+}
+
+NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const TransformEntry * entry) {
+    const auto f = mCache.find(entry);
+    if (f != mCache.end()) return f->second;
+    if (entry->isBuiltIn()) return mCache[entry] = builtIn(entry);
+    if (mActive[entry]) return report(NFD_Status::NotGuaranteed, false, "invokes itself");
+    mActive[entry] = true;
+    NFD_StatusReport r;
+    try {
+        const std::vector<Rule *> parsed = parseTransformRules(extractTRules(readFile(entry->file)));
+        const std::vector<Rule *> rules = entry->direction == TransformDirection::Forward ? ExtractForwardRules(parsed)
+                                                                                          : ExtractReverseBackwardRules(parsed);
+        r = Determine_NFD_Status(rules);
+    } catch (const std::exception & e) {
+        r = report(NFD_Status::NotGuaranteed, false, std::string("rules not read: ") + e.what());
+    }
+    mActive[entry] = false;
+    return mCache[entry] = r;
+}
+
+NFD_StatusReport NFD_StatusAnalyzer::Determine_NFD_Status(const std::vector<Rule *> & forwardRules) {
+    CharSetAnalysis sets;
+    //  The global filter, and the filter carried through a block of transform
+    //  rules (see nfd_status.h).
+    std::unique_ptr<UnicodeSet> global;
+    std::unique_ptr<UnicodeSet> carried;
+    bool blockStart = true;
+    std::vector<NFD_StatusReport> steps;
+    std::vector<Rule *> group;
+    auto endGroup = [&]() {
+        if (group.empty()) return;
+        NFD_PreservationFailure failure;
+        NFD_StatusReport r = Is_NFD_Preserving(group, &failure)
+            ? report(NFD_Status::Preserving, true, "")
+            : report(NFD_Status::NotGuaranteed, false, "step " + std::to_string(steps.size() + 1) + " (conversion group): " +
+                     failure.reason + ": " + printRule(failure.rule));
+        steps.push_back(withinFilter(r, global.get()));
+        group.clear();
+        blockStart = true;
+        carried.reset();
+    };
+    for (Rule * rule : forwardRules) {
+        if (const FilterRule * fr = dyn_cast<FilterRule>(rule)) {
+            if (!fr->isInverse()) global.reset(new UnicodeSet(sets.setOf(fr->getFilterSet(), true)));
+        } else if (const TransformRule * tr = dyn_cast<TransformRule>(rule)) {
+            endGroup();
+            if (!tr->hasForward()) continue;
+            std::unique_ptr<UnicodeSet> filter;
+            if (tr->getForwardFilter()) {
+                filter.reset(new UnicodeSet(sets.setOf(tr->getForwardFilter(), true)));
+                if (blockStart && !global) carried.reset(new UnicodeSet(*filter));
+            } else if (carried) {
+                filter.reset(new UnicodeSet(*carried));
+            }
+            blockStart = false;
+            if (global) {
+                if (filter) *filter = *filter & *global; else filter.reset(new UnicodeSet(*global));
+            }
+            NFD_StatusReport r = withinFilter(invoked(tr->getForwardID()), filter.get());
+            r.reason = "step " + std::to_string(steps.size() + 1) + " (" + tr->getForwardID().getText() + "): " + r.reason;
+            steps.push_back(r);
+        } else if (isa<ConversionRule>(rule)) {
+            group.push_back(rule);
+        }
+    }
+    endGroup();
+    //  The last step that is Always, and the first step after it that is
+    //  NotGuaranteed.
+    size_t lastAlways = steps.size();
+    for (size_t i = 0; i < steps.size(); i++) if (steps[i].status == NFD_Status::Always) lastAlways = i;
+    const size_t from = lastAlways == steps.size() ? 0 : lastAlways + 1;
+    bool safe = true;
+    for (const NFD_StatusReport & r : steps) safe = safe && r.status != NFD_Status::NotGuaranteed && r.filterSafe;
+    for (size_t i = from; i < steps.size(); i++) {
+        if (steps[i].status == NFD_Status::NotGuaranteed) return report(NFD_Status::NotGuaranteed, false, steps[i].reason);
+    }
+    if (lastAlways != steps.size()) return report(NFD_Status::Always, safe, steps[lastAlways].reason);
+    return report(NFD_Status::Preserving, safe, "");
 }
 
 }

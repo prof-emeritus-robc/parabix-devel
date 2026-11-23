@@ -21,6 +21,7 @@
 
 #include <ldml/transform_rules.h>
 #include "charset_analysis.h"
+#include "set_index.h"
 #include <re/adt/adt.h>
 #include <ucd/core/unicode_set.h>
 #include <map>
@@ -392,20 +393,44 @@ bool RuleOverlapAnalysis::mayMatchWithin(const ConversionRule * s, const Convers
 std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules) {
     std::vector<RuleOverlap> overlaps;
     RuleOverlapAnalysis analysis;
+    //  Each group (the rules between transform rules), its pairs of an earlier
+    //  and a later rule.  Two rules may overlap only if their leading
+    //  characters meet (RuleOverlapAnalysis::Leading: compatible requires a
+    //  first character of both, or a match without characters of either):
+    //  the earlier rules are found by an index of their leading characters,
+    //  not by testing every pair.  (Hans-Hant's groups have over a thousand
+    //  rules, nearly all beginning with characters of their own.)
+    auto group = [&](size_t start, size_t end) {
+        std::vector<size_t> forward;
+        for (size_t i = start; i < end; i++) {
+            const ConversionRule * r = dyn_cast<ConversionRule>(rules[i]);
+            if (r && appliesForward(r->getDirection())) forward.push_back(i);
+        }
+        std::vector<RuleOverlapAnalysis::Leading> leading;
+        SetIndex index;
+        for (size_t i : forward) {
+            leading.push_back(analysis.leading(cast<ConversionRule>(rules[i])));
+            index.add(leading.back().chars, leading.back().mayBeEmpty);
+        }
+        index.build();
+        for (size_t k = 0; k < forward.size(); k++) {
+            const ConversionRule * later = cast<ConversionRule>(rules[forward[k]]);
+            //  (The items meeting it, in order: the earlier ones first.)
+            for (size_t m : index.meeting(leading[k].chars, leading[k].mayBeEmpty)) {
+                if (m >= k) break;
+                const ConversionRule * earlier = cast<ConversionRule>(rules[forward[m]]);
+                if (analysis.mayOverlap(earlier, later)) overlaps.push_back(RuleOverlap{forward[m], forward[k]});
+            }
+        }
+    };
     size_t groupStart = 0;
     for (size_t i = 0; i < rules.size(); i++) {
         if (isa<TransformRule>(rules[i])) {
+            group(groupStart, i);
             groupStart = i + 1;
-            continue;
-        }
-        const ConversionRule * later = dyn_cast<ConversionRule>(rules[i]);
-        if (later == nullptr || !appliesForward(later->getDirection())) continue;
-        for (size_t j = groupStart; j < i; j++) {
-            const ConversionRule * earlier = dyn_cast<ConversionRule>(rules[j]);
-            if (earlier == nullptr || !appliesForward(earlier->getDirection())) continue;
-            if (analysis.mayOverlap(earlier, later)) overlaps.push_back(RuleOverlap{j, i});
         }
     }
+    group(groupStart, rules.size());
     return overlaps;
 }
 

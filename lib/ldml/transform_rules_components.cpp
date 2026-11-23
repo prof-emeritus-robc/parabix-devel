@@ -91,22 +91,101 @@ std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *>
         rules.push_back(i);
         f.push_back(footprint(rule));
     }
-    std::vector<size_t> parent(rules.size());
+    const size_t n = rules.size();
+    std::vector<size_t> parent(n);
     std::iota(parent.begin(), parent.end(), 0);
     auto find = [&](size_t x) {
         while (parent[x] != x) x = parent[x] = parent[parent[x]];
         return x;
     };
-    //  (Pairwise; the groups have at most a few thousand rules.)
-    for (size_t i = 0; i < rules.size(); i++) {
-        for (size_t j = i + 1; j < rules.size(); j++) {
-            if (find(i) == find(j)) continue;
-            if (!(f[i].text & f[j].text).empty() || affects(f[i], f[j]) || affects(f[j], f[i])) parent[find(i)] = find(j);
+    auto unite = [&](size_t x, size_t y) {
+        x = find(x);
+        y = find(y);
+        if (x != y) parent[x] = y;
+    };
+    //  The relations of the rules hold where their sets share a character.  The
+    //  characters are divided into the elementary intervals of the bounds of all
+    //  the sets, and each relation is resolved within each interval: rules a and
+    //  b (a != b) are related there if a has the interval in one of its sets X
+    //  and b in another Y (text and text; context and text or result; text and
+    //  result).  All the rules having the interval in X or Y are then connected
+    //  (the complete bipartite relation, without the pairs of a rule with
+    //  itself, connects them unless they are a single rule).  (The pairwise
+    //  comparison of the sets was quadratic: about 0.7 s for Hans-Hant.)
+    std::vector<UCD::codepoint_t> bounds;
+    auto addBounds = [&](const UnicodeSet & set) {
+        for (const auto & range : set) {
+            bounds.push_back(range.first);
+            if (range.second < UCD::UNICODE_MAX) bounds.push_back(range.second + 1);
+        }
+    };
+    for (const Footprint & x : f) {
+        addBounds(x.text);
+        addBounds(x.context);
+        addBounds(x.result);
+    }
+    std::sort(bounds.begin(), bounds.end());
+    bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
+    enum : unsigned char {Text = 1, Context = 2, Result = 4};
+    //  For each interval, the rules having it in their sets, with the sets.
+    std::vector<std::vector<std::pair<size_t, unsigned char>>> at(bounds.size());
+    auto mark = [&](size_t r, const UnicodeSet & set, unsigned char kind) {
+        for (const auto & range : set) {
+            const size_t lo = std::lower_bound(bounds.begin(), bounds.end(), range.first) - bounds.begin();
+            const size_t hi = std::upper_bound(bounds.begin(), bounds.end(), range.second) - bounds.begin();
+            for (size_t k = lo; k < hi; k++) {
+                auto & v = at[k];
+                if (!v.empty() && v.back().first == r) v.back().second |= kind;
+                else v.emplace_back(r, kind);
+            }
+        }
+    };
+    for (size_t r = 0; r < n; r++) {
+        mark(r, f[r].text, Text);
+        mark(r, f[r].context, Context);
+        mark(r, f[r].result, Result);
+    }
+    //  Connect the rules of v having a kind of X or of Y, if some a has X and
+    //  some b != a has Y.
+    auto connect = [&](const std::vector<std::pair<size_t, unsigned char>> & v, unsigned char x, unsigned char y) {
+        size_t first = SIZE_MAX, count = 0;
+        bool hasX = false, hasY = false;
+        for (const auto & e : v) {
+            if (!(e.second & (x | y))) continue;
+            hasX |= (e.second & x) != 0;
+            hasY |= (e.second & y) != 0;
+            if (count++ == 0) first = e.first;
+        }
+        if (count < 2 || !hasX || !hasY) return;
+        for (const auto & e : v) {
+            if (e.second & (x | y)) unite(e.first, first);
+        }
+    };
+    for (const auto & v : at) {
+        if (v.size() < 2) continue;
+        connect(v, Text, Text);
+        connect(v, Context, Text | Result);
+        connect(v, Text, Result);
+    }
+    //  A rule with a context and another that changes the length.
+    {
+        size_t first = SIZE_MAX, count = 0;
+        bool context = false, changing = false;
+        for (size_t r = 0; r < n; r++) {
+            if (!(f[r].hasContext || f[r].lengthChanging)) continue;
+            context |= f[r].hasContext;
+            changing |= f[r].lengthChanging;
+            if (count++ == 0) first = r;
+        }
+        if (count >= 2 && context && changing) {
+            for (size_t r = 0; r < n; r++) {
+                if (f[r].hasContext || f[r].lengthChanging) unite(r, first);
+            }
         }
     }
     std::vector<std::vector<size_t>> components;
-    std::vector<size_t> index(rules.size(), SIZE_MAX);
-    for (size_t i = 0; i < rules.size(); i++) {
+    std::vector<size_t> index(n, SIZE_MAX);
+    for (size_t i = 0; i < n; i++) {
         const size_t r = find(i);
         if (index[r] == SIZE_MAX) {
             index[r] = components.size();

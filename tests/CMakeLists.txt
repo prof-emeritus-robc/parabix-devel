@@ -126,6 +126,13 @@ add_test(NAME region_reversal_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/region_reversal_test.py ${TEST_BIN_DIR}/region_reversal)
 
+# Character classes on UTF-8 bytes (kernel::CharClassesKernel), checked with Python
+parabix_add_executable(NAME utf8_classes SRC utf8_classes.cpp
+                       DEPS kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.unicode toolchain)
+add_test(NAME utf8_classes_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/utf8_classes_test.py ${TEST_BIN_DIR}/utf8_classes)
+
 # make_circular_buffer under each --CircularBufferImpl: every copy mirrors the same pages
 parabix_add_executable(NAME test_circular_buffer SRC test_circular_buffer.cpp
                        DEPS kernel.core toolchain)

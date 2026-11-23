@@ -117,7 +117,9 @@ CharClassesKernel::CharClassesKernel(LLVMTypeSystemInterface & ts, std::string s
               pablo::BitMovementMode_string(mode) + maskSuffix(mask)
 , {}, {maskedOutput(mask, "charclasses", CharClasses)})
 , mCCs(ccs)
-, mSignature(signature)
+//  (The signature names the kernel's body: its classes, and the movement and
+//  mask, as the name does.)
+, mSignature(signature + pablo::BitMovementMode_string(mode) + maskSuffix(mask))
 , mBitMovement(mode)
 , mHasMask(mask.mask != nullptr)
 , mMaskKind(mask.kind) {

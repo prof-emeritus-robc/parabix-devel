@@ -49,12 +49,31 @@
 //      Also report the simple insertion rules (a captured text, replaced by
 //      fixed text, the reference to the capture and fixed text), by the kind
 //      of insertion and the length of the captured text.
+//  ldml_trules [--xml] [--quiet] --nfd-preserving file ...
+//      Report whether each conversion group (forward and backward, as
+//      extracted forward rules) preserves NFD (see Is_NFD_Preserving): for
+//      each group that may not, the first rule that fails and the reason
+//      (unless --quiet), and the counts of each file and in total.
+//  ldml_trules [--xml] [--quiet] --components file ...
+//      The independent components of each conversion group of the forward
+//      and backward rules (IndependentComponents): the number of its rules,
+//      of its components and the size of the largest; with --quiet, only the
+//      groups of 100 rules or more.
+//  ldml_trules --nfd-status [transform ...]
+//      Report the NFD status of each named transform (see ldml/nfd_status.h),
+//      of the registry of the default transform directory, or of all its
+//      transforms if none are named: Always, Preserving or NotGuaranteed,
+//      whether it is filter safe, the numbers of its Any-NFC steps whose input
+//      is always in NFD and in NFD if the transform's input is (of all its
+//      Any-NFC steps: NFC a+p/n), and the reason.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 //  With --output=<file>, the reports are written to the file (- for the
 //  standard output); the messages go to the standard error.
 
 #include <ldml/transform_rules.h>
+#include <ldml/nfd_status.h>
+#include <ldml/transform_registry.h>
 #include <toolchain/toolio.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
@@ -231,6 +250,14 @@ static const TestCase testCases[] = {
     // (Within a text, the text boundary of a negated set is dropped.)
     {"\\p{Script=Greek} → x ; [:^gc=Lu:] → y ;", "[:script=Greek:] → x ;\n[^[:gc=Lu:]$] → y ;\n"},
     {"$v = [aeiou] ; [$v y] → V ;", "$v = [aeiou] ;\n[$v y] → V ;\n"},
+    // A variable of one character is a character in a set, as in ICU: [$u-$v]
+    // is a range (Latin-InterIndic's [$ka-$ha]), not a difference.
+    {"$u = b ; $v = \\u0064 ; [$u-$v] → x ;", "$u = b ;\n$v = d ;\n[b-d] → x ;\n"},
+    {"$u = b ; [a-$u] → x ;", "$u = b ;\n[ab] → x ;\n"},
+    {"$u = b ; [$u-d] → x ;", "$u = b ;\n[b-d] → x ;\n"},
+    {"$u = [b] ; $v = [d] ; [$u-$v] → x ;", "$u = [b] ;\n$v = [d] ;\n[$u-$v] → x ;\n"},
+    {"$u = b ; [^$u] → x ; [$u c] → y ;", "$u = b ;\n[^$u$] → x ;\n[$u c] → y ;\n"},
+    {"$u = d ; $v = b ; [$u-$v] → x ;", nullptr},
     {"[a\\-z] → x ;", "[\\-az] → x ;\n"},
     {"$mac = M [aA] [cC] ;", "$mac = M [Aa] [Cc] ;\n"},
     {"$space = [:Separator:]* ; high $space school → 'H.S.' ;",
@@ -465,6 +492,121 @@ struct OverlapCounts {
     size_t overlaps = 0;
 };
 
+static int reportNFD_Status(const std::vector<std::string> & names) {
+    TransformRegistry registry;
+    std::vector<std::string> warnings;
+    if (!registry.loadDirectory(defaultTransformDirectory(), warnings)) {
+        std::cerr << "cannot read " << defaultTransformDirectory() << "\n";
+        return 2;
+    }
+    NFD_StatusAnalyzer analyzer(registry);
+    std::vector<std::string> all = names;
+    if (all.empty()) for (const TransformEntry & e : registry.entries()) all.push_back(e.canonicalName);
+    std::map<std::string, unsigned> counts;
+    int status = 0;
+    for (const std::string & n : all) {
+        if (registry.lookup(n) == nullptr) {
+            std::cerr << n << ": unknown transform\n";
+            status = 1;
+            continue;
+        }
+        const NFD_StatusReport r = analyzer.Determine_NFD_Status(n);
+        counts[NFD_StatusName(r.status)]++;
+        //  The Any-NFC steps of the transform, and those with an input in NFD
+        //  (Always before them).
+        unsigned nfc = 0, nfdInput = 0, nfdIfInput = 0;
+        const TransformEntry * const entry = registry.lookup(n);
+        if (!entry->isBuiltIn()) {
+            try {
+                const std::vector<Rule *> parsed = parseTransformRules(extractTRules(readFile(entry->file)));
+                const std::vector<Rule *> rules = entry->direction == TransformDirection::Forward ? ExtractForwardRules(parsed)
+                                                                                                  : ExtractReverseBackwardRules(parsed);
+                const std::vector<NFD_Status> before = analyzer.StatusBeforeTransformRules(rules);
+                size_t k = 0;
+                for (const Rule * rule : rules) {
+                    const TransformRule * const t = llvm::dyn_cast<TransformRule>(rule);
+                    if (t == nullptr) continue;
+                    const TransformEntry * const e = registry.lookup(t->getForwardID().getText());
+                    if (e && e->canonicalName == "Any-NFC") {
+                        nfc++;
+                        nfdInput += before[k] == NFD_Status::Always;
+                        nfdIfInput += before[k] == NFD_Status::Preserving;
+                    }
+                    k++;
+                }
+            } catch (const std::exception &) {}
+        }
+        counts["NFC steps"] += nfc;
+        counts["NFC steps with NFD input"] += nfdInput;
+        counts["NFC steps with NFD input if the transform's is"] += nfdIfInput;
+        toolio::stream() << n << "\t" << NFD_StatusName(r.status) << (r.filterSafe ? "\tfilter-safe" : "\t-")
+                         << "\tNFC " << nfdInput << "+" << nfdIfInput << "/" << nfc << (r.reason.empty() ? "" : "\t" + r.reason) << "\n";
+    }
+    if (names.empty()) {
+        for (const auto & c : counts) toolio::stream() << "Total " << c.first << ": " << c.second << "\n";
+    }
+    return status;
+}
+
+struct NFD_Counts {
+    unsigned groups = 0;
+    unsigned preserving = 0;
+};
+
+static void reportNFD_Preservation(const std::vector<std::string> & tRules, const std::string & label, bool quiet, NFD_Counts & total) {
+    const std::vector<Rule *> parsed = parseTransformRules(tRules);
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        const std::vector<std::vector<Rule *>> groups = ConversionGroups(extract(parsed, e));
+        if (groups.empty()) continue;
+        NFD_Counts n;
+        std::string failures;
+        for (size_t g = 0; g < groups.size(); g++) {
+            NFD_PreservationFailure failure;
+            n.groups++;
+            if (Is_NFD_Preserving(groups[g], &failure)) {
+                n.preserving++;
+            } else if (!quiet) {
+                failures += "    group " + std::to_string(g + 1) + " (" + std::to_string(groups[g].size()) + " rules): " +
+                            failure.reason + ": " + printRule(failure.rule) + "\n";
+            }
+        }
+        toolio::stream() << label << (e == Extract::Forward ? " forward: " : " backward: ") << n.preserving << " of "
+                         << n.groups << " groups NFD-preserving\n" << failures;
+        total.groups += n.groups;
+        total.preserving += n.preserving;
+    }
+}
+
+static void reportComponents(const std::vector<std::string> & tRules, const std::string & label, bool quiet) {
+    const std::vector<Rule *> parsed = parseTransformRules(tRules);
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        const std::vector<std::vector<Rule *>> groups = ConversionGroups(extract(parsed, e));
+        for (size_t g = 0; g < groups.size(); g++) {
+            const std::vector<std::vector<size_t>> components = IndependentComponents(groups[g]);
+            size_t rules = 0, largest = 0;
+            for (const auto & c : components) {
+                rules += c.size();
+                largest = std::max(largest, c.size());
+            }
+            if (quiet && rules < 100) continue;
+            toolio::stream() << label << (e == Extract::Forward ? " forward" : " backward") << " group " << g + 1 << ": " << rules
+                             << " rules, " << components.size() << " components, largest " << largest << "\n";
+            if (quiet) continue;
+            //  The components with rules that have before contexts: the size, and
+            //  the first such rule.
+            for (size_t c = 0; c < components.size(); c++) {
+                for (size_t i : components[c]) {
+                    const ConversionRule * const rule = llvm::cast<ConversionRule>(groups[g][i]);
+                    if (!rule->getSourceSide(Direction::Forward)->hasBeforeContext()) continue;
+                    toolio::stream() << "    component " << c + 1 << " (" << components[c].size() << " rules), with before contexts: "
+                                     << printRule(rule) << "\n";
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static void reportOverlaps(const std::vector<std::string> & tRules, const std::string & label, bool quiet, OverlapCounts & total) {
     const std::vector<Rule *> parsed = parseTransformRules(tRules);
     for (const Extract e : {Extract::Forward, Extract::Backward}) {
@@ -657,6 +799,73 @@ static const OverlapTestCase overlapTestCases[] = {
     {"[:Greek:] → 1 ; α → 2 ;", true},
     {"{ } c → 1 ; b → 2 ;", false},
     {"{ } c → 1 ; c → 2 ;", true},
+};
+
+//  NFD preservation of a rule list's single conversion group (forward rules).
+struct NFD_TestCase {
+    const char * rules;
+    bool preserving;
+};
+
+static const NFD_TestCase nfdTestCases[] = {
+    {"a → b ;", true},                               // starters
+    {"c → ;", false},                                // deleting a starter: ́ c ̣ → ́ ̣
+    {"[:L:] { c → ;", true},                         // (after a letter, a starter)
+    {"x → y \\u0301 ;", false},                    // ends with a mark: x ̣ → y ́ ̣
+    {"x } [:L:] → y \\u0301 ;", true},             // followed by a letter (a starter)
+    {"x } \\u0323 → y \\u0301 ;", false},          // followed by ̣ (220)
+    {"x } \\u0301 → y \\u0300 ;", true},           // followed by a mark of the same class
+    {"x → é ;", false},                              // é has a canonical decomposition
+    {"x → e \\u0301 ;", false},
+    {"x } [:^M:] → e \\u0301 ;", false},           // (a negated set includes the text boundary: no bound)
+    {"x → \\u0301 e ;", false},                    // begins with a mark: ̣ x → ̣ ́ e
+    {"\\u0323 → \\u0301 ;", false},                // ̣ may be followed by a mark of ccc 222 (U+059A)
+    {"\\u0301 → \\u0300 ;", true},                 // a mark replaced by one of the same class
+    {"\\u0301 → ;", true},                          // deleting marks keeps their order
+    {"x → \\u0301 \\u0323 ;", false},              // out of order within the result
+    {"x → \\u0323 \\u0301 ;", false},              // (begins with a mark)
+    {"[:L:] { x → \\u0323 \\u0301 ; ", false},     // (ends with 230, followed by anything)
+    {"[:L:] { x } [:L:] → \\u0323 \\u0301 ;", true},
+    {"(a) x → $1 y ;", true},
+    {"([:M:]) x → $1 y ;", true},                    // the mark stays where it was
+    {"(\\u0301) x → $1 y ;", true},
+    {"(\\u0301?) x → $1 y ;", false},                // (conservative: the capture may be empty)
+    {"x ([:M:]) → y $1 ;", true},
+    {"x ([:M:]) → $1 y ;", false},                   // the mark moves before y, after the text before x
+    {"x → &Any-Upper(x) ;", false},                  // functions are not analysed
+    {"$v = \\u0301 ; x } [:L:] → y $v ;", true},
+    {"x → 가 ;", false},                              // Hangul syllables decompose
+    {"x → ᄀ ᅡ ;", true},
+};
+
+//  The NFD status of the forward rules of a transform invoking built-ins.
+struct NFD_StatusTestCase {
+    const char * rules;
+    NFD_Status status;
+    bool filterSafe;
+};
+
+static const NFD_StatusTestCase nfdStatusTestCases[] = {
+    {":: NFD ; a → b ;", NFD_Status::Always, true},
+    {":: NFD ; x → y \\u0301 ;", NFD_Status::NotGuaranteed, false},
+    {":: NFD ; a → b ; :: NFC ;", NFD_Status::NotGuaranteed, false},
+    {":: NFC ; a → b ; :: NFD ;", NFD_Status::Always, false},
+    {"a → b ;", NFD_Status::Preserving, true},
+    {":: [:Latin:] ; :: NFD ;", NFD_Status::Preserving, true},
+    {":: [a-z] NFD ;", NFD_Status::Preserving, true},
+    {":: [a-z] NFKD ;", NFD_Status::NotGuaranteed, false},
+    {":: [[a-z][:M:]] NFKD ;", NFD_Status::Preserving, false},
+    {":: NFKD ;", NFD_Status::Always, false},
+    {":: NFKD ; :: [a-z] Upper ;", NFD_Status::Always, false},
+    {":: Any-Hex ;", NFD_Status::Always, true},
+    {":: Any-Hex/XML ; :: Null ;", NFD_Status::Always, true},
+    {":: Hex-Any ;", NFD_Status::NotGuaranteed, false},
+    {":: Null ;", NFD_Status::Preserving, true},
+    {":: NFD ; :: Lower ; :: Upper ; :: CaseFold ;", NFD_Status::Always, true},
+    {":: [a-z] Null ; :: NFD ;", NFD_Status::Preserving, true},     // (ICU carries [a-z] to NFD)
+    {":: Null ; :: [a-z] Null ; :: NFD ;", NFD_Status::Always, true},
+    {":: NFD ; :: Unknown-Transform ;", NFD_Status::NotGuaranteed, false},
+    {":: NFD ; :: Any-Remove ;", NFD_Status::Always, false},
 };
 
 static const EliminationTestCase partitionTestCases[] = {
@@ -1648,6 +1857,40 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
         }
     }
+    {
+        TransformRegistry builtIns;
+        NFD_StatusAnalyzer analyzer(builtIns);
+        for (const NFD_StatusTestCase & t : nfdStatusTestCases) {
+            count++;
+            try {
+                const NFD_StatusReport r = analyzer.Determine_NFD_Status(ExtractForwardRules(parseTransformRules({t.rules})));
+                if (r.status != t.status || r.filterSafe != t.filterSafe) {
+                    failures++;
+                    std::cerr << "FAIL (NFD status): " << t.rules << "\n  expected: " << NFD_StatusName(t.status) << " " << t.filterSafe
+                              << " actual: " << NFD_StatusName(r.status) << " " << r.filterSafe << " (" << r.reason << ")\n";
+                }
+            } catch (const TransformRuleParseError & e) {
+                failures++;
+                std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
+            }
+        }
+    }
+    for (const NFD_TestCase & t : nfdTestCases) {
+        count++;
+        try {
+            const std::vector<std::vector<Rule *>> groups = ConversionGroups(ExtractForwardRules(parseTransformRules({t.rules})));
+            NFD_PreservationFailure failure;
+            const bool actual = groups.size() == 1 && Is_NFD_Preserving(groups[0], &failure);
+            if (actual != t.preserving) {
+                failures++;
+                std::cerr << "FAIL (NFD preservation): " << t.rules << "\n  expected: " << t.preserving << " actual: " << actual
+                          << (actual ? "" : " (" + failure.reason + ")") << "\n";
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
+        }
+    }
     for (const EliminationTestCase & t : unreferencedTestCases) {
         count++;
         try {
@@ -1801,10 +2044,19 @@ static int run(int argc, char * argv[]) {
     bool count = false;
     bool classifyAfter = false;
     bool classifyRuleKinds = false;
+    bool nfdPreserving = false;
+    bool components = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--self-test") return runSelfTest();
+        if (arg == "--nfd-status") {
+            std::vector<std::string> names;
+            for (int j = i + 1; j < argc; j++) {
+                if (std::string(argv[j]).compare(0, 9, "--output=") != 0) names.push_back(argv[j]);
+            }
+            return reportNFD_Status(names);
+        }
         else if (arg == "--xml") xml = true;
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--forward") e = Extract::Forward;
@@ -1818,6 +2070,8 @@ static int run(int argc, char * argv[]) {
         else if (arg == "--count-nullable-captures") count = true;
         else if (arg == "--classify-after-contexts") classifyAfter = true;
         else if (arg == "--classify-rules") classifyRuleKinds = true;
+        else if (arg == "--nfd-preserving") nfdPreserving = true;
+        else if (arg == "--components") components = true;
         else if (arg.compare(0, 9, "--output=") == 0) continue;   // (main)
         else files.push_back(arg);
     }
@@ -1831,6 +2085,9 @@ static int run(int argc, char * argv[]) {
                   << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --classify-after-contexts file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --classify-rules file ...\n"
+                  << "       " << argv[0] << " [--xml] [--quiet] --nfd-preserving file ...\n"
+                  << "       " << argv[0] << " [--xml] [--quiet] --components file ...\n"
+                  << "       " << argv[0] << " --nfd-status [transform ...]\n"
                   << "       " << argv[0] << " --self-test\n"
                   << "       (and --output=<file> for the reports)\n";
         return 2;
@@ -1842,11 +2099,16 @@ static int run(int argc, char * argv[]) {
     PartitionCounts partitionTotal;
     AfterContextCounts afterCounts;
     RuleClassCounts ruleClassCounts;
+    NFD_Counts nfdTotal;
     for (const std::string & f : files) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            if (classifyRuleKinds) {
+            if (components) {
+                reportComponents(tRules, f, quiet);
+            } else if (nfdPreserving) {
+                reportNFD_Preservation(tRules, f, quiet, nfdTotal);
+            } else if (classifyRuleKinds) {
                 classifyRules(tRules, f, quiet, ruleClassCounts);
             } else if (classifyAfter) {
                 classifyAfterContexts(tRules, f, afterCounts);
@@ -1883,6 +2145,9 @@ static int run(int argc, char * argv[]) {
     }
     if (classifyRuleKinds) {
         reportRuleClasses(ruleClassCounts);
+    }
+    if (nfdPreserving) {
+        toolio::stream() << "Total: " << nfdTotal.preserving << " of " << nfdTotal.groups << " groups NFD-preserving\n";
     }
     if (partition) {
         toolio::stream() << "Total: " << partitionTotal.groups << " groups, " << partitionTotal.variables << " set variables (" << partitionTotal.divided << " divided), "

@@ -167,6 +167,22 @@ static cl::opt<bool> SequentialWhile("sequential-while",
              "kernel's While loop, where it can decide all the string rules, instead of in --converted-context-rounds staged "
              "rounds of matching, LeftmostMatches and applying kernels (doc/round-replacement.md step 6; default on)"),
     cl::init(true), cl::cat(XlitOptions));
+static cl::opt<bool> NormalizationPeephole("normalization-peephole",
+    cl::desc("Omit a normalization step (NFD or NFC) whose result the next step normalizes again (NFD, NFC, NFKD or NFKC, "
+             "over the same characters or more, a set closed under canonical equivalence), across the transforms invoked: "
+             "N2(N1(x)) = N2(x), as N1 keeps the text canonically equivalent (default on)"),
+    cl::init(true), cl::cat(XlitOptions));
+static cl::opt<bool> ShowNormalizationPeephole("show-normalization-peephole",
+    cl::desc("Report each normalization step omitted by --normalization-peephole on the standard error"),
+    cl::init(false), cl::Hidden, cl::cat(XlitOptions));
+static cl::opt<bool> NFC_InputNFD("nfc-input-nfd",
+    cl::desc("Compose (Any-NFC) with NormalizationInput::InputIsNFD where the text is known to be in NFD: an NFD stage "
+             "(a step or a transform of NFD status Always) comes before it in the transform, or in the transforms "
+             "invoking it, and every stage after that one preserves NFD (see ldml::NFD_StatusAnalyzer) (default on)"),
+    cl::init(true), cl::cat(XlitOptions));
+static cl::opt<bool> ShowNFC_InputNFD("show-nfc-input-nfd",
+    cl::desc("Report each Any-NFC composed with InputIsNFD by --nfc-input-nfd on the standard error"),
+    cl::init(false), cl::Hidden, cl::cat(XlitOptions));
 static cl::opt<bool> MaskedNormalization("masked-normalization",
     cl::desc("Normalize within a filter by the masked kernels (NFD_PipelineBuilder::NFD_U21 and NFC_U21 in Unicode mode, "
              "NFD_PipelineBuilder::NFD_Masked and NFC_Masked in UTF-8 mode), rather than with the characters outside the "
@@ -284,6 +300,13 @@ static UCD::UnicodeSet regionSeparators() {
     }
     return set;
 }
+//  The conversion groups of more rules than this split by their independent
+//  components (ldml::SplitIndependentComponents): those with before contexts,
+//  then the others, as groups of their own.  0: none.
+static cl::opt<unsigned> SplitComponents("split-components",
+    cl::desc("Split the conversion groups of more rules than this into the independent components with before contexts "
+             "and the others, applied as separate groups (0: none)"),
+    cl::init(512), cl::cat(XlitOptions));
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(XlitOptions));
@@ -443,11 +466,9 @@ static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * 
         case Transform::NFC:
             OutputBytes = NFC_Bytes(P, ByteStream, BasisBits);
             break;
-        case Transform::NFKC: {
-            StreamSet * const NFKD_Bytes_ = NFKD_Bytes(P, NFD_builder, ByteStream, BasisBits);
-            OutputBytes = NFC_Bytes(P, NFKD_Bytes_, BasisOf(P, NFKD_Bytes_));
+        case Transform::NFKC:
+            OutputBytes = NFKC_Bytes(P, NFD_builder, NormalizationFocusOptions(), ByteStream, BasisBits);
             break;
-        }
         case Transform::Lower:
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::lc, BasisBits));
             break;
@@ -610,6 +631,8 @@ private:
                           std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
                           UCD::UnicodeSet & unchanged, std::string & reason);
     const ldml::TransformRegistry & mRegistry;
+    //  The NFD status of the transforms invoked (see setNFD_Before).
+    ldml::NFD_StatusAnalyzer mNFD_Status{mRegistry};
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
     std::map<std::string, ShapeGroups> mShapeGroups;
@@ -1077,11 +1100,33 @@ static void attachFrontLetters(ldml::TransformPlan & plan, const ldml::FrontLett
     }
 }
 
+//  The NFD status of the text before each transform step of a plan (see
+//  ldml::TransformStep::nfdBefore), from the forward rules of the transform as
+//  extracted.  The rewriting passes keep the transform rules in order and only
+//  insert :: Null ; (the steps not matched, which keep NotGuaranteed).
+static void setNFD_Before(ldml::TransformPlan & plan, const std::vector<ldml::Rule *> & extracted, ldml::NFD_StatusAnalyzer & status) {
+    const std::vector<ldml::NFD_Status> before = status.StatusBeforeTransformRules(extracted);
+    std::vector<const ldml::TransformRule *> rules;
+    for (const ldml::Rule * r : extracted) if (const auto * t = llvm::dyn_cast<ldml::TransformRule>(r)) rules.push_back(t);
+    size_t k = 0;
+    for (ldml::TransformStep & step : plan.steps) {
+        if (step.kind != ldml::TransformStep::Kind::Transform) continue;
+        if (k < rules.size() && rules[k]->getForwardID().getText() == step.transform.getText()) {
+            step.nfdBefore = before[k++];
+        }
+    }
+}
+
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
     try {
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        const std::vector<ldml::Rule *> extracted = rules;
+        //  (On the rules as given: the later passes restate rules with contexts
+        //  of large sets, e.g. DisambiguateOrder's negated after contexts, which
+        //  would join the components.)
+        if (SplitComponents > 0) rules = ldml::SplitIndependentComponents(rules, SplitComponents);
         rules = ldml::MoveTextAnchors(rules);
         rules = ldml::EnumerateRepeatedCaptures(rules);
         //  (Set aside before revisits are composed: see ldml::FrontLetterRevisits.)
@@ -1145,6 +1190,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
             }
         }
         attachFrontLetters(a.plan, frontLetters);
+        setNFD_Before(a.plan, extracted, mNFD_Status);
         //  The pairs left to priority by DisambiguateOrder, as string rules of
         //  the same group (see ldml::TransformStep::stringPriority).
         for (const auto & pr : dstats.prioritized) {
@@ -2114,6 +2160,255 @@ protected:
     }
 };
 
+//  The results of the static string rules of a group in its chunked staged
+//  rounds (see RulePipelineBuilder::conversionGroup), computed once at the first
+//  positions of their matches, from which each round's results are replayed
+//  where its selection applies them (StaticReplay).  As no two of the rules
+//  match at a position, the results at a position are those of the rule that
+//  matches there: at offset o of its text (o < offsets), the target of the
+//  character there (target, as FusedRules's changeChar writes it: the
+//  character, or the deletion mark beyond the replacement; absolute, or to be
+//  XORed with the character, see StaticReplay) and whether it changes (changed:
+//  not a character kept); the changes of the positions inserted after its last
+//  character (mark, slot i >= 1, relative to the deletion mark or absolute, as
+//  changeMark writes them); and the number inserted after it (insert).  Not
+//  rules with runs or a kept character within the replacement (keep).
+struct StartLayout {
+    unsigned offsets = 0;
+    unsigned slots = 1;
+    std::vector<unsigned> insertCounts;
+    unsigned width() const {return offsets * 22 + (slots - 1) * 21 + static_cast<unsigned>(insertCounts.size());}
+    unsigned target(unsigned o, unsigned b) const {return o * 22 + b;}
+    unsigned changed(unsigned o) const {return o * 22 + 21;}
+    unsigned mark(unsigned i, unsigned b) const {return offsets * 22 + (i - 1) * 21 + b;}
+    unsigned insert(size_t k) const {return offsets * 22 + (slots - 1) * 21 + static_cast<unsigned>(k);}
+    std::string signature() const {
+        std::string s = "o" + std::to_string(offsets) + "s" + std::to_string(slots) + "i";
+        for (unsigned k : insertCounts) s += std::to_string(k) + ",";
+        return s;
+    }
+};
+
+struct StartRule {
+    unsigned length;                // of the text
+    std::u32string replacement;     // (as FusedStringRule::replacement)
+};
+
+//  The results at the first positions of the matches of a chunk of the static
+//  rules (Firsts, a stream per rule), ORed with those of the chunks before (In,
+//  if given), as laid out by StartLayout.
+class StartResults final : public pablo::PabloKernel {
+public:
+    StartResults(LLVMTypeSystemInterface & ts, const StartLayout & layout, const std::vector<StartRule> & rules, bool absolute,
+                 StreamSet * Firsts, StreamSet * In, StreamSet * Out)
+    : PabloKernel(ts, "StartResults_" + getStringHash(signature(layout, rules, absolute, In != nullptr)),
+                  [&] {
+                      Bindings inputs{Binding{"Firsts", Firsts}};
+                      if (In) inputs.emplace_back("In", In);
+                      return inputs;
+                  }(),
+                  {Binding{"Out", Out}}),
+      mLayout(layout), mRules(rules), mAbsolute(absolute), mHasIn(In != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> firsts = getInputStreamSet("Firsts");
+        std::vector<PabloAST *> out = mHasIn ? getInputStreamSet("In") : std::vector<PabloAST *>(mLayout.width(), pb.createZeroes());
+        auto add = [&](unsigned i, PabloAST * f) {out[i] = pb.createOr(out[i], f);};
+        for (size_t r = 0; r < mRules.size(); r++) {
+            const StartRule & rule = mRules[r];
+            PabloAST * const f = firsts[r];
+            const unsigned n = rule.length, m = static_cast<unsigned>(rule.replacement.size());
+            for (unsigned o = 0; o < n; o++) {
+                if (o < m && rule.replacement[o] == ldml::StringRuleKept) continue;
+                const UCD::codepoint_t t = o < m ? static_cast<UCD::codepoint_t>(rule.replacement[o]) : DeletionMark;
+                for (unsigned b = 0; b < 21; b++) {
+                    if ((t >> b) & 1) add(mLayout.target(o, b), f);
+                }
+                add(mLayout.changed(o), f);
+            }
+            for (unsigned j = n; j < m; j++) {
+                const UCD::codepoint_t d = (mAbsolute ? 0 : DeletionMark) ^ static_cast<UCD::codepoint_t>(rule.replacement[j]);
+                for (unsigned b = 0; b < 21; b++) {
+                    if ((d >> b) & 1) add(mLayout.mark(j - n + 1, b), f);
+                }
+            }
+            if (m > n) {
+                const size_t k = std::find(mLayout.insertCounts.begin(), mLayout.insertCounts.end(), m - n) - mLayout.insertCounts.begin();
+                add(mLayout.insert(k), f);
+            }
+        }
+        writeOutputStreamSet("Out", out);
+    }
+private:
+    static std::string signature(const StartLayout & layout, const std::vector<StartRule> & rules, bool absolute, bool in) {
+        std::string s = layout.signature() + (absolute ? "A" : "X") + (in ? "I" : "");
+        for (const StartRule & r : rules) {
+            s += "|" + std::to_string(r.length) + ":";
+            for (char32_t c : r.replacement) s += std::to_string(c) + ",";
+        }
+        return s;
+    }
+    const StartLayout mLayout;
+    const std::vector<StartRule> mRules;
+    const bool mAbsolute;
+    const bool mHasIn;
+};
+
+//  The results of a round of the static rules (see StartResults): where a
+//  match is selected (Selected, at its first position; the results there are
+//  those of the static rule matching there, none for another), the results at
+//  its first position moved to the positions of its text: the target at offset
+//  o to the position o after it (XORed with the character there, unless
+//  absolute, where it changes), and the inserted positions and their number to
+//  its last position, by the lengths of the texts (Starts: the first positions
+//  of the matches of the static rules by class, of the texts of lengths[k]).
+//  Also the coverage of the matches (Spans, their positions; Starts, their
+//  first), as FusedRules gives it.
+class StaticReplay final : public pablo::PabloKernel {
+public:
+    StaticReplay(LLVMTypeSystemInterface & ts, const StartLayout & layout, const std::vector<unsigned> & lengths, bool absolute,
+                 StreamSet * Selected, StreamSet * Starts, StreamSet * Results, StreamSet * U21,
+                 const std::vector<StreamSet *> & changes, const std::map<unsigned, StreamSet *> & insertions,
+                 StreamSet * Spans, StreamSet * StartsOut)
+    : PabloKernel(ts, "StaticReplay_" + getStringHash(signature(layout, lengths, absolute)),
+                  [&] {
+                      Bindings inputs{Binding{"Selected", Selected}, Binding{"Starts", Starts}, Binding{"Results", Results}};
+                      if (!absolute) inputs.emplace_back("U21", U21);
+                      return inputs;
+                  }(),
+                  [&] {
+                      Bindings outputs;
+                      for (size_t i = 0; i < changes.size(); i++) outputs.emplace_back("Changes" + std::to_string(i), changes[i]);
+                      for (const auto & k : insertions) outputs.emplace_back("Insert" + std::to_string(k.first), k.second);
+                      outputs.emplace_back("Spans", Spans);
+                      outputs.emplace_back("StartsOut", StartsOut);
+                      return outputs;
+                  }()),
+      mLayout(layout), mLengths(lengths), mAbsolute(absolute) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const sel = getInputStreamSet("Selected")[0];
+        const std::vector<PabloAST *> starts = getInputStreamSet("Starts");
+        const std::vector<PabloAST *> R = getInputStreamSet("Results");
+        std::vector<PabloAST *> basis;
+        if (!mAbsolute) basis = getInputStreamSet("U21");
+        PabloAST * const zeroes = pb.createZeroes();
+        auto shifted = [&](PabloAST * x, unsigned o) {return o ? pb.createAdvance(x, o) : x;};
+        //  Slot 0: the targets at each offset.
+        std::vector<PabloAST *> changes0(21, zeroes);
+        for (unsigned o = 0; o < mLayout.offsets; o++) {
+            PabloAST * const at = shifted(pb.createAnd(sel, R[mLayout.changed(o)]), o);
+            for (unsigned b = 0; b < 21; b++) {
+                PabloAST * t = shifted(pb.createAnd(sel, R[mLayout.target(o, b)]), o);
+                if (!mAbsolute) t = pb.createAnd(at, pb.createXor(basis[b], t));
+                changes0[b] = pb.createOr(changes0[b], t);
+            }
+        }
+        writeOutputStreamSet("Changes0", changes0);
+        //  The inserted slots and their number, at the last positions, by length.
+        std::vector<PabloAST *> selLength(mLengths.size());
+        for (size_t k = 0; k < mLengths.size(); k++) selLength[k] = pb.createAnd(sel, starts[k]);
+        auto atLast = [&](PabloAST * x) {
+            PabloAST * v = zeroes;
+            for (size_t k = 0; k < mLengths.size(); k++) v = pb.createOr(v, shifted(pb.createAnd(selLength[k], x), mLengths[k] - 1));
+            return v;
+        };
+        for (unsigned i = 1; i < mLayout.slots; i++) {
+            std::vector<PabloAST *> c(21);
+            for (unsigned b = 0; b < 21; b++) c[b] = atLast(R[mLayout.mark(i, b)]);
+            writeOutputStreamSet("Changes" + std::to_string(i), c);
+        }
+        for (size_t k = 0; k < mLayout.insertCounts.size(); k++) {
+            writeOutputStreamSet("Insert" + std::to_string(mLayout.insertCounts[k]), std::vector<PabloAST *>{atLast(R[mLayout.insert(k)])});
+        }
+        PabloAST * spans = zeroes, * first = zeroes;
+        for (size_t k = 0; k < mLengths.size(); k++) {
+            first = pb.createOr(first, selLength[k]);
+            for (unsigned o = 0; o < mLengths[k]; o++) spans = pb.createOr(spans, shifted(selLength[k], o));
+        }
+        writeOutputStreamSet("Spans", std::vector<PabloAST *>{spans});
+        writeOutputStreamSet("StartsOut", std::vector<PabloAST *>{first});
+    }
+private:
+    static std::string signature(const StartLayout & layout, const std::vector<unsigned> & lengths, bool absolute) {
+        std::string s = layout.signature() + (absolute ? "A" : "X") + "l";
+        for (unsigned l : lengths) s += std::to_string(l) + ",";
+        return s;
+    }
+    const StartLayout mLayout;
+    const std::vector<unsigned> mLengths;
+    const bool mAbsolute;
+};
+
+//  The results of the rules of a group applied by two sets of kernels, at
+//  disjoint positions (see the chunked staged rounds of RulePipelineBuilder::
+//  conversionGroup), combined as one kernel combines the results of its rules:
+//  the changes at each position of the replacements, the insertions by count
+//  and the marked positions by case mapping, ORed (a stream set absent from
+//  one of them: none).  The coverage is not combined.
+class MergeFusedResults final : public pablo::PabloKernel {
+public:
+    //  The stream sets of a set of results, by their names (without a prefix).
+    using Parts = std::vector<std::pair<std::string, StreamSet *>>;
+    static Parts parts(const std::vector<StreamSet *> & changes, const std::map<unsigned, StreamSet *> & insertions,
+                       const std::map<unsigned, StreamSet *> & marks) {
+        Parts p;
+        for (size_t i = 0; i < changes.size(); i++) {
+            if (changes[i]) p.emplace_back("Changes" + std::to_string(i), changes[i]);
+        }
+        for (const auto & k : insertions) p.emplace_back("Insert" + std::to_string(k.first), k.second);
+        for (const auto & k : marks) p.emplace_back("Mark" + std::to_string(k.first), k.second);
+        return p;
+    }
+    MergeFusedResults(LLVMTypeSystemInterface & ts, const Parts & a, const Parts & b, const Parts & out)
+    : PabloKernel(ts, "MergeFusedResults_" + signature(a) + "_" + signature(b) + "_" + signature(out),
+                  [&] {
+                      Bindings inputs;
+                      for (const auto & x : a) inputs.emplace_back("A" + x.first, x.second);
+                      for (const auto & x : b) inputs.emplace_back("B" + x.first, x.second);
+                      return inputs;
+                  }(),
+                  [&] {
+                      Bindings outputs;
+                      for (const auto & x : out) outputs.emplace_back(x.first, x.second);
+                      return outputs;
+                  }()),
+      mA(names(a)), mB(names(b)), mOut([&] {
+          std::vector<std::pair<std::string, unsigned>> v;
+          for (const auto & x : out) v.emplace_back(x.first, x.second->getNumElements());
+          return v;
+      }()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        for (const auto & o : mOut) {
+            std::vector<PabloAST *> merged(o.second, pb.createZeroes());
+            for (const auto & side : {std::make_pair(std::string("A"), &mA), std::make_pair(std::string("B"), &mB)}) {
+                if (!side.second->count(o.first)) continue;
+                const std::vector<PabloAST *> s = getInputStreamSet(side.first + o.first);
+                for (size_t j = 0; j < s.size() && j < merged.size(); j++) merged[j] = pb.createOr(merged[j], s[j]);
+            }
+            writeOutputStreamSet(o.first, merged);
+        }
+    }
+private:
+    static std::string signature(const Parts & p) {
+        std::string s;
+        for (const auto & x : p) s += x.first.substr(0, 1) + x.first.substr(x.first.find_first_of("0123456789")) + "." +
+                                      std::to_string(x.second->getNumElements());
+        return s;
+    }
+    static std::set<std::string> names(const Parts & p) {
+        std::set<std::string> v;
+        for (const auto & x : p) v.insert(x.first);
+        return v;
+    }
+    const std::set<std::string> mA, mB;
+    const std::vector<std::pair<std::string, unsigned>> mOut;
+};
+
 //  The bixnum of the numbers of positions to insert after the characters, given
 //  the positions of the characters after which each number of positions is to be
 //  inserted (disjoint).
@@ -2721,7 +3016,56 @@ static constexpr size_t FusedMaxAlternatives = 32;
 //  whole group (larger groups keep their before contexts matched against the text).
 static cl::opt<unsigned> FusedMaxWholeGroupRules("whole-group-rules", cl::desc("The most string rules (or subgroups) of a group "
                                                  "whose before contexts are matched against the converted text in one correction kernel"),
-                                                 cl::init(256), cl::cat(XlitOptions));
+                                                 cl::init(512), cl::cat(XlitOptions));
+
+//  A whole group whose string matches are selected sequentially in staged rounds
+//  (see RulePipelineBuilder::conversionGroup), with more string rules than this,
+//  is applied in chunks: only the string rules whose before contexts are matched
+//  against the converted text are in the kernels of each round; the others are
+//  matched once, in chunks, and applied in chunks where selected.  Such a group
+//  then needs at most --whole-group-rules of those rules (and subgroups).
+static cl::opt<unsigned> StagedChunkRules("staged-chunk-rules", cl::desc("Split the staged sequential selection of a whole group "
+                                          "with more string rules than this: only the rules whose before contexts are matched against "
+                                          "the converted text in the kernels of each round, the others in chunks (0: every such group)"),
+                                          cl::init(256), cl::cat(XlitOptions));
+
+//  A correction kernel for a whole group applied in one kernel (the While
+//  loop) reads the matches of the string rules whose before contexts are not
+//  matched against the converted text, matched before in chunks (see
+//  RulePipelineBuilder::conversionGroup), instead of matching them itself.
+static cl::opt<bool> StaticMatchChunks("static-match-chunks", cl::desc("Match the string rules of a whole-group correction kernel "
+                                       "whose before contexts are not matched against the converted text in chunk kernels before it "
+                                       "(no gain measured: the kernel still applies them)"),
+                                       cl::init(false), cl::cat(XlitOptions));
+
+//  A correction kernel for a whole group resolved by the While loop, without
+//  sequential selection, has the string rules that the loop does not decide
+//  (static) selected and applied before it, in chunks, their results given to
+//  it as its state (see RulePipelineBuilder::conversionGroup).
+static cl::opt<bool> StaticApplyChunks("static-apply-chunks", cl::desc("Select and apply the string rules of a whole-group "
+                                       "correction kernel that its While loop does not decide in chunk kernels before it"),
+                                       cl::init(true), cl::cat(XlitOptions));
+
+//  In the chunked staged rounds, the results of the static string rules are
+//  computed once, at the first positions of their matches, and replayed in each
+//  round where selected (StartResults, StaticReplay), instead of the rules
+//  applied in each round.
+static cl::opt<bool> StaticReplayOnce("static-replay", cl::desc("In the chunked staged rounds, compute the results of the static "
+                                      "string rules once and replay them in each round where selected"),
+                                      cl::init(true), cl::cat(XlitOptions));
+
+static bool chunkedStaged(const ldml::TransformStep & step) {
+    return step.sequentialSelection && step.stringRules.size() > StagedChunkRules;
+}
+
+//  Whether a group can be applied by a correction kernel for the whole group,
+//  given the number of its string rules whose before contexts are matched
+//  against the converted text: in one kernel, or in the chunked staged rounds.
+static bool wholeGroupFits(const ldml::TransformStep & step, size_t convertedRules) {
+    if (step.subgroups.size() > FusedMaxWholeGroupRules) return false;
+    if (step.stringRules.size() <= FusedMaxWholeGroupRules) return true;
+    return chunkedStaged(step) && convertedRules <= FusedMaxWholeGroupRules;
+}
 
 namespace {
 
@@ -3831,6 +4175,62 @@ static void translateCaptureContexts(ldml::TransformPlan & plan) {
     }
 }
 
+//  A group with string rules whose before contexts its conversions may make
+//  match differently in the converted text (against which ICU matches them),
+//  and which must be selected (an overlap order) or whose coverage other rules
+//  need, is applied by one correction kernel with all its rules (see wholeGroup
+//  in RulePipelineBuilder::conversionGroup).  Where that cannot be (too many
+//  rules for --whole-group-rules, MultipleCaptureMultipleReplacement rules
+//  selected with them, or subgroups yielding to earlier rules), the contexts
+//  are matched against the text itself, which may give another result: the
+//  pipeline then warns (see RulePipelineBuilder::conversionGroup), with this
+//  reason, the first such rule and why the group cannot be in one kernel.
+static std::string wholeGroupProblem(const ldml::TransformStep & step) {
+    if (ConvertedContextRounds == 0 || step.stringRules.empty()) return "";
+    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
+    bool changing = false;
+    for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
+        for (const ldml::CharMapping & m : subgroup.mappings) {
+            UCD::UnicodeSet chars = m.chars;
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
+            changing |= !chars.empty();
+        }
+    }
+    const bool needCoverage = (step.coverStringRules || hasConvertedSubgroup(step, outcomes)) && changing;
+    if (step.stringOrder.empty() && !needCoverage) return "";
+    const ldml::ConversionRule * converted = nullptr;
+    size_t convertedRules = 0;
+    for (size_t r = 0; r < step.stringRules.size(); r++) {
+        const ldml::StringRule & rule = step.stringRules[r];
+        if (r < step.stringPriority.size() && !step.stringPriority[r].empty()) continue;
+        bool emptyText = rule.text.empty();
+        for (const UCD::UnicodeSet & chars : rule.text) emptyText |= chars.empty();
+        if (emptyText) continue;
+        FusedContexts before, after;
+        if (fusedContexts(rule.engineAfter, false, after) && fusedContexts(rule.engineBefore, true, before, true)
+                && convertedContextMatters(before, outcomes)) {
+            if (converted == nullptr) converted = rule.rule;
+            convertedRules++;
+        }
+    }
+    if (converted == nullptr) return "";
+    std::string why;
+    if (!wholeGroupFits(step, convertedRules)) {
+        why = "its group has " + std::to_string(step.stringRules.size()) + " string rules (" + std::to_string(convertedRules) +
+              " with before contexts matched against the converted text) and " + std::to_string(step.subgroups.size()) +
+              " subgroups, more than --whole-group-rules=" + std::to_string(FusedMaxWholeGroupRules);
+    } else if (!step.captureReplacements.empty() && (step.jointSelection || step.sequentialSelection || !needCoverage)) {
+        why = "MultipleCaptureMultipleReplacement rules are selected with the string rules of its group";
+    } else {
+        for (size_t g = 0; g < step.subgroups.size() && why.empty(); g++) {
+            if (g < step.subgroupPriority.size() && !step.subgroupPriority[g].empty()) why = "a subgroup of its group yields to earlier rules";
+        }
+    }
+    if (why.empty()) return "";
+    return ldml::printRule(converted) + "  (its before context may match differently in the converted text, where ICU matches "
+           "it, and it cannot be matched there with all the rules of its group in one kernel: " + why + ")";
+}
+
 static std::string captureSpanProblem(const ldml::MultipleCaptureMultipleReplacementSet & set, const cc::Alphabet * encoding);
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
     if (step.captureReplacements.empty()) return;
@@ -3977,14 +4377,18 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         }
     }
     bool wholeGroup = false;
-    for (const ldml::StringRule & sr : step.stringRules) {
+    auto convertedString = [&](const ldml::StringRule & sr) {
         FusedContexts before, after;
-        if (sr.engineBefore && fusedContexts(sr.engineBefore, true, before, true) && fusedContexts(sr.engineAfter, false, after)
-                && convertedContextMatters(before, outcomes)) {
-            const bool wholeGroupFits = step.stringRules.size() <= FusedMaxWholeGroupRules && step.subgroups.size() <= FusedMaxWholeGroupRules
-                && (step.captureReplacements.empty() || (!step.jointSelection && !step.sequentialSelection && needCoverage));
-            wholeGroup |= (!step.stringOrder.empty() || needCoverage) && wholeGroupFits;
-            if ((step.stringOrder.empty() && !needCoverage) || wholeGroupFits) {
+        return sr.engineBefore && fusedContexts(sr.engineBefore, true, before, true) && fusedContexts(sr.engineAfter, false, after)
+               && convertedContextMatters(before, outcomes);
+    };
+    const size_t convertedRules = std::count_if(step.stringRules.begin(), step.stringRules.end(), convertedString);
+    const bool fits = wholeGroupFits(step, convertedRules)
+        && (step.captureReplacements.empty() || (!step.jointSelection && !step.sequentialSelection && needCoverage));
+    for (const ldml::StringRule & sr : step.stringRules) {
+        if (convertedString(sr)) {
+            wholeGroup |= (!step.stringOrder.empty() || needCoverage) && fits;
+            if ((step.stringOrder.empty() && !needCoverage) || fits) {
                 toolio::out() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
             } else {
                 toolio::out() << "    warning: the before context of " << ldml::printRule(sr.rule)
@@ -3995,11 +4399,17 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     if (wholeGroup && step.sequentialSelection) {
         //  (In the While loop where every string rule can be decided there: no runs, and
         //  results fixed at each position of their texts; see FusedRulesConfig::sequential.)
+        const bool chunked = chunkedStaged(step);
         toolio::out() << "    string matches selected sequentially "
-                     << (SequentialWhile
+                     << (SequentialWhile && step.stringRules.size() <= FusedMaxWholeGroupRules
                          ? "in the correction kernel's While loop if its rules allow, otherwise " : "")
                      << "between the " << ConvertedContextRounds + 1
-                     << " rounds of matching before contexts against the converted text\n";
+                     << " rounds of matching before contexts against the converted text";
+        if (chunked) {
+            toolio::out() << " (the rounds in chunks: the " << convertedRules << " string rules matched against the converted text "
+                         << "in each round, the other " << step.stringRules.size() - convertedRules << " matched once)";
+        }
+        toolio::out() << "\n";
     }
     //  The contexts that are not fused (with unbounded repetitions) are matched
     //  against the text itself.
@@ -8926,10 +9336,174 @@ private:
     const char32_t mLower, mUpper;
 };
 
+static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                                          const ldml::TransformEntry * entry);
+
+//  Whether a set is closed under canonical equivalence: a character is in it
+//  if and only if all the characters of its canonical decomposition are.
+static bool canonicallyClosed(const UCD::UnicodeSet & set) {
+    static const std::vector<std::pair<UCD::codepoint_t, std::u32string>> decompositions = [] {
+        using namespace UCD;
+        auto * const dt = llvm::cast<EnumeratedPropertyObject>(getPropertyObject(property_t::dt));
+        const UnicodeSet mapped = dt->GetCodepointSet(DT_ns::Can) + UnicodeSet(0xAC00, 0xD7A3);   // (Hangul syllables)
+        NFD_Engine engine(NFD);
+        std::vector<std::pair<codepoint_t, std::u32string>> d;
+        for (const auto & range : mapped) {
+            for (codepoint_t cp = range.first; cp <= range.second; cp++) d.emplace_back(cp, engine.decompose(std::u32string(1, cp)));
+        }
+        return d;
+    }();
+    for (const auto & d : decompositions) {
+        bool all = true;
+        for (char32_t c : d.second) all = all && set.contains(c);
+        if (all != set.contains(d.first)) return false;
+    }
+    return true;
+}
+
+//  The normalization peephole (--normalization-peephole).  A normalization
+//  step N1 (NFD or NFC) is omitted when the next step to change the text is a
+//  normalization N2 (NFD, NFC, NFKD or NFKC) over a set S2 of characters (its
+//  filters and those it is applied within) that includes N1's set S1 and is
+//  closed under canonical equivalence (canonicallyClosed).  N1 replaces each
+//  run of S1 with a canonically equivalent text, whose characters are in S2,
+//  within the same run of S2: the runs of S2 are canonically equivalent, and
+//  so N2(N1(x)) = N2(x).  The next step is found across the transforms
+//  invoked: the remaining steps of the plans being applied (the frames, shared
+//  by the builders of UTF-8 and Unicode modes), and the first steps of the
+//  transforms they invoke; only Null is passed over, and anything not applied
+//  by the regular plan (shape groups, ICU, a transform not implementable)
+//  ends the search, as does the end of the plans of the pipeline.
+struct NormalizationFrames {
+    struct Frame {
+        const std::vector<ldml::TransformStep> * steps;
+        size_t next;                    // the step after the one being applied
+        UCD::UnicodeSet scope;          // the characters the plan's steps apply to
+        UCD::UnicodeSet stepScope;      // those of the step being applied
+        const ldml::TransformStep * builtIn = nullptr;   // that step, if it invokes a built-in directly
+        bool inputNFD = false;          // whether the input of the plan is known to be in NFD
+        size_t current = 0;             // the (first) step being applied
+        bool segment = false;           // whether a segment of steps is being applied
+    };
+    std::vector<Frame> frames;
+    //  An NFD omitted (see omit): the next normalization, which makes it
+    //  redundant, does not have the NFD input it would have given.
+    mutable bool omittedDecomposition = false;
+
+    //  Is the text in NFD, given the status before a step and whether the input is?
+    static bool knownNFD(ldml::NFD_Status before, bool inputNFD) {
+        return before == ldml::NFD_Status::Always || (before == ldml::NFD_Status::Preserving && inputNFD);
+    }
+
+    static UCD::UnicodeSet all() {return UCD::UnicodeSet(0, 0x10FFFF);}
+    void enter(const TransformAnalysis & a) {
+        UCD::UnicodeSet scope = frames.empty() ? all() : frames.back().stepScope;
+        if (a.plan.filter) scope = scope & a.plan.filterSet;
+        //  The input of the plan: that of a segment of the plan applying it, or
+        //  the text before the step invoking it.
+        bool inputNFD = false;
+        if (!frames.empty()) {
+            const Frame & p = frames.back();
+            inputNFD = p.segment ? p.inputNFD
+                                 : (p.current < p.steps->size() && knownNFD((*p.steps)[p.current].nfdBefore, p.inputNFD));
+        }
+        frames.push_back(Frame{&a.plan.steps, 0, scope, scope, nullptr, inputNFD, 0, false});
+    }
+    void exit() {frames.pop_back();}
+    //  Before the steps [i, j) are applied (one step, or a segment of them).
+    void begin(size_t i, size_t j, const ldml::TransformRegistry & registry) {
+        Frame & f = frames.back();
+        f.next = j;
+        f.current = i;
+        f.segment = j != i + 1;
+        f.stepScope = f.scope;
+        f.builtIn = nullptr;
+        if (j != i + 1) return;
+        const ldml::TransformStep & step = (*f.steps)[i];
+        if (step.kind != ldml::TransformStep::Kind::Transform) return;
+        if (step.filter) f.stepScope = f.scope & step.filterSet;
+        const ldml::TransformEntry * const e = registry.lookup(step.transform.getText());
+        if (e && e->isBuiltIn()) f.builtIn = &step;
+    }
+    void end() {frames.back().builtIn = nullptr;}
+
+    enum class Probe {Opaque, Transparent, Found};
+    static bool normalization(const std::string & name) {
+        return name == "Any-NFD" || name == "Any-NFC" || name == "Any-NFKD" || name == "Any-NFKC";
+    }
+    //  A step applied to the characters of base: Found if it is a normalization
+    //  that makes the one over s1 redundant, Transparent if it leaves the text
+    //  as it is (Null), Opaque otherwise.
+    static Probe probe(const ldml::TransformStep & step, const UCD::UnicodeSet & base, const UCD::UnicodeSet & s1,
+                       const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer, std::set<std::string> & seen) {
+        if (step.kind != ldml::TransformStep::Kind::Transform) return Probe::Opaque;
+        const ldml::TransformEntry * const e = registry.lookup(step.transform.getText());
+        if (e == nullptr) return Probe::Opaque;
+        const UCD::UnicodeSet scope = step.filter ? base & step.filterSet : base;
+        if (e->isBuiltIn()) {
+            if (e->canonicalName == "Any-Null") return Probe::Transparent;
+            if (!normalization(e->canonicalName)) return Probe::Opaque;
+            return ((s1 - scope).empty() && canonicallyClosed(scope)) ? Probe::Found : Probe::Opaque;
+        }
+        if (!seen.insert(e->canonicalName).second) return Probe::Opaque;
+        const TransformAnalysis & a = analyzer.analyze(e);
+        if (!a.implementable || (ApplyShapeGroups && shapeChoice(registry, analyzer, e).any())) return Probe::Opaque;
+        const UCD::UnicodeSet inner = a.plan.filter ? scope & a.plan.filterSet : scope;
+        for (const ldml::TransformStep & s : a.plan.steps) {
+            const Probe p = probe(s, inner, s1, registry, analyzer, seen);
+            if (p != Probe::Transparent) return p;
+        }
+        return Probe::Transparent;
+    }
+    //  Whether the built-in name, about to be applied by the step being applied
+    //  directly, may be omitted.
+    bool omit(const std::string & name, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer) const {
+        if (!NormalizationPeephole || frames.empty() || (name != "Any-NFD" && name != "Any-NFC")) return false;
+        const Frame & top = frames.back();
+        if (top.builtIn == nullptr) return false;
+        const ldml::TransformEntry * const e = registry.lookup(top.builtIn->transform.getText());
+        if (e == nullptr || e->canonicalName != name) return false;
+        std::set<std::string> seen;
+        for (size_t k = frames.size(); k-- > 0; ) {
+            const Frame & f = frames[k];
+            for (size_t i = f.next; i < f.steps->size(); i++) {
+                switch (probe((*f.steps)[i], f.scope, top.stepScope, registry, analyzer, seen)) {
+                    case Probe::Found:
+                        if (ShowNormalizationPeephole) llvm::errs() << "xlit: " << name << " omitted (normalized again by a later step)\n";
+                        if (name == "Any-NFD") omittedDecomposition = true;
+                        return true;
+                    case Probe::Opaque: return false;
+                    case Probe::Transparent: break;
+                }
+            }
+        }
+        return false;
+    }
+    //  The input mode of the normalization name, about to be applied (not
+    //  omitted) by the step being applied directly: InputIsNFD for Any-NFC if
+    //  the text before the step is known to be in NFD (--nfc-input-nfd).
+    NormalizationInput input(const std::string & name, const ldml::TransformRegistry & registry) {
+        if (!normalization(name)) return NormalizationInput::Any;
+        const bool omitted = omittedDecomposition;
+        omittedDecomposition = false;
+        if (!NFC_InputNFD || name != "Any-NFC" || omitted || frames.empty()) return NormalizationInput::Any;
+        const Frame & top = frames.back();
+        if (top.builtIn == nullptr || !knownNFD(top.builtIn->nfdBefore, top.inputNFD)) return NormalizationInput::Any;
+        const ldml::TransformEntry * const e = registry.lookup(top.builtIn->transform.getText());
+        if (e == nullptr || e->canonicalName != name) return NormalizationInput::Any;
+        if (ShowNFC_InputNFD) llvm::errs() << "xlit: Any-NFC with InputIsNFD\n";
+        return NormalizationInput::InputIsNFD;
+    }
+};
+
 class RulePipelineBuilder {
 public:
-    RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P) {}
+    RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                        std::shared_ptr<NormalizationFrames> frames = nullptr)
+    : mFrames(frames ? std::move(frames) : std::make_shared<NormalizationFrames>()),
+      mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P) {}
+    //  The plans being applied (see NormalizationFrames).
+    std::shared_ptr<NormalizationFrames> mFrames;
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
     StreamSet * applyShapeGroups(const TransformAnalyzer::ShapeGroups & groups, StreamSet * U21);
@@ -9072,7 +9646,9 @@ private:
     Staged barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask);
     Staged fcc(StreamSet * U21, StreamSet * mask = nullptr);
     Staged fcd(StreamSet * U21);
-    Staged maskedNFC(StreamSet * U21, StreamSet * selected);
+    Staged maskedNFC(StreamSet * U21, StreamSet * selected, NormalizationInput input = NormalizationInput::Any);
+    //  The input mode of the Any-NFC being applied (see NormalizationFrames::input).
+    NormalizationInput mNFC_Input = NormalizationInput::Any;
     Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -9334,8 +9910,12 @@ Staged RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::ve
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null" || (mOmitICUBuiltIns && isICUBuiltIn(name))) return U21;
+    if (mFrames->omit(name, mRegistry, mAnalyzer)) return U21;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
-        return activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
+        mNFC_Input = mFrames->input(name, mRegistry);
+        StreamSet * const result = activeMask() ? inStep(maskedNormalization(name, U21)) : normalization(name, U21);
+        mNFC_Input = NormalizationInput::Any;
+        return result;
     }
     if (name == "Any-FCD") return inStep(fcd(U21));
     if (name == "Any-Lower" || name == "Any-Upper") {
@@ -9401,10 +9981,15 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
     if (name == "Any-NFD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFD, U21, nullptr, nullptr, focus);
     if (name == "Any-NFKD") return mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
     if (name == "Any-FCC") return fcc(U21).text;
-    if (name == "Any-NFKC") U21 = mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
-    if (U21NFC) return NFC_U21(P, U21);
+    //  (NFKC: the NFC of the NFKD, which is in NFKD.)
+    NormalizationInput input = name == "Any-NFC" ? mNFC_Input : NormalizationInput::Any;
+    if (name == "Any-NFKC") {
+        U21 = mNFD.NFD_U21(UCD::DecompositionOptions::NFKD, U21, nullptr, nullptr, focus);
+        input = NormalizationInput::InputIsNFKD;
+    }
+    if (U21NFC) return NFC_U21(P, U21, nullptr, nullptr, true, input);
     StreamSet * const basis = UTF8_Of(P, U21);
-    StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
+    StreamSet * const composed = NFC_FocusedTransform(NormalizationFocusOptions(), input).build(P, BytesOf(P, basis), basis);
     return U21_Of(P, BasisOf(P, composed));
 }
 
@@ -9436,14 +10021,14 @@ Staged RulePipelineBuilder::maskedNormalization(const std::string & name, Stream
         if (name != "Any-NFKC") return Staged(Result, std::move(positions));
         //  NFKC: the masked NFC of the masked NFKD, with the selection in step.
         if (U21NFC) {
-            Staged composed = maskedNFC(Result, mMasks.mapped(selected, positions));
+            Staged composed = maskedNFC(Result, mMasks.mapped(selected, positions), NormalizationInput::InputIsNFKD);
             positions.append(composed.positions);
             return Staged(composed.text, std::move(positions));
         }
     }
     //  (NFC and FCC on the 21-bit basis within the selection.)
     if (MaskedNormalization && U21NFC) {
-        if (name == "Any-NFC") return maskedNFC(U21, selected);
+        if (name == "Any-NFC") return maskedNFC(U21, selected, mNFC_Input);
         if (name == "Any-FCC") return fcc(U21, selected);
     }
     return barrierNormalization(name, U21, selected);
@@ -9452,9 +10037,9 @@ Staged RulePipelineBuilder::maskedNormalization(const std::string & name, Stream
 //  NFC within the selected characters (each run by itself, see NFC_U21): as a
 //  position map, the selected characters deleted and the composed ones
 //  (OutMask) inserted between the others, within the masks (as barrierNormalization).
-Staged RulePipelineBuilder::maskedNFC(StreamSet * U21, StreamSet * selected) {
+Staged RulePipelineBuilder::maskedNFC(StreamSet * U21, StreamSet * selected, NormalizationInput input) {
     StreamSet * const OutMask = mP.CreateStreamSet(1);
-    StreamSet * const Result = NFC_U21(mP, U21, selected, OutMask);
+    StreamSet * const Result = NFC_U21(mP, U21, selected, OutMask, true, input);
     if (codegen::EnableIllustrator) mP.captureBixNum("Result", Result);
     PositionMap positions;
     positions.remove(mMasks.complement(selected));
@@ -11672,7 +12257,9 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     bool wholeGroup = false;
     if (correct && (!step.stringOrder.empty() || needCoverage)) {
         for (size_t r = 0; r < numStringRules; r++) wholeGroup |= convertible[r];
-        if (numStringRules > FusedMaxWholeGroupRules || step.subgroups.size() > FusedMaxWholeGroupRules) wholeGroup = false;
+        //  (A group with more string rules than --whole-group-rules, in the chunked
+        //  staged rounds: only its rules matched against the converted text count.)
+        if (!wholeGroupFits(step, std::count(convertible.begin(), convertible.end(), true))) wholeGroup = false;
         //  (The MultipleCaptureMultipleReplacement rules are applied before, where they
         //  are not selected with the string rules, and the kernel applies the rest where
         //  their matches do not cover the text, given their results; not with a
@@ -11680,6 +12267,16 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  yield to string rules known to the kernel, see yields.)
         if (!step.captureReplacements.empty() && (step.jointSelection || step.sequentialSelection || !needCoverage)) wholeGroup = false;
         for (size_t g = 0; g < step.subgroups.size(); g++) wholeGroup &= !yields(g);
+        //  (Otherwise the contexts are matched against the text itself, which may
+        //  give another result than ICU's: not silently, see wholeGroupProblem.)
+        bool anyConvertible = false;
+        for (size_t r = 0; r < numStringRules; r++) anyConvertible |= convertible[r];
+        if (anyConvertible && !wholeGroup) {
+            std::string why = wholeGroupProblem(step);
+            if (why.empty()) why = "(a string rule of its group)";
+            llvm::errs() << "xlit: warning: " << mTransformLabel << ": a before context matched against the text itself, "
+                         << "where ICU matches it against the converted text: " << why << "\n";
+        }
     }
     if (wholeGroup) {
         FusedRulesConfig config;
@@ -11757,8 +12354,20 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  The string matches selected sequentially in the While loop of one
         //  correction kernel, where it can decide all the string rules (see
         //  FusedRulesConfig::sequential); otherwise in staged rounds.
+        //  A string rule of the config in another config, with its sources.
+        auto moved = [&](const FusedStringRule & r, FusedRulesConfig & to) {
+            FusedStringRule m = r;
+            for (int * s : {&m.match, &m.afterMatch}) {
+                if (*s < 0) continue;
+                to.sources.push_back(config.sources[static_cast<size_t>(*s)]);
+                *s = static_cast<int>(to.sources.size() - 1);
+            }
+            return m;
+        };
         bool sequentialLoop = false;
-        if (step.sequentialSelection && SequentialWhile) {
+        //  (Not a group with more string rules than --whole-group-rules, in the
+        //  chunked staged rounds.)
+        if (step.sequentialSelection && SequentialWhile && numStringRules <= FusedMaxWholeGroupRules) {
             FusedRulesConfig trial = config;
             trial.selection.clear();
             trial.sequential = true;
@@ -11768,7 +12377,243 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 config.sequential = true;
             }
         }
-        if (step.sequentialSelection && !sequentialLoop) {
+        if (step.sequentialSelection && !sequentialLoop && chunkedStaged(step)) {
+            //  The staged rounds below, in chunks (see StagedChunkRules).  The matches
+            //  of the string rules whose before contexts are not matched against the
+            //  converted text (static) are the same in every round: they are matched
+            //  once, in chunks.  Each round matches the others (the core) against the
+            //  converted text of the previous round, in a kernel, selects the matches
+            //  of all (LeftmostMatches), applies the static rules where selected, in
+            //  chunks, and the core rules and the subgroups in a kernel, outside the
+            //  static matches applied (if the subgroups apply outside the matches of
+            //  the string rules), and merges their results, at disjoint positions,
+            //  as the kernel of all the rules ORs them.
+            auto classOf = [](const FusedStringRule & r) {
+                return MatchClass{static_cast<unsigned>(r.text.size()), r.run, r.runStrings, r.runSingles};
+            };
+            std::vector<MatchClass> byLengthOf;
+            for (const FusedStringRule & r : config.strings) {
+                const MatchClass k = classOf(r);
+                if (std::find(byLengthOf.begin(), byLengthOf.end(), k) == byLengthOf.end()) byLengthOf.push_back(k);
+            }
+            auto lengthIndex = [&](const MatchClass & k) {
+                return static_cast<size_t>(std::find(byLengthOf.begin(), byLengthOf.end(), k) - byLengthOf.begin());
+            };
+            const SelectionClasses selection = selectionClasses(byLengthOf);
+            config.staged = true;
+            config.selection.clear();
+            FusedRulesConfig core = config;
+            core.strings.clear();
+            std::vector<size_t> fusedStatic, staticRules;       // indexes of config.strings
+            std::vector<std::pair<size_t, size_t>> stringLengths;
+            std::vector<std::vector<SelectStringMatches::Source>> staticByLength(byLengthOf.size());
+            for (size_t i = 0; i < config.strings.size(); i++) {
+                const FusedStringRule & r = config.strings[i];
+                stringLengths.push_back(lengths[order[i]]);
+                if (r.converted) {
+                    core.strings.push_back(r);
+                    continue;
+                }
+                staticRules.push_back(i);
+                if (r.match >= 0) {
+                    const FusedMatchSource & s = config.sources[static_cast<size_t>(r.match)];
+                    staticByLength[lengthIndex(classOf(r))].push_back(SelectStringMatches::Source{s.streamSet, s.index});
+                } else {
+                    fusedStatic.push_back(i);
+                }
+            }
+            const FusedState none;
+            //  With --static-replay: the results of the static rules computed once,
+            //  at the first positions of their matches (StartResults), and replayed
+            //  in each round where selected (StaticReplay), instead of the rules
+            //  applied in each round.  Not with runs, or kept characters.
+            const bool absoluteResults = mBytes != nullptr;
+            const bool replay = StaticReplayOnce && !staticRules.empty()
+                && std::all_of(staticRules.begin(), staticRules.end(), [&](size_t i) {
+                       const FusedStringRule & r = config.strings[i];
+                       return r.run.empty() && r.runStrings.empty() && r.keep < 0;
+                   });
+            StartLayout startLayout;
+            StreamSet * startResults = nullptr;
+            StreamSet * staticStarts = nullptr;
+            std::vector<unsigned> staticLengths;
+            if (replay) {
+                for (size_t i : staticRules) {
+                    const FusedStringRule & r = config.strings[i];
+                    const unsigned n = static_cast<unsigned>(r.text.size()), m = static_cast<unsigned>(r.replacement.size());
+                    startLayout.offsets = std::max(startLayout.offsets, n);
+                    if (m > n) {
+                        startLayout.slots = std::max(startLayout.slots, m - n + 1);
+                        if (std::find(startLayout.insertCounts.begin(), startLayout.insertCounts.end(), m - n) == startLayout.insertCounts.end()) {
+                            startLayout.insertCounts.push_back(m - n);
+                        }
+                    }
+                }
+                std::vector<std::vector<SelectStringMatches::Source>> byStaticLength;
+                std::vector<MatchClass> staticClasses;
+                auto staticLengthIndex = [&](size_t i) {
+                    const unsigned n = static_cast<unsigned>(config.strings[i].text.size());
+                    const size_t x = std::find(staticLengths.begin(), staticLengths.end(), n) - staticLengths.begin();
+                    if (x == staticLengths.size()) {
+                        staticLengths.push_back(n);
+                        staticClasses.push_back(classOf(config.strings[i]));
+                        byStaticLength.emplace_back();
+                    }
+                    return x;
+                };
+                auto addResults = [&](StreamSet * firsts, const std::vector<size_t> & rules) {
+                    std::vector<StartRule> startRules;
+                    for (size_t i : rules) {
+                        startRules.push_back(StartRule{static_cast<unsigned>(config.strings[i].text.size()), config.strings[i].replacement});
+                    }
+                    StreamSet * const out = P.CreateStreamSet(startLayout.width());
+                    P.CreateKernelCall<StartResults>(startLayout, startRules, absoluteResults, firsts, startResults, out);
+                    startResults = out;
+                };
+                for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, fusedStatic)) {
+                    FusedRulesConfig m;
+                    m.matchOnly = true;
+                    for (size_t i : chunk) m.strings.push_back(moved(config.strings[i], m));
+                    StreamSet * const matches = P.CreateStreamSet(chunk.size());
+                    StreamSet * const chunkClasses = fusedClasses(m);
+                    m.region = regions != nullptr;
+                    P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, matches);
+                    for (size_t k = 0; k < chunk.size(); k++) {
+                        byStaticLength[staticLengthIndex(chunk[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
+                    }
+                    addResults(matches, chunk);
+                }
+                //  (The rules matched by the engine, gathered.)
+                std::vector<size_t> engineRules;
+                std::vector<std::vector<SelectStringMatches::Source>> gather;
+                for (size_t i : staticRules) {
+                    const FusedStringRule & r = config.strings[i];
+                    if (r.match < 0) continue;
+                    const FusedMatchSource & src = config.sources[static_cast<size_t>(r.match)];
+                    engineRules.push_back(i);
+                    gather.push_back({SelectStringMatches::Source{src.streamSet, src.index}});
+                    byStaticLength[staticLengthIndex(i)].push_back(SelectStringMatches::Source{src.streamSet, src.index});
+                }
+                if (!engineRules.empty()) {
+                    StreamSet * const gathered = P.CreateStreamSet(engineRules.size());
+                    P.CreateKernelCall<MatchStartsByLength>(gather, gathered);
+                    addResults(gathered, engineRules);
+                }
+                staticStarts = P.CreateStreamSet(staticLengths.size());
+                P.CreateKernelCall<MatchStartsByLength>(byStaticLength, staticStarts);
+                staticByLength.assign(byLengthOf.size(), {});
+                for (size_t x = 0; x < staticClasses.size(); x++) {
+                    staticByLength[lengthIndex(staticClasses[x])].push_back(SelectStringMatches::Source{staticStarts, static_cast<unsigned>(x)});
+                }
+            } else {
+            for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, fusedStatic)) {
+                FusedRulesConfig m;
+                m.matchOnly = true;
+                for (size_t i : chunk) {
+                    m.strings.push_back(moved(config.strings[i], m));
+                    const MatchClass k = classOf(config.strings[i]);
+                    if (std::find(m.startsByLength.begin(), m.startsByLength.end(), k) == m.startsByLength.end()) m.startsByLength.push_back(k);
+                }
+                const std::vector<MatchClass> chunkLengths = m.startsByLength;
+                StreamSet * const matches = P.CreateStreamSet(chunkLengths.size());
+                StreamSet * const chunkClasses = fusedClasses(m);
+                m.region = regions != nullptr;
+                P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, matches);
+                for (size_t k = 0; k < chunkLengths.size(); k++) {
+                    staticByLength[lengthIndex(chunkLengths[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
+                }
+            }
+            }
+            std::vector<MatchClass> coreLengths;
+            for (const FusedStringRule & r : core.strings) {
+                const MatchClass k = classOf(r);
+                if (std::find(coreLengths.begin(), coreLengths.end(), k) == coreLengths.end()) coreLengths.push_back(k);
+            }
+            StreamSet * const coreClasses = fusedClasses(core);
+            FusedState previous;
+            for (unsigned round = 0; round <= ConvertedContextRounds; round++) {
+                std::vector<std::vector<SelectStringMatches::Source>> byLength = staticByLength;
+                if (!core.strings.empty()) {
+                    FusedRulesConfig matching = core;
+                    matching.matchOnly = true;
+                    matching.subgroups.clear();
+                    matching.startsByLength = coreLengths;
+                    StreamSet * const coreStarts = P.CreateStreamSet(coreLengths.size());
+                    matching.region = regions != nullptr;
+                    P.CreateKernelCall<FusedRules>(absolutely(std::move(matching), &core), U21, coreClasses, inText, mask, nullptr,
+                                                   previous, none, coreStarts);
+                    for (size_t k = 0; k < coreLengths.size(); k++) {
+                        byLength[lengthIndex(coreLengths[k])].push_back(SelectStringMatches::Source{coreStarts, static_cast<unsigned>(k)});
+                    }
+                }
+                StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
+                P.CreateKernelCall<MatchStartsByLength>(byLength, starts);
+                StreamSet * const selected = P.CreateStreamSet(1);
+                P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
+                //  The static rules, where selected (with their coverage, if the
+                //  subgroups apply outside the matches).
+                FusedState staticOut;
+                if (replay) {
+                    for (unsigned i = 0; i < startLayout.slots; i++) staticOut.changes.push_back(P.CreateStreamSet(21));
+                    for (unsigned k : startLayout.insertCounts) staticOut.insertions[k] = P.CreateStreamSet(1);
+                    staticOut.spans = P.CreateStreamSet(1);
+                    staticOut.starts = P.CreateStreamSet(1);
+                    P.CreateKernelCall<StaticReplay>(startLayout, staticLengths, absoluteResults, selected, staticStarts, startResults, U21,
+                                                     staticOut.changes, staticOut.insertions, staticOut.spans, staticOut.starts);
+                } else {
+                    const FusedState saved = state;
+                    state = FusedState{};
+                    for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
+                        FusedRulesConfig a;
+                        a.coverage = config.groupCoverage;
+                        a.selected = static_cast<int>(a.sources.size());
+                        a.sources.push_back(FusedMatchSource{selected, 0});
+                        for (size_t i : chunk) a.strings.push_back(moved(config.strings[i], a));
+                        applyFused(std::move(a), nullptr);
+                    }
+                    staticOut = state;
+                    state = saved;
+                }
+                //  The core rules and the subgroups.
+                StreamSet * allowedAt = nullptr;
+                if (config.groupCoverage && staticOut.spans) {
+                    StreamSet * const uncovered = P.CreateStreamSet(1);
+                    P.CreateKernelCall<UncoveredPositions>(staticOut.spans, staticOut.starts, uncovered);
+                    allowedAt = combine(mask, uncovered, false);
+                }
+                FusedRulesConfig applying = core;
+                applying.selected = static_cast<int>(applying.sources.size());
+                applying.sources.push_back(FusedMatchSource{selected, 0});
+                const FusedLayout layout(applying, previous);
+                FusedState out;
+                for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
+                for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+                applying.region = regions != nullptr;
+                P.CreateKernelCall<FusedRules>(absolutely(std::move(applying), &core), U21, coreClasses, inText, mask, allowedAt,
+                                               previous, out, nullptr);
+                if (staticOut.changes.empty() && staticOut.insertions.empty() && staticOut.marks.empty()) {
+                    previous = out;
+                    continue;
+                }
+                FusedState merged;
+                for (size_t i = 0; i < std::max(out.changes.size(), staticOut.changes.size()); i++) {
+                    merged.changes.push_back(P.CreateStreamSet(21));
+                }
+                for (const FusedState * s : {static_cast<const FusedState *>(&out), static_cast<const FusedState *>(&staticOut)}) {
+                    for (const auto & k : s->insertions) {
+                        if (!merged.insertions.count(k.first)) merged.insertions[k.first] = P.CreateStreamSet(1);
+                    }
+                    for (const auto & k : s->marks) {
+                        if (!merged.marks.count(k.first)) merged.marks[k.first] = P.CreateStreamSet(1);
+                    }
+                }
+                P.CreateKernelCall<MergeFusedResults>(MergeFusedResults::parts(staticOut.changes, staticOut.insertions, staticOut.marks),
+                                                      MergeFusedResults::parts(out.changes, out.insertions, out.marks),
+                                                      MergeFusedResults::parts(merged.changes, merged.insertions, merged.marks));
+                previous = merged;
+            }
+            state = previous;
+        } else if (step.sequentialSelection && !sequentialLoop) {
             //  The string matches are selected sequentially, between the rounds:
             //  each round is a kernel matching the before contexts against the
             //  converted text of the previous round, the selection of the matches
@@ -11815,6 +12660,146 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 StreamSet * const uncovered = P.CreateStreamSet(1);
                 P.CreateKernelCall<UncoveredPositions>(state.spans, state.starts, uncovered);
                 allowed = notAtCaptures(combine(mask, uncovered, false));
+            }
+            //  The string rules whose before contexts are not matched against the
+            //  converted text (static, not decided by their contexts in the While
+            //  loop) matched before, in chunks: the kernel reads their matches
+            //  (FusedStringRule::match), as it does those of the engine.
+            //  The string rules that the While loop does not decide (static: their
+            //  before contexts are not matched against the converted text, and they
+            //  may not begin within the match of a rule decided in the loop, see
+            //  loopStringRules) selected and applied before the correction kernel, in
+            //  chunks, their results given to it as the state (see
+            //  StaticApplyChunks).  The kernel's base outcome is then the state given,
+            //  as it was the state with the results of these rules, and the rules it
+            //  decides begin only outside their applied matches (Selected), as its
+            //  selection and its dropping of matches within applied ones had them.
+            if (StaticApplyChunks && !config.sequential && resolvableByWhile(config)) {
+                const std::vector<bool> loop = loopStringRules(config);
+                std::vector<size_t> staticRules;                                // indexes of config.strings
+                std::vector<size_t> pos(config.strings.size(), SIZE_MAX);      // the index in staticRules
+                std::vector<std::pair<size_t, size_t>> stringLengths;
+                for (size_t i = 0; i < config.strings.size(); i++) {
+                    stringLengths.push_back(lengths[order[i]]);
+                    if (loop[i]) continue;
+                    pos[i] = staticRules.size();
+                    staticRules.push_back(i);
+                }
+                if (!staticRules.empty()) {
+                    //  Their matches.
+                    std::vector<SelectStringMatches::Source> firsts(staticRules.size());
+                    std::vector<size_t> fusedStatic;
+                    for (size_t k = 0; k < staticRules.size(); k++) {
+                        const FusedStringRule & r = config.strings[staticRules[k]];
+                        if (r.match >= 0) {
+                            const FusedMatchSource & s = config.sources[static_cast<size_t>(r.match)];
+                            firsts[k] = SelectStringMatches::Source{s.streamSet, s.index};
+                        } else {
+                            fusedStatic.push_back(staticRules[k]);
+                        }
+                    }
+                    const FusedState none;
+                    for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, fusedStatic)) {
+                        FusedRulesConfig m;
+                        m.matchOnly = true;
+                        for (size_t i : chunk) m.strings.push_back(moved(config.strings[i], m));
+                        StreamSet * const matches = P.CreateStreamSet(chunk.size());
+                        StreamSet * const chunkClasses = fusedClasses(m);
+                        m.region = regions != nullptr;
+                        P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, matches);
+                        for (size_t k = 0; k < chunk.size(); k++) firsts[pos[chunk[k]]] = SelectStringMatches::Source{matches, static_cast<unsigned>(k)};
+                    }
+                    //  Those that apply: selected as the kernel selects them (by their
+                    //  predecessors among them; those decided in the loop do not select
+                    //  them, see FusedRules::generatePabloMethod's settle).
+                    std::vector<FusedMatchSource> applied;
+                    if (!config.selection.empty()) {
+                        std::vector<SelectStringMatches::Rule> select;
+                        for (size_t i : staticRules) {
+                            const FusedRulesConfig::Selection & sel = config.selection[i];
+                            SelectStringMatches::Rule sr;
+                            sr.length = sel.length;
+                            sr.selfOverlapping = sel.selfOverlapping;
+                            for (size_t p : sel.predecessors) {
+                                if (pos[p] != SIZE_MAX) sr.predecessors.push_back(pos[p]);
+                            }
+                            select.push_back(std::move(sr));
+                        }
+                        StreamSet * const Applied = P.CreateStreamSet(staticRules.size());
+                        P.CreateKernelCall<SelectStringMatches>(select, firsts, Applied, nullptr, nullptr);
+                        for (size_t k = 0; k < staticRules.size(); k++) applied.push_back(FusedMatchSource{Applied, static_cast<unsigned>(k)});
+                    } else {
+                        for (const SelectStringMatches::Source & f : firsts) applied.push_back(FusedMatchSource{f.streamSet, f.index});
+                    }
+                    //  Applied in chunks, after the state, with the coverage of their
+                    //  matches alone.
+                    StreamSet * const savedSpans = state.spans;
+                    StreamSet * const savedStarts = state.starts;
+                    state.spans = state.starts = nullptr;
+                    for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
+                        FusedRulesConfig a;
+                        a.coverage = true;
+                        for (size_t i : chunk) {
+                            FusedStringRule fr = config.strings[i];
+                            fr.afterMatch = -1;
+                            fr.match = static_cast<int>(a.sources.size());
+                            a.sources.push_back(applied[pos[i]]);
+                            a.strings.push_back(std::move(fr));
+                        }
+                        applyFused(std::move(a), nullptr);
+                    }
+                    StreamSet * const uncovered = P.CreateStreamSet(1);
+                    P.CreateKernelCall<UncoveredPositions>(state.spans, state.starts, uncovered);
+                    state.spans = savedSpans;
+                    state.starts = savedStarts;
+                    //  The kernel, with the other rules.
+                    FusedRulesConfig rest = config;
+                    rest.strings.clear();
+                    rest.selection.clear();
+                    std::vector<size_t> restIndex(config.strings.size(), SIZE_MAX);
+                    for (size_t i = 0; i < config.strings.size(); i++) {
+                        if (!loop[i]) continue;
+                        restIndex[i] = rest.strings.size();
+                        rest.strings.push_back(config.strings[i]);
+                    }
+                    if (!config.selection.empty()) {
+                        for (size_t i = 0; i < config.strings.size(); i++) {
+                            if (!loop[i]) continue;
+                            FusedRulesConfig::Selection sel = config.selection[i];
+                            sel.predecessors.clear();
+                            for (size_t p : config.selection[i].predecessors) {
+                                if (restIndex[p] != SIZE_MAX) sel.predecessors.push_back(restIndex[p]);
+                            }
+                            rest.selection.push_back(std::move(sel));
+                        }
+                    }
+                    rest.selected = static_cast<int>(rest.sources.size());
+                    rest.sources.push_back(FusedMatchSource{uncovered, 0});
+                    if (config.groupCoverage) allowed = combine(allowed ? allowed : mask, uncovered, false);
+                    config = std::move(rest);
+                }
+            }
+            if (StaticMatchChunks) {
+                std::vector<size_t> staticRules;
+                std::vector<std::pair<size_t, size_t>> stringLengths;
+                for (size_t i = 0; i < config.strings.size(); i++) {
+                    stringLengths.push_back(lengths[order[i]]);
+                    if (!config.strings[i].converted && config.strings[i].match < 0) staticRules.push_back(i);
+                }
+                const FusedState none;
+                for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
+                    FusedRulesConfig m;
+                    m.matchOnly = true;
+                    for (size_t i : chunk) m.strings.push_back(moved(config.strings[i], m));
+                    StreamSet * const firsts = P.CreateStreamSet(chunk.size());
+                    StreamSet * const chunkClasses = fusedClasses(m);
+                    m.region = regions != nullptr;
+                    P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, firsts);
+                    for (size_t k = 0; k < chunk.size(); k++) {
+                        config.strings[chunk[k]].match = static_cast<int>(config.sources.size());
+                        config.sources.push_back(FusedMatchSource{firsts, static_cast<unsigned>(k)});
+                    }
+                }
             }
             applyFused(std::move(config), allowed);
         }
@@ -12716,6 +13701,8 @@ public:
                         std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr)
     : mMasks(P), mP(P), mRegistry(registry), mAnalyzer(analyzer), mGroupCounts(groupCounts) {}
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * Basis);
+    //  The plans being applied, shared with the builder of Unicode mode (see NormalizationFrames).
+    std::shared_ptr<NormalizationFrames> mFrames = std::make_shared<NormalizationFrames>();
     //  The lines as regions, as in Unicode mode (see RulePipelineBuilder::pushRegions).
     void pushRegions(StreamSet * Basis) {
         assert (mMasks.empty());
@@ -12750,7 +13737,7 @@ private:
     void utf8Masks(std::vector<TransformMask> && masks, StreamSet * Basis);
     RulePipelineBuilder & unicode() {
         if (!mUnicode) {
-            mUnicode = std::make_unique<RulePipelineBuilder>(mP, mRegistry, mAnalyzer);
+            mUnicode = std::make_unique<RulePipelineBuilder>(mP, mRegistry, mAnalyzer, mFrames);
             if (mBounded) mUnicode->boundRegions();
         }
         return *mUnicode;
@@ -12779,6 +13766,8 @@ private:
     StreamSet * builtIn(const std::string & name, StreamSet * Basis);
     StreamSet * normalization(const std::string & name, StreamSet * Basis);
     Staged maskedNormalization(const std::string & name, StreamSet * Basis);
+    //  The input mode of the Any-NFC being applied (see NormalizationFrames::input).
+    NormalizationInput mNFC_Input = NormalizationInput::Any;
     StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
     //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
     //  masks of the filters in effect (the innermost last, within the ones
@@ -13046,15 +14035,19 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
         mMasks.insertAnywhere();
     }
     size_t group = 0;
+    mFrames->enter(a);
     for (size_t i = 0; i < a.plan.steps.size(); ) {
         const ldml::TransformStep & step = a.plan.steps[i];
         if (MixedModes && !utf8Step(step)) {
             const size_t j = segmentEnd(a, i);
+            mFrames->begin(i, j, mRegistry);
             Basis = unicodeSegment(name + "U" + std::to_string(++mSegments), a, i, j, Basis);
+            mFrames->end();
             checkMasks(name + ": after the Unicode segment of steps " + std::to_string(i + 1) + "-" + std::to_string(j), Basis);
             i = j;
             continue;
         }
+        mFrames->begin(i, i + 1, mRegistry);
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, Basis);
             mInvokedWithFilter = step.filter != nullptr;
@@ -13065,9 +14058,11 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
             mGroupLabel = name + "G" + std::to_string(++group);
             Basis = conversionGroup(step, Basis, outermost);
         }
+        mFrames->end();
         checkMasks(name + ": after step " + std::to_string(i + 1), Basis);
         i++;
     }
+    mFrames->exit();
     if (a.plan.filter) popFilter();
     mDepth--;
     return Basis;
@@ -13138,8 +14133,12 @@ static bool utf8BuiltIn(const std::string & name) {
 
 StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
     if (name == "Any-Null") return Basis;
+    if (mFrames->omit(name, mRegistry, mAnalyzer)) return Basis;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
-        return mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
+        mNFC_Input = mFrames->input(name, mRegistry);
+        StreamSet * const result = mMasks.empty() ? normalization(name, Basis) : inStep(maskedNormalization(name, Basis));
+        mNFC_Input = NormalizationInput::Any;
+        return result;
     }
     if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
     llvm::report_fatal_error(llvm::StringRef("xlit: built-in transform " + name + " not in UTF-8 mode"));
@@ -13153,11 +14152,8 @@ StreamSet * UTF8PipelineBuilder::normalization(const std::string & name, StreamS
     StreamSet * bytes = BytesOf(P, Basis);
     if (name == "Any-NFD") return BasisOf(P, NFD_Bytes(P, NFD_builder, bytes, Basis));
     if (name == "Any-NFKD") return BasisOf(P, NFKD_Bytes(P, NFD_builder, bytes, Basis));
-    if (name == "Any-NFKC") {
-        bytes = NFKD_Bytes(P, NFD_builder, bytes, Basis);
-        Basis = BasisOf(P, bytes);
-    }
-    return BasisOf(P, NFC_Bytes(P, bytes, Basis));
+    if (name == "Any-NFKC") return BasisOf(P, NFKC_Bytes(P, NFD_builder, NormalizationFocusOptions(), bytes, Basis));
+    return BasisOf(P, NFC_FocusedTransform(NormalizationFocusOptions(), mNFC_Input).build(P, bytes, Basis));
 }
 
 //  The bytes of the characters marked at their first bytes (Firsts), within
@@ -13290,7 +14286,8 @@ Staged UTF8PipelineBuilder::maskedNormalization(const std::string & name, Stream
             mask = OutMask;
         }
         StreamSet * const OutMask = P.CreateStreamSet(1);
-        bytes = NFC_Masked(P, NormalizationFocusOptions(), bytes, Basis, mask, OutMask);
+        bytes = NFC_Masked(P, NormalizationFocusOptions(), bytes, Basis, mask, OutMask,
+                           name == "Any-NFKC" ? NormalizationInput::InputIsNFKD : mNFC_Input);
         PositionMap composed;
         composed.remove(mMasks.complement(mask));
         composed.insert(mMasks.complement(OutMask), PositionMap::Inserted::In);
@@ -14110,7 +15107,10 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     size_t segment = 0;
     size_t group = 0;
     std::vector<bool> applied(choice ? choice->useShapes.size() : 0, false);
+    mFrames->enter(a);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        const size_t i = static_cast<size_t>(&step - a.plan.steps.data());
+        mFrames->begin(i, i + 1, mRegistry);
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             segment++;
         } else if (choice && choice->useShapes[segment]) {
@@ -14157,7 +15157,9 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (step.frontLettersEnd) U21 = frontLettersEnd(step, U21);
             if (outermost && groupRules(step) > 0) mGroupCounts.push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         }
+        mFrames->end();
     }
+    mFrames->exit();
     if (a.plan.filter) popFilter();
     mShapeChoice = choice;
     mDeletedRunEnds = deletedRunEnds;

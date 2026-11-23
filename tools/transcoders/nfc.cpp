@@ -62,6 +62,12 @@ static cl::opt<MaskSelect> NFC_MaskSelect("nfc-mask-select", cl::desc("With -nfc
                clEnumValN(MaskSelect::Inside, "inside", "the bytes within the output mask"),
                clEnumValN(MaskSelect::Outside, "outside", "the bytes outside it")),
     cl::init(MaskSelect::All), cl::cat(NFC_Options), cl::Hidden);
+static cl::opt<NormalizationInput> NFC_Input("nfc-input", cl::desc("What the input is known to be: NFC then skips the "
+                                             "decomposition and canonical ordering stages"),
+    cl::values(clEnumValN(NormalizationInput::Any, "any", "any text (default)"),
+               clEnumValN(NormalizationInput::InputIsNFD, "nfd", "the input is in NFD"),
+               clEnumValN(NormalizationInput::InputIsNFKD, "nfkd", "the input is in NFKD")),
+    cl::init(NormalizationInput::Any), cl::cat(NFC_Options));
 static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers (alias of -focus-layers=filter)"), cl::init(false), cl::cat(NFC_Options));
 
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -115,7 +121,7 @@ FocusStageFunctionType focus_stage_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("FocusedBasis", 8, 1, ReturnedBuffer(1)),
                             Input<const char*>{"buffer"}, Input<size_t>{"length"}
                             );
-    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions(), NFC_Input);
     StreamSet * const ByteStream = P.getOutputStreamSet("ByteStream");
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     source_logic(P, ByteStream, BasisBits);
@@ -133,7 +139,7 @@ TransformStageFunctionType transform_stage_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("ValidWorkMask", 1, 1, ReturnedBuffer(1))
                             );
-    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions(), NFC_Input);
     NFC.transform(P, P.getInputStreamSet("FocusedBasis"), P.getOutputStreamSet("TransformedBasis"), P.getOutputStreamSet("ValidWorkMask"));
     return P.compile();
 }
@@ -148,7 +154,7 @@ FinalStageFunctionType final_stage_pipeline(CPUDriver & driver) {
                             Input<streamset_t>("TransformedBasis", 8, 1),
                             Input<uint32_t>("outputFD")
                             );
-    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions(), NFC_Input);
     StreamSet * const ByteStream = P.getInputStreamSet("ByteStream");
     StreamSet * const WorkSelectionMask = P.getInputStreamSet("WorkSelectionMask");
     P.SetStageLabel("placement");
@@ -165,7 +171,7 @@ typedef void (*XfrmFunctionType)(const char * buffer, const size_t length, uint3
 
 XfrmFunctionType generate_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<const char*>{"buffer"}, Input<size_t>{"length"}, Input<uint32_t>("outputFD"));
-    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions(), NFC_Input);
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
@@ -226,7 +232,7 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
             Result = P.CreateStreamSet(21, 1);
             FilterByMask(P, index, Decoded, Result);
         } else {
-            Result = NFC_U21(P, U21, Mask21, OutputMask, NFC.getOptions().Focus);
+            Result = NFC_U21(P, U21, Mask21, OutputMask, NFC.getOptions().Focus, NFC_Input);
         }
         if (OutputMask) {
             StreamSet * selected = OutputMask;
@@ -244,7 +250,7 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
         P.CreateKernelCall<P2SKernel>(OutputBasis, OutputBytes);
     } else if (Mask) {
         StreamSet * const OutputMask = NFC_MaskSelect == MaskSelect::All ? nullptr : P.CreateStreamSet(1, 1);
-        OutputBytes = NFC_Masked(P, NFC.getOptions(), ByteStream, BasisBits, Mask, OutputMask);
+        OutputBytes = NFC_Masked(P, NFC.getOptions(), ByteStream, BasisBits, Mask, OutputMask, NFC_Input);
         if (OutputMask) {
             StreamSet * selected = OutputMask;
             if (NFC_MaskSelect == MaskSelect::Outside) {
@@ -263,11 +269,11 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
         // within the work regions.
         P.SetStageLabel("focus");
         StreamSet * const WorkSelectionMask = P.CreateStreamSet(1, 1);
-        DetermineNFC_WorkSelection(P, BasisBits, WorkSelectionMask);
+        DetermineNFC_WorkSelection(P, BasisBits, WorkSelectionMask, nullptr, NFC_Input);
         P.SetStageLabel("transform");
         StreamSet * const TransformedBasis = P.CreateStreamSet(8, 1);
         StreamSet * const ValidWorkMask = P.CreateStreamSet(1, 1);
-        NFC_Transform(P, BasisBits, TransformedBasis, ValidWorkMask, WorkSelectionMask);
+        NFC_Transform(P, BasisBits, TransformedBasis, ValidWorkMask, WorkSelectionMask, nullptr, nullptr, NFC_Input);
         P.SetStageLabel("output");
         OutputBytes = P.CreateStreamSet(1, 8);
         P.CreateKernelCall<P2SKernel>(TransformedBasis, OutputBytes);

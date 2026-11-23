@@ -218,14 +218,21 @@ public:
     re::Name * getVariable() const {return mVariable;}
     std::string getName() const;
     re::RE * getDefinition() const;
-    static VariableDefinitionRule * Create(re::Name * variable) {
-        return new VariableDefinitionRule(variable);
+    //  Whether the definition is written as a UnicodeSet ($v = [b] ;), not as
+    //  text ($v = b ;).  The two differ within a UnicodeSet when the value is a
+    //  single character: there, as in ICU, a variable defined as a character is
+    //  that character, so [$u-$v] is a range of two such variables, and a
+    //  difference of two sets.
+    bool isSet() const {return mIsSet;}
+    static VariableDefinitionRule * Create(re::Name * variable, bool isSet = false) {
+        return new VariableDefinitionRule(variable, isSet);
     }
     LDML_RULE_SUBTYPE(VariableDefinition)
 private:
-    VariableDefinitionRule(re::Name * variable)
-    : Rule(ClassTypeId::VariableDefinition), mVariable(variable) {}
+    VariableDefinitionRule(re::Name * variable, bool isSet)
+    : Rule(ClassTypeId::VariableDefinition), mVariable(variable), mIsSet(isSet) {}
     re::Name * const mVariable;
+    const bool mIsSet;
 };
 
 VariableDefinitionRule * makeVariableDefinitionRule(const std::string & name, re::RE * definition);
@@ -1237,6 +1244,87 @@ struct FunctionCallStats {
 };
 std::vector<Rule *> ExpandFunctionCalls(const std::vector<Rule *> & rules, const FunctionEvaluator & evaluate,
                                         FunctionCallStats * stats = nullptr);
+
+//  NFD preservation of a conversion group: whether the group's output is in
+//  NFD whenever its input is, by a conservative, rule-by-rule check.  The
+//  group is the forward conversion rules between two transform rules (as
+//  ExtractForwardRules or ExtractReverseBackwardRules gives them; other rules
+//  are ignored).  A text is in NFD when none of its characters has a
+//  canonical decomposition (NFD_QC=Y) and no mark follows a mark of a higher
+//  canonical combining class (ccc; a starter has ccc 0).  The check shows that
+//  each application of a rule keeps the whole text in NFD: the text L M R,
+//  with the match M, becomes L S R, with the result S.  Then:
+//  - The literal characters of S are NFD_QC=Y and in canonical order among
+//    themselves; a copy of a capture ($n) is a part of the text, in NFD, and
+//    begins and ends with characters the capture may begin and end with.  A
+//    function call (&T(...)) is not analysed: the group then fails the check
+//    (ExpandFunctionCalls may remove it first).
+//  - The character before S (the last of L) may be bounded: by the last item
+//    of the before context, when that item matches a character (not empty, not
+//    the text boundary); and, when every character with which M may begin is
+//    a mark, by the highest ccc among them, as L M is in NFD.  Likewise the
+//    character after S (the first of R): by the first item of the after
+//    context, or, when every character with which M may end is a mark, by the
+//    lowest ccc among them.
+//  - S begins with a starter or with marks of ccc at least that bound before
+//    it, and ends with a starter or with marks of ccc at most the bound after
+//    it.  Where S may be empty (a deletion), the bound before must not exceed
+//    the bound after, unless M consists of marks only (deleting marks from an
+//    ordered run leaves it ordered).
+//  The cursor and the revisiting of results do not matter: each application,
+//  revisits included, keeps the text in NFD.  Filters do not matter either:
+//  characters outside them are unchanged, and the bounds from the contexts
+//  hold whether or not the contexts see past the filter (a context item that
+//  matches a character matches the adjacent one).  A text boundary in a
+//  context gives no bound.  Is_NFD_Preserving returns false with the first
+//  rule that fails and the reason, in failure, if given.
+struct NFD_PreservationFailure {
+    const ConversionRule * rule = nullptr;
+    std::string reason;
+};
+bool Is_NFD_Preserving(const std::vector<Rule *> & group, NFD_PreservationFailure * failure = nullptr);
+
+//  The conversion groups of a list of forward rules (separated by the transform
+//  rules), in order, each as the list of its conversion rules.
+std::vector<std::vector<Rule *>> ConversionGroups(const std::vector<Rule *> & rules);
+
+//  The independent components of a conversion group (forward rules): a
+//  partition of its rules such that applying the components one after the
+//  other, each as a group of its own, in any order, gives what the group gives
+//  (the separate kernels of a group).  Conservatively, two rules are in
+//  the same component (transitively) where one may affect the other:
+//  - their texts share a character (their matches may overlap or begin at the
+//    same position, and are then selected together);
+//  - a context of one has a character of the text or of the result of the
+//    other (the other's application changes what the context sees, before or
+//    after it is applied; a context is matched against the converted text
+//    before the position and the text itself after it);
+//  - the text of one has a character of the result of the other (the result
+//    of one applied first could make a match of the other);
+//  - one may change the length of the text it replaces (a deletion, an
+//    insertion, a repetition, a copied capture: the characters on either side
+//    then become adjacent, or no longer), and the other has a context.
+//  The characters of a pattern are those of its sets (patternCharacters); a
+//  result with a function call may have any character.  Rules without a
+//  forward direction are left out.  Components are given by the indexes of
+//  their rules in the group, in the order of their first rules.
+std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *> & group);
+
+//  The conversion groups of more than minRules rules split by their independent
+//  components (IndependentComponents): the components with rules that have
+//  before contexts, then the others, as two groups separated by ":: Null ;",
+//  each with the rules in their order.  A group is split only if both parts
+//  have rules.  The variable definitions of a group are kept before both.  (The
+//  before contexts are matched against the converted text, which takes a
+//  kernel of the whole group, see xlit; split, the other components are
+//  applied apart, as simpler groups.)  With stats, the number of groups split
+//  and of their rules set apart.
+struct ComponentSplitStats {
+    size_t groups = 0;
+    size_t rulesSetApart = 0;
+};
+std::vector<Rule *> SplitIndependentComponents(const std::vector<Rule *> & rules, size_t minRules,
+                                               ComponentSplitStats * stats = nullptr);
 
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.

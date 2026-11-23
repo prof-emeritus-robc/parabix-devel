@@ -9500,8 +9500,8 @@ class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                         std::shared_ptr<NormalizationFrames> frames = nullptr)
-    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P),
-      mFrames(frames ? std::move(frames) : std::make_shared<NormalizationFrames>()) {}
+    : mFrames(frames ? std::move(frames) : std::make_shared<NormalizationFrames>()),
+      mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P), mMasks(P) {}
     //  The plans being applied (see NormalizationFrames).
     std::shared_ptr<NormalizationFrames> mFrames;
     // Apply the transform of a registry entry to U21 (an implementable transform).

@@ -2144,7 +2144,6 @@ std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r, std::ve
     std::vector<Leaf> before, following;
     if (!collect(src->getBeforeContext(), false, before)) return {};
     if (!collect(src->getText(), true, following)) return {};
-    const size_t keyLeaves = following.size();
     if (!collect(src->getAfterContext(), false, following)) return {};
     bool any = false;
     size_t combinations = 1;

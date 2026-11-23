@@ -684,7 +684,6 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
-        PabloAST * const zeroes = pb.createZeroes();
         const std::vector<PabloAST *> Basis = getInputStreamSet("Basis");
         Var * const basisVar = getInputStreamVar("Basis");
         const std::vector<PabloAST *> markCodeAtStarter = getInputStreamSet("MarkCodeAtStarter");

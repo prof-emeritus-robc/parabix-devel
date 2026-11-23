@@ -579,6 +579,17 @@ public:
         std::string reason;
     };
     const ShapeGroups & shapeGroupsOf(const ldml::TransformEntry * entry);
+    //  The segments of the steps of shapeGroups, without planning their
+    //  conversion groups (cached): the transform rules between them (as
+    //  shapeChoice prints them), and whether the rules have a filter rule.
+    //  (Planning the shape groups disambiguates the order of all the rules
+    //  again, over a second for Hans-Hant: shapeChoice does it only where the
+    //  segments correspond to those of the regular plan.)
+    struct ShapeSegments {
+        std::vector<std::string> transforms;
+        bool filter = false;
+    };
+    const ShapeSegments & shapeSegmentsOf(const ldml::TransformEntry * entry);
     //  The choice, for each segment of a transform (the conversion groups
     //  between consecutive transform rules), between its regular plan and its
     //  shape groups (see --apply-shape-groups): the shape groups where they are
@@ -636,6 +647,7 @@ private:
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
     std::map<std::string, ShapeGroups> mShapeGroups;
+    std::map<std::string, ShapeSegments> mShapeSegments;
 };
 
 static std::string readFile(const std::string & path) {
@@ -810,6 +822,30 @@ const TransformAnalyzer::ShapeGroups & TransformAnalyzer::shapeGroupsOf(const ld
         g.applicable = g.reason.empty();
     }
     return mShapeGroups.emplace(name, std::move(g)).first->second;
+}
+
+const TransformAnalyzer::ShapeSegments & TransformAnalyzer::shapeSegmentsOf(const ldml::TransformEntry * entry) {
+    const std::string & name = entry->canonicalName;
+    auto f = mShapeSegments.find(name);
+    if (f != mShapeSegments.end()) return f->second;
+    ShapeSegments s;
+    //  (The rules as shapeGroups extracts them; none if they are not loaded,
+    //  as its steps.)
+    try {
+        const std::vector<ldml::Rule *> parsed = ldml::parseTransformRules(ldml::extractTRules(readFile(entry->file)));
+        const std::vector<ldml::Rule *> rules = entry->direction == ldml::TransformDirection::Forward
+                                                ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        for (const ldml::Rule * r : rules) {
+            if (const ldml::TransformRule * t = dyn_cast<ldml::TransformRule>(r)) {
+                s.transforms.push_back(t->getForwardID().getText() + (t->getForwardFilter() ? " (filtered)" : ""));
+            } else if (isa<ldml::FilterRule>(r)) {
+                s.filter = true;
+            }
+        }
+    } catch (const std::exception &) {
+        s = ShapeSegments();
+    }
+    return mShapeSegments.emplace(name, std::move(s)).first->second;
 }
 
 //  A conversion group planned by shape groups (see TransformAnalyzer::
@@ -13373,7 +13409,6 @@ static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformR
     if (f != analyzer.mShapeChoices.end()) return f->second;
     TransformAnalyzer::ShapeChoice choice;
     const TransformAnalysis & a = analyzer.analyze(entry);
-    const TransformAnalyzer::ShapeGroups & groups = analyzer.shapeGroupsOf(entry);
     //  The segments of each plan, by their transform rules.
     std::vector<std::string> regularTransforms, shapeTransforms;
     std::vector<std::vector<const ldml::TransformStep *>> regularSegments(1);
@@ -13385,6 +13420,14 @@ static const TransformAnalyzer::ShapeChoice & shapeChoice(const ldml::TransformR
             regularSegments.back().push_back(&step);
         }
     }
+    //  (Whether the segments correspond, before planning the shape groups.)
+    {
+        const TransformAnalyzer::ShapeSegments & s = analyzer.shapeSegmentsOf(entry);
+        if (!a.implementable || a.plan.filter != nullptr || s.filter || regularTransforms != s.transforms) {
+            return analyzer.mShapeChoices.emplace(entry->canonicalName, std::move(choice)).first->second;
+        }
+    }
+    const TransformAnalyzer::ShapeGroups & groups = analyzer.shapeGroupsOf(entry);
     choice.shapeSegments.resize(1);
     bool filters = a.plan.filter != nullptr;
     for (const TransformAnalyzer::ShapeStep & step : groups.steps) {

@@ -360,7 +360,7 @@ static const std::vector<std::pair<std::string, Transform>> implementedTransform
     {"Any-Remove", Transform::Remove},
 };
 
-//  The forms of escapes decoded by each Hex-Any transform (see kernel::HexEscapeForm).
+//  The forms of escapes decoded by each Hex-Any transform (see kernel::HexEncoding).
 static unsigned hexDecodeForms(const std::string & name) {
     if (name == "Hex-Any") return HexEscapeAll;
     if (name == "Hex-Any/Java") return HexEscapeJava;
@@ -370,6 +370,58 @@ static unsigned hexDecodeForms(const std::string & name) {
     if (name == "Hex-Any/XML") return HexEscapeXML;
     if (name == "Hex-Any/XML10") return HexEscapeXML10;
     return 0;
+}
+
+//  Any-Hex/Unicode, /C, /XML and /Perl: the pipeline of the escapes (of
+//  codepoints, or with UTF8, of the UTF-8 code units of the characters), and
+//  the lengths of the escapes by the characters escaped.  Each is a
+//  context-free, single-character mapping, so within a mask only the masked
+//  characters need be converted (see RulePipelineBuilder::localCharacterMapping
+//  and UTF8PipelineBuilder::hexEscapes).
+struct HexEncoding {
+    void (*pipeline)(PipelineBuilder & P, StreamSet * Basis, StreamSet * Out, bool UTF8);
+    std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths;
+};
+
+static const HexEncoding * hexEncoding(const std::string & name) {
+    //  Any-Hex/Unicode: U+ and the codepoint in uppercase hexadecimal, of 4, 5
+    //  or 6 digits by its magnitude.
+    static const HexEncoding unicode{UnicodeHexPipeline, {
+        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // U+ and 4 digits
+        {7, UCD::UnicodeSet(0x10000, 0xFFFFF)},     // U+ and 5 digits
+        {8, UCD::UnicodeSet(0x100000, 0x10FFFF)},   // U+ and 6 digits
+    }};
+    //  Any-Hex/C: a character of the basic multilingual plane as \uXXXX, a
+    //  supplementary one as \UXXXXXXXX.
+    static const HexEncoding c{CHexPipeline, {
+        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
+        {10, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // \U and 8 digits
+    }};
+    //  Any-Hex/XML: &#x, the hexadecimal digits without leading zeroes (at
+    //  least one) and ;
+    static const HexEncoding xml{XMLHexPipeline, {
+        {5, UCD::UnicodeSet(0x0, 0xF)},            // &#x and 1 digit and ;
+        {6, UCD::UnicodeSet(0x10, 0xFF)},          // &#x and 2 digits and ;
+        {7, UCD::UnicodeSet(0x100, 0xFFF)},        // &#x and 3 digits and ;
+        {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // &#x and 4 digits and ;
+        {9, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // &#x and 5 digits and ;
+        {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // &#x and 6 digits and ;
+    }};
+    //  Any-Hex/Perl: \x{, the hexadecimal digits without leading zeroes (at
+    //  least one) and }
+    static const HexEncoding perl{PerlHexPipeline, {
+        {5, UCD::UnicodeSet(0x0, 0xF)},            // \x{ and 1 digit and }
+        {6, UCD::UnicodeSet(0x10, 0xFF)},          // \x{ and 2 digits and }
+        {7, UCD::UnicodeSet(0x100, 0xFFF)},        // \x{ and 3 digits and }
+        {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // \x{ and 4 digits and }
+        {9, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // \x{ and 5 digits and }
+        {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // \x{ and 6 digits and }
+    }};
+    if (name == "Any-Hex/Unicode") return &unicode;
+    if (name == "Any-Hex/C") return &c;
+    if (name == "Any-Hex/XML") return &xml;
+    if (name == "Any-Hex/Perl") return &perl;
+    return nullptr;
 }
 
 //  Basis bits of a byte stream.
@@ -9711,11 +9763,8 @@ private:
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
     Staged hexJava(StreamSet * U21);
-    Staged hexUnicode(StreamSet * U21);
-    Staged hexC(StreamSet * U21);
-    Staged hexXML(StreamSet * U21);
+    Staged hexEscapes(const HexEncoding & form, StreamSet * U21);
     Staged hexXML10(StreamSet * U21);
-    Staged hexPerl(StreamSet * U21);
     Staged hexDecode(unsigned forms, StreamSet * U21);
     Staged remove(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
@@ -9987,11 +10036,8 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Title") return titlecase(U21);
     if (name == "Any-Hex") return inStep(hexJava(U21));
     if (name == "Any-Hex/Java") return inStep(hexJava(U21));
-    if (name == "Any-Hex/Unicode") return inStep(hexUnicode(U21));
-    if (name == "Any-Hex/C") return inStep(hexC(U21));
-    if (name == "Any-Hex/XML") return inStep(hexXML(U21));
+    if (const HexEncoding * form = hexEncoding(name)) return inStep(hexEscapes(*form, U21));
     if (name == "Any-Hex/XML10") return inStep(hexXML10(U21));
-    if (name == "Any-Hex/Perl") return inStep(hexPerl(U21));
     if (const unsigned forms = hexDecodeForms(name)) return inStep(hexDecode(forms, U21));
     if (name == "Any-Remove") return inStep(remove(U21));
     llvm::report_fatal_error(llvm::StringRef("xlit: built-in transform " + name + " is not implemented"));
@@ -10280,60 +10326,13 @@ Staged RulePipelineBuilder::hexJava(StreamSet * U21) {
     });
 }
 
-//  Any-Hex/Unicode: each character as U+ and its codepoint in uppercase
-//  hexadecimal, of 4, 5 or 6 digits by its magnitude (UnicodeHexPipeline) --
-//  a context-free, single-character mapping, so within a mask only the
-//  masked characters need be converted (localCharacterMapping).
-Staged RulePipelineBuilder::hexUnicode(StreamSet * U21) {
-    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
-        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // U+ and 4 digits
-        {7, UCD::UnicodeSet(0x10000, 0xFFFFF)},     // U+ and 5 digits
-        {8, UCD::UnicodeSet(0x100000, 0x10FFFF)},   // U+ and 6 digits
-    };
-    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+//  Any-Hex/Unicode, /C, /XML and /Perl (see hexEncoding), within the mask
+//  by localCharacterMapping.
+Staged RulePipelineBuilder::hexEscapes(const HexEncoding & form, StreamSet * U21) {
+    return localCharacterMapping(U21, form.lengths, [&](StreamSet * Selected) {
         PipelineBuilder & P = mP;
         StreamSet * const Hex = P.CreateStreamSet(21, 1);
-        UnicodeHexPipeline(P, Selected, Hex);
-        SHOW_BIXNUM(Hex);
-        return Hex;
-    });
-}
-
-//  Any-Hex/C: each basic mulitplane character encoded as \uxxxx,
-//  each supplementary plane character as \Uxxxxxxxx (UnicodeHexPipeline) --
-//  a context-free, single-character mapping, so within a mask only the
-//  masked characters need be converted (localCharacterMapping).
-Staged RulePipelineBuilder::hexC(StreamSet * U21) {
-    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
-        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
-        {10, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // \U and 8 digits
-    };
-    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
-        PipelineBuilder & P = mP;
-        StreamSet * const Hex = P.CreateStreamSet(21, 1);
-        CHexPipeline(P, Selected, Hex);
-        SHOW_BIXNUM(Hex);
-        return Hex;
-    });
-}
-
-//  Any-Hex/XML: each basic mulitplane character encoded as &#x<hexdigit>+;
-//  where leading zeroes are deleted from <hexdigit>s, except for the last --
-//  a context-free, single-character mapping, so within a mask only the
-//  masked characters need be converted (localCharacterMapping).
-Staged RulePipelineBuilder::hexXML(StreamSet * U21) {
-    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
-        {5, UCD::UnicodeSet(0x0, 0xF)},            // &#x and 1 digit and ;
-        {6, UCD::UnicodeSet(0x10, 0xFF)},          // &#x and 2 digits and ;
-        {7, UCD::UnicodeSet(0x100, 0xFFF)},        // &#x and 3 digits and ;
-        {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // &#x and 4 digits and ;
-        {9, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // &#x and 5 digits and ;
-        {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // &#x and 6 digits and ;
-    };
-    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
-        PipelineBuilder & P = mP;
-        StreamSet * const Hex = P.CreateStreamSet(21, 1);
-        XMLHexPipeline(P, Selected, Hex);
+        form.pipeline(P, Selected, Hex, false);
         SHOW_BIXNUM(Hex);
         return Hex;
     });
@@ -10359,28 +10358,6 @@ Staged RulePipelineBuilder::hexXML10(StreamSet * U21) {
         XMLDecimalPipeline(P, Selected, Dec);
         SHOW_BIXNUM(Dec);
         return Dec;
-    });
-}
-
-//  Any-Hex/Perl: each basic mulitplane character encoded as &#x<hexdigit>+;
-//  where leading zeroes are deleted from <hexdigit>s, except for the last --
-//  a context-free, single-character mapping, so within a mask only the
-//  masked characters need be converted (localCharacterMapping).
-Staged RulePipelineBuilder::hexPerl(StreamSet * U21) {
-    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
-        {5, UCD::UnicodeSet(0x0, 0xF)},            // \x{ and 1 digit and }
-        {6, UCD::UnicodeSet(0x10, 0xFF)},          // \x{ and 2 digits and }
-        {7, UCD::UnicodeSet(0x100, 0xFFF)},        // \x{ and 3 digits and }
-        {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // \x{ and 4 digits and }
-        {9, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // \x{ and 5 digits and }
-        {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // \x{ and 6 digits and }
-    };
-    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
-        PipelineBuilder & P = mP;
-        StreamSet * const Hex = P.CreateStreamSet(21, 1);
-        PerlHexPipeline(P, Selected, Hex);
-        SHOW_BIXNUM(Hex);
-        return Hex;
     });
 }
 
@@ -13826,6 +13803,7 @@ private:
     //  The input mode of the Any-NFC being applied (see NormalizationFrames::input).
     NormalizationInput mNFC_Input = NormalizationInput::Any;
     StreamSet * caseMapping(const std::string & name, StreamSet * Basis);
+    StreamSet * hexEscapes(const HexEncoding & form, StreamSet * Basis);
     //  Filters, as in Unicode mode (see RulePipelineBuilder::pushFilter): the
     //  masks of the filters in effect (the innermost last, within the ones
     //  before it), over the bytes of the characters each selects, kept in step
@@ -14185,7 +14163,7 @@ StreamSet * UTF8PipelineBuilder::conversionGroup(const ldml::TransformStep & ste
 //  The built-in transforms of UTF-8 mode (see utf8BuiltIn).
 static bool utf8BuiltIn(const std::string & name) {
     return name == "Any-Null" || name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" ||
-           name == "Any-Lower" || name == "Any-Upper";
+           name == "Any-Lower" || name == "Any-Upper" || hexEncoding(name) != nullptr;
 }
 
 StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * Basis) {
@@ -14198,6 +14176,7 @@ StreamSet * UTF8PipelineBuilder::builtIn(const std::string & name, StreamSet * B
         return result;
     }
     if (name == "Any-Lower" || name == "Any-Upper") return caseMapping(name, Basis);
+    if (const HexEncoding * form = hexEncoding(name)) return hexEscapes(*form, Basis);
     llvm::report_fatal_error(llvm::StringRef("xlit: built-in transform " + name + " not in UTF-8 mode"));
 }
 
@@ -14428,6 +14407,101 @@ StreamSet * UTF8PipelineBuilder::caseMapping(const std::string & name, StreamSet
         }
     }
     return charMap(fullCaseMap(name == "Any-Lower" ? UCD::lc : UCD::uc), Basis);
+}
+
+//  The bixnum of the numbers of positions to insert after the final bytes of
+//  the characters within Mask, given the classes of the characters marked at
+//  their final bytes (disjoint), one for each count.
+class UTF8_MaskedInsertionCounts final : public pablo::PabloKernel {
+public:
+    UTF8_MaskedInsertionCounts(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & counts,
+                               StreamSet * Classes, StreamSet * Mask, StreamSet * BixNum)
+    : PabloKernel(ts, "UTF8_MaskedInsertionCounts" + [&] {
+                      std::string sig = "_b" + std::to_string(BixNum->getNumElements());
+                      for (unsigned k : counts) sig += "_" + std::to_string(k);
+                      return sig;
+                  }(),
+                  {Binding{"Classes", Classes}, Binding{"Mask", Mask}}, {Binding{"BixNum", BixNum}}),
+      mCounts(counts), mBits(BixNum->getNumElements()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * const mask = getInputStreamSet("Mask")[0];
+        std::vector<PabloAST *> bits(mBits, pb.createZeroes());
+        for (size_t i = 0; i < mCounts.size(); i++) {
+            PabloAST * const at = pb.createAnd(classes[i], mask);
+            for (unsigned b = 0; b < mBits; b++) {
+                if ((mCounts[i] >> b) & 1) bits[b] = pb.createOr(bits[b], at);
+            }
+        }
+        writeOutputStreamSet("BixNum", bits);
+    }
+private:
+    const std::vector<unsigned> mCounts;
+    const unsigned mBits;
+};
+
+//  Any-Hex/Unicode, /C, /XML and /Perl (see hexEncoding) on the bytes.
+//  Within a mask, as by RulePipelineBuilder::localCharacterMapping: the bytes
+//  of the masked characters converted by themselves and merged with the rest,
+//  each masked character given the positions of its escape by those inserted
+//  after its final byte (as many as its escape has more bytes than it, at
+//  least 1 as an escape has 5 bytes or more), which inherit its masks.
+StreamSet * UTF8PipelineBuilder::hexEscapes(const HexEncoding & form, StreamSet * Basis) {
+    PipelineBuilder & P = mP;
+    auto convert = [&](StreamSet * Selected) {
+        StreamSet * const Hex = P.CreateStreamSet(8);
+        form.pipeline(P, Selected, Hex, true);
+        SHOW_BIXNUM(Hex);
+        return Hex;
+    };
+    StreamSet * const mask = mMasks.active();
+    if (!mask) return convert(Basis);
+    StreamSet * const Selected = P.CreateStreamSet(8);
+    FilterByMask(P, mask, Basis, Selected);
+    StreamSet * const NonSelected = P.CreateStreamSet(8);
+    FilterByMask(P, mMasks.complement(mask), Basis, NonSelected);
+    StreamSet * const Mapped = convert(Selected);
+    //  The characters by the number of positions inserted after them: the
+    //  length of their escape less that of their UTF-8 sequence.
+    static const UCD::UnicodeSet byLength[4] = {UCD::UnicodeSet(0, 0x7F), UCD::UnicodeSet(0x80, 0x7FF),
+                                                UCD::UnicodeSet(0x800, 0xFFFF), UCD::UnicodeSet(0x10000, 0x10FFFF)};
+    std::map<unsigned, UCD::UnicodeSet> byCount;
+    for (const auto & l : form.lengths) {
+        for (unsigned n = 1; n <= 4; n++) {
+            const UCD::UnicodeSet chars = l.second & byLength[n - 1];
+            if (chars.empty()) continue;
+            assert (l.first > n);
+            byCount[l.first - n] = byCount[l.first - n] + chars;
+        }
+    }
+    std::vector<unsigned> counts;
+    std::vector<re::CC *> classes;
+    unsigned maxCount = 0;
+    for (const auto & c : byCount) {
+        counts.push_back(c.first);
+        classes.push_back(re::makeCC(c.second, &cc::Unicode));
+        maxCount = std::max(maxCount, c.first);
+    }
+    //  (The classes marked at the final bytes: CharClassesKernel's Advance mode.)
+    StreamSet * const Finals = P.CreateStreamSet(classes.size());
+    P.CreateKernelCall<CharClassesKernel>(classes, Basis, Finals, pablo::BitMovementMode::Advance);
+    unsigned bits = 0;
+    while ((maxCount >> bits) != 0) bits++;
+    StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
+    P.CreateKernelCall<UTF8_MaskedInsertionCounts>(counts, Finals, mask, InsertBixNum);
+    SHOW_BIXNUM(InsertBixNum);
+    StreamSet * const SpreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+    PositionMap positions;
+    positions.insert(SpreadMask);
+    StreamSet * const placement = mMasks.mapped(mask, positions);
+    SHOW_STREAM(placement);
+    StreamSet * const Merged = P.CreateStreamSet(8);
+    MergeByMask(P, placement, Mapped, NonSelected, Merged);
+    SHOW_BIXNUM(Merged);
+    return inStep(Staged(Merged, std::move(positions)));
 }
 
 //  A transform in UTF-8 mode on the UTF-8 code units of a text, made

@@ -54,6 +54,11 @@
 //      extracted forward rules) preserves NFD (see Is_NFD_Preserving): for
 //      each group that may not, the first rule that fails and the reason
 //      (unless --quiet), and the counts of each file and in total.
+//  ldml_trules [--xml] [--quiet] --components file ...
+//      The independent components of each conversion group of the forward
+//      and backward rules (IndependentComponents): the number of its rules,
+//      of its components and the size of the largest; with --quiet, only the
+//      groups of 100 rules or more.
 //  ldml_trules --nfd-status [transform ...]
 //      Report the NFD status of each named transform (see ldml/nfd_status.h),
 //      of the registry of the default transform directory, or of all its
@@ -569,6 +574,36 @@ static void reportNFD_Preservation(const std::vector<std::string> & tRules, cons
                          << n.groups << " groups NFD-preserving\n" << failures;
         total.groups += n.groups;
         total.preserving += n.preserving;
+    }
+}
+
+static void reportComponents(const std::vector<std::string> & tRules, const std::string & label, bool quiet) {
+    const std::vector<Rule *> parsed = parseTransformRules(tRules);
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        const std::vector<std::vector<Rule *>> groups = ConversionGroups(extract(parsed, e));
+        for (size_t g = 0; g < groups.size(); g++) {
+            const std::vector<std::vector<size_t>> components = IndependentComponents(groups[g]);
+            size_t rules = 0, largest = 0;
+            for (const auto & c : components) {
+                rules += c.size();
+                largest = std::max(largest, c.size());
+            }
+            if (quiet && rules < 100) continue;
+            toolio::stream() << label << (e == Extract::Forward ? " forward" : " backward") << " group " << g + 1 << ": " << rules
+                             << " rules, " << components.size() << " components, largest " << largest << "\n";
+            if (quiet) continue;
+            //  The components with rules that have before contexts: the size, and
+            //  the first such rule.
+            for (size_t c = 0; c < components.size(); c++) {
+                for (size_t i : components[c]) {
+                    const ConversionRule * const rule = llvm::cast<ConversionRule>(groups[g][i]);
+                    if (!rule->getSourceSide(Direction::Forward)->hasBeforeContext()) continue;
+                    toolio::stream() << "    component " << c + 1 << " (" << components[c].size() << " rules), with before contexts: "
+                                     << printRule(rule) << "\n";
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -2010,6 +2045,7 @@ static int run(int argc, char * argv[]) {
     bool classifyAfter = false;
     bool classifyRuleKinds = false;
     bool nfdPreserving = false;
+    bool components = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -2035,6 +2071,7 @@ static int run(int argc, char * argv[]) {
         else if (arg == "--classify-after-contexts") classifyAfter = true;
         else if (arg == "--classify-rules") classifyRuleKinds = true;
         else if (arg == "--nfd-preserving") nfdPreserving = true;
+        else if (arg == "--components") components = true;
         else if (arg.compare(0, 9, "--output=") == 0) continue;   // (main)
         else files.push_back(arg);
     }
@@ -2049,6 +2086,7 @@ static int run(int argc, char * argv[]) {
                   << "       " << argv[0] << " [--xml] --classify-after-contexts file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --classify-rules file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --nfd-preserving file ...\n"
+                  << "       " << argv[0] << " [--xml] [--quiet] --components file ...\n"
                   << "       " << argv[0] << " --nfd-status [transform ...]\n"
                   << "       " << argv[0] << " --self-test\n"
                   << "       (and --output=<file> for the reports)\n";
@@ -2066,7 +2104,9 @@ static int run(int argc, char * argv[]) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            if (nfdPreserving) {
+            if (components) {
+                reportComponents(tRules, f, quiet);
+            } else if (nfdPreserving) {
                 reportNFD_Preservation(tRules, f, quiet, nfdTotal);
             } else if (classifyRuleKinds) {
                 classifyRules(tRules, f, quiet, ruleClassCounts);

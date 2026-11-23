@@ -1288,6 +1288,28 @@ bool Is_NFD_Preserving(const std::vector<Rule *> & group, NFD_PreservationFailur
 //  rules), in order, each as the list of its conversion rules.
 std::vector<std::vector<Rule *>> ConversionGroups(const std::vector<Rule *> & rules);
 
+//  The independent components of a conversion group (forward rules): a
+//  partition of its rules such that applying the components one after the
+//  other, each as a group of its own, in any order, gives what the group gives
+//  (the separate kernels of a group).  Conservatively, two rules are in
+//  the same component (transitively) where one may affect the other:
+//  - their texts share a character (their matches may overlap or begin at the
+//    same position, and are then selected together);
+//  - a context of one has a character of the text or of the result of the
+//    other (the other's application changes what the context sees, before or
+//    after it is applied; a context is matched against the converted text
+//    before the position and the text itself after it);
+//  - the text of one has a character of the result of the other (the result
+//    of one applied first could make a match of the other);
+//  - one may change the length of the text it replaces (a deletion, an
+//    insertion, a repetition, a copied capture: the characters on either side
+//    then become adjacent, or no longer), and the other has a context.
+//  The characters of a pattern are those of its sets (patternCharacters); a
+//  result with a function call may have any character.  Rules without a
+//  forward direction are left out.  Components are given by the indexes of
+//  their rules in the group, in the order of their first rules.
+std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *> & group);
+
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.
 std::vector<re::Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated = false);

@@ -16,6 +16,7 @@ SRC
     transform_rules_expand.cpp
     transform_rules_functions.cpp
     transform_rules_nfd.cpp
+    transform_rules_components.cpp
     transform_rules_overlap.cpp
     transform_rules_partition.cpp
     transform_rules_parser.cpp

@@ -66,7 +66,7 @@ static cl::opt<bool, true> EnableLocalCarriesOption("LocalCarries", cl::location
 bool CheckWhileProgress = false;
 static cl::opt<bool, true> CheckWhileProgressOption("CheckWhileProgress", cl::location(CheckWhileProgress),
     cl::desc("Check that each iteration of a Pablo While (within a block) advances the lowest bit of its "
-             "condition, failing with the kernel and positions otherwise (Pablo kernels are then not cached)"),
+             "condition beyond the previous iteration's (the first iteration is not compared with the entry condition), failing with the kernel and positions otherwise (Pablo kernels are then not cached)"),
     cl::cat(codegen::CodeGenOptions), cl::init(false));
 
 bool ShowCarryExtent = false;

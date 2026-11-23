@@ -501,21 +501,25 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
     Value * const outerCond = mCarryManager->generateEntrySummaryTest(b, outerCondition);
 
     // (-CheckWhileProgress: the position of the lowest bit of a condition, the
-    // block width if none, and whether it has none.)
+    // block width if none, and whether it has none. The condition on entry is not
+    // compared: it is often an initial value unrelated to what an iteration adds,
+    // such as all the positions that may change, while the first iteration's new
+    // bits also come from the carries of the previous block. So the first
+    // iteration's condition is the first one compared, with the next one's.)
     auto lowestOf = [&](Value * const condition) -> std::pair<Value *, Value *> {
         const auto width = condition->getType()->getPrimitiveSizeInBits();
         Value * const bits = b.CreateBitCast(condition, b.getIntNTy(width));
         Value * const low = b.CreateZExtOrTrunc(b.CreateCountForwardZeroes(bits), b.getInt64Ty());
         return {low, b.CreateIsNull(bits)};
     };
-    Value * const entryLow = CheckWhileProgress ? lowestOf(outerCondition).first : nullptr;
     b.CreateCondBr(outerCond, whileBodyBlock, whileEndBlock);
 
     b.SetInsertPoint(whileBodyBlock);
     PHINode * lowPhi = nullptr;
     if (LLVM_UNLIKELY(CheckWhileProgress)) {
+        // -1 (as a signed number, below every position): no earlier iteration.
         lowPhi = b.CreatePHI(b.getInt64Ty(), 2, "while.low");
-        lowPhi->addIncoming(entryLow, whileEntryBlock);
+        lowPhi->addIncoming(b.getInt64(-1), whileEntryBlock);
     }
 
     //
@@ -627,10 +631,11 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
     Value * const innerCondition = compileExpression(b, cond);
     Value * const exitCond = mCarryManager->generateExitSummaryTest(b, innerCondition);
     if (LLVM_UNLIKELY(CheckWhileProgress)) {
-        // Another iteration must start from a later lowest bit than this one did
-        // (or from none, with only carries pending).
+        // Another iteration must start from a later lowest bit than the previous
+        // one did (or from none, with only carries pending). After the first
+        // iteration, lowPhi is -1 and any position passes.
         const auto next = lowestOf(innerCondition);
-        Value * const progress = b.CreateOr(b.CreateNot(exitCond), b.CreateOr(next.second, b.CreateICmpUGT(next.first, lowPhi)));
+        Value * const progress = b.CreateOr(b.CreateNot(exitCond), b.CreateOr(next.second, b.CreateICmpSGT(next.first, lowPhi)));
         std::string condName;
         raw_string_ostream out(condName);
         PabloPrinter::print(cond, out);

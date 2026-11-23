@@ -2836,6 +2836,23 @@ static cl::opt<unsigned> StagedChunkRules("staged-chunk-rules", cl::desc("Split 
                                           "the converted text in the kernels of each round, the others in chunks (0: every such group)"),
                                           cl::init(256), cl::cat(XlitOptions));
 
+//  A correction kernel for a whole group applied in one kernel (the While
+//  loop) reads the matches of the string rules whose before contexts are not
+//  matched against the converted text, matched before in chunks (see
+//  RulePipelineBuilder::conversionGroup), instead of matching them itself.
+static cl::opt<bool> StaticMatchChunks("static-match-chunks", cl::desc("Match the string rules of a whole-group correction kernel "
+                                       "whose before contexts are not matched against the converted text in chunk kernels before it "
+                                       "(no gain measured: the kernel still applies them)"),
+                                       cl::init(false), cl::cat(XlitOptions));
+
+//  A correction kernel for a whole group resolved by the While loop, without
+//  sequential selection, has the string rules that the loop does not decide
+//  (static) selected and applied before it, in chunks, their results given to
+//  it as its state (see RulePipelineBuilder::conversionGroup).
+static cl::opt<bool> StaticApplyChunks("static-apply-chunks", cl::desc("Select and apply the string rules of a whole-group "
+                                       "correction kernel that its While loop does not decide in chunk kernels before it"),
+                                       cl::init(true), cl::cat(XlitOptions));
+
 static bool chunkedStaged(const ldml::TransformStep & step) {
     return step.sequentialSelection && step.stringRules.size() > StagedChunkRules;
 }
@@ -12136,6 +12153,16 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  The string matches selected sequentially in the While loop of one
         //  correction kernel, where it can decide all the string rules (see
         //  FusedRulesConfig::sequential); otherwise in staged rounds.
+        //  A string rule of the config in another config, with its sources.
+        auto moved = [&](const FusedStringRule & r, FusedRulesConfig & to) {
+            FusedStringRule m = r;
+            for (int * s : {&m.match, &m.afterMatch}) {
+                if (*s < 0) continue;
+                to.sources.push_back(config.sources[static_cast<size_t>(*s)]);
+                *s = static_cast<int>(to.sources.size() - 1);
+            }
+            return m;
+        };
         bool sequentialLoop = false;
         //  (Not a group with more string rules than --whole-group-rules, in the
         //  chunked staged rounds.)
@@ -12174,16 +12201,6 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             const SelectionClasses selection = selectionClasses(byLengthOf);
             config.staged = true;
             config.selection.clear();
-            //  A string rule of the config in another config, with its sources.
-            auto moved = [&](const FusedStringRule & r, FusedRulesConfig & to) {
-                FusedStringRule m = r;
-                for (int * s : {&m.match, &m.afterMatch}) {
-                    if (*s < 0) continue;
-                    to.sources.push_back(config.sources[static_cast<size_t>(*s)]);
-                    *s = static_cast<int>(to.sources.size() - 1);
-                }
-                return m;
-            };
             FusedRulesConfig core = config;
             core.strings.clear();
             std::vector<size_t> fusedStatic, staticRules;       // indexes of config.strings
@@ -12348,6 +12365,146 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 StreamSet * const uncovered = P.CreateStreamSet(1);
                 P.CreateKernelCall<UncoveredPositions>(state.spans, state.starts, uncovered);
                 allowed = notAtCaptures(combine(mask, uncovered, false));
+            }
+            //  The string rules whose before contexts are not matched against the
+            //  converted text (static, not decided by their contexts in the While
+            //  loop) matched before, in chunks: the kernel reads their matches
+            //  (FusedStringRule::match), as it does those of the engine.
+            //  The string rules that the While loop does not decide (static: their
+            //  before contexts are not matched against the converted text, and they
+            //  may not begin within the match of a rule decided in the loop, see
+            //  loopStringRules) selected and applied before the correction kernel, in
+            //  chunks, their results given to it as the state (see
+            //  StaticApplyChunks).  The kernel's base outcome is then the state given,
+            //  as it was the state with the results of these rules, and the rules it
+            //  decides begin only outside their applied matches (Selected), as its
+            //  selection and its dropping of matches within applied ones had them.
+            if (StaticApplyChunks && !config.sequential && resolvableByWhile(config)) {
+                const std::vector<bool> loop = loopStringRules(config);
+                std::vector<size_t> staticRules;                                // indexes of config.strings
+                std::vector<size_t> pos(config.strings.size(), SIZE_MAX);      // the index in staticRules
+                std::vector<std::pair<size_t, size_t>> stringLengths;
+                for (size_t i = 0; i < config.strings.size(); i++) {
+                    stringLengths.push_back(lengths[order[i]]);
+                    if (loop[i]) continue;
+                    pos[i] = staticRules.size();
+                    staticRules.push_back(i);
+                }
+                if (!staticRules.empty()) {
+                    //  Their matches.
+                    std::vector<SelectStringMatches::Source> firsts(staticRules.size());
+                    std::vector<size_t> fusedStatic;
+                    for (size_t k = 0; k < staticRules.size(); k++) {
+                        const FusedStringRule & r = config.strings[staticRules[k]];
+                        if (r.match >= 0) {
+                            const FusedMatchSource & s = config.sources[static_cast<size_t>(r.match)];
+                            firsts[k] = SelectStringMatches::Source{s.streamSet, s.index};
+                        } else {
+                            fusedStatic.push_back(staticRules[k]);
+                        }
+                    }
+                    const FusedState none;
+                    for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, fusedStatic)) {
+                        FusedRulesConfig m;
+                        m.matchOnly = true;
+                        for (size_t i : chunk) m.strings.push_back(moved(config.strings[i], m));
+                        StreamSet * const matches = P.CreateStreamSet(chunk.size());
+                        StreamSet * const chunkClasses = fusedClasses(m);
+                        m.region = regions != nullptr;
+                        P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, matches);
+                        for (size_t k = 0; k < chunk.size(); k++) firsts[pos[chunk[k]]] = SelectStringMatches::Source{matches, static_cast<unsigned>(k)};
+                    }
+                    //  Those that apply: selected as the kernel selects them (by their
+                    //  predecessors among them; those decided in the loop do not select
+                    //  them, see FusedRules::generatePabloMethod's settle).
+                    std::vector<FusedMatchSource> applied;
+                    if (!config.selection.empty()) {
+                        std::vector<SelectStringMatches::Rule> select;
+                        for (size_t i : staticRules) {
+                            const FusedRulesConfig::Selection & sel = config.selection[i];
+                            SelectStringMatches::Rule sr;
+                            sr.length = sel.length;
+                            sr.selfOverlapping = sel.selfOverlapping;
+                            for (size_t p : sel.predecessors) {
+                                if (pos[p] != SIZE_MAX) sr.predecessors.push_back(pos[p]);
+                            }
+                            select.push_back(std::move(sr));
+                        }
+                        StreamSet * const Applied = P.CreateStreamSet(staticRules.size());
+                        P.CreateKernelCall<SelectStringMatches>(select, firsts, Applied, nullptr, nullptr);
+                        for (size_t k = 0; k < staticRules.size(); k++) applied.push_back(FusedMatchSource{Applied, static_cast<unsigned>(k)});
+                    } else {
+                        for (const SelectStringMatches::Source & f : firsts) applied.push_back(FusedMatchSource{f.streamSet, f.index});
+                    }
+                    //  Applied in chunks, after the state, with the coverage of their
+                    //  matches alone.
+                    StreamSet * const savedSpans = state.spans;
+                    StreamSet * const savedStarts = state.starts;
+                    state.spans = state.starts = nullptr;
+                    for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
+                        FusedRulesConfig a;
+                        a.coverage = true;
+                        for (size_t i : chunk) {
+                            FusedStringRule fr = config.strings[i];
+                            fr.afterMatch = -1;
+                            fr.match = static_cast<int>(a.sources.size());
+                            a.sources.push_back(applied[pos[i]]);
+                            a.strings.push_back(std::move(fr));
+                        }
+                        applyFused(std::move(a), nullptr);
+                    }
+                    StreamSet * const uncovered = P.CreateStreamSet(1);
+                    P.CreateKernelCall<UncoveredPositions>(state.spans, state.starts, uncovered);
+                    state.spans = savedSpans;
+                    state.starts = savedStarts;
+                    //  The kernel, with the other rules.
+                    FusedRulesConfig rest = config;
+                    rest.strings.clear();
+                    rest.selection.clear();
+                    std::vector<size_t> restIndex(config.strings.size(), SIZE_MAX);
+                    for (size_t i = 0; i < config.strings.size(); i++) {
+                        if (!loop[i]) continue;
+                        restIndex[i] = rest.strings.size();
+                        rest.strings.push_back(config.strings[i]);
+                    }
+                    if (!config.selection.empty()) {
+                        for (size_t i = 0; i < config.strings.size(); i++) {
+                            if (!loop[i]) continue;
+                            FusedRulesConfig::Selection sel = config.selection[i];
+                            sel.predecessors.clear();
+                            for (size_t p : config.selection[i].predecessors) {
+                                if (restIndex[p] != SIZE_MAX) sel.predecessors.push_back(restIndex[p]);
+                            }
+                            rest.selection.push_back(std::move(sel));
+                        }
+                    }
+                    rest.selected = static_cast<int>(rest.sources.size());
+                    rest.sources.push_back(FusedMatchSource{uncovered, 0});
+                    if (config.groupCoverage) allowed = combine(allowed ? allowed : mask, uncovered, false);
+                    config = std::move(rest);
+                }
+            }
+            if (StaticMatchChunks) {
+                std::vector<size_t> staticRules;
+                std::vector<std::pair<size_t, size_t>> stringLengths;
+                for (size_t i = 0; i < config.strings.size(); i++) {
+                    stringLengths.push_back(lengths[order[i]]);
+                    if (!config.strings[i].converted && config.strings[i].match < 0) staticRules.push_back(i);
+                }
+                const FusedState none;
+                for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
+                    FusedRulesConfig m;
+                    m.matchOnly = true;
+                    for (size_t i : chunk) m.strings.push_back(moved(config.strings[i], m));
+                    StreamSet * const firsts = P.CreateStreamSet(chunk.size());
+                    StreamSet * const chunkClasses = fusedClasses(m);
+                    m.region = regions != nullptr;
+                    P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, firsts);
+                    for (size_t k = 0; k < chunk.size(); k++) {
+                        config.strings[chunk[k]].match = static_cast<int>(config.sources.size());
+                        config.sources.push_back(FusedMatchSource{firsts, static_cast<unsigned>(k)});
+                    }
+                }
             }
             applyFused(std::move(config), allowed);
         }

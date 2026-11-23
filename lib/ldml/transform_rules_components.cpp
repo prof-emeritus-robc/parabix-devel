@@ -117,4 +117,61 @@ std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *>
     return components;
 }
 
+std::vector<Rule *> SplitIndependentComponents(const std::vector<Rule *> & rules, size_t minRules, ComponentSplitStats * stats) {
+    std::vector<Rule *> out;
+    std::vector<Rule *> group;
+    auto flush = [&]() {
+        size_t conversions = 0;
+        for (Rule * r : group) conversions += isa<ConversionRule>(r);
+        std::vector<bool> first(group.size(), false);
+        bool split = false;
+        if (conversions > minRules) {
+            const std::vector<std::vector<size_t>> components = IndependentComponents(group);
+            size_t inFirst = 0;
+            for (const std::vector<size_t> & c : components) {
+                bool before = false;
+                for (size_t i : c) {
+                    before |= cast<ConversionRule>(group[i])->getSourceSide(Direction::Forward)->getBeforeContext() != nullptr;
+                }
+                if (!before) continue;
+                for (size_t i : c) first[i] = true;
+                inFirst += c.size();
+            }
+            //  (The rules without a forward direction stay in the first part.)
+            for (size_t i = 0; i < group.size(); i++) {
+                const ConversionRule * const c = dyn_cast<ConversionRule>(group[i]);
+                if (c && !appliesInDirection(c, Direction::Forward)) first[i] = true;
+            }
+            split = inFirst > 0 && inFirst < conversions;
+            if (split && stats) {
+                stats->groups++;
+                stats->rulesSetApart += conversions - inFirst;
+            }
+        }
+        if (!split) {
+            out.insert(out.end(), group.begin(), group.end());
+        } else {
+            for (size_t i = 0; i < group.size(); i++) {
+                if (first[i] || isa<VariableDefinitionRule>(group[i])) out.push_back(group[i]);
+            }
+            out.push_back(makeTransformRule(TransformID("Null")));
+            for (size_t i = 0; i < group.size(); i++) {
+                if (!first[i] && isa<ConversionRule>(group[i])) out.push_back(group[i]);
+                else if (isa<VariableDefinitionRule>(group[i])) out.push_back(group[i]);
+            }
+        }
+        group.clear();
+    };
+    for (Rule * r : rules) {
+        if (isa<TransformRule>(r) || isa<FilterRule>(r)) {
+            flush();
+            out.push_back(r);
+        } else {
+            group.push_back(r);
+        }
+    }
+    flush();
+    return out;
+}
+
 }

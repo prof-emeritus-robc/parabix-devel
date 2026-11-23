@@ -300,6 +300,13 @@ static UCD::UnicodeSet regionSeparators() {
     }
     return set;
 }
+//  The conversion groups of more rules than this split by their independent
+//  components (ldml::SplitIndependentComponents): those with before contexts,
+//  then the others, as groups of their own.  0: none.
+static cl::opt<unsigned> SplitComponents("split-components",
+    cl::desc("Split the conversion groups of more rules than this into the independent components with before contexts "
+             "and the others, applied as separate groups (0: none)"),
+    cl::init(512), cl::cat(XlitOptions));
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(XlitOptions));
@@ -1116,6 +1123,10 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
         const std::vector<ldml::Rule *> extracted = rules;
+        //  (On the rules as given: the later passes restate rules with contexts
+        //  of large sets, e.g. DisambiguateOrder's negated after contexts, which
+        //  would join the components.)
+        if (SplitComponents > 0) rules = ldml::SplitIndependentComponents(rules, SplitComponents);
         rules = ldml::MoveTextAnchors(rules);
         rules = ldml::EnumerateRepeatedCaptures(rules);
         //  (Set aside before revisits are composed: see ldml::FrontLetterRevisits.)

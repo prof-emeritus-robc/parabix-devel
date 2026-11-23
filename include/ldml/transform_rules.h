@@ -1310,6 +1310,22 @@ std::vector<std::vector<Rule *>> ConversionGroups(const std::vector<Rule *> & ru
 //  their rules in the group, in the order of their first rules.
 std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *> & group);
 
+//  The conversion groups of more than minRules rules split by their independent
+//  components (IndependentComponents): the components with rules that have
+//  before contexts, then the others, as two groups separated by ":: Null ;",
+//  each with the rules in their order.  A group is split only if both parts
+//  have rules.  The variable definitions of a group are kept before both.  (The
+//  before contexts are matched against the converted text, which takes a
+//  kernel of the whole group, see xlit; split, the other components are
+//  applied apart, as simpler groups.)  With stats, the number of groups split
+//  and of their rules set apart.
+struct ComponentSplitStats {
+    size_t groups = 0;
+    size_t rulesSetApart = 0;
+};
+std::vector<Rule *> SplitIndependentComponents(const std::vector<Rule *> & rules, size_t minRules,
+                                               ComponentSplitStats * stats = nullptr);
+
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.
 std::vector<re::Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated = false);

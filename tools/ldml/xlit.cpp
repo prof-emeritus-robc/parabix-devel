@@ -2149,6 +2149,188 @@ protected:
     }
 };
 
+//  The results of the static string rules of a group in its chunked staged
+//  rounds (see RulePipelineBuilder::conversionGroup), computed once at the first
+//  positions of their matches, from which each round's results are replayed
+//  where its selection applies them (StaticReplay).  As no two of the rules
+//  match at a position, the results at a position are those of the rule that
+//  matches there: at offset o of its text (o < offsets), the target of the
+//  character there (target, as FusedRules's changeChar writes it: the
+//  character, or the deletion mark beyond the replacement; absolute, or to be
+//  XORed with the character, see StaticReplay) and whether it changes (changed:
+//  not a character kept); the changes of the positions inserted after its last
+//  character (mark, slot i >= 1, relative to the deletion mark or absolute, as
+//  changeMark writes them); and the number inserted after it (insert).  Not
+//  rules with runs or a kept character within the replacement (keep).
+struct StartLayout {
+    unsigned offsets = 0;
+    unsigned slots = 1;
+    std::vector<unsigned> insertCounts;
+    unsigned width() const {return offsets * 22 + (slots - 1) * 21 + static_cast<unsigned>(insertCounts.size());}
+    unsigned target(unsigned o, unsigned b) const {return o * 22 + b;}
+    unsigned changed(unsigned o) const {return o * 22 + 21;}
+    unsigned mark(unsigned i, unsigned b) const {return offsets * 22 + (i - 1) * 21 + b;}
+    unsigned insert(size_t k) const {return offsets * 22 + (slots - 1) * 21 + static_cast<unsigned>(k);}
+    std::string signature() const {
+        std::string s = "o" + std::to_string(offsets) + "s" + std::to_string(slots) + "i";
+        for (unsigned k : insertCounts) s += std::to_string(k) + ",";
+        return s;
+    }
+};
+
+struct StartRule {
+    unsigned length;                // of the text
+    std::u32string replacement;     // (as FusedStringRule::replacement)
+};
+
+//  The results at the first positions of the matches of a chunk of the static
+//  rules (Firsts, a stream per rule), ORed with those of the chunks before (In,
+//  if given), as laid out by StartLayout.
+class StartResults final : public pablo::PabloKernel {
+public:
+    StartResults(LLVMTypeSystemInterface & ts, const StartLayout & layout, const std::vector<StartRule> & rules, bool absolute,
+                 StreamSet * Firsts, StreamSet * In, StreamSet * Out)
+    : PabloKernel(ts, "StartResults_" + getStringHash(signature(layout, rules, absolute, In != nullptr)),
+                  [&] {
+                      Bindings inputs{Binding{"Firsts", Firsts}};
+                      if (In) inputs.emplace_back("In", In);
+                      return inputs;
+                  }(),
+                  {Binding{"Out", Out}}),
+      mLayout(layout), mRules(rules), mAbsolute(absolute), mHasIn(In != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> firsts = getInputStreamSet("Firsts");
+        std::vector<PabloAST *> out = mHasIn ? getInputStreamSet("In") : std::vector<PabloAST *>(mLayout.width(), pb.createZeroes());
+        auto add = [&](unsigned i, PabloAST * f) {out[i] = pb.createOr(out[i], f);};
+        for (size_t r = 0; r < mRules.size(); r++) {
+            const StartRule & rule = mRules[r];
+            PabloAST * const f = firsts[r];
+            const unsigned n = rule.length, m = static_cast<unsigned>(rule.replacement.size());
+            for (unsigned o = 0; o < n; o++) {
+                if (o < m && rule.replacement[o] == ldml::StringRuleKept) continue;
+                const UCD::codepoint_t t = o < m ? static_cast<UCD::codepoint_t>(rule.replacement[o]) : DeletionMark;
+                for (unsigned b = 0; b < 21; b++) {
+                    if ((t >> b) & 1) add(mLayout.target(o, b), f);
+                }
+                add(mLayout.changed(o), f);
+            }
+            for (unsigned j = n; j < m; j++) {
+                const UCD::codepoint_t d = (mAbsolute ? 0 : DeletionMark) ^ static_cast<UCD::codepoint_t>(rule.replacement[j]);
+                for (unsigned b = 0; b < 21; b++) {
+                    if ((d >> b) & 1) add(mLayout.mark(j - n + 1, b), f);
+                }
+            }
+            if (m > n) {
+                const size_t k = std::find(mLayout.insertCounts.begin(), mLayout.insertCounts.end(), m - n) - mLayout.insertCounts.begin();
+                add(mLayout.insert(k), f);
+            }
+        }
+        writeOutputStreamSet("Out", out);
+    }
+private:
+    static std::string signature(const StartLayout & layout, const std::vector<StartRule> & rules, bool absolute, bool in) {
+        std::string s = layout.signature() + (absolute ? "A" : "X") + (in ? "I" : "");
+        for (const StartRule & r : rules) {
+            s += "|" + std::to_string(r.length) + ":";
+            for (char32_t c : r.replacement) s += std::to_string(c) + ",";
+        }
+        return s;
+    }
+    const StartLayout mLayout;
+    const std::vector<StartRule> mRules;
+    const bool mAbsolute;
+    const bool mHasIn;
+};
+
+//  The results of a round of the static rules (see StartResults): where a
+//  match is selected (Selected, at its first position; the results there are
+//  those of the static rule matching there, none for another), the results at
+//  its first position moved to the positions of its text: the target at offset
+//  o to the position o after it (XORed with the character there, unless
+//  absolute, where it changes), and the inserted positions and their number to
+//  its last position, by the lengths of the texts (Starts: the first positions
+//  of the matches of the static rules by class, of the texts of lengths[k]).
+//  Also the coverage of the matches (Spans, their positions; Starts, their
+//  first), as FusedRules gives it.
+class StaticReplay final : public pablo::PabloKernel {
+public:
+    StaticReplay(LLVMTypeSystemInterface & ts, const StartLayout & layout, const std::vector<unsigned> & lengths, bool absolute,
+                 StreamSet * Selected, StreamSet * Starts, StreamSet * Results, StreamSet * U21,
+                 const std::vector<StreamSet *> & changes, const std::map<unsigned, StreamSet *> & insertions,
+                 StreamSet * Spans, StreamSet * StartsOut)
+    : PabloKernel(ts, "StaticReplay_" + getStringHash(signature(layout, lengths, absolute)),
+                  [&] {
+                      Bindings inputs{Binding{"Selected", Selected}, Binding{"Starts", Starts}, Binding{"Results", Results}};
+                      if (!absolute) inputs.emplace_back("U21", U21);
+                      return inputs;
+                  }(),
+                  [&] {
+                      Bindings outputs;
+                      for (size_t i = 0; i < changes.size(); i++) outputs.emplace_back("Changes" + std::to_string(i), changes[i]);
+                      for (const auto & k : insertions) outputs.emplace_back("Insert" + std::to_string(k.first), k.second);
+                      outputs.emplace_back("Spans", Spans);
+                      outputs.emplace_back("StartsOut", StartsOut);
+                      return outputs;
+                  }()),
+      mLayout(layout), mLengths(lengths), mAbsolute(absolute) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const sel = getInputStreamSet("Selected")[0];
+        const std::vector<PabloAST *> starts = getInputStreamSet("Starts");
+        const std::vector<PabloAST *> R = getInputStreamSet("Results");
+        std::vector<PabloAST *> basis;
+        if (!mAbsolute) basis = getInputStreamSet("U21");
+        PabloAST * const zeroes = pb.createZeroes();
+        auto shifted = [&](PabloAST * x, unsigned o) {return o ? pb.createAdvance(x, o) : x;};
+        //  Slot 0: the targets at each offset.
+        std::vector<PabloAST *> changes0(21, zeroes);
+        for (unsigned o = 0; o < mLayout.offsets; o++) {
+            PabloAST * const at = shifted(pb.createAnd(sel, R[mLayout.changed(o)]), o);
+            for (unsigned b = 0; b < 21; b++) {
+                PabloAST * t = shifted(pb.createAnd(sel, R[mLayout.target(o, b)]), o);
+                if (!mAbsolute) t = pb.createAnd(at, pb.createXor(basis[b], t));
+                changes0[b] = pb.createOr(changes0[b], t);
+            }
+        }
+        writeOutputStreamSet("Changes0", changes0);
+        //  The inserted slots and their number, at the last positions, by length.
+        std::vector<PabloAST *> selLength(mLengths.size());
+        for (size_t k = 0; k < mLengths.size(); k++) selLength[k] = pb.createAnd(sel, starts[k]);
+        auto atLast = [&](PabloAST * x) {
+            PabloAST * v = zeroes;
+            for (size_t k = 0; k < mLengths.size(); k++) v = pb.createOr(v, shifted(pb.createAnd(selLength[k], x), mLengths[k] - 1));
+            return v;
+        };
+        for (unsigned i = 1; i < mLayout.slots; i++) {
+            std::vector<PabloAST *> c(21);
+            for (unsigned b = 0; b < 21; b++) c[b] = atLast(R[mLayout.mark(i, b)]);
+            writeOutputStreamSet("Changes" + std::to_string(i), c);
+        }
+        for (size_t k = 0; k < mLayout.insertCounts.size(); k++) {
+            writeOutputStreamSet("Insert" + std::to_string(mLayout.insertCounts[k]), std::vector<PabloAST *>{atLast(R[mLayout.insert(k)])});
+        }
+        PabloAST * spans = zeroes, * first = zeroes;
+        for (size_t k = 0; k < mLengths.size(); k++) {
+            first = pb.createOr(first, selLength[k]);
+            for (unsigned o = 0; o < mLengths[k]; o++) spans = pb.createOr(spans, shifted(selLength[k], o));
+        }
+        writeOutputStreamSet("Spans", std::vector<PabloAST *>{spans});
+        writeOutputStreamSet("StartsOut", std::vector<PabloAST *>{first});
+    }
+private:
+    static std::string signature(const StartLayout & layout, const std::vector<unsigned> & lengths, bool absolute) {
+        std::string s = layout.signature() + (absolute ? "A" : "X") + "l";
+        for (unsigned l : lengths) s += std::to_string(l) + ",";
+        return s;
+    }
+    const StartLayout mLayout;
+    const std::vector<unsigned> mLengths;
+    const bool mAbsolute;
+};
+
 //  The results of the rules of a group applied by two sets of kernels, at
 //  disjoint positions (see the chunked staged rounds of RulePipelineBuilder::
 //  conversionGroup), combined as one kernel combines the results of its rules:
@@ -2852,6 +3034,14 @@ static cl::opt<bool> StaticMatchChunks("static-match-chunks", cl::desc("Match th
 static cl::opt<bool> StaticApplyChunks("static-apply-chunks", cl::desc("Select and apply the string rules of a whole-group "
                                        "correction kernel that its While loop does not decide in chunk kernels before it"),
                                        cl::init(true), cl::cat(XlitOptions));
+
+//  In the chunked staged rounds, the results of the static string rules are
+//  computed once, at the first positions of their matches, and replayed in each
+//  round where selected (StartResults, StaticReplay), instead of the rules
+//  applied in each round.
+static cl::opt<bool> StaticReplayOnce("static-replay", cl::desc("In the chunked staged rounds, compute the results of the static "
+                                      "string rules once and replay them in each round where selected"),
+                                      cl::init(true), cl::cat(XlitOptions));
 
 static bool chunkedStaged(const ldml::TransformStep & step) {
     return step.sequentialSelection && step.stringRules.size() > StagedChunkRules;
@@ -12222,6 +12412,89 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 }
             }
             const FusedState none;
+            //  With --static-replay: the results of the static rules computed once,
+            //  at the first positions of their matches (StartResults), and replayed
+            //  in each round where selected (StaticReplay), instead of the rules
+            //  applied in each round.  Not with runs, or kept characters.
+            const bool absoluteResults = mBytes != nullptr;
+            const bool replay = StaticReplayOnce && !staticRules.empty()
+                && std::all_of(staticRules.begin(), staticRules.end(), [&](size_t i) {
+                       const FusedStringRule & r = config.strings[i];
+                       return r.run.empty() && r.runStrings.empty() && r.keep < 0;
+                   });
+            StartLayout startLayout;
+            StreamSet * startResults = nullptr;
+            StreamSet * staticStarts = nullptr;
+            std::vector<unsigned> staticLengths;
+            if (replay) {
+                for (size_t i : staticRules) {
+                    const FusedStringRule & r = config.strings[i];
+                    const unsigned n = static_cast<unsigned>(r.text.size()), m = static_cast<unsigned>(r.replacement.size());
+                    startLayout.offsets = std::max(startLayout.offsets, n);
+                    if (m > n) {
+                        startLayout.slots = std::max(startLayout.slots, m - n + 1);
+                        if (std::find(startLayout.insertCounts.begin(), startLayout.insertCounts.end(), m - n) == startLayout.insertCounts.end()) {
+                            startLayout.insertCounts.push_back(m - n);
+                        }
+                    }
+                }
+                std::vector<std::vector<SelectStringMatches::Source>> byStaticLength;
+                std::vector<MatchClass> staticClasses;
+                auto staticLengthIndex = [&](size_t i) {
+                    const unsigned n = static_cast<unsigned>(config.strings[i].text.size());
+                    const size_t x = std::find(staticLengths.begin(), staticLengths.end(), n) - staticLengths.begin();
+                    if (x == staticLengths.size()) {
+                        staticLengths.push_back(n);
+                        staticClasses.push_back(classOf(config.strings[i]));
+                        byStaticLength.emplace_back();
+                    }
+                    return x;
+                };
+                auto addResults = [&](StreamSet * firsts, const std::vector<size_t> & rules) {
+                    std::vector<StartRule> startRules;
+                    for (size_t i : rules) {
+                        startRules.push_back(StartRule{static_cast<unsigned>(config.strings[i].text.size()), config.strings[i].replacement});
+                    }
+                    StreamSet * const out = P.CreateStreamSet(startLayout.width());
+                    P.CreateKernelCall<StartResults>(startLayout, startRules, absoluteResults, firsts, startResults, out);
+                    startResults = out;
+                };
+                for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, fusedStatic)) {
+                    FusedRulesConfig m;
+                    m.matchOnly = true;
+                    for (size_t i : chunk) m.strings.push_back(moved(config.strings[i], m));
+                    StreamSet * const matches = P.CreateStreamSet(chunk.size());
+                    StreamSet * const chunkClasses = fusedClasses(m);
+                    m.region = regions != nullptr;
+                    P.CreateKernelCall<FusedRules>(absolutely(std::move(m)), U21, chunkClasses, inText, mask, nullptr, none, none, matches);
+                    for (size_t k = 0; k < chunk.size(); k++) {
+                        byStaticLength[staticLengthIndex(chunk[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
+                    }
+                    addResults(matches, chunk);
+                }
+                //  (The rules matched by the engine, gathered.)
+                std::vector<size_t> engineRules;
+                std::vector<std::vector<SelectStringMatches::Source>> gather;
+                for (size_t i : staticRules) {
+                    const FusedStringRule & r = config.strings[i];
+                    if (r.match < 0) continue;
+                    const FusedMatchSource & src = config.sources[static_cast<size_t>(r.match)];
+                    engineRules.push_back(i);
+                    gather.push_back({SelectStringMatches::Source{src.streamSet, src.index}});
+                    byStaticLength[staticLengthIndex(i)].push_back(SelectStringMatches::Source{src.streamSet, src.index});
+                }
+                if (!engineRules.empty()) {
+                    StreamSet * const gathered = P.CreateStreamSet(engineRules.size());
+                    P.CreateKernelCall<MatchStartsByLength>(gather, gathered);
+                    addResults(gathered, engineRules);
+                }
+                staticStarts = P.CreateStreamSet(staticLengths.size());
+                P.CreateKernelCall<MatchStartsByLength>(byStaticLength, staticStarts);
+                staticByLength.assign(byLengthOf.size(), {});
+                for (size_t x = 0; x < staticClasses.size(); x++) {
+                    staticByLength[lengthIndex(staticClasses[x])].push_back(SelectStringMatches::Source{staticStarts, static_cast<unsigned>(x)});
+                }
+            } else {
             for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, fusedStatic)) {
                 FusedRulesConfig m;
                 m.matchOnly = true;
@@ -12238,6 +12511,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 for (size_t k = 0; k < chunkLengths.size(); k++) {
                     staticByLength[lengthIndex(chunkLengths[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
                 }
+            }
             }
             std::vector<MatchClass> coreLengths;
             for (const FusedStringRule & r : core.strings) {
@@ -12267,18 +12541,28 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
                 //  The static rules, where selected (with their coverage, if the
                 //  subgroups apply outside the matches).
-                const FusedState saved = state;
-                state = FusedState{};
-                for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
-                    FusedRulesConfig a;
-                    a.coverage = config.groupCoverage;
-                    a.selected = static_cast<int>(a.sources.size());
-                    a.sources.push_back(FusedMatchSource{selected, 0});
-                    for (size_t i : chunk) a.strings.push_back(moved(config.strings[i], a));
-                    applyFused(std::move(a), nullptr);
+                FusedState staticOut;
+                if (replay) {
+                    for (unsigned i = 0; i < startLayout.slots; i++) staticOut.changes.push_back(P.CreateStreamSet(21));
+                    for (unsigned k : startLayout.insertCounts) staticOut.insertions[k] = P.CreateStreamSet(1);
+                    staticOut.spans = P.CreateStreamSet(1);
+                    staticOut.starts = P.CreateStreamSet(1);
+                    P.CreateKernelCall<StaticReplay>(startLayout, staticLengths, absoluteResults, selected, staticStarts, startResults, U21,
+                                                     staticOut.changes, staticOut.insertions, staticOut.spans, staticOut.starts);
+                } else {
+                    const FusedState saved = state;
+                    state = FusedState{};
+                    for (const std::vector<size_t> & chunk : fusedStringChunks(stringLengths, staticRules)) {
+                        FusedRulesConfig a;
+                        a.coverage = config.groupCoverage;
+                        a.selected = static_cast<int>(a.sources.size());
+                        a.sources.push_back(FusedMatchSource{selected, 0});
+                        for (size_t i : chunk) a.strings.push_back(moved(config.strings[i], a));
+                        applyFused(std::move(a), nullptr);
+                    }
+                    staticOut = state;
+                    state = saved;
                 }
-                const FusedState staticOut = state;
-                state = saved;
                 //  The core rules and the subgroups.
                 StreamSet * allowedAt = nullptr;
                 if (config.groupCoverage && staticOut.spans) {
@@ -12304,7 +12588,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 for (size_t i = 0; i < std::max(out.changes.size(), staticOut.changes.size()); i++) {
                     merged.changes.push_back(P.CreateStreamSet(21));
                 }
-                for (const FusedState * s : {static_cast<const FusedState *>(&out), &staticOut}) {
+                for (const FusedState * s : {static_cast<const FusedState *>(&out), static_cast<const FusedState *>(&staticOut)}) {
                     for (const auto & k : s->insertions) {
                         if (!merged.insertions.count(k.first)) merged.insertions[k.first] = P.CreateStreamSet(1);
                     }

@@ -92,6 +92,116 @@ void BinaryToHex::generateFinalBlockMethod(KernelBuilder & b, Value * const rema
     b.CreateMemZero(b.getRawOutputPointer("hexdata", b.CreateAdd(priorProduced, remainingHexDigits)), toZero);
 }
 
+//
+// Decode UTF-8 Data to an 8-bit natural binary representation
+// as well as an insertion length code.
+//
+// Under natural binary:
+// ASCII bytes are unchanged
+// 2-byte sequences 110pqrst 10uvwxyz =>
+//                  00000pqr stuvwxyz
+// 3-byte sequences 1110jklm 10npqrst 10uvwxyz =>
+//                  00000000 jklmnpqr stuvwxyz
+// 4-byte sequences 11110def 10ghjklm 10npqrst 10uvwxyz =>
+//                  00000000 000defgh jklmnpqr stuvwxyz
+//
+// Insertion length codes at the first byte of the
+// UTF-8 sequence give the amount needed to expand
+// the sequence to 4 positions.
+// ASCII code is 11  (add 3)
+// Two-byte prefix code is 10 (add 2)
+// Three-byte prefix code is 01 (add 1)
+// Four-byte prefix code is 00
+//
+
+class U8_DecodeToBinary final : public pablo::PabloKernel {
+public:
+    U8_DecodeToBinary(LLVMTypeSystemInterface & ts, StreamSet * u8_basis, StreamSet * binary_basis, StreamSet * diffcode);
+protected:
+    void generatePabloMethod() override;
+};
+
+U8_DecodeToBinary::U8_DecodeToBinary(LLVMTypeSystemInterface & ts,
+                               StreamSet * u8_basis,
+                               StreamSet * binary_basis,
+                               StreamSet * diffcode)
+        : PabloKernel(ts, "U8_DecodeToBinary",
+                      {Binding{"u8_basis", u8_basis}},
+                      {Binding{"binary_basis", binary_basis}, Binding{"diffcode", diffcode}}) {
+                              addAttribute(kernel::LocalCarries());
+                      }
+
+void U8_DecodeToBinary::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    std::vector<PabloAST *> u8_basis = getInputStreamSet("u8_basis");
+    PabloAST * ASCII = pb.createInFile(pb.createNot(u8_basis[7]));
+    PabloAST * prefix = pb.createAnd(u8_basis[7], u8_basis[6]);
+    PabloAST * prefix34 = pb.createAnd(prefix, u8_basis[5]);
+    PabloAST * prefix2 = pb.createXor(prefix, prefix34);
+    PabloAST * prefix4 = pb.createAnd(prefix34, u8_basis[4]);
+    PabloAST * prefix3 = pb.createXor(prefix34, prefix4);
+
+    std::vector<PabloAST *> diffcode(2);
+    diffcode[1] = pb.createOr(ASCII, prefix2);
+    diffcode[0] = pb.createOr(ASCII, prefix3);
+
+    std::vector<Var *> outVar(8);
+    // Initialize based on ASCII, otherwise 0.
+    for (unsigned i = 0; i < 8; i++) {
+        outVar[i] = pb.createVar("out" + std::to_string(i), pb.createAnd(ASCII, u8_basis[i]));
+    }
+
+    auto nested = pb.createScope();
+    pb.createIf(prefix, nested);
+    std::vector<PabloAST *> low4Advanced(4);
+    for (unsigned i = 0; i < 4; i++) {
+        low4Advanced[i] = nested.createAdvance(u8_basis[i], 1);
+    }
+    PabloAST * scope22 = nested.createAdvance(prefix2, 1);
+    PabloAST * scope33 = nested.createAdvance(prefix3, 2);
+    PabloAST * scope44 = nested.createAdvance(prefix4, 3);
+    PabloAST * scope_final = nested.createOr3(scope22, scope33, scope44);
+    //
+    // Final positions have the low 6 bits unchanged, high 2 bits from
+    // previous byte.
+    //
+    PabloAST * outBasis[8];
+    for (unsigned i = 0; i < 6; i++) {
+        outBasis[i] = nested.createAnd(scope_final, u8_basis[i]);
+    }
+    for (unsigned i = 6; i < 8; i++) {
+        outBasis[i] = nested.createAnd(scope_final, low4Advanced[i-6]);
+    }
+    // Second last positions have 4 bits shifted down and
+    // possibly 4 bits from the previous byte
+    //
+    PabloAST * scope32 = nested.createAdvance(prefix3, 1);
+    PabloAST * scope43 = nested.createAdvance(prefix4, 2);
+    PabloAST * scope_secondlast = nested.createOr(scope32, scope43);
+    PabloAST * secondlast = nested.createOr(prefix2, scope_secondlast);
+    for (unsigned i = 0; i < 4; i++) {
+        outBasis[i] = nested.createOr(outBasis[i], nested.createAnd(secondlast, u8_basis[i+2]));
+        outBasis[i+4] = nested.createOr(outBasis[i+4], nested.createAnd(scope_secondlast, low4Advanced[i]));
+    }
+    //
+    // Now the upper bits for 4 byte sequences.
+    // Low 2 bits are moved down 4 positions, remaining 3 bits are shifted.
+    PabloAST * scope42 = nested.createAdvance(prefix4, 1);
+    for (unsigned i = 0; i < 2; i++) {
+        outBasis[i] = nested.createOr(outBasis[i], nested.createAnd(scope42, u8_basis[i+4]));
+    }
+    for (unsigned i = 2; i < 5; i++) {
+        outBasis[i] = nested.createOr(outBasis[i], nested.createAnd(scope42, low4Advanced[i-2]));
+    }
+    // Update the basis vars in the outer scope.
+    for (unsigned i = 0; i < 8; i++) {
+        nested.createAssign(outVar[i], nested.createOr(outVar[i], outBasis[i]));
+    }
+    writeOutputStreamSet("binary_basis", outVar);
+    writeOutputStreamSet("diffcode", diffcode);
+}
+
+
 static std::string bixSplitUniqueName(StreamSet * bixData, StreamSet * bixPairData) {
     unsigned inBits = bixData->getNumElements();
     unsigned outBits = bixPairData->getNumElements();
@@ -240,13 +350,33 @@ void ZeroExtendASCII_to_U21::generatePabloMethod() {
     writeOutputStreamSet("U21", U21data);
 }
 
-void kernel::UnicodeHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
+static void UTF8_To_Bix4x8_Pipeline(PipelineBuilder & P, StreamSet * Basis, StreamSet * Bix4x8) {
+    StreamSet * Binary = P.CreateStreamSet(8);
+    StreamSet * InsBixNum = P.CreateStreamSet(2);
+    P.CreateKernelCall<U8_DecodeToBinary>(Basis, Binary, InsBixNum);
 
+    StreamSet * spreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, InsBixNum, spreadMask, kernel::InsertPosition::Before);
+
+    SpreadByMask(P, spreadMask, Binary, Bix4x8);
+}
+
+static void Unicode_To_Bix4x8_Pipeline(PipelineBuilder & P, StreamSet * U21, StreamSet * Bix4x8) {
     StreamSet * Bix2x16 = P.CreateStreamSet(16);
-    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+    P.CreateKernelCall<BixSplit>(U21, Bix2x16);
+
+    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+}
+
+void kernel::UnicodeHexPipeline(PipelineBuilder & P, StreamSet * Basis, StreamSet * Out, bool UTF8) {
 
     StreamSet * Bix4x8 = P.CreateStreamSet(8);
-    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    if (UTF8) {
+        UTF8_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    } else {
+        Unicode_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    }
 
     StreamSet * Bix8x4 = P.CreateStreamSet(4);
     P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
@@ -255,10 +385,12 @@ void kernel::UnicodeHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamS
     StreamSet * filterMask = P.CreateStreamSet(1);
     P.CreateKernelCall<UnicodeEscapedHex>(Bix8x4, Hex8, filterMask);
 
-    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    StreamSet * EncodedU8 = UTF8 ? Out : P.CreateStreamSet(8);
     FilterByMask(P, filterMask, Hex8, EncodedU8);
 
-    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+    if (!UTF8) {
+        P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, Out);
+    }
 }
 
 class BixDecodeSurrogates final : public pablo::PabloKernel {
@@ -497,13 +629,15 @@ void CEscapedHex::generatePabloMethod() {
     writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
 }
 
-void kernel::CHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
-
-    StreamSet * Bix2x16 = P.CreateStreamSet(16);
-    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+void kernel::CHexPipeline(PipelineBuilder & P, StreamSet * Basis, StreamSet * Out, bool UTF8) {
 
     StreamSet * Bix4x8 = P.CreateStreamSet(8);
-    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    if (UTF8) {
+        UTF8_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    } else {
+        Unicode_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    }
 
     StreamSet * Bix8x4 = P.CreateStreamSet(4);
     P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
@@ -525,10 +659,12 @@ void kernel::CHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U
     //
     P.CreateKernelCall<CEscapedHex>(expandedBix4, spreadMask, Hex8, filterMask);
 
-    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    StreamSet * EncodedU8 = UTF8 ? Out : P.CreateStreamSet(8);
     FilterByMask(P, filterMask, Hex8, EncodedU8);
 
-    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+    if (!UTF8) {
+        P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, Out);
+    }
 }
 
 class XMLEscapedHex final : public pablo::PabloKernel {
@@ -617,13 +753,15 @@ void XMLEscapedHex::generatePabloMethod() {
     writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
 }
 
-void kernel::XMLHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
-
-    StreamSet * Bix2x16 = P.CreateStreamSet(16);
-    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+void kernel::XMLHexPipeline(PipelineBuilder & P, StreamSet * Basis, StreamSet * Out, bool UTF8) {
 
     StreamSet * Bix4x8 = P.CreateStreamSet(8);
-    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    if (UTF8) {
+        UTF8_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    } else {
+        Unicode_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    }
 
     StreamSet * Bix8x4 = P.CreateStreamSet(4);
     P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
@@ -646,10 +784,12 @@ void kernel::XMLHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet *
 
     P.CreateKernelCall<XMLEscapedHex>(expandedBix4, spreadMask, Hex8, filterMask);
 
-    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    StreamSet * EncodedU8 = UTF8 ? Out : P.CreateStreamSet(8);
     FilterByMask(P, filterMask, Hex8, EncodedU8);
 
-    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+    if (!UTF8) {
+        P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, Out);
+    }
 }
 
 //
@@ -894,13 +1034,15 @@ void PerlEscapedHex::generatePabloMethod() {
     writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
 }
 
-void kernel::PerlHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
-
-    StreamSet * Bix2x16 = P.CreateStreamSet(16);
-    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+void kernel::PerlHexPipeline(PipelineBuilder & P, StreamSet * Basis, StreamSet * Out, bool UTF8) {
 
     StreamSet * Bix4x8 = P.CreateStreamSet(8);
-    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    if (UTF8) {
+        UTF8_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    } else {
+        Unicode_To_Bix4x8_Pipeline(P, Basis, Bix4x8);
+    }
 
     StreamSet * Bix8x4 = P.CreateStreamSet(4);
     P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
@@ -923,10 +1065,12 @@ void kernel::PerlHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet 
 
     P.CreateKernelCall<PerlEscapedHex>(expandedBix4, spreadMask, Hex8, filterMask);
 
-    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    StreamSet * EncodedU8 = UTF8 ? Out : P.CreateStreamSet(8);
     FilterByMask(P, filterMask, Hex8, EncodedU8);
 
-    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+    if (!UTF8) {
+        P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, Out);
+    }
 }
 
 HexDecode::HexDecode(LLVMTypeSystemInterface & ts,

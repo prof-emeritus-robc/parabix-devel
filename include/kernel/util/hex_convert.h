@@ -65,15 +65,22 @@ private:
     bool mLowerHex;
 };
 
-void UnicodeHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+//
+//  The Any-Hex pipelines: each character of the input replaced by its escape.
+//  By default, the input and output are 21-bit codepoint basis streams (one
+//  position per character).  For Unicode, C, XML and Perl, with UTF8, they are
+//  instead UTF-8 basis bits (8 x i1, one position per code unit): the input
+//  well-formed UTF-8, the output the ASCII bytes of the escapes.
+//
+void UnicodeHexPipeline(kernel::PipelineBuilder & p, StreamSet * Basis, StreamSet * Out, bool UTF8 = false);
 
 void JavaHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
-void CHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+void CHexPipeline(kernel::PipelineBuilder & p, StreamSet * Basis, StreamSet * Out, bool UTF8 = false);
 
-void XMLHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+void XMLHexPipeline(kernel::PipelineBuilder & p, StreamSet * Basis, StreamSet * Out, bool UTF8 = false);
 
-void PerlHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+void PerlHexPipeline(kernel::PipelineBuilder & p, StreamSet * Basis, StreamSet * Out, bool UTF8 = false);
 
 //  Any-Hex/XML10: each codepoint as &#, its value in decimal (without leading
 //  zeroes) and ;

@@ -6134,6 +6134,27 @@ void FusedRules::generatePabloMethod() {
     };
     PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
     PabloAST * const allowed = mHasAllowed ? getInputStreamSet("Allowed")[0] : mask;
+    //  The positions from which a text matches (within the mask, if masked): its
+    //  sets at the offsets after them.  The texts are matched as the paths of a
+    //  trie: each prefix once, extended by the texts that share it, and the
+    //  contexts of the rules added to the whole text after.  (Many rules share
+    //  their prefixes, or their whole texts with different contexts: the
+    //  syllables of Latin-Bopomofo.)
+    std::map<std::string, PabloAST *> textPrefixes;
+    auto textAt = [&](const std::vector<UCD::UnicodeSet> & text, bool masked) -> PabloAST * {
+        PabloAST * m = ones;
+        std::string key = masked ? "M" : "U";
+        for (unsigned j = 0; j < text.size(); j++) {
+            key += "|" + setKey(text[j]);
+            PabloAST *& p = textPrefixes[key];
+            if (p == nullptr) {
+                p = pb.createAnd(m, classAt(j, text[j]));
+                if (masked) p = pb.createAnd(p, j ? pb.createLookahead(mask, j) : mask);
+            }
+            m = p;
+        }
+        return m;
+    };
     //  The positions where none of the earlier rules yielded to matches (with
     //  its text from the position), or nullptr if there are none.
     auto notYielded = [&](const std::vector<FusedYield> & yields) -> PabloAST * {
@@ -6141,11 +6162,7 @@ void FusedRules::generatePabloMethod() {
         PabloAST * earlier = zeroes;
         for (const FusedYield & y : yields) {
             const unsigned n = y.text.size();
-            PabloAST * m = contexts(y.before, y.after, n);
-            for (unsigned j = 0; j < n; j++) {
-                m = pb.createAnd(m, classAt(j, y.text[j]));
-                if (mask && y.masked) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
-            }
+            PabloAST * const m = pb.createAnd(textAt(y.text, mask && y.masked), contexts(y.before, y.after, n));
             earlier = pb.createOr(earlier, m);
         }
         return pb.createNot(earlier);
@@ -6162,11 +6179,8 @@ void FusedRules::generatePabloMethod() {
             continue;
         }
         const unsigned n = r.text.size();
-        PabloAST * m = contexts((correction && r.converted) ? FusedContexts{FusedContext()} : r.before, r.after, n);
-        for (unsigned j = 0; j < n; j++) {
-            m = pb.createAnd(m, classAt(j, r.text[j]));
-            if (mask) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
-        }
+        PabloAST * m = pb.createAnd(textAt(r.text, mask != nullptr),
+                                    contexts((correction && r.converted) ? FusedContexts{FusedContext()} : r.before, r.after, n));
         if (r.afterMatch >= 0) {
             PabloAST * const a = source(r.afterMatch);
             m = pb.createAnd(m, n > 1 ? pb.createLookahead(a, n - 1) : a);

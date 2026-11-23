@@ -5,18 +5,18 @@ of one or more characters, and their triggers, for classes V (V′) and K
 (K′), and on October 30 for the chain revisits (class I) and the mark run
 edits (class M). CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
-the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
+the Greek_Latin_UNGEGN capture fix), xlit with `--revisit-report`.*
 
 A revisit rule is a conversion rule whose result places the cursor before
 part of its output (`X → A | B ;`): ICU then continues matching at `B`, so the
 rules of the group may apply again to `B`, and through `B` to the text that
 follows. This report classifies every such rule by the rules its revisit
-triggers: how many, and of what kind. Part 1 covers the rules tconv already
+triggers: how many, and of what kind. Part 1 covers the rules xlit already
 implements, and how; Part 2 the rules it does not implement yet.
 
 ## Method
 
-`tconv --revisit-report <transform>` runs the usual analysis and, for each
+`xlit --revisit-report <transform>` runs the usual analysis and, for each
 rule with text to revisit in the transform's own rules (in the direction of
 the transform, after function calls on captures are expanded), records what
 `ComposeRevisits` (`lib/ldml/transform_rules_revisit.cpp`) found:
@@ -40,7 +40,7 @@ composition was abandoned.
 All 422 rule-defined transforms were run (Hani-Latn, Hant-Latn and Jpan-Latn
 skipped for memory; their own files have no revisit rules, and the transforms
 they invoke were run separately). Each transform's records are reproducible
-with `tconv --revisit-report NAME` (one JSON object per line).
+with `xlit --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
@@ -67,7 +67,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 Two structural facts stand out:
 
-- **Where tconv implements the revisit, the trigger is shallow.** At most 5
+- **Where xlit implements the revisit, the trigger is shallow.** At most 5
   rule applications on a path (B, E), at most 2 characters of lookahead beyond
   the text to revisit (D), and at most 45 composed rules for one revisit rule,
   mostly from enumerating a captured character.
@@ -86,11 +86,11 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (837 rules)
+# Part 1. Rules implemented by xlit (837 rules)
 
-## How tconv implements revisits
+## How xlit implements revisits
 
-tconv implements no revisit at run time. `ComposeRevisits`, early in the
+xlit implements no revisit at run time. `ComposeRevisits`, early in the
 analysis of a transform (after function calls on captures are expanded, before
 capture simplification, finite expansion, order disambiguation and planning),
 replaces each revisit rule by ordinary rules without revisits, at the revisit
@@ -342,7 +342,7 @@ follow each other in a run: with `te\~ → | t ;` and `to\~ → | t ;`, ICU turn
      k, and the other rules may not match it (as A).
 2. *Plan* (`planTransform`). A group of prefix runs alone becomes a step with
    `TransformStep::prefixRuns` (P, S, A for each rule).
-3. *Kernel* (`PrefixRuns` in tconv). By family, the families with the same
+3. *Kernel* (`PrefixRuns` in xlit). By family, the families with the same
    texts S sharing a run class, with the character classes of the sets P and
    of the sets of S, and a lookahead of the longest m:
    - for each text t, `Full_t = Lookahead(S1, 1) & … & Lookahead(Sm, m)`
@@ -402,7 +402,7 @@ and the 4 `_Geminate` variants), the output matches ICU (`uconv -x` on the
 same CLDR rule text): 408 random texts each, rich in runs, including runs of
 40 marks crossing block boundaries, and a 15 MB text with runs of up to 700
 marks, with 1 and 3 threads. The CLDR test data of these transforms (which
-have no runs) passes. `QA/tconv_prefix_runs_test.py` (`make check`) covers a
+have no runs) passes. `QA/xlit_prefix_runs_test.py` (`make check`) covers a
 captured P with A of two characters (and a run of 600), a literal P with an
 empty A, A of one character, and A of three, zero and one characters in one
 group within a filter, and texts S of two and three characters (families of
@@ -498,7 +498,7 @@ and they blocked 6 rules of V.
 *Implementation:* a chain revisit, `(E M1 ... Mk A*) X → | $1 Y ;` with
 `Y` in `A` (`chainRevisit`), replaces in a group of its own each `X` that
 follows `E M1 ... Mk [A X]*`, which a Pablo kernel computes with a
-MatchStar (`ChainRevisits` in tconv). Before contexts cannot express it:
+MatchStar (`ChainRevisits` in xlit). Before contexts cannot express it:
 ICU matches them backward, and `$accentMinus*` would take the macron. The
 chain revisits of a group are applied before the rest of the group, in a
 group of their own, when the rest cannot see the difference
@@ -523,8 +523,8 @@ group of their own, when the rest cannot see the difference
 With the rules of Latn-Grek moved this way (by hand, into a `::(Null);`
 group), ICU 78.3's `createFromRules` gives the same results as on the
 original rules on 25,000 random lines (4,112 of them with U+0345); without
-`jJvwVW` in `E`, 38 lines differ. tconv gives ICU's results on a test rules
-file with a family (QA `tconv_chain_revisits_test.py`). Latn-Grek's 6 rules
+`jJvwVW` in `E`, 38 lines differ. xlit gives ICU's results on a test rules
+file with a family (QA `xlit_chain_revisits_test.py`). Latn-Grek's 6 rules
 `j → | i ;`, … are still V, now blocked by the smooth breathing rule (N),
 and moving the breathing rules too does not preserve the results (`ph`,
 `ch`, `rh`, `th` take the `h` before ICU reaches it).
@@ -540,7 +540,7 @@ final mark above, delete the final mark, and revisit the marks between
 *Implementation:* a mark run edit, `P ($R*) T → C | $1 ;` (or `$R+`; C no
 longer than P, `markRunEdit`), applies in a group of its own at each `P`
 followed by a run of `R` and `T`, where no rule before it applies.
-`MarkRunEdits` in tconv applies the edits of a group together, by family
+`MarkRunEdits` in xlit applies the edits of a group together, by family
 (the same `R` and `T`): the regular expression engine gives the starts of
 `[P1] R* T` for each family, and one Pablo kernel picks the first edit (in
 order) whose `P` matches there, unless a rule kept before it matches,
@@ -568,12 +568,12 @@ Latn-Arab is implementable, identical to ICU 78.3's `createFromRules` on its
 file's rules (reverse) on 40,000 random lines (3,364 with ة). The moved
 Latin-ThaiLogical edits, done by hand in a `::(Null);` group, give ICU's
 results on 20,000 lines; with them, `z → | s ;` (V) composes. QA
-`tconv_mark_run_edits_test.py` covers two families, a kept rule, `R+` and
+`xlit_mark_run_edits_test.py` covers two families, a kept rule, `R+` and
 `R*`, a mark outside the filter and a run longer than a block.
 
 # Part 2. Rules not yet implemented (95 rules)
 
-tconv leaves these rules unchanged, and reports their transforms as not
+xlit leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
 composition was abandoned).
 

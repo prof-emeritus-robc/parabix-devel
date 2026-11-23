@@ -81,7 +81,7 @@ prewarm() {
     case "$TOOL" in
         icgrep)                set -- "-c fox" "-c -i \\w+" ;;
         ucount|ufilter)        set -- "\\p{L}" ;;
-        tconv)                 set -- "Latin-ASCII" ;;
+        xlit)                  set -- "Latin-ASCII" ;;
         csvcut|csvgrep|csv2json) set -- "" ;;
         wc|base64|hexlines|gb18030|nfc|nfd|nfkd|u32u16|u32u8|u8u16|x8u16|tokenizer|editd|hashdemo|matchprior|ztf-runs|stereo2mono)
                                set -- "" ;;

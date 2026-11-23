@@ -893,11 +893,25 @@ void U8_Compiler::compileFromCodeUnit(U8_Seq_Kind k, EnclosingInfo & if_parent, 
                     EnclosingInfo partitionInfo(partitionRange, t, code_unit);
                     if (nesting) {
                         auto nested = pb.createScope();
-                        pb.createIf(t, nested);
-                        if (units_this_partition == 1) {
-                            compileFromCodeUnit(k, partitionInfo, partitionInfo, code_unit + 1, nested);
+                        if (units_this_partition == 1 && !AdvanceBasis) {
+                            //  The body works at the next code unit: its If tests
+                            //  the test moved there, not the test itself.  (Tested
+                            //  where the test is, the body is skipped in a block
+                            //  whose first positions hold the next code units of a
+                            //  test at the end of the block before, unless a carry
+                            //  of the body makes it enter; and the movement into
+                            //  the body may be the same Advance outside the If.)
+                            PabloAST * const moved = adjustPosition(t, code_unit, code_unit + 1, pb);
+                            EnclosingInfo movedInfo(partitionRange, moved, code_unit + 1);
+                            pb.createIf(moved, nested);
+                            compileFromCodeUnit(k, movedInfo, movedInfo, code_unit + 1, nested);
                         } else {
-                            compileFromCodeUnit(k, partitionInfo, partitionInfo, code_unit, nested);
+                            pb.createIf(t, nested);
+                            if (units_this_partition == 1) {
+                                compileFromCodeUnit(k, partitionInfo, partitionInfo, code_unit + 1, nested);
+                            } else {
+                                compileFromCodeUnit(k, partitionInfo, partitionInfo, code_unit, nested);
+                            }
                         }
                     } else {
                         if (units_this_partition == 1) {

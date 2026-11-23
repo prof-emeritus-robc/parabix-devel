@@ -109,6 +109,21 @@ SCResults SelfComposableLogic
               pablo::PabloAST * A, pablo::PabloAST * AA,
               pablo::PabloAST * A_ahead, pablo::PabloAST * AA_ahead);
 
+//  What NFC (and NFKC) may assume of its input (within the mask, if any: each
+//  run of it).  With InputIsNFD the input is in NFD; with InputIsNFKD it is in
+//  NFKD, and so in NFD too.  No character of such an input has a canonical
+//  decomposition, and its marks are in canonical order: NFC then skips the
+//  decomposition stages (the excluded composites and the singletons) and the
+//  canonical ordering, as composition keeps the order of the marks that remain,
+//  and inserts room only for the characters that may occur (those of NFD_QC=Y,
+//  or NFKD_QC=Y).  NFKC with InputIsNFKD is NFC with InputIsNFKD; otherwise it
+//  is NFKD, then NFC with InputIsNFKD (an NFD input still needs the
+//  compatibility decompositions and their ordering).
+enum class NormalizationInput {Any, InputIsNFD, InputIsNFKD};
+
+//  The characters that may occur in an input of the mode (all, for Any).
+UCD::UnicodeSet NormalizationInputSet(NormalizationInput mode);
+
 //  The stages of NFC, by the kernels built in C++ from NFC_Tables
 //  (lib/kernel/unicode/normalization/nfc_kernels.cpp):
 //  - the insertion amounts: NFC expands where a precomposed character has a
@@ -125,7 +140,8 @@ SCResults SelfComposableLogic
 //  the characters within it, and the compositions are of characters within
 //  one run of it (see NFC_Transform); the long composables' ccc_NR then also
 //  marks the bytes outside the mask, which block them.
-void NFC_InitialInsertion(PipelineBuilder & P, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask = nullptr);
+void NFC_InitialInsertion(PipelineBuilder & P, StreamSet * Basis, StreamSet * InsertionBixNum, StreamSet * WorkMask = nullptr,
+                          NormalizationInput mode = NormalizationInput::Any);
 void NFC_ExcludedComposites(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask = nullptr);
 void NFC_Singletons(PipelineBuilder & P, StreamSet * Basis, StreamSet * Result, StreamSet * Mask = nullptr);
 void NFC_ShortComposables(PipelineBuilder & P, StreamSet * Basis, StreamSet * FinalBasis, StreamSet * Mask = nullptr);
@@ -139,8 +155,9 @@ StreamSet * NFC_MaskStreams(PipelineBuilder & P, StreamSet * In, StreamSet * Mas
 //  Focused (the work regions filtered by character, transformed and placed back)
 //  or in place.
 StreamSet * NFC_U21(PipelineBuilder & P, StreamSet * U21, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr,
-                    bool focus = true);
-void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates);
+                    bool focus = true, NormalizationInput mode = NormalizationInput::Any);
+void NFC_CandidateClasses(PipelineBuilder & P, StreamSet * Basis, StreamSet * Candidates,
+                          NormalizationInput mode = NormalizationInput::Any);
 //
 //  Compute a mask for final work placement, given
 //  (a) a set of ccs that define the insertion amounts (as a BixNum)
@@ -204,7 +221,7 @@ void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions, S
 // The focus of NFC: the UTF-8 sequences that may change (composable sequences
 // and excluded composites).
 void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                                StreamSet * Mask = nullptr);
+                                StreamSet * Mask = nullptr, NormalizationInput mode = NormalizationInput::Any);
 
 // NFC of the UTF-8 basis bits U8_Basis.  The transform works in a working space,
 // U8_Basis with room inserted for decompositions; ValidWorkMask marks the positions
@@ -217,12 +234,14 @@ void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, Strea
 // OutputMask, if given, receives the mask over TransformedBasis.
 void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * TransformedBasis,
                    StreamSet * ValidWorkMask, StreamSet * WorkMask = nullptr,
-                   StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr);
+                   StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr,
+                   NormalizationInput mode = NormalizationInput::Any);
 
 // The placement of the transformed work regions in the output, given the
 // ValidWorkMask from NFC_Transform of the work regions.
 void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask, StreamSet * Mask = nullptr);
+                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask, StreamSet * Mask = nullptr,
+                       NormalizationInput mode = NormalizationInput::Any);
 
 // NFC within a mask (a stream over Basis set on every byte of each character
 // within it; the C++ kernels only): each run of the mask normalized by itself,
@@ -232,7 +251,7 @@ void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * Wo
 // given, receives the mask over them (the normalized characters, and those
 // outside the mask where they were).
 StreamSet * NFC_Masked(PipelineBuilder & P, const kernel::FocusOptions & options, StreamSet * Bytes, StreamSet * Basis,
-                       StreamSet * Mask, StreamSet * OutputMask = nullptr);
+                       StreamSet * Mask, StreamSet * OutputMask = nullptr, NormalizationInput mode = NormalizationInput::Any);
 
 // NFD Support
 
@@ -349,4 +368,19 @@ private:
 //  NFD_PipelineBuilder, which must outlive them.
 kernel::FocusedTransform NFD_FocusedTransform(NFD_PipelineBuilder & builder, const kernel::FocusOptions & options);
 kernel::FocusedTransform NFKD_FocusedTransform(NFD_PipelineBuilder & builder, const kernel::FocusOptions & options);
-kernel::FocusedTransform NFC_FocusedTransform(const kernel::FocusOptions & options);
+kernel::FocusedTransform NFC_FocusedTransform(const kernel::FocusOptions & options,
+                                              NormalizationInput mode = NormalizationInput::Any);
+
+//  NFKC (see NormalizationInput): NFKD by the builder (of the pipeline P), unless the input is in
+//  NFKD, then NFC with InputIsNFKD.
+//  - NFKC_Bytes: of UTF-8 text, focused as the options give (NFKD_FocusedTransform,
+//    NFC_FocusedTransform); returns the output bytes.
+//  - NFKC_Masked: within a mask, as NFC_Masked (NFD_Masked, then NFC_Masked within
+//    the mask over its output); OutputMask, if given, receives the mask over the output.
+//  - NFKC_U21: of a 21-bit basis, as NFC_U21 (NFD_U21, then NFC_U21).
+StreamSet * NFKC_Bytes(PipelineBuilder & P, NFD_PipelineBuilder & builder, const kernel::FocusOptions & options, StreamSet * Bytes, StreamSet * Basis,
+                       NormalizationInput mode = NormalizationInput::Any);
+StreamSet * NFKC_Masked(PipelineBuilder & P, NFD_PipelineBuilder & builder, const kernel::FocusOptions & options, StreamSet * Bytes, StreamSet * Basis,
+                        StreamSet * Mask, StreamSet * OutputMask = nullptr, NormalizationInput mode = NormalizationInput::Any);
+StreamSet * NFKC_U21(PipelineBuilder & P, NFD_PipelineBuilder & builder, StreamSet * U21, StreamSet * Mask = nullptr, StreamSet * OutputMask = nullptr,
+                     bool focus = true, NormalizationInput mode = NormalizationInput::Any);

@@ -15,6 +15,8 @@ SRC
     transform_rules_exclusive.cpp
     transform_rules_expand.cpp
     transform_rules_functions.cpp
+    transform_rules_nfd.cpp
+    transform_rules_components.cpp
     transform_rules_overlap.cpp
     transform_rules_partition.cpp
     transform_rules_parser.cpp
@@ -34,3 +36,8 @@ DEPS
     unicode.data
     slaballocator
 )
+
+#  The CLDR data of the source tree (third_party/cldr, imported from CLDR by
+#  scripts/CLDR/import_cldr.sh): the default transform directory.
+target_compile_definitions(ldml.transforms PRIVATE
+    PARABIX_SOURCE_CLDR_DIR="${PROJECT_SOURCE_DIR}/third_party/cldr")

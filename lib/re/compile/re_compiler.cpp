@@ -269,8 +269,15 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
             PabloAST * nextPos = NextCharacter(marker, mPB);
             return Marker(mPB.createAnd(nextPos, lookahead(amt - 1)), Position::AtNextChar);
         } else if (marker.position() == Position::AtNextCodeUnit) {
-            // At the first code unit of the next character.
-            return Marker(mPB.createAnd(marker.stream(), lookahead(amt - 1)), Position::AtNextCodeUnit);
+            // At the first code unit of the next character (a negative lookahead
+            // holds only there: not within a character of several code units,
+            // where a marker of this kind may be, e.g. at the start of the body
+            // of a lookbehind, which is matched everywhere).
+            PabloAST * la = lookahead(amt - 1);
+            if (a->getSense() == Assertion::Sense::Negative) {
+                la = mPB.createAnd(la, mPB.createNot(mPB.createAdvance(mPB.createNot(mMain.mIndexStream), 1)), "atCharStarts");
+            }
+            return Marker(mPB.createAnd(marker.stream(), la), Position::AtNextCodeUnit);
         } else {
             // At the final code unit of the next character: the lookahead is
             // evaluated at the first code units of characters (those after an
@@ -463,7 +470,15 @@ Marker RE_Block_Compiler::compileAssertionBody(Assertion * const a, Marker marke
         AlignMarkers(marker, lookback);
         PabloAST * lb = lookback.stream();
         if (a->getSense() == Assertion::Sense::Negative) {
-            lb = mPB.createAnd(mPB.createNot(lb), mMain.mIndexStream);
+            // The negation holds at the positions of the marker's kind only: the
+            // final code units of characters (AtEnd, AtNextChar), or their first
+            // code units (AtNextCodeUnit: those after an index position, or at
+            // the start), not within a character of several code units.
+            PabloAST * valid = mMain.mIndexStream;
+            if (marker.position() == Position::AtNextCodeUnit) {
+                valid = mPB.createNot(mPB.createAdvance(mPB.createNot(mMain.mIndexStream), 1), "charStarts");
+            }
+            lb = mPB.createAnd(mPB.createNot(lb), valid);
         }
         return Marker(mPB.createAnd(marker.stream(), lb, "lookback"), marker.position());
     }

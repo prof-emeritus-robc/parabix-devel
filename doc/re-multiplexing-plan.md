@@ -45,7 +45,7 @@ ends), so that
 - **Boundary properties only** (`UnicodePropertyLogic`, `regexp_engine.cpp`):
   `\b{g}` and `\b{w}` multiplex the classes of their boundary expressions
   (`b_mpx`) and match over that alphabet. This is the one live use.
-- **tconv** multiplexes its large mapping subgroups itself (02e77ee59), outside
+- **xlit** multiplexes its large mapping subgroups itself (02e77ee59), outside
   the engine.
 
 ### What is disabled or lost
@@ -392,7 +392,7 @@ the number of kernels and reversals that would consume the basis.
   filtered by the UTF-8 index (`k` streams), in place of `UTF8_Decoder` and
   the filtering of 21 streams. Every builder of the pipeline (reversal,
   lookbehinds matched forward, lookaheads by reversal) uses these codes (see
-  milestone 2). A source already of Unicode (csvgrep, tconv) and the
+  milestone 2). A source already of Unicode (csvgrep, xlit) and the
   UTF-8 modes are unchanged.
 - Not multiplexed, with the reason (`RE_PipelineBuilder::
   multiplexingFailure`, and printed with `-ShowREs`, as is the number of

@@ -13,9 +13,12 @@
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/stream_select.h>
 #include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/utf8_support.h>
 #include <pablo/pablo.h>
 #include <re/adt/re_cc.h>
 #include <re/alphabet/alphabet.h>
+#include <re/cc/cc_compiler.h>
+#include <re/cc/cc_compiler_target.h>
 #include <toolchain/toolchain.h>
 
 using namespace pablo;
@@ -55,12 +58,24 @@ unsigned bitsFor(unsigned n) {
     return bits;
 }
 
-//  The positions where bits (a number at each position) give the number t.
-PabloAST * numberAt(PabloBuilder & pb, const std::vector<PabloAST *> & bits, unsigned t) {
-    PabloAST * is = pb.createOnes();
-    for (unsigned k = 0; k < bits.size(); k++) is = pb.createAnd(is, ((t >> k) & 1) ? bits[k] : pb.createNot(bits[k]));
-    return is;
-}
+//  The positions where bits (a number at each position, 0 where none) give a
+//  number of a set (of numbers from 1): compiled as a class over the bits, so
+//  that the logic grows with the structure of the set, not with its size (a
+//  map may have thousands of strings or tails).
+class NumberSets {
+public:
+    NumberSets(PabloBuilder & pb, std::vector<PabloAST *> bits) : mPB(pb) {
+        bits.resize(std::max<size_t>(bits.size(), 21), pb.createZeroes());
+        mCompiler = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
+    }
+    PabloAST * in(const UCD::UnicodeSet & set) {
+        if (set.empty()) return mPB.createZeroes();
+        return mCompiler->compileCC(re::makeCC(set, &cc::Unicode), mPB);
+    }
+private:
+    PabloBuilder & mPB;
+    std::unique_ptr<cc::Parabix_CC_Compiler_Builder> mCompiler;
+};
 
 //  The plan of a character map.  Each character mapped keeps, in place, as
 //  many of its bytes as its replacement has (up to all of them), changed by
@@ -202,10 +217,13 @@ protected:
         if (mInserts) {
             // The lengths of the tails, by their numbers.
             std::vector<PabloAST *> inserts(mPlan.insertBits, pb.createZeroes());
-            for (unsigned t = 1; t <= mPlan.tails.size(); t++) {
-                PabloAST * const is = numberAt(pb, tail, t);
-                const unsigned length = static_cast<unsigned>(mPlan.tails[t - 1].size());
-                for (unsigned k = 0; k < mPlan.insertBits; k++) if ((length >> k) & 1) inserts[k] = pb.createOr(inserts[k], is);
+            NumberSets tailIn(pb, tail);
+            for (unsigned k = 0; k < mPlan.insertBits; k++) {
+                UCD::UnicodeSet with;
+                for (unsigned t = 1; t <= mPlan.tails.size(); t++) {
+                    if ((mPlan.tails[t - 1].size() >> k) & 1) with.insert(t);
+                }
+                inserts[k] = tailIn.in(with);
             }
             inserts.insert(inserts.end(), tail.begin(), tail.end());
             writeOutputStreamSet("inserts", inserts);
@@ -219,26 +237,6 @@ private:
     const bool mWithin;
 };
 
-//  A mask after positions are inserted (where SpreadMask is 0, the mask spread
-//  by it): each run of positions inserted after a position (of at most Run)
-//  has the value of the mask there.
-class UTF8_InheritMask final : public PabloKernel {
-public:
-    UTF8_InheritMask(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Spread, unsigned run, StreamSet * Inherited)
-    : PabloKernel(ts, "UTF8_InheritMask" + std::to_string(run),
-                  {Binding{"spreadMask", SpreadMask}, Binding{"spread", Spread}}, {Binding{"inherited", Inherited}}),
-      mRun(run) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const inserted = pb.createNot(getInputStreamSet("spreadMask")[0]);
-        PabloAST * m = getInputStreamSet("spread")[0];
-        for (unsigned i = 0; i < mRun; i++) m = pb.createOr(m, pb.createAnd(inserted, pb.createAdvance(m, 1)));
-        writeOutputStreamSet("inherited", std::vector<PabloAST *>{pb.createInFile(m)});
-    }
-private:
-    const unsigned mRun;
-};
 
 //  The bytes of the tails written at the positions inserted (zeroes) after
 //  the last bytes of the characters, given the numbers of the tails there.
@@ -253,14 +251,19 @@ protected:
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST *> result = getInputStreamSet("basis");
         const std::vector<PabloAST *> tails = getInputStreamSet("tails");
-        for (unsigned t = 1; t <= mPlan.tails.size(); t++) {
-            PabloAST * const at = numberAt(pb, tails, t);
-            const std::string & tail = mPlan.tails[t - 1];
-            for (unsigned i = 0; i < tail.size(); i++) {
-                PabloAST * const pos = pb.createAdvance(at, i + 1);
-                for (unsigned b = 0; b < 8; b++) {
-                    if ((static_cast<unsigned char>(tail[i]) >> b) & 1) result[b] = pb.createOr(result[b], pos);
+        //  Bit b of byte i of the tails: the numbers of the tails with it, i + 1
+        //  positions after.
+        NumberSets tailIn(pb, tails);
+        size_t longest = 0;
+        for (const std::string & tail : mPlan.tails) longest = std::max(longest, tail.size());
+        for (unsigned i = 0; i < longest; i++) {
+            for (unsigned b = 0; b < 8; b++) {
+                UCD::UnicodeSet with;
+                for (unsigned t = 1; t <= mPlan.tails.size(); t++) {
+                    const std::string & tail = mPlan.tails[t - 1];
+                    if (i < tail.size() && ((static_cast<unsigned char>(tail[i]) >> b) & 1)) with.insert(t);
                 }
+                if (!with.empty()) result[b] = pb.createOr(result[b], pb.createAdvance(tailIn.in(with), i + 1));
             }
         }
         writeOutputStreamSet("result", result);
@@ -269,10 +272,322 @@ private:
     const Plan mPlan;
 };
 
+
+//  The selector values of the strings that keep the character (see
+//  UTF8_SelectorKept), whose UTF-8 begins with these bytes.
+static const std::string KeptPrefix = "\xEF\xB7\x91";
+static bool keptString(const std::string & str) {return str.compare(0, KeptPrefix.size(), KeptPrefix) == 0;}
+
+//  The positions with a selector (a number other than 0) that replaces the
+//  character (not one of Kept).
+class SelectorsPresent final : public PabloKernel {
+public:
+    SelectorsPresent(LLVMTypeSystemInterface & ts, StreamSet * Selectors, UCD::UnicodeSet kept, StreamSet * Present)
+    : PabloKernel(ts, "SelectorsPresent" + std::to_string(Selectors->getNumElements()) + (kept.empty() ? "" : "_" + keptKey(kept)),
+                  {Binding{"selectors", Selectors}}, {Binding{"present", Present}}),
+      mKept(std::move(kept)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> sel = getInputStreamSet("selectors");
+        PabloAST * any = pb.createZeroes();
+        for (PabloAST * b : sel) any = pb.createOr(any, b);
+        if (!mKept.empty()) {
+            NumberSets selIn(pb, sel);
+            any = pb.createAnd(any, pb.createNot(selIn.in(mKept)));
+        }
+        writeOutputStreamSet("present", std::vector<PabloAST *>{any});
+    }
+private:
+    static std::string keptKey(const UCD::UnicodeSet & kept) {
+        std::string s;
+        for (const auto & r : kept) s += std::to_string(r.first) + "-" + std::to_string(r.second) + ",";
+        return getStringHash(s);
+    }
+    const UCD::UnicodeSet mKept;
+};
+
+//  The selector form of a map (see UTF8_SelectorPipeline): at the last byte of
+//  each character with a selector s (Selectors, a number there; 0: none), the
+//  first byte of string s is assigned (not XORed: it does not depend on the
+//  character replaced), the character's other bytes (Spans, all the bytes of
+//  the characters with a selector) are deleted, or all of them for an empty
+//  string, and the rest of the string is inserted after it (the bits of its
+//  length, then of the number of its tail, at the last byte).  A string that
+//  keeps the character (UTF8_SelectorKept) leaves its bytes, and the rest of
+//  the string is inserted after it.
+class UTF8_SelectorApply final : public PabloKernel {
+public:
+    UTF8_SelectorApply(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Selectors, StreamSet * Spans,
+                       std::vector<std::string> strings, std::vector<unsigned> tailOf, Plan plan,
+                       StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts)
+    : PabloKernel(ts, "UTF8_SelectorApply_" + getStringHash(signature(strings, plan)) + "_" + std::to_string(Selectors->getNumElements()) +
+                      (Keep ? "_k" : "") + (Inserts ? "_i" : ""),
+                  {Binding{"basis", Basis}, Binding{"selectors", Selectors}, Binding{"spans", Spans}},
+                  outputs(Translated, Keep, Inserts)),
+      mStrings(std::move(strings)), mTailOf(std::move(tailOf)), mPlan(std::move(plan)), mKeep(Keep != nullptr), mInserts(Inserts != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        const std::vector<PabloAST *> sel = getInputStreamSet("selectors");
+        PabloAST * const spans = getInputStreamSet("spans")[0];
+        PabloAST * changed = pb.createZeroes();
+        for (PabloAST * b : sel) changed = pb.createOr(changed, b);
+        //  The selector values with each bit of the first byte, of the length of
+        //  the tail and of its number, and those of the empty string, and of the
+        //  strings that keep the character (their tails all but the mark).
+        UCD::UnicodeSet emptySet, keptSet;
+        std::vector<UCD::UnicodeSet> assignedSet(8), countSet(mPlan.insertBits), tailSet(mPlan.tailBits);
+        for (unsigned s = 1; s <= mStrings.size(); s++) {
+            const std::string & str = mStrings[s - 1];
+            if (str.empty()) {
+                emptySet.insert(s);
+                continue;
+            }
+            const bool kept = keptString(str);
+            if (kept) {
+                keptSet.insert(s);
+            } else {
+                for (unsigned b = 0; b < 8; b++) {
+                    if ((static_cast<unsigned char>(str[0]) >> b) & 1) assignedSet[b].insert(s);
+                }
+            }
+            const unsigned len = static_cast<unsigned>(str.size() - (kept ? KeptPrefix.size() : 1));
+            for (unsigned k = 0; k < mPlan.insertBits; k++) if ((len >> k) & 1) countSet[k].insert(s);
+            const unsigned t = mTailOf[s - 1];
+            for (unsigned k = 0; k < mPlan.tailBits; k++) if ((t >> k) & 1) tailSet[k].insert(s);
+        }
+        NumberSets selIn(pb, sel);
+        PabloAST * const emptied = selIn.in(emptySet);
+        if (!keptSet.empty()) changed = pb.createAnd(changed, pb.createNot(selIn.in(keptSet)));
+        std::vector<PabloAST *> assigned(8), counts(mPlan.insertBits), tails(mPlan.tailBits);
+        for (unsigned b = 0; b < 8; b++) assigned[b] = selIn.in(assignedSet[b]);
+        for (unsigned k = 0; k < mPlan.insertBits; k++) counts[k] = selIn.in(countSet[k]);
+        for (unsigned k = 0; k < mPlan.tailBits; k++) tails[k] = selIn.in(tailSet[k]);
+        for (unsigned b = 0; b < 8; b++) basis[b] = pb.createOr(pb.createAnd(basis[b], pb.createNot(changed)), assigned[b]);
+        writeOutputStreamSet("translated", basis);
+        if (mKeep) {
+            //  (Deleted: the bytes of a character with a selector but its last, and
+            //  the last too for an empty string.)
+            PabloAST * const deleted = pb.createOr(pb.createAnd(spans, pb.createNot(changed)), emptied);
+            writeOutputStreamSet("keep", std::vector<PabloAST *>{pb.createInFile(pb.createNot(deleted))});
+        }
+        if (mInserts) {
+            std::vector<PabloAST *> inserts = counts;
+            inserts.insert(inserts.end(), tails.begin(), tails.end());
+            writeOutputStreamSet("inserts", inserts);
+        }
+    }
+private:
+    static Bindings outputs(StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts) {
+        Bindings b{Binding{"translated", Translated}};
+        if (Keep) b.emplace_back("keep", Keep);
+        if (Inserts) b.emplace_back("inserts", Inserts);
+        return b;
+    }
+    static std::string signature(const std::vector<std::string> & strings, const Plan & plan) {
+        std::string s = plan.signature() + "|";
+        for (const std::string & str : strings) {
+            for (const char c : str) {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02X", static_cast<unsigned char>(c));
+                s += buf;
+            }
+            s += ".";
+        }
+        return s;
+    }
+    const std::vector<std::string> mStrings;
+    const std::vector<unsigned> mTailOf;
+    const Plan mPlan;
+    const bool mKeep;
+    const bool mInserts;
+};
+
+//  The prefixes of the strings that keep a character with a string inserted
+//  before it (see UTF8_SelectorPipeline): numbered from 1, the bytes inserted
+//  before the character's first byte.
+struct PrefixPlan {
+    std::vector<std::string> prefixes;      // by number less one
+    std::vector<unsigned> prefixOf;         // by selector less one (0: none)
+    unsigned numberBits = 0;
+    unsigned countBits = 0;                 // the bits of the longest prefix's length
+    unsigned longest() const {
+        size_t n = 0;
+        for (const std::string & p : prefixes) n = std::max(n, p.size());
+        return static_cast<unsigned>(n);
+    }
+    std::string signature() const {
+        std::string s;
+        for (const std::string & p : prefixes) {
+            for (const char c : p) {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02X", static_cast<unsigned char>(c));
+                s += buf;
+            }
+            s += ".";
+        }
+        s += "|";
+        for (const unsigned n : prefixOf) s += std::to_string(n) + ",";
+        return s;
+    }
+};
+
+//  At the first byte of each character whose selector (at its last byte) has
+//  a prefix: the bits of the prefix's length, then of its number.
+class UTF8_SelectorPrefixes final : public PabloKernel {
+public:
+    UTF8_SelectorPrefixes(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Selectors, PrefixPlan plan, StreamSet * Prefixes)
+    : PabloKernel(ts, "UTF8_SelectorPrefixes_" + getStringHash(plan.signature()) + "_" + std::to_string(Selectors->getNumElements()),
+                  {Binding{"basis", Basis}, Binding{"selectors", Selectors, FixedRate(1), LookAhead(3)}},
+                  {Binding{"prefixes", Prefixes}}),
+      mPlan(std::move(plan)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        const std::vector<PabloAST *> sel = getInputStreamSet("selectors");
+        //  The sets of selector values with each bit of the length and number of their prefix.
+        std::vector<UCD::UnicodeSet> countSet(mPlan.countBits), numberSet(mPlan.numberBits);
+        for (unsigned s = 1; s <= mPlan.prefixOf.size(); s++) {
+            const unsigned n = mPlan.prefixOf[s - 1];
+            if (n == 0) continue;
+            const unsigned len = static_cast<unsigned>(mPlan.prefixes[n - 1].size());
+            for (unsigned k = 0; k < mPlan.countBits; k++) if ((len >> k) & 1) countSet[k].insert(s);
+            for (unsigned k = 0; k < mPlan.numberBits; k++) if ((n >> k) & 1) numberSet[k].insert(s);
+        }
+        //  The first bytes of the characters of each length, whose selectors are
+        //  length - 1 positions ahead.
+        NumberSets byteIn(pb, basis);
+        const UCD::UnicodeSet leads[4] = {UCD::UnicodeSet(0, 0x7F), UCD::UnicodeSet(0xC0, 0xDF), UCD::UnicodeSet(0xE0, 0xEF),
+                                          UCD::UnicodeSet(0xF0, 0xF7)};
+        std::vector<PabloAST *> out(mPlan.countBits + mPlan.numberBits, pb.createZeroes());
+        for (unsigned n = 1; n <= 4; n++) {
+            PabloAST * const lead = byteIn.in(leads[n - 1]);
+            std::vector<PabloAST *> ahead;
+            for (PabloAST * b : sel) ahead.push_back(n == 1 ? b : pb.createLookahead(b, n - 1));
+            NumberSets selIn(pb, ahead);
+            for (unsigned k = 0; k < mPlan.countBits; k++) out[k] = pb.createOr(out[k], pb.createAnd(lead, selIn.in(countSet[k])));
+            for (unsigned k = 0; k < mPlan.numberBits; k++) {
+                out[mPlan.countBits + k] = pb.createOr(out[mPlan.countBits + k], pb.createAnd(lead, selIn.in(numberSet[k])));
+            }
+        }
+        writeOutputStreamSet("prefixes", out);
+    }
+private:
+    const PrefixPlan mPlan;
+};
+
+
+//  The bytes of the prefixes written at the positions inserted (zeroes) before
+//  the first bytes of the characters, given the numbers of the prefixes there:
+//  byte j of a prefix of length L, L - j positions before.
+class UTF8_SelectorPrefixWrite final : public PabloKernel {
+public:
+    UTF8_SelectorPrefixWrite(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Numbers, PrefixPlan plan, StreamSet * Result)
+    : PabloKernel(ts, "UTF8_SelectorPrefixWrite_" + getStringHash(plan.signature()),
+                  {Binding{"basis", Basis}, Binding{"numbers", Numbers, FixedRate(1), LookAhead(plan.longest())}},
+                  {Binding{"result", Result}}),
+      mPlan(std::move(plan)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> result = getInputStreamSet("basis");
+        const std::vector<PabloAST *> numbers = getInputStreamSet("numbers");
+        for (unsigned d = 1; d <= mPlan.longest(); d++) {
+            std::vector<PabloAST *> ahead;
+            for (PabloAST * b : numbers) ahead.push_back(pb.createLookahead(b, d));
+            NumberSets numberIn(pb, ahead);
+            for (unsigned b = 0; b < 8; b++) {
+                UCD::UnicodeSet with;
+                for (unsigned n = 1; n <= mPlan.prefixes.size(); n++) {
+                    const std::string & p = mPlan.prefixes[n - 1];
+                    if (p.size() < d) continue;
+                    if ((static_cast<unsigned char>(p[p.size() - d]) >> b) & 1) with.insert(n);
+                }
+                if (!with.empty()) result[b] = pb.createOr(result[b], numberIn.in(with));
+            }
+        }
+        writeOutputStreamSet("result", result);
+    }
+private:
+    const PrefixPlan mPlan;
+};
+
+//  The prefixes inserted before the characters whose selectors have them:
+//  returns the basis with them, and the selectors kept in step; the positions
+//  inserted (each in the run of the character after it) added to Positions.
+StreamSet * insertPrefixes(PipelineBuilder & P, const PrefixPlan & plan, StreamSet * Basis, StreamSet *& Selectors,
+                           PositionMap * Positions) {
+    StreamSet * const Prefixes = P.CreateStreamSet(plan.countBits + plan.numberBits);
+    P.CreateKernelCall<UTF8_SelectorPrefixes>(Basis, Selectors, plan, Prefixes);
+    std::vector<unsigned> countBits;
+    for (unsigned k = 0; k < plan.countBits; k++) countBits.push_back(k);
+    StreamSet * const Counts = P.CreateStreamSet(plan.countBits);
+    P.CreateKernelCall<StreamSelect>(Counts, Select(Prefixes, countBits));
+    StreamSet * const SpreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, Counts, SpreadMask, InsertPosition::Before);
+    SHOW_STREAM(SpreadMask);
+    StreamSet * const SpreadBasis = P.CreateStreamSet(8);
+    SpreadByMask(P, SpreadMask, Basis, SpreadBasis);
+    StreamSet * const SpreadSelectors = P.CreateStreamSet(Selectors->getNumElements());
+    SpreadByMask(P, SpreadMask, Selectors, SpreadSelectors);
+    Selectors = SpreadSelectors;
+    StreamSet * const Numbers = P.CreateStreamSet(plan.numberBits);
+    SpreadByMask(P, SpreadMask, Prefixes, Numbers, plan.countBits);
+    if (Positions) Positions->insert(SpreadMask, PositionMap::Inserted::InheritNext, plan.longest());
+    StreamSet * const Result = P.CreateStreamSet(8);
+    P.CreateKernelCall<UTF8_SelectorPrefixWrite>(SpreadBasis, Numbers, plan, Result);
+    SHOW_BIXNUM(Result);
+    return Result;
+}
+
+//  The rest of a map, from the text changed in place: the bytes deleted (Keep)
+//  and the tails inserted (Inserts), added to Positions (each byte inserted in
+//  the run of the character before it).
+StreamSet * finishMap(PipelineBuilder & P, const Plan & plan, StreamSet * Translated, StreamSet * Keep, StreamSet * Inserts,
+                      const bool deletes, const bool inserts, PositionMap * Positions) {
+    SHOW_BIXNUM(Translated);
+    StreamSet * Basis = Translated;
+    if (deletes) {
+        SHOW_STREAM(Keep);
+        StreamSet * const KeptBasis = P.CreateStreamSet(8);
+        FilterByMask(P, Keep, Basis, KeptBasis);
+        Basis = KeptBasis;
+        if (Inserts) {
+            StreamSet * const KeptInserts = P.CreateStreamSet(Inserts->getNumElements());
+            FilterByMask(P, Keep, Inserts, KeptInserts);
+            Inserts = KeptInserts;
+        }
+        if (Positions) Positions->remove(Keep);
+    }
+    if (!inserts) return Basis;
+    // The insertions: the positions inserted after the last bytes, and the
+    // bytes of the tails written there.
+    std::vector<unsigned> countBits;
+    for (unsigned k = 0; k < plan.insertBits; k++) countBits.push_back(k);
+    StreamSet * const Counts = P.CreateStreamSet(plan.insertBits);
+    P.CreateKernelCall<StreamSelect>(Counts, Select(Inserts, countBits));
+    StreamSet * const SpreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, Counts, SpreadMask, InsertPosition::After);
+    SHOW_STREAM(SpreadMask);
+    StreamSet * const SpreadBasis = P.CreateStreamSet(8);
+    SpreadByMask(P, SpreadMask, Basis, SpreadBasis);
+    StreamSet * const SpreadTails = P.CreateStreamSet(plan.tailBits);
+    SpreadByMask(P, SpreadMask, Inserts, SpreadTails, plan.insertBits);
+    if (Positions) Positions->insert(SpreadMask, PositionMap::Inserted::Inherit);
+    StreamSet * const Result = P.CreateStreamSet(8);
+    P.CreateKernelCall<UTF8_CharMapTails>(SpreadBasis, SpreadTails, plan, Result);
+    SHOW_BIXNUM(Result);
+    return Result;
+}
+
 }
 
 StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, StreamSet * Basis,
-                                 const UCD::UnicodeSet & contextual, StreamSet * Applies, std::vector<StreamSet *> * Masks) {
+                                 const UCD::UnicodeSet & contextual, StreamSet * Applies, StreamSet * Within,
+                                 PositionMap * Positions) {
     if (map.empty()) return Basis;
     // Each character mapped: the changes of its bytes in place, the number of
     // bytes to delete, and the tail inserted.
@@ -344,53 +659,73 @@ StreamSet * UTF8_CharMapPipeline(PipelineBuilder & P, const UTF8_CharMap & map, 
     StreamSet * const Translated = P.CreateStreamSet(8);
     StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
     StreamSet * Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
-    StreamSet * const Within = (Masks && !Masks->empty()) ? Masks->back() : nullptr;
     P.CreateKernelCall<UTF8_CharMapApply>(Basis, Classes, Applies, Within, plan, Translated, Keep, Inserts);
-    SHOW_BIXNUM(Translated);
-    Basis = Translated;
-    if (deletes) {
-        SHOW_STREAM(Keep);
-        StreamSet * const KeptBasis = P.CreateStreamSet(8);
-        FilterByMask(P, Keep, Basis, KeptBasis);
-        Basis = KeptBasis;
-        if (Inserts) {
-            StreamSet * const KeptInserts = P.CreateStreamSet(Inserts->getNumElements());
-            FilterByMask(P, Keep, Inserts, KeptInserts);
-            Inserts = KeptInserts;
+    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Positions);
+}
+
+StreamSet * UTF8_SelectorPipeline(PipelineBuilder & P, const std::vector<std::u32string> & strings, StreamSet * Basis,
+                                  StreamSet * Selectors, PositionMap * Positions) {
+    Plan plan;
+    std::vector<std::string> bytes;
+    std::vector<unsigned> tailOf;
+    std::map<std::string, unsigned> tailNumber;
+    unsigned maxTail = 0;
+    bool deletes = false;
+    UCD::UnicodeSet kept;
+    //  (A string with a prefix before the mark: the prefix inserted first, and
+    //  the rest applied as a string that keeps the character.)
+    PrefixPlan prefixes;
+    std::map<std::string, unsigned> prefixNumber;
+    for (const std::u32string & full : strings) {
+        std::u32string str = full;
+        unsigned pn = 0;
+        const size_t at = full.find(UTF8_SelectorKept);
+        if (at != std::u32string::npos && at > 0) {
+            const std::string p = utf8(full.substr(0, at));
+            auto f = prefixNumber.emplace(p, static_cast<unsigned>(prefixes.prefixes.size() + 1));
+            if (f.second) prefixes.prefixes.push_back(p);
+            pn = f.first->second;
+            prefixes.countBits = std::max(prefixes.countBits, bitsFor(static_cast<unsigned>(p.size())));
+            str = full.substr(at);
         }
-        if (Masks) for (StreamSet *& m : *Masks) {
-            StreamSet * const kept = P.CreateStreamSet(1);
-            FilterByMask(P, Keep, m, kept);
-            m = kept;
+        prefixes.prefixOf.push_back(pn);
+        bytes.push_back(utf8(str));
+        const std::string & b = bytes.back();
+        unsigned t = 0;
+        //  (The tail: the string but its first byte, or but the mark of a kept character.)
+        const size_t skip = keptString(b) ? KeptPrefix.size() : 1;
+        if (skip > 1) kept.insert(static_cast<UCD::codepoint_t>(bytes.size()));
+        if (b.empty()) {
+            deletes = true;
+        } else if (b.size() > skip) {
+            auto f = tailNumber.emplace(b.substr(skip), static_cast<unsigned>(plan.tails.size() + 1));
+            if (f.second) plan.tails.push_back(b.substr(skip));
+            t = f.first->second;
+            maxTail = std::max(maxTail, static_cast<unsigned>(b.size() - skip));
         }
+        tailOf.push_back(t);
     }
-    if (!inserts) return Basis;
-    // The insertions: the positions inserted after the last bytes, and the
-    // bytes of the tails written there.
-    std::vector<unsigned> countBits;
-    for (unsigned k = 0; k < plan.insertBits; k++) countBits.push_back(k);
-    StreamSet * const Counts = P.CreateStreamSet(plan.insertBits);
-    P.CreateKernelCall<StreamSelect>(Counts, Select(Inserts, countBits));
-    StreamSet * const SpreadMask = P.CreateStreamSet(1);
-    InsertionSpreadMask(P, Counts, SpreadMask, InsertPosition::After);
-    SHOW_STREAM(SpreadMask);
-    StreamSet * const SpreadBasis = P.CreateStreamSet(8);
-    SpreadByMask(P, SpreadMask, Basis, SpreadBasis);
-    StreamSet * const SpreadTails = P.CreateStreamSet(plan.tailBits);
-    SpreadByMask(P, SpreadMask, Inserts, SpreadTails, plan.insertBits);
-    unsigned longestTail = 0;
-    for (const std::string & t : plan.tails) longestTail = std::max(longestTail, static_cast<unsigned>(t.size()));
-    if (Masks) for (StreamSet *& m : *Masks) {
-        StreamSet * const spread = P.CreateStreamSet(1);
-        SpreadByMask(P, SpreadMask, m, spread);
-        StreamSet * const inherited = P.CreateStreamSet(1);
-        P.CreateKernelCall<UTF8_InheritMask>(SpreadMask, spread, longestTail, inherited);
-        m = inherited;
+    plan.tailBits = bitsFor(static_cast<unsigned>(plan.tails.size()));
+    plan.insertBits = bitsFor(maxTail);
+    if (!prefixes.prefixes.empty()) {
+        prefixes.numberBits = bitsFor(static_cast<unsigned>(prefixes.prefixes.size()));
+        Basis = insertPrefixes(P, prefixes, Basis, Selectors, Positions);
     }
-    StreamSet * const Result = P.CreateStreamSet(8);
-    P.CreateKernelCall<UTF8_CharMapTails>(SpreadBasis, SpreadTails, plan, Result);
-    SHOW_BIXNUM(Result);
-    return Result;
+    // The bytes of the characters with a selector (marked at their last bytes).
+    StreamSet * const Index = P.CreateStreamSet(1);
+    P.CreateKernelCall<UTF8_index>(Basis, Index);
+    StreamSet * const Changed = P.CreateStreamSet(1);
+    P.CreateKernelCall<SelectorsPresent>(Selectors, kept, Changed);
+    StreamSet * const Spans = P.CreateStreamSet(1);
+    P.CreateKernelCall<U8Spans>(Changed, Index, Spans, BitMovementMode::LookAhead);
+    // (Bytes are deleted wherever a multi-byte character has a selector, or a string is empty.)
+    deletes = true;
+    const bool inserts = !plan.tails.empty();
+    StreamSet * const Translated = P.CreateStreamSet(8);
+    StreamSet * const Keep = deletes ? P.CreateStreamSet(1) : nullptr;
+    StreamSet * const Inserts = inserts ? P.CreateStreamSet(plan.insertBits + plan.tailBits) : nullptr;
+    P.CreateKernelCall<UTF8_SelectorApply>(Basis, Selectors, Spans, bytes, tailOf, plan, Translated, Keep, Inserts);
+    return finishMap(P, plan, Translated, Keep, Inserts, deletes, inserts, Positions);
 }
 
 }

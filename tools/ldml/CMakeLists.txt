@@ -17,9 +17,9 @@ DEPS
 
 parabix_add_executable(
 NAME
-    tconv
+    xlit
 SRC
-    tconv.cpp
+    xlit.cpp
     icu_transform.cpp
 DEPS
     ldml.transforms
@@ -39,23 +39,23 @@ DEPS
     toolchain
 )
 
-# The ICU implementation of transforms, for tconv --use-ICU (if ICU is found;
+# The ICU implementation of transforms, for xlit --use-ICU (if ICU is found;
 # -DICU_ROOT=<prefix> to give its location; Homebrew's icu4c is looked for).
 if(NOT ICU_ROOT)
-    file(GLOB TCONV_ICU_CANDIDATES /opt/homebrew/opt/icu4c* /usr/local/opt/icu4c*)
-    if(TCONV_ICU_CANDIDATES)
-        list(SORT TCONV_ICU_CANDIDATES)
-        list(REVERSE TCONV_ICU_CANDIDATES)
-        list(GET TCONV_ICU_CANDIDATES 0 TCONV_ICU_ROOT)
-        set(ICU_ROOT ${TCONV_ICU_ROOT})
+    file(GLOB XLIT_ICU_CANDIDATES /opt/homebrew/opt/icu4c* /usr/local/opt/icu4c*)
+    if(XLIT_ICU_CANDIDATES)
+        list(SORT XLIT_ICU_CANDIDATES)
+        list(REVERSE XLIT_ICU_CANDIDATES)
+        list(GET XLIT_ICU_CANDIDATES 0 XLIT_ICU_ROOT)
+        set(ICU_ROOT ${XLIT_ICU_ROOT})
     endif()
 endif()
 find_package(ICU COMPONENTS uc i18n data)
 if(ICU_FOUND)
-    message(STATUS "tconv: ICU ${ICU_VERSION} (${ICU_INCLUDE_DIRS}) for --use-ICU")
-    target_include_directories(tconv PRIVATE ${ICU_INCLUDE_DIRS})
-    target_link_libraries(tconv PRIVATE ICU::i18n ICU::uc ICU::data)
-    target_compile_definitions(tconv PRIVATE TCONV_WITH_ICU=1)
+    message(STATUS "xlit: ICU ${ICU_VERSION} (${ICU_INCLUDE_DIRS}) for --use-ICU")
+    target_include_directories(xlit PRIVATE ${ICU_INCLUDE_DIRS})
+    target_link_libraries(xlit PRIVATE ICU::i18n ICU::uc ICU::data)
+    target_compile_definitions(xlit PRIVATE XLIT_WITH_ICU=1)
 else()
-    message(STATUS "tconv: ICU not found; --use-ICU is not available")
+    message(STATUS "xlit: ICU not found; --use-ICU is not available")
 endif()

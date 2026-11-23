@@ -34,12 +34,19 @@ namespace ldml {
 
 namespace {
 
+//  Where a character edge may be matched: anywhere, within a run of a global
+//  filter (an item of the text to replace, which ends with the run), or only
+//  outside the filter (a set of an after context with FilterRunOutsideMark).
+//  Edges within the run and outside it never match the same character.
+enum class Place {Any, Within, Outside};
+
 struct NFA {
     enum class Kind {Epsilon, Chars, Boundary};
     struct Edge {
         unsigned to;
         Kind kind;
         UCD::UnicodeSet chars;
+        Place place = Place::Any;
     };
     std::vector<std::vector<Edge>> out;
     unsigned start = 0;
@@ -48,8 +55,8 @@ struct NFA {
         out.emplace_back();
         return static_cast<unsigned>(out.size() - 1);
     }
-    void addEdge(unsigned from, unsigned to, Kind k, UCD::UnicodeSet chars = UCD::UnicodeSet()) {
-        out[from].push_back(Edge{to, k, std::move(chars)});
+    void addEdge(unsigned from, unsigned to, Kind k, UCD::UnicodeSet chars = UCD::UnicodeSet(), Place place = Place::Any) {
+        out[from].push_back(Edge{to, k, std::move(chars), place});
     }
     // Append the states of another automaton, returning the offset of its states.
     unsigned append(const NFA & other) {
@@ -57,7 +64,7 @@ struct NFA {
         for (const auto & edges : other.out) {
             out.emplace_back();
             for (const Edge & e : edges) {
-                out.back().push_back(Edge{e.to + offset, e.kind, e.chars});
+                out.back().push_back(Edge{e.to + offset, e.kind, e.chars, e.place});
             }
         }
         return offset;
@@ -79,7 +86,7 @@ NFA reverse(const NFA & a) {
     for (size_t i = 0; i < a.out.size(); i++) n.addState();
     for (unsigned q = 0; q < a.out.size(); q++) {
         for (const NFA::Edge & e : a.out[q]) {
-            n.addEdge(e.to, q, e.kind, e.chars);
+            n.addEdge(e.to, q, e.kind, e.chars, e.place);
         }
     }
     n.start = a.accept;
@@ -126,7 +133,9 @@ bool compatible(const NFA & a, const NFA & b) {
             for (const NFA::Edge & ea : a.out[qa]) {
                 if (ea.kind != NFA::Kind::Chars) continue;
                 for (const NFA::Edge & eb : b.out[qb]) {
-                    if (eb.kind == NFA::Kind::Chars && ea.chars.intersects(eb.chars)) {
+                    const bool apart = (ea.place == Place::Within && eb.place == Place::Outside)
+                                       || (ea.place == Place::Outside && eb.place == Place::Within);
+                    if (eb.kind == NFA::Kind::Chars && !apart && ea.chars.intersects(eb.chars)) {
                         visit(State{ea.to, eb.to, false});
                     }
                 }
@@ -144,8 +153,10 @@ enum class Side {Before, After};
 class NFABuilder {
 public:
     NFABuilder(CharSetAnalysis & sets) : mSets(sets) {}
-    // An automaton for the pattern in the forward direction (nullptr: empty).
-    NFA build(const RE * re, Side side) {
+    // An automaton for the pattern in the forward direction (nullptr: empty);
+    // with key, of a text to replace (its edges within a run).
+    NFA build(const RE * re, Side side, bool key = false) {
+        mKey = key;
         NFA n;
         n.start = n.addState();
         n.accept = n.addState();
@@ -163,6 +174,7 @@ private:
         n.addEdge(to, to, NFA::Kind::Chars, AllCodepoints);
     }
     CharSetAnalysis & mSets;
+    bool mKey = false;
 };
 
 // Large bounded repetitions are treated as unbounded.
@@ -170,7 +182,11 @@ constexpr int MaxExpandedRepetitions = 16;
 
 void NFABuilder::build(NFA & n, const RE * re, unsigned from, unsigned to, Side side) {
     if (CharSetAnalysis::isSetExpression(re)) {
-        n.addEdge(from, to, NFA::Kind::Chars, mSets.setOf(re));
+        UCD::UnicodeSet chars = mSets.setOf(re);
+        const Place place = mKey ? Place::Within : marksFilterRunOutside(chars) ? Place::Outside : Place::Any;
+        //  (The mark, not a character of the text, as the edge records it.)
+        if (place == Place::Outside) chars = chars - UCD::UnicodeSet(FilterRunOutsideMark);
+        n.addEdge(from, to, NFA::Kind::Chars, std::move(chars), place);
     } else if (isa<Start>(re)) {
         // The start of the text, which cannot follow a position.
         if (side == Side::Before) n.addEdge(from, to, NFA::Kind::Boundary);
@@ -260,7 +276,7 @@ struct RuleOverlapAnalysis::Impl {
         }
         a.beforeContext = builder.build(before, Side::Before);
         a.before = reverse(a.beforeContext);
-        a.key = builder.build(text, Side::After);
+        a.key = builder.build(text, Side::After, true);
         a.afterContext = builder.build(src->getAfterContext(), Side::After);
         a.after = concat(a.key, a.afterContext);
         return automata.emplace(r, std::move(a)).first->second;
@@ -343,7 +359,7 @@ bool RuleOverlapAnalysis::mayMatchWithin(const ConversionRule * s, const Convers
             // reached only by e.
             NFA prefix = key;
             const unsigned end = prefix.addState();
-            prefix.addEdge(q, end, NFA::Kind::Chars, e.chars);
+            prefix.addEdge(q, end, NFA::Kind::Chars, e.chars, e.place);
             prefix.accept = end;
             const NFA behind = reverse(concat(ar.beforeContext, prefix));
             if (!compatible(as.before, behind)) continue;
@@ -356,11 +372,11 @@ bool RuleOverlapAnalysis::mayMatchWithin(const ConversionRule * s, const Convers
             for (unsigned p = 0; p < states; p++) {
                 for (const NFA::Edge & k : key.out[p]) {
                     if (k.kind == NFA::Kind::Chars) {
-                        suffix.addEdge(p, k.to + states, k.kind, k.chars);
-                        suffix.addEdge(p + states, k.to + states, k.kind, k.chars);
+                        suffix.addEdge(p, k.to + states, k.kind, k.chars, k.place);
+                        suffix.addEdge(p + states, k.to + states, k.kind, k.chars, k.place);
                     } else {
-                        suffix.addEdge(p, k.to, k.kind, k.chars);
-                        suffix.addEdge(p + states, k.to + states, k.kind, k.chars);
+                        suffix.addEdge(p, k.to, k.kind, k.chars, k.place);
+                        suffix.addEdge(p + states, k.to + states, k.kind, k.chars, k.place);
                     }
                 }
             }

@@ -5,9 +5,9 @@
 
 #pragma once
 
-//  The ICU implementation of transforms, for tconv --use-ICU (built with ICU
-//  if CMake finds it: TCONV_WITH_ICU).  A transform defined by a CLDR file is
-//  made by ICU from the rules of that file (createFromRules), as tconv reads
+//  The ICU implementation of transforms, for xlit --use-ICU (built with ICU
+//  if CMake finds it: XLIT_WITH_ICU).  A transform defined by a CLDR file is
+//  made by ICU from the rules of that file (createFromRules), as xlit reads
 //  them, after the transforms its rules invoke that are defined by CLDR files,
 //  registered under the names by which they are invoked; a built-in transform
 //  is ICU's own (createInstance).
@@ -18,11 +18,11 @@
 #include <utility>
 #include <vector>
 
-namespace tconv {
+namespace xlit {
 
 class ICUTransform {
 public:
-    //  Whether tconv was built with ICU.
+    //  Whether xlit was built with ICU.
     static bool available();
     //  Registers a transform made from rules (the tRule text of a CLDR file),
     //  in a direction, as the name given (for the rules that invoke it), or

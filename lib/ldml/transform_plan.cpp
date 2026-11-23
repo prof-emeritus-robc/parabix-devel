@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <ldml/transform_rules_printer.h>
@@ -1528,6 +1529,8 @@ static bool keptStringRule(const ConversionRule * c, CharSetAnalysis & sets, Str
     if (result->hasCursor()) return false;
     std::vector<std::vector<UCD::UnicodeSet>> texts(1), captures;
     std::vector<std::string> names;
+    //  (Whether an item follows the optional set: then it is not at the end.)
+    bool afterOptional = false;
     std::function<bool (re::RE *, bool)> flatten = [&](re::RE * re, bool inCapture) -> bool {
         //  An optional set at the end of the text (see keptStringRules).
         if (const re::Rep * rep = dyn_cast<re::Rep>(re); optional && inCapture && rep && rep->getLB() == 0 && rep->getUB() == 1
@@ -1536,6 +1539,7 @@ static bool keptStringRule(const ConversionRule * c, CharSetAnalysis & sets, Str
             if (present) captures.back().push_back(**optional);
             return true;
         }
+        if (optional && optional->has_value() && (plainSet(re) || isa<re::Capture>(re))) afterOptional = true;
         if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
             for (re::RE * e : *seq) if (!flatten(e, inCapture)) return false;
             return true;
@@ -1554,7 +1558,7 @@ static bool keptStringRule(const ConversionRule * c, CharSetAnalysis & sets, Str
         }
         return false;
     };
-    if (!flatten(source->getText(), false) || captures.empty()) return false;
+    if (!flatten(source->getText(), false) || captures.empty() || afterOptional) return false;
     //  (The optional set at the end of the last capture, the end of the text.)
     if (optional && optional->has_value() && (texts.back().size() > 0 || source->hasAfterContext())) return false;
     for (const auto & b : captures) if (b.empty()) return false;
@@ -2271,7 +2275,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                     set.greedyStarts = !supported;
                     continue;
                 }
-                //  (Possessive captures in the lookahead, which tconv checks the
+                //  (Possessive captures in the lookahead, which xlit checks the
                 //  engine supports in their form.)
                 set.engineStarts = true;
             }
@@ -2438,7 +2442,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
     return plan;
 }
 
-StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
+static StringRuleOverlaps computeStringRuleOverlaps(const TransformStep & step) {
     StringRuleOverlaps result;
     const size_t n = step.stringRules.size();
     //  within[a][b]: rule b may match within the text of rule a.  Quick checks
@@ -2612,6 +2616,38 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
             }
         }
     }
+    return result;
+}
+
+//  The overlaps of the string rules of a group, cached: the analysis of a large
+//  group takes seconds, and a run makes it several times for the same rules (in
+//  planTransform, and in planDivCodeGroup for each mode and pipeline).  The
+//  analysis reads only the rule and the text of each string rule; the key is
+//  the rule's address (rules are never freed, so their addresses identify
+//  them) and the intervals of the sets of its text.
+StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
+    std::vector<uintptr_t> key;
+    for (const StringRule & r : step.stringRules) {
+        key.push_back(reinterpret_cast<uintptr_t>(r.rule));
+        key.push_back(r.text.size());
+        for (const UCD::UnicodeSet & t : r.text) {
+            key.push_back(t.size());
+            for (const auto & range : t) {
+                key.push_back(range.first);
+                key.push_back(range.second);
+            }
+        }
+    }
+    static std::mutex lock;
+    static std::map<std::vector<uintptr_t>, StringRuleOverlaps> cache;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        auto f = cache.find(key);
+        if (f != cache.end()) return f->second;
+    }
+    StringRuleOverlaps result = computeStringRuleOverlaps(step);
+    std::lock_guard<std::mutex> guard(lock);
+    cache.emplace(std::move(key), result);
     return result;
 }
 

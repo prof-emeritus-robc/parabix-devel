@@ -43,6 +43,10 @@ void PipelineCompiler::determineNumOfLinearStrides(KernelBuilder & b) {
 
     mHasZeroExtendedInput = nullptr;
 
+    if (mIsPartitionRoot) {
+        mPartitionExternalInputsClosed = partitionExternalInputsClosed(b);
+    }
+
     for (const auto input : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
         const BufferPort & port = mBufferGraph[input];
         if (port.canModifySegmentLength()) {
@@ -1135,6 +1139,35 @@ Value * PipelineCompiler::calculateTransferableItemCounts(KernelBuilder & b,
 #endif
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief partitionExternalInputsClosed
+ *
+ * Whether every input that a kernel of the current partition, other than its root, takes from another
+ * partition is closed (nullptr if there are none). The kernels of a partition terminate with its root:
+ * they share its termination signal, and a partition whose root has terminated is skipped. So the root's
+ * final invocation must wait for these inputs as well; otherwise a kernel of the partition fed by a
+ * partition that finishes later (e.g. one doing fewer strides per segment) never processes its final
+ * partial stride (issue #44).
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PipelineCompiler::partitionExternalInputsClosed(KernelBuilder & b) {
+    assert (mIsPartitionRoot);
+    const auto partitionId = KernelPartitionId[mKernelId];
+    const auto end = FirstKernelInPartition[partitionId + 1U];
+    Value * allClosed = nullptr;
+    for (auto kernel = mKernelId + 1U; kernel < end; ++kernel) {
+        for (const auto input : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+            const auto streamSet = source(input, mBufferGraph);
+            const BufferNode & bn = mBufferGraph[streamSet];
+            if (LLVM_UNLIKELY(bn.isConstant())) continue;
+            const auto producer = parent(streamSet, mBufferGraph);
+            if (producer != PipelineInput && KernelPartitionId[producer] == partitionId) continue;
+            Value * const closed = isClosed(b, streamSet);
+            allClosed = allClosed ? b.CreateAnd(allClosed, closed) : closed;
+        }
+    }
+    return allClosed;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief checkForSufficientInputData
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::checkForSufficientInputData(KernelBuilder & b, const BufferPort & port, const unsigned streamSet) {
@@ -1155,6 +1188,11 @@ void PipelineCompiler::checkForSufficientInputData(KernelBuilder & b, const Buff
     Value * const accessible = getAccessibleInputItems(b, port); assert (accessible);
 
     Value * closed = isClosed(b, streamSet); assert (closed->getType() == b.getInt1Ty());
+    // A root's input counts as closed only once the inputs that the other kernels of its partition
+    // take from other partitions are closed too (see partitionExternalInputsClosed).
+    if (mIsPartitionRoot && mPartitionExternalInputsClosed) {
+        closed = b.CreateAnd(closed, mPartitionExternalInputsClosed);
+    }
     Value * minimum = strideLength;
 
     Value * const required = addLookahead(b, port, minimum); assert (required);

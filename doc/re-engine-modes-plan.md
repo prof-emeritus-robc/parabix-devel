@@ -16,7 +16,7 @@ Revision 2 (after review of f10feda56):
   outside the engine's current capabilities is reported as an error, and later
   phases relax the preconditions;
 - **LDML conventions** (functions, `[$]` and the special treatment of `$`,
-  cursors, possessive contexts) are not Parabix RE semantics: tconv translates
+  cursors, possessive contexts) are not Parabix RE semantics: xlit translates
   them;
 - a section on **general lookahead by reversing match regions in place**,
   within a region limit, with characters the RE cannot match as barriers.
@@ -31,15 +31,15 @@ Give the regular expression engine (`RE_PipelineBuilder`,
 | **Search** (match ends) | a mark at (or `grepOffset` after) the last code unit of every match | `matchSearchPipeline` |
 | **Span** | the union of the positions of all nonempty matches | `matchSpanPipeline` |
 | **MatchStarts** *(new)* | a mark at the first position of every match | internal only: `matchStartPipeline`, used for lookahead externals |
-| **SearchAndReplace** *(new)* | the text with the matches of an unambiguous search pattern replaced by a replacement pattern (literals and capture references) | hand-built in tconv |
+| **SearchAndReplace** *(new)* | the text with the matches of an unambiguous search pattern replaced by a replacement pattern (literals and capture references) | hand-built in xlit |
 
 and classify every RE analysis and transformation by the mode(s), and the role
 (search pattern / replacement pattern), for which it is valid and useful, so that
 each mode runs exactly the passes that preserve what it computes, after checking
 the preconditions that make the RE implementable in that mode.
 
-tconv is the first client of both: its `RulePipelineBuilder::matchStarts` and
-`matchPattern` (`tools/ldml/tconv.cpp:4709-4767`) already emulate the two modes
+xlit is the first client of both: its `RulePipelineBuilder::matchStarts` and
+`matchPattern` (`tools/ldml/xlit.cpp:4709-4767`) already emulate the two modes
 with the existing ones, and its conversion groups are a search-and-replace
 engine specialised to LDML rules.
 
@@ -109,14 +109,14 @@ makes lookbehinds easy for the search mode makes lookaheads easy for the
 starts mode, and vice versa. The section on reversal below exploits this
 directly.
 
-### What tconv does with the engine
+### What xlit does with the engine
 
 - `matchStarts(before, after, text)`: compiles
   `(?<=before) (?= text after)` in search mode, i.e. a starts query disguised as
   a zero-width search.
 - `matchPattern(before, after, items, &spans)`: compiles
   `(?<=before) items (?=after)` in span mode, then shifts the ends back by
-  `grepOffset`; `MatchStartsFromEnds` (`tconv.cpp:837`) derives starts from spans
+  `grepOffset`; `MatchStartsFromEnds` (`xlit.cpp:837`) derives starts from spans
   and ends when no match can end within another (`endsUnique`).
 - Selection and replacement are its own kernels: `SelectStringMatches`,
   `MatchStartsByLength`, `LeftmostMatches` (sequential leftmost selection, a
@@ -171,7 +171,7 @@ Sufficient, checkable tests (precondition analyses, below):
   begins with characters outside X, as in chains).
 
 Phase 1 also requires **no overlap** (no match may begin strictly within
-another, `CC_Sequence_Search` / tconv's `RuleOverlapAnalysis::mayMatchWithin`),
+another, `CC_Sequence_Search` / xlit's `RuleOverlapAnalysis::mayMatchWithin`),
 so that every candidate is selected bit-parallel. Overlap is not an ambiguity
 (all conventions select from the left), only a capability: it is relaxed later
 by a sequential leftmost selection kernel.
@@ -194,7 +194,7 @@ counts would all have to be measured along `u8index`. They use:
 
 This is the existing `unicodeBasisOverride` (as grep's coloring sets it) plus
 forcing Unicode where a strategy needs it. In Unicode mode the S&R result is a
-U21 stream, converted to UTF-8 by the client (tconv already works in U21).
+U21 stream, converted to UTF-8 by the client (xlit already works in U21).
 Supporting the UTF-8 indexed mode is a later optimization.
 
 ### Preconditions per mode
@@ -212,7 +212,7 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE &);
 ```
 
 The pipeline methods treat any failure (printed with `Printer_RE`) as fatal;
-clients such as tconv call `checkPreconditions` themselves to choose another
+clients such as xlit call `checkPreconditions` themselves to choose another
 implementation or report the rule. The `report_fatal_error` calls of
 `compileExternal` and `matchStartPipeline` become assertions, unreachable once
 the preconditions hold. Each later phase that adds a capability relaxes the
@@ -232,18 +232,18 @@ Phase 1 preconditions:
 ### Standard Parabix RE semantics only
 
 The engine implements standard Parabix RE semantics. LDML transform
-conventions are translated by tconv into standard REs and standard engine
+conventions are translated by xlit into standard REs and standard engine
 calls, and are not engine features:
 
-| LDML convention | Translation in tconv |
+| LDML convention | Translation in xlit |
 |---|---|
 | contexts `before { text } after` | lookbehind / lookahead assertions (as `matchPattern` does now) |
 | possessive context matching (ICU) | standard possessive quantifiers (`ldml::possessiveContext`) |
-| `[$]` text boundary, `^` and `$` in contexts (`makeTextBoundary`, `resolveTextBoundary`) | standard `Start` / `End`, with the regions tconv supplies (whole text, or lines with `-lines`) |
-| functions `&Any-Hex($1)` | the engine delivers the capture's span; tconv applies the transform kernel to it |
-| cursor and revisit (`|`, `@`) | stays in tconv (it implies rescanning) |
-| insertion rules (`A { } C → S`, empty text) | stay in tconv: an empty match fails U2 |
-| deletion mark, filters, rule order | stay in tconv |
+| `[$]` text boundary, `^` and `$` in contexts (`makeTextBoundary`, `resolveTextBoundary`) | standard `Start` / `End`, with the regions xlit supplies (whole text, or lines with `-lines`) |
+| functions `&Any-Hex($1)` | the engine delivers the capture's span; xlit applies the transform kernel to it |
+| cursor and revisit (`|`, `@`) | stays in xlit (it implies rescanning) |
+| insertion rules (`A { } C → S`, empty text) | stay in xlit: an empty match fails U2 |
+| deletion mark, filters, rule order | stay in xlit |
 
 For functions, the S&R mode offers the streams of a capture's span (start,
 coverage, end) as an output, so that a client can transform captured text with
@@ -339,7 +339,7 @@ captures intact.
 | length analysis | `getLengthRange` with references sized by their captures: fixed ⇒ a per-match constant insertion/deletion count |
 | `toUTF8` of literals | in byte mode (UTF-8 output) |
 
-(Functions and cursors are LDML conventions, translated by tconv; see above.)
+(Functions and cursors are LDML conventions, translated by xlit; see above.)
 
 ## Design
 
@@ -397,7 +397,7 @@ alternative splitting, without `emptyMatchElimination`):
    milestone 2: it needs exact spans, which come only from named fixed spans,
    unique prefixes, length classes and chains, whose starts strategies 3–6
    compute directly (`chainSpans` itself computes the chain's starts).
-   `MatchStartsFromEnds` stays in tconv.
+   `MatchStartsFromEnds` stays in xlit.
 
 The precondition is that every alternative reaches one of 3–6; otherwise the
 RE is reported (later: region reversal, below).
@@ -422,7 +422,7 @@ semantics agree and the pipeline is:
 3. **Capture boundaries** for referenced captures (U3): for `A (B) C`, the
    start of `B` is `A`'s fixed distance from the start or the end of `A`'s
    maximal run; its end likewise from `C`'s side, back from the match end
-   (tconv's `CaptureWalk` handles fixed texts between captures). Output: the
+   (xlit's `CaptureWalk` handles fixed texts between captures). Output: the
    start, coverage and end streams of each referenced capture, also offered to
    clients (for LDML functions).
 4. **Replacement assembly**: deletion mask of the matched text not kept,
@@ -446,9 +446,9 @@ void searchReplacePipeline(const PreparedSearchReplace &, kernel::StreamSet * ou
 void captureSpans(const PreparedSearchReplace &, unsigned capture, kernel::StreamSet * startCoverEnd);
 ```
 
-The kernels that tconv already uses for this move from `tools/ldml/tconv.cpp`
+The kernels that xlit already uses for this move from `tools/ldml/xlit.cpp`
 to `lib/kernel/re/` (selection, capture walk) and `lib/kernel/streamutils/`
-(insertion counts, filling), with tconv calling them from there.
+(insertion counts, filling), with xlit calling them from there.
 
 ## General lookahead by region reversal
 
@@ -485,7 +485,7 @@ assertions) contains it: no match contains it, and an assertion that reaches it
 fails, as it does at the boundary of a region, where nothing is beyond. This
 holds unless the RE has `Start` or `End` anchors (in either direction, after
 reversal), which would match at the barriers: for such an RE, only the region
-follows are barriers. Without match regions (a text as one region, as in tconv
+follows are barriers. Without match regions (a text as one region, as in xlit
 without `-lines`), the barriers alone delimit the regions, and the end of the
 text ends the last one.
 
@@ -605,10 +605,10 @@ RE kernel.
 2. **MatchStarts public mode** with strategies 1, 3, 4 and 6 (chains, pulled
    forward), byte or full Unicode mode, its preconditions; tests.
 3. **Length-class starts** (strategy 5) and `removeNullableSuffix`. Done (see the status below).
-4. **tconv on MatchStarts**: replace `RulePipelineBuilder::matchStarts` (the
-   `(?<=B)(?=T A)` trick) and the starts half of `matchPattern`; tconv
+4. **xlit on MatchStarts**: replace `RulePipelineBuilder::matchStarts` (the
+   `(?<=B)(?=T A)` trick) and the starts half of `matchPattern`; xlit
    translates its contexts and boundaries to standard REs; compare outputs
-   on the CLDR test cases (`tconv_coverage.py`) — no change expected.
+   on the CLDR test cases (`xlit_coverage.py`) — no change expected.
 5. **Replacement patterns**: parser for `$n`/`${n}`/`${name}`/`\n`,
    validation, length analysis, literal folding. Done (see the status below).
 6. **S&R, literal replacements**: U1, U2, no overlap; precondition analyses
@@ -616,9 +616,9 @@ RE kernel.
    exercise it. Done, with overlapping matches that end together (see the status below).
 7. **S&R, captures**: U3 analysis, capture boundaries, `captureSpans`. Done,
    with captured text kept in place (see the status below).
-8. **tconv on S&R**: string rules and MultipleCaptureMultipleReplacement sets
-   through the engine, with functions applied by tconv to `captureSpans`;
-   tconv keeps rule ordering, filters, insertions, cursors and deferred rules.
+8. **xlit on S&R**: string rules and MultipleCaptureMultipleReplacement sets
+   through the engine, with functions applied by xlit to `captureSpans`;
+   xlit keeps rule ordering, filters, insertions, cursors and deferred rules.
    Done for the groups of a single rule (see the status below).
 9. **Region reversal**: the in-place reversal kernel, with the region limit
    (`--reverse-region-limit`) and barriers (characters the RE cannot match);
@@ -719,26 +719,26 @@ to clients, and the pipeline methods treat precondition failures as fatal.
 - `RulePipelineBuilder::matchStarts` computes the starts of
   `(?<=B) T A` (before context as a lookbehind, the text, the after context)
   with the MatchStarts mode, in place of the zero-width search for
-  `(?<=B)(?=T A)`. tconv checks the preconditions first and falls back to the
+  `(?<=B)(?=T A)`. xlit checks the preconditions first and falls back to the
   zero-width search if they fail; in the CLDR transforms (other than the Han
   transforms), the 149 uses in 68 transforms all use the engine.
 - The first positions of the string rules matched by the engine
   (`engineFirsts`) are their starts by `matchStarts`, rather than the ends
   shifted back by `grepOffset` and by the length; within a filter, the mask is
   checked at each character of a match by shifting it back.
-- `MatchStartsFromEnds` stays in tconv: it gives the first start of each run of
+- `MatchStartsFromEnds` stays in xlit: it gives the first start of each run of
   spans, not every start (the two differ where a match begins within another),
   and the spans that it uses are needed for coverage and selection anyway.
-- The contexts were already translated to standard REs by tconv's planning:
+- The contexts were already translated to standard REs by xlit's planning:
   `ldml::engineContext` drops the text boundary `[$]` where a character must
   be matched beyond it and turns a final negated set into a negative
   lookahead (or lookbehind), and `ldml::expandedContext` and
   `ldml::possessiveContext` give the sets and ICU's possessive matching. No
   further translation was needed.
 - Verification (build22, LLVM 22): the 285 CLDR transform test files (all but
-  the Han ones) through tconv before and after. Every file that ran before
+  the Han ones) through xlit before and after. Every file that ran before
   gives the same output. Four that crashed before in LLVM 22 code generation
-  (`computeKnownBits` stack overflow, which also affects tconv at 4f721235f)
+  (`computeKnownBits` stack overflow, which also affects xlit at 4f721235f)
   now run, as their kernels changed: am-fonipa-t-am, ar-t-am and fa-t-am pass
   all their cases; chr-t-am (am-chr) gives the same output as build18 (LLVM
   18), with the line breaks lost. 22 files still crash in LLVM 22 code
@@ -848,7 +848,7 @@ to clients, and the pipeline methods treat precondition failures as fatal.
 - Precondition: the references are in the order of their captures in the
   search pattern, each capture referred to once and not within another.
   Moving or copying captured text (`$2$1`, `$1$1`) is not yet supported (a
-  later capability; swaps could use region reversal, as tconv does).
+  later capability; swaps could use region reversal, as xlit does).
 - Mode: a replacement with references that are not folded selects full
   Unicode indexing (`prepareSearchReplace`), as the walks are over characters.
 - The search pattern is compiled without the captures that only the
@@ -879,24 +879,24 @@ to clients, and the pipeline methods treat precondition failures as fatal.
 - A conversion group of a single rule, a string rule or a
   MultipleCaptureMultipleReplacement rule referring to its captures in order
   (`T0 (B1) T1 ... (Bk) Tk → R0 $1 R1 ... $k Rk`), is applied by the search
-  and replace of the engine (`engineSearchReplace` in `tconv.cpp`) when its
-  preconditions hold, and no filter is in effect; otherwise by tconv's
+  and replace of the engine (`engineSearchReplace` in `xlit.cpp`) when its
+  preconditions hold, and no filter is in effect; otherwise by xlit's
   kernels, as before. The search pattern is the rule's text, its captures
   and its contexts as lookbehind and lookahead, with repetitions possessive
-  as for tconv's own engine matches (`ldml::possessiveContext`); the
+  as for xlit's own engine matches (`ldml::possessiveContext`); the
   replacement is built from the plan (`MultipleCaptureMultipleReplacementSet::
   results` now keeps R1 ... Rk). With no match ending within another, the
   engine's selection from the left is ICU's. A before context must match as
-  it does in the converted text (`convertedContextMatters`, as for tconv's
+  it does in the converted text (`convertedContextMatters`, as for xlit's
   capture sets), and rules with runs (`S+ → x`) or that may match within
-  their own text are left to tconv.
+  their own text are left to xlit.
 - `RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(sr, codeUnits)`: the
   result as the basis bits of the code units of the source (21 streams for
-  tconv's codepoints), from the same assembly as `searchReplacePipeline`
+  xlit's codepoints), from the same assembly as `searchReplacePipeline`
   (`replaceMatches`).
-- `tconv --plan` tells, for each group of a single rule, whether the engine
+- `xlit --plan` tells, for each group of a single rule, whether the engine
   applies it, or the engine's reason not to; `--disable-engine-search-replace`
-  keeps every group on tconv's kernels.
+  keeps every group on xlit's kernels.
 - In the CLDR transforms (other than the Han ones), 9 groups in 8 transforms are planned for
   the engine (cy-cy_FONIPA, my-my_FONIPA, ru-ja, si-si_FONIPA, si-si_Latn,
   ta-ta_FONIPA, vec-vec_FONIPA, byn_Latn-byn_Ethi/Xaleget). The test files
@@ -914,12 +914,12 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   a start and a follow is now within a capture if one is open before it
   (`captureCoverage`).
 - Not done (later work): groups of several rules (one replacement per
-  alternative, as tconv's rule order selects), filters (the matches within
+  alternative, as xlit's rule order selects), filters (the matches within
   the mask, e.g. as an external of the engine), functions applied to
-  `captureSpans`, and MultipleCaptureMultipleReplacement rules that tconv's
+  `captureSpans`, and MultipleCaptureMultipleReplacement rules that xlit's
   planner rejects but the engine could apply (a replaced text between
   captures of variable length: the planner would defer them to the engine).
-- Tests: `tconv_engine_test` (`QA/tconv_engine_test.py`, new: four rules
+- Tests: `xlit_engine_test` (`QA/xlit_engine_test.py`, new: four rules
   through the engine, compared with Python's `re.sub` and with
   `--disable-engine-search-replace`; 0.5 s with the object cache), and
   adjacent captures in `replace_test` and `capture_spans_test`.
@@ -952,7 +952,7 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   `reverse(R)` for the MatchEnds goal; otherwise the forward failures are
   reported, with the reason the reversal does not apply.
 - `RE_ModeOptions::reversal` (default true): whether the engine may match by
-  reversal (starts and lookaheads). tconv turns it off for all its uses of the
+  reversal (starts and lookaheads). xlit turns it off for all its uses of the
   engine (`engineOptions`: a text without `-lines` is one region of any
   length), so its outputs are unchanged.
 - General lookaheads by reversal, in every mode: a lookahead that no forward
@@ -1001,7 +1001,7 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   within the coverage), reversed back to the character before each
   boundary, and advanced by one in `CaptureBoundaries`. Only the streams the
   walk needs are reversed, not the basis. Allowed with
-  `RE_ModeOptions::reversal` (so not in tconv). Examples now supported:
+  `RE_ModeOptions::reversal` (so not in xlit). Examples now supported:
   `([a-z0-9]*[a-z])\d+;` with `<$1>`, `x[a-z0-9]*([a-z]\d+);`,
   `([a-z0-9]*[a-z])(\d+)-([a-z]+);` with `$1.$2.$3`. A run back that reaches
   the start of the match is not taken as maximal (the coverage of an

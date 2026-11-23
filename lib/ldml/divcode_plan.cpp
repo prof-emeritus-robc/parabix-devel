@@ -171,7 +171,7 @@ UCD::UnicodeSet DivCodePlan::pseudoTest(const UCD::UnicodeSet & set) const {
 //  propagate (see DivCodePlan::propagating).
 static void classifyConverted(DivCodePlan & plan) {
     auto sameItem = [](const DivContextItem & a, const DivContextItem & b) {
-        return a.kind == b.kind && a.set == b.set && a.negated == b.negated && a.runEnd == b.runEnd && a.external == b.external
+        return a.kind == b.kind && a.set == b.set && a.negated == b.negated && a.runEnd == b.runEnd && a.outside == b.outside && a.external == b.external
                && a.guardEnd == b.guardEnd && a.throughKind == b.throughKind && a.through == b.through;
     };
     auto sameContext = [&](const DivContext & a, const DivContext & b) {
@@ -271,6 +271,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     //  The stages of the string rules: one-way overlaps in an acyclic graph
     //  (see DivRule::stage); others are not eligible.
     std::vector<unsigned> stageOf(step.stringRules.size(), 1);
+    std::vector<std::vector<size_t>> stagePredecessors(step.stringRules.size());
     plan.stages = step.stringRules.empty() ? 0 : 1;
     if (step.stringRules.size() > 1) {
         const StringRuleOverlaps o = analyzeStringRuleOverlaps(step);
@@ -283,6 +284,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
                 problem("string rule overlaps, cyclic" + counts);
             } else {
                 plan.overlapPairs = o.oneWay;
+                stagePredecessors = o.predecessors;
                 for (size_t r : o.order) {
                     for (size_t q : o.predecessors[r]) stageOf[r] = std::max(stageOf[r], stageOf[q] + 1);
                     plan.stages = std::max(plan.stages, stageOf[r]);
@@ -302,9 +304,12 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     //  An item of a context: its set and whether it holds at the text boundary.
     auto classifyItem = [&](const UCD::UnicodeSet & set, bool boundary, bool before, DivContextItem & item) {
         item.runEnd = marksFilterRunEnd(set);
+        item.outside = marksFilterRunOutside(set);
+        if (item.outside && (before || boundary)) problem("before contexts of characters outside the filter");
+        const UCD::UnicodeSet chars = item.outside ? set - UCD::UnicodeSet(FilterRunOutsideMark) : set;
         //  With the text boundary: tested as the negation of the complement.
         item.negated = boundary;
-        item.set = boundary ? ~set : set;
+        item.set = boundary ? ~chars : chars;
         const size_t direct = blockCount(item.set, s), complement = blockCount(~item.set, s);
         if (std::min(direct, complement) <= options.maxSetBlocks) {
             //  A set given by its complement includes the characters of code 0,
@@ -325,7 +330,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
 
     //  A context, its items classified (the alphabet completed later).
     //  (converted: whether the before context is matched against the converted
-    //  text, in rounds; allowed only for single-character rules, phase 1.)
+    //  text; allowed only for single-character rules, phase 1.)
     auto classify = [&](RE * re, RE * engineBefore, bool before, DivContext & context, bool * converted = nullptr,
                         bool single = false) {
         std::vector<std::pair<UCD::UnicodeSet, bool>> items;
@@ -339,7 +344,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
         if (before) {
             if (!options.convertedBefore) {
                 problem("before contexts (no check of the converted text)");
-            } else if (options.convertedBefore(step, engineBefore) && options.convertedRounds > 0) {
+            } else if (options.convertedBefore(step, engineBefore) && options.convertedContexts) {
                 if (!single && !converted) {
                     problem("string rules with before contexts matched against the converted text");
                 } else if (items.size() > 1) {
@@ -991,6 +996,28 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     for (const Source & src : sources) {
         if (src.stringRule >= 0 && src.converted && src.family < 0) problem("string rules with before contexts matched against the converted text");
     }
+    //  A string rule whose before context is matched against the converted text
+    //  may begin at a later position of the text of a string rule (itself
+    //  included) where the overlaps (analyzeStringRuleOverlaps) have no such
+    //  pair: they exclude it where its before context cannot match there in the
+    //  text, but matched against the converted text it may, the rule containing it
+    //  having applied (x { bb → c ; aab → ; on xaabb, where ICU applies no rule
+    //  within aab).  Not eligible: the regular plan applies such matches only
+    //  outside the applied matches of the others.
+    for (const Source & src : sources) {
+        if (src.stringRule < 0 || !src.converted || src.text.empty()) continue;
+        const std::vector<size_t> & pre = stagePredecessors[static_cast<size_t>(src.stringRule)];
+        bool within = false;
+        for (const Source & other : sources) {
+            if (other.stringRule < 0 || std::find(pre.begin(), pre.end(), static_cast<size_t>(other.stringRule)) != pre.end()) continue;
+            for (size_t o = 1; o < other.text.size() && !within; o++) within = other.text[o].intersects(src.text.front());
+            if (within) break;
+        }
+        if (within) {
+            problem("a string rule with a before context matched against the converted text may begin within the text of a string rule");
+            break;
+        }
+    }
 
     //  The alphabet: the blocks of the texts, of the explicit context sets (or
     //  their complements), and of the characters of earlier single-character
@@ -1063,7 +1090,7 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     for (const std::string & k : plan.afterStreamKeys) content += "{" + k + "}";
     auto appendOne = [&](const DivContextItem & item) {
         content += "|" + std::to_string(static_cast<int>(item.kind)) + (item.negated ? "!" : "") + (item.guardEnd ? "g" : "")
-                   + (item.runEnd ? "r" : "");
+                   + (item.runEnd ? "r" : "") + (item.outside ? "o" : "");
         if (item.kind == DivContextItem::Kind::External) content += "e" + std::to_string(item.external);
         else if (item.kind == DivContextItem::Kind::Stream) content += "s" + std::to_string(item.external);
         else if (item.present()) appendSet(content, item.set);

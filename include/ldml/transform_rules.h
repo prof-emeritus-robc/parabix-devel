@@ -218,14 +218,21 @@ public:
     re::Name * getVariable() const {return mVariable;}
     std::string getName() const;
     re::RE * getDefinition() const;
-    static VariableDefinitionRule * Create(re::Name * variable) {
-        return new VariableDefinitionRule(variable);
+    //  Whether the definition is written as a UnicodeSet ($v = [b] ;), not as
+    //  text ($v = b ;).  The two differ within a UnicodeSet when the value is a
+    //  single character: there, as in ICU, a variable defined as a character is
+    //  that character, so [$u-$v] is a range of two such variables, and a
+    //  difference of two sets.
+    bool isSet() const {return mIsSet;}
+    static VariableDefinitionRule * Create(re::Name * variable, bool isSet = false) {
+        return new VariableDefinitionRule(variable, isSet);
     }
     LDML_RULE_SUBTYPE(VariableDefinition)
 private:
-    VariableDefinitionRule(re::Name * variable)
-    : Rule(ClassTypeId::VariableDefinition), mVariable(variable) {}
+    VariableDefinitionRule(re::Name * variable, bool isSet)
+    : Rule(ClassTypeId::VariableDefinition), mVariable(variable), mIsSet(isSet) {}
     re::Name * const mVariable;
+    const bool mIsSet;
 };
 
 VariableDefinitionRule * makeVariableDefinitionRule(const std::string & name, re::RE * definition);
@@ -515,7 +522,9 @@ std::vector<Rule *> MutuallyExclusivePartitioning(const std::vector<Rule *> & ru
 //  against the source side (the left side of forward rules).
 //
 //  Patterns are analyzed as regular expressions with Unicode properties
-//  resolved.  The analysis is conservative: as possessive quantification is
+//  resolved.  A set of an after context with FilterRunOutsideMark, which
+//  matches outside a global filter only, never matches where an item of a
+//  text to replace does (within a run of the filter).  The analysis is conservative: as possessive quantification is
 //  not modelled, rules may be reported as overlapping when they do not, but
 //  rules reported as not overlapping never match at the same position.
 class RuleOverlapAnalysis {
@@ -591,7 +600,18 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  and, for E1 = ab and L = a, a } [^b] → result, and for E = a } b* c and
 //  L = a, a } b* [^bc] → result; for E = c { a } b and L = a,
 //  a } [^b] → result ; [^c] { a } b → result.  The text boundary is a class of its own
-//  beyond the key (e.g. E = a } [b$] gives a } [^b$] → result).  Earlier
+//  beyond the key (e.g. E = a } [b$] gives a } [^b$] → result).  With a
+//  global filter and transform rules (as ICU applies the rules to each run
+//  of the filter's characters, see MoveTextAnchors), the text of a rule
+//  ends with the run but its after context does not: a negated set beyond
+//  L where the earlier rules still matching have no after contexts (E = abc
+//  and L = a: a } b [^c]) also matches at the end of a run (it is marked
+//  with FilterRunEndMark).  Likewise, where only such earlier rules continue
+//  on the characters C of an item of L's after context, L also matches C
+//  beyond the run, as its after context sees them there and the texts of
+//  the earlier rules end: E = ac and L = a } c (masked otherwise) give
+//  a } [c] → result with the set marked FilterRunOutsideMark (as for
+//  Hira-Latn's ビ } $small_y → b | '~' ; after ビュ → byu ;).  Earlier
 //  rules with items before the position contribute before contexts.  An L
 //  masked by its earlier rules is removed.
 //
@@ -893,6 +913,22 @@ constexpr UCD::codepoint_t FilterRunEndMark = 0xFDD2;
 //  set complemented, as [^c], contains both, and does not).
 inline bool marksFilterRunEnd(const UCD::UnicodeSet & set) {
     return set.contains(FilterRunEndMark) && !set.contains(FilterRunEndMark + 1);
+}
+//  In a set of an after context, its characters only at the positions outside
+//  the global filter (a noncharacter, not in the text): where the text of an
+//  earlier rule, ending with the run, fails, but an after context sees the
+//  character beyond the run (see DisambiguateOrder).  The pipeline gives the
+//  class of such a set its characters at the positions outside the filter's
+//  mask only (none without a mask).  The next noncharacter is absent from
+//  such a set (a complement, which contains both, has no mark).
+constexpr UCD::codepoint_t FilterRunOutsideMark = 0xFDD6;
+inline bool marksFilterRunOutside(const UCD::UnicodeSet & set) {
+    return set.contains(FilterRunOutsideMark) && !set.contains(FilterRunOutsideMark + 1);
+}
+inline UCD::UnicodeSet withFilterRunOutside(const UCD::UnicodeSet & set) {
+    UCD::UnicodeSet marked = set;
+    marked.insert(FilterRunOutsideMark);
+    return marked - UCD::UnicodeSet(FilterRunOutsideMark + 1);
 }
 //  In a set of the text or the after context of a rule of the group after
 //  prefix runs that only delete (see ComposeRevisits), a position that does
@@ -1208,6 +1244,87 @@ struct FunctionCallStats {
 };
 std::vector<Rule *> ExpandFunctionCalls(const std::vector<Rule *> & rules, const FunctionEvaluator & evaluate,
                                         FunctionCallStats * stats = nullptr);
+
+//  NFD preservation of a conversion group: whether the group's output is in
+//  NFD whenever its input is, by a conservative, rule-by-rule check.  The
+//  group is the forward conversion rules between two transform rules (as
+//  ExtractForwardRules or ExtractReverseBackwardRules gives them; other rules
+//  are ignored).  A text is in NFD when none of its characters has a
+//  canonical decomposition (NFD_QC=Y) and no mark follows a mark of a higher
+//  canonical combining class (ccc; a starter has ccc 0).  The check shows that
+//  each application of a rule keeps the whole text in NFD: the text L M R,
+//  with the match M, becomes L S R, with the result S.  Then:
+//  - The literal characters of S are NFD_QC=Y and in canonical order among
+//    themselves; a copy of a capture ($n) is a part of the text, in NFD, and
+//    begins and ends with characters the capture may begin and end with.  A
+//    function call (&T(...)) is not analysed: the group then fails the check
+//    (ExpandFunctionCalls may remove it first).
+//  - The character before S (the last of L) may be bounded: by the last item
+//    of the before context, when that item matches a character (not empty, not
+//    the text boundary); and, when every character with which M may begin is
+//    a mark, by the highest ccc among them, as L M is in NFD.  Likewise the
+//    character after S (the first of R): by the first item of the after
+//    context, or, when every character with which M may end is a mark, by the
+//    lowest ccc among them.
+//  - S begins with a starter or with marks of ccc at least that bound before
+//    it, and ends with a starter or with marks of ccc at most the bound after
+//    it.  Where S may be empty (a deletion), the bound before must not exceed
+//    the bound after, unless M consists of marks only (deleting marks from an
+//    ordered run leaves it ordered).
+//  The cursor and the revisiting of results do not matter: each application,
+//  revisits included, keeps the text in NFD.  Filters do not matter either:
+//  characters outside them are unchanged, and the bounds from the contexts
+//  hold whether or not the contexts see past the filter (a context item that
+//  matches a character matches the adjacent one).  A text boundary in a
+//  context gives no bound.  Is_NFD_Preserving returns false with the first
+//  rule that fails and the reason, in failure, if given.
+struct NFD_PreservationFailure {
+    const ConversionRule * rule = nullptr;
+    std::string reason;
+};
+bool Is_NFD_Preserving(const std::vector<Rule *> & group, NFD_PreservationFailure * failure = nullptr);
+
+//  The conversion groups of a list of forward rules (separated by the transform
+//  rules), in order, each as the list of its conversion rules.
+std::vector<std::vector<Rule *>> ConversionGroups(const std::vector<Rule *> & rules);
+
+//  The independent components of a conversion group (forward rules): a
+//  partition of its rules such that applying the components one after the
+//  other, each as a group of its own, in any order, gives what the group gives
+//  (the separate kernels of a group).  Conservatively, two rules are in
+//  the same component (transitively) where one may affect the other:
+//  - their texts share a character (their matches may overlap or begin at the
+//    same position, and are then selected together);
+//  - a context of one has a character of the text or of the result of the
+//    other (the other's application changes what the context sees, before or
+//    after it is applied; a context is matched against the converted text
+//    before the position and the text itself after it);
+//  - the text of one has a character of the result of the other (the result
+//    of one applied first could make a match of the other);
+//  - one may change the length of the text it replaces (a deletion, an
+//    insertion, a repetition, a copied capture: the characters on either side
+//    then become adjacent, or no longer), and the other has a context.
+//  The characters of a pattern are those of its sets (patternCharacters); a
+//  result with a function call may have any character.  Rules without a
+//  forward direction are left out.  Components are given by the indexes of
+//  their rules in the group, in the order of their first rules.
+std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *> & group);
+
+//  The conversion groups of more than minRules rules split by their independent
+//  components (IndependentComponents): the components with rules that have
+//  before contexts, then the others, as two groups separated by ":: Null ;",
+//  each with the rules in their order.  A group is split only if both parts
+//  have rules.  The variable definitions of a group are kept before both.  (The
+//  before contexts are matched against the converted text, which takes a
+//  kernel of the whole group, see xlit; split, the other components are
+//  applied apart, as simpler groups.)  With stats, the number of groups split
+//  and of their rules set apart.
+struct ComponentSplitStats {
+    size_t groups = 0;
+    size_t rulesSetApart = 0;
+};
+std::vector<Rule *> SplitIndependentComponents(const std::vector<Rule *> & rules, size_t minRules,
+                                               ComponentSplitStats * stats = nullptr);
 
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.

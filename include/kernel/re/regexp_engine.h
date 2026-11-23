@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <kernel/streamutils/position_map.h>
 #include <kernel/core/streamset.h>
 #include <map>
 #include <string>
@@ -103,6 +104,12 @@ struct RE_ModeOptions {
     // reversedStarts).  A client whose regions may exceed the region limit
     // (re::ReverseRegionLimit, a runtime error) turns it off.
     bool reversal = true;
+    // For the MatchSpans goal: whether spans may be partial where no span
+    // algorithm applies to an alternative of the RE (see checkPreconditions):
+    // the spans of the shortest matches ending at each end, which cover a
+    // part of a longer match (e.g. enough for coloring).  Without it, such an
+    // RE fails the preconditions of the goal.
+    bool partialSpans = false;
 };
 
 struct RE_Mode {
@@ -167,7 +174,7 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
 //
 // The plan of the engine for a prepared RE on a source of an encoding: how its
 // pipeline methods compile the RE for its goal, without building a pipeline,
-// for clients that need to know before they build one (e.g. tconv choosing
+// for clients that need to know before they build one (e.g. xlit choosing
 // between implementations, or reporting how a pattern is matched).
 //   - lengthAlphabet, codeUnitAlphabet: the alphabets as compiled (byte mode:
 //     UTF-8/UTF-8; UTF-8 indexed: Unicode lengths over UTF-8 code units;
@@ -175,12 +182,16 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
 //   - compiled: the RE after the mode passes, as compiled;
 //   - matchOffset: the marks of matchSearchPipeline are this many positions
 //     after the last position of each match (e.g. for a trailing lookahead
-//     not looked ahead by name): positions of code units, or, with Unicode
-//     indexing of a UTF-8 source (codeUnitAlphabet Unicode), of characters,
-//     which RE_PipelineBuilder::getU8Index maps to their last code units;
+//     not looked ahead by name): positions of code units in byte mode; of
+//     characters in the UTF-8 indexed mode (the marks at their last code
+//     units); or, with Unicode indexing of a UTF-8 source (codeUnitAlphabet
+//     Unicode), of characters, which RE_PipelineBuilder::getU8Index maps to
+//     their last code units;
 //   - startsByReversal: the starts of the matches found by reversal (the
 //     MatchStarts goal);
-//   - failures: the preconditions that do not hold (see checkPreconditions).
+//   - failures: the preconditions that do not hold (see checkPreconditions;
+//     for the MatchSpans goal, the alternatives with no span algorithm,
+//     unless RE_ModeOptions::partialSpans).
 //
 struct RE_Plan {
     const cc::Alphabet * lengthAlphabet = nullptr;
@@ -683,13 +694,16 @@ public:
     // The text with the matches replaced, as for searchReplacePipeline, but
     // as the basis bits of the code units of the source (codeUnits: 8 streams
     // for UTF-8, 21 for a source of Unicode codepoints, see RE_context).
-    // With masks (streams of the source, each of which must be 1 throughout
-    // every match replaced, e.g. the masks of filters the matches lie in),
-    // resultMasks: the masks at the positions of the result, 1 at the text
-    // the replacements insert, and otherwise the bit of the source position
-    // kept there.
+    // With positions, the changes from the positions of the source to those
+    // of the result are added to it (see kernel::PositionMap), by which the
+    // client keeps its other streams of the source in step: the position after
+    // the text if the engine extends it (outside the matches), the text the
+    // replacements insert (within the matches replaced: Inserted::In), and the
+    // positions deleted.  A stream of the client's that is 1 throughout every
+    // match replaced (as the mask of a filter the matches lie in) is 1 at the
+    // text inserted.
     void searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, kernel::StreamSet * codeUnits,
-                                        kernel::StreamSet * masks = nullptr, kernel::StreamSet * resultMasks = nullptr);
+                                        kernel::PositionMap * positions = nullptr);
 
     // The captures named (see re::capturesByName) in the matches replaced by
     // searchReplacePipeline, for clients that transform captured text
@@ -866,8 +880,7 @@ protected:
         kernel::StreamSet * replaced = nullptr;
     };
     ReplacedText replaceMatches(const PreparedSearchReplace & sr, bool follows, bool replaced,
-                                kernel::StreamSet * result, kernel::StreamSet * masks = nullptr,
-                                kernel::StreamSet * resultMasks = nullptr);
+                                kernel::StreamSet * result, kernel::PositionMap * positions = nullptr);
 
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);

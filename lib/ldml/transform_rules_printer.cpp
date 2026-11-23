@@ -363,7 +363,12 @@ std::string printRule(const Rule * rule) {
         }
     } else if (const VariableDefinitionRule * v = dyn_cast<VariableDefinitionRule>(rule)) {
         s = "$" + v->getName() + " =";
-        appendPart(s, printSequence(v->getDefinition()));
+        //  (A set of one character keeps its brackets: see VariableDefinitionRule::isSet.)
+        if (v->isSet() && isSingleCodepoint(v->getDefinition())) {
+            appendPart(s, printSet(v->getDefinition()));
+        } else {
+            appendPart(s, printSequence(v->getDefinition()));
+        }
     } else if (const ConversionRule * c = dyn_cast<ConversionRule>(rule)) {
         s = printRuleSide(c->getLeftSide());
         switch (c->getDirection()) {

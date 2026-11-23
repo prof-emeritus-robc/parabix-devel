@@ -665,7 +665,10 @@ NFA emptyNFA() {
 
 class Disambiguator {
 public:
-    Disambiguator(DisambiguationStats & stats) : mStats(stats) {}
+    //  runs: the rules apply to each run of the characters of a global filter
+    //  (a filter with transform rules, as ldml::MoveTextAnchors), where the
+    //  texts of the rules end with the run, but their after contexts do not.
+    Disambiguator(DisambiguationStats & stats, bool runs) : mStats(stats), mRuns(runs) {}
 
     // Whether rule L is replaced (by the pieces, possibly none if L is
     // masked by its earlier rules), given its earlier overlapping rules.
@@ -784,8 +787,9 @@ private:
         return distinct.size() == 1 ? distinct[0] : makeAlt(distinct.begin(), distinct.end());
     }
     // A negated set, which also matches the text boundary (Start or End for a
-    // before or after context) unless boundary is nullptr.
-    RE * negated(const std::vector<RE *> & sets, RE * boundary) {
+    // before or after context) unless boundary is nullptr, and, if runEnd,
+    // the end of a filtered run (see FilterRunEndMark).
+    RE * negated(const std::vector<RE *> & sets, RE * boundary, bool runEnd = false) {
         // (Of the characters of the sets: their strings begin with them.)
         std::vector<RE *> chars;
         for (RE * set : sets) {
@@ -793,6 +797,9 @@ private:
             collectSetStrings(set, strings);
             chars.push_back(strings.empty() ? set : charPart(set, mAnalysis.setOf(set, false)));
         }
+        //  (A set with FilterRunEndMark but not the next noncharacter marks the
+        //  run end: see marksFilterRunEnd.)
+        if (runEnd) chars.push_back(makeCC(FilterRunEndMark + 1));
         RE * complement = makeDiff(makeAny(), unionOf(chars));
         return boundary ? makeAlt({complement, boundary}) : complement;
     }
@@ -820,6 +827,7 @@ private:
     bool exploreSides(const std::vector<Earlier> & rules, std::vector<std::pair<Found, Found>> & sides);
 
     DisambiguationStats & mStats;
+    const bool mRuns;
     std::vector<const ConversionRule *> mPrioritized;
     CharSetAnalysis mAnalysis;
     RuleOverlapAnalysis mOverlaps;
@@ -1574,6 +1582,12 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
     std::vector<Step> steps;
     std::vector<std::set<State>> nexts;
     std::vector<LState> lNexts;
+    //  At the end of a filtered run (see mRuns), the texts of the earlier rules
+    //  end, but L's after context sees the character beyond the run: where
+    //  only earlier rules without after contexts continue on the characters of
+    //  an item of L's after context, L also matches them outside the filter
+    //  (FilterRunOutsideMark), and its following items as they are.
+    std::vector<std::pair<Step, LState>> outside;
 
     for (const UCD::UnicodeSet & part : parts) {
         int item = -1;
@@ -1594,9 +1608,11 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         };
         const auto lMarks = item >= 0 ? marks(lItems[item].set) : std::make_pair(false, false);
         std::set<State> next;
+        bool keysOnly = mRuns && after && item >= static_cast<int>(mKeyLength) && !lMarks.first && !lMarks.second;
         for (const State & s : active) {
             for (const NFA::Edge & e : automaton(rules[s.first], after).out[s.second]) {
                 if (e.kind != NFA::Kind::Chars || !e.chars.intersects(part)) continue;
+                keysOnly &= !rules[s.first].rule->getLeftSide()->hasAfterContext() && !marks(e.set).first;
                 next.insert(State{s.first, e.to});
                 const auto eMarks = marks(e.set);
                 if (lMarks.second || eMarks.second || (item >= 0 && eMarks.first && !lMarks.first)) {
@@ -1607,6 +1623,7 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         }
         closure(rules, after, next);
         if (lMarks.first && !marks(cls).first) cls = makeCC(withDeletedRunBlock(part));
+        if (keysOnly && !next.empty()) outside.emplace_back(Step{makeCC(withFilterRunOutside(part)), item}, lNext);
         steps.push_back(Step{cls, item});
         nexts.push_back(next);
         lNexts.push_back(lNext);
@@ -1709,7 +1726,16 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         }
         std::vector<Step> p = path;
         RE * const boundary = after ? static_cast<RE *>(makeEnd()) : static_cast<RE *>(makeStart());
-        p.push_back(Step{negated(excluded, boundaryFails ? boundary : nullptr), -1});
+        //  At the end of a filtered run, the texts of the earlier rules end:
+        //  those without after contexts fail there, as they do at the end of the
+        //  text (and L, beyond its items, applies).  (An after context sees
+        //  beyond the run, so that the set does not match there if an earlier
+        //  rule with an after context may still match.)
+        const bool runEnd = mRuns && after && boundaryFails && candidates.empty()
+                            && std::all_of(active.begin(), active.end(), [&](const State & s) {
+                                   return !rules[s.first].rule->getLeftSide()->hasAfterContext();
+                               });
+        p.push_back(Step{negated(excluded, boundaryFails ? boundary : nullptr, runEnd), -1});
         out.push_back(Found{p, pending, done});
     }
     // The text boundary: matched by a boundary item of L, or beyond L.
@@ -1728,6 +1754,11 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         std::vector<Step> p = path;
         p.push_back(steps[i]);
         if (!explore(rules, after, nexts[i], lNexts[i], p, pending, false, seen, out)) return false;
+    }
+    for (const auto & o : outside) {
+        std::vector<Step> p = path;
+        p.push_back(o.first);
+        if (!explore(rules, after, {}, o.second, p, pending, false, seen, out)) return false;
     }
     return true;
 }
@@ -1947,8 +1978,20 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     pieces.erase(std::remove_if(pieces.begin(), pieces.end(), [&](Rule * piece) {
         return !printed.insert(printRule(piece)).second;
     }), pieces.end());
-    // Verify that no piece overlaps a resolved rule.
+    // Verify that no piece overlaps a resolved rule.  (A piece matching outside
+    // the filter, FilterRunOutsideMark, overlaps the rules whose texts end with
+    // the run, as their characters, but not where it matches.)
+    auto outsideFilter = [&](const ConversionRule * r) {
+        const RE * const ctx = r->getLeftSide()->getAfterContext();
+        if (ctx == nullptr) return false;
+        std::vector<const RE *> items;
+        if (const Seq * seq = dyn_cast<Seq>(ctx)) items.assign(seq->begin(), seq->end()); else items.push_back(ctx);
+        return std::any_of(items.begin(), items.end(), [&](const RE * item) {
+            return CharSetAnalysis::isSet(item) && marksFilterRunOutside(mAnalysis.setOf(const_cast<RE *>(item), false));
+        });
+    };
     for (Rule * piece : pieces) {
+        if (outsideFilter(cast<ConversionRule>(piece))) continue;
         for (const Earlier & e : rules) {
             const ConversionRule * r = cast<ConversionRule>(piece);
             if (e.possessive || possessiveL ? mayOverlapPossessive(e, r) : mOverlaps.mayOverlap(e.rule, r)) {
@@ -2101,7 +2144,6 @@ std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r, std::ve
     std::vector<Leaf> before, following;
     if (!collect(src->getBeforeContext(), false, before)) return {};
     if (!collect(src->getText(), true, following)) return {};
-    const size_t keyLeaves = following.size();
     if (!collect(src->getAfterContext(), false, following)) return {};
     bool any = false;
     size_t combinations = 1;
@@ -2288,7 +2330,13 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
     for (const RuleOverlap & o : overlaps) {
         earlierOf[o.later].push_back(cast<ConversionRule>(rules[o.earlier]));
     }
-    Disambiguator d(s);
+    //  (Runs as ldml::MoveTextAnchors finds them.)
+    bool filter = false, transforms = false;
+    for (const Rule * r : rules) {
+        if (const FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse()) filter = true;
+        transforms |= isa<TransformRule>(r);
+    }
+    Disambiguator d(s, filter && transforms);
     AlternativeSplitter splitter;
     RuleOverlapAnalysis analysis;
     std::vector<Rule *> result;

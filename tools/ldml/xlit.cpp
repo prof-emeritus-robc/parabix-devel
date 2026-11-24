@@ -160,7 +160,8 @@ static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known 
 static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::desc("Before contexts that the conversions of a group may change: matched against the converted text (resolved by "
              "the correction kernel's While loop, exact at any chain length) if nonzero, against the text itself if 0.  Also "
-             "the rounds of the staged sequential selection of string rules with runs (exact for chains of up to this many)"),
+             "the rounds of the staged sequential selection (groups over --whole-group-rules, runs of sets with strings; exact for "
+             "chains of up to this many)"),
     cl::init(8), cl::cat(XlitOptions));
 static cl::opt<bool> SequentialWhile("sequential-while",
     cl::desc("Select the string matches of a whole group selected sequentially (two-way or cyclic overlaps) in the correction "
@@ -5249,9 +5250,11 @@ struct FusedSubgroupPlan {
 //  loop decides each match at its first position: from its before context, if
 //  converted, as it decides a subgroup's, and from the matches decided in the
 //  loop that may cover that position (see loopCoverers).  Each must have
-//  a fixed string as its result at each position of its text (no run; a
-//  character kept is the position's own, one deleted has none), and there are
-//  no insertion rules.
+//  a fixed string as its result at each position of its text (a character
+//  kept is the position's own, one deleted has none), and there are no
+//  insertion rules.  A run of a set (with sequential selection only) is
+//  deleted: its positions after the text of a match applied are covered by
+//  that match, with an empty result.
 //  Whether a match of rule r may begin at offset o of a match of rule p.
 static bool mayBeginWithin(const FusedRulesConfig & c, size_t r, size_t p, unsigned o) {
     if (o == 0 || o >= c.strings[p].text.size()) return false;
@@ -5294,7 +5297,9 @@ static bool loopStringResolvable(const FusedRulesConfig & c, size_t r, std::stri
     };
     if (!c.insertions.empty()) return no("insertion rules in its group");
     if (!s.runStrings.empty()) return no("a run of a set with strings");
-    if (!s.run.empty()) return no("a run");
+    //  (A run of a set: its positions a cover of their own, see FusedRules; the
+    //  rules with runs are selected sequentially.)
+    if (!s.run.empty() && !c.sequential) return no("a run outside sequential selection");
     if (s.keep >= 0) return no("a kept character with a replacement around it");
     if (s.converted && s.match >= 0) return no("a before context matched by the engine");
     //  (A character kept, or deleted: at a position of the text, the first of its
@@ -7042,6 +7047,17 @@ void FusedRules::generatePabloMethod() {
                 PabloAST * notCand;
                 Var * T = nullptr;          // of a match known to apply (offset > 0, accumulated)
                 Var * F = nullptr;          // of a candidate known not to
+                //  The run of the rule (offset: the length of its text; result empty):
+                //  cand, the positions of the runs following the texts of its
+                //  candidates; T, of those of the matches known to apply; F, the
+                //  positions of runs known clear (none of these candidates may apply).
+                //  runChars, the positions of the characters of the run (within the
+                //  mask); passStatic, those not after the text of a candidate;
+                //  notRunBefore, those after a position not of the run.
+                bool run = false;
+                PabloAST * runChars = nullptr;
+                PabloAST * passStatic = nullptr;
+                PabloAST * notRunBefore = nullptr;
             };
             std::vector<StringCover> covers;
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
@@ -7069,6 +7085,24 @@ void FusedRules::generatePabloMethod() {
                         sc.T = pb.createVar("ST" + suffix, zeroes);
                         sc.F = pb.createVar("SF" + suffix, zeroes);
                     }
+                    dep = pb.createOr(dep, sc.cand);
+                    coversOf[r].push_back(covers.size());
+                    covers.push_back(std::move(sc));
+                }
+                if (!rule.run.empty()) {
+                    StringCover sc;
+                    sc.rule = r;
+                    sc.offset = n;
+                    sc.run = true;
+                    sc.runChars = classAt(0, rule.run);
+                    if (mask) sc.runChars = pb.createAnd(sc.runChars, mask);
+                    sc.cand = runTail(rule, n > 1 ? pb.createAdvance(candS[r], n - 1) : candS[r]);
+                    sc.notCand = pb.createNot(sc.cand);
+                    sc.passStatic = pb.createAnd(sc.runChars, pb.createNot(pb.createAdvance(candS[r], n)));
+                    sc.notRunBefore = pb.createNot(pb.createAdvance(sc.runChars, 1));
+                    const std::string suffix = std::to_string(r);
+                    sc.T = pb.createVar("RT" + suffix, zeroes);
+                    sc.F = pb.createVar("RF" + suffix, zeroes);
                     dep = pb.createOr(dep, sc.cand);
                     coversOf[r].push_back(covers.size());
                     covers.push_back(std::move(sc));
@@ -7361,7 +7395,8 @@ void FusedRules::generatePabloMethod() {
                     for (size_t p : convStrings) {
                         for (size_t k : coversOf[p]) {
                             const StringCover & sc = covers[k];
-                            if (!mayBeginWithin(mConfig, r, p, sc.offset)) continue;
+                            if (sc.run ? !mConfig.strings[r].text.front().intersects(mConfig.strings[p].run)
+                                       : !mayBeginWithin(mConfig, r, p, sc.offset)) continue;
                             if (p < r) {
                                 within = wb.createOr(within, covT[k]);
                                 notWithin = wb.createAnd(notWithin, covF[k]);
@@ -7385,6 +7420,33 @@ void FusedRules::generatePabloMethod() {
                         if (sc.offset == 0) {
                             covT[k] = t;
                             covF[k] = wb.createOr(sc.notCand, f);
+                            continue;
+                        }
+                        if (sc.run) {
+                            //  Covered: the run after the text of a match known to apply.
+                            //  Known clear: a position of the run after one not the end
+                            //  of a candidate that may apply, and either not of the run
+                            //  or itself known clear.  Both are carried from the positions
+                            //  already known (T, F) as well as from their seeds: the
+                            //  carries of the previous block reach the first iteration
+                            //  only, so a run continued from the previous block is
+                            //  continued from what the earlier iterations found.
+                            const unsigned n = sc.offset;
+                            PabloAST * const ends = n > 1 ? wb.createAdvance(t, n - 1) : t;
+                            PabloAST * const tail = wb.createMatchStar(wb.createOr(wb.createAdvance(ends, 1), sc.T), sc.runChars);
+                            PabloAST * const rt = wb.createOr(sc.T, wb.createAnd(tail, sc.runChars));
+                            //  (The positions known clear pass: at the first position of a
+                            //  block, the Advance gives the previous block's only in the
+                            //  first iteration.)
+                            PabloAST * const pass = wb.createOr(wb.createOr(sc.passStatic, sc.F),
+                                                                wb.createAnd(sc.runChars, wb.createAdvance(f, n)));
+                            PabloAST * const seeds = wb.createOr(wb.createAnd(pass, sc.notRunBefore), sc.F);
+                            PabloAST * const clear = wb.createAnd(wb.createMatchStar(seeds, pass), pass);
+                            PabloAST * const rf = wb.createOr(sc.F, clear);
+                            wb.createAssign(sc.T, rt);
+                            wb.createAssign(sc.F, rf);
+                            covT[k] = rt;
+                            covF[k] = wb.createOr(sc.notCand, rf);
                             continue;
                         }
                         PabloAST * const st = wb.createOr(sc.T, wb.createAdvance(t, sc.offset));
@@ -7662,9 +7724,7 @@ void FusedRules::generatePabloMethod() {
             PabloAST * stringsWithin = zeroes;
             for (size_t r : convStrings) {
                 firstOf[r] = DT[r];
-                for (unsigned o = 1; o < mConfig.strings[r].text.size(); o++) {
-                    stringsWithin = pb.createOr(stringsWithin, pb.createAdvance(firstOf[r], o));
-                }
+                stringsWithin = pb.createOr(stringsWithin, withinMatches(r, firstOf[r]));
             }
             if (mConfig.groupCoverage && stringsWithin != zeroes) {
                 PabloAST * const uncovered = pb.createNot(stringsWithin);

@@ -10,7 +10,9 @@
 #  rounds of matching, LeftmostMatches and applying kernels.  The loop is exact
 #  at any chain length: chains of conversions longer than the rounds, also
 #  across blocks.  The expected results are ICU's (createFromRules, each line
-#  a text).  With --sequential-while=0 the chains of 9 or more fail.
+#  a text; those with runs also ICU4J's).  With --sequential-while=0 the
+#  chains of 9 or more fail.  String rules with runs (of a set) are decided in
+#  the loop as well (doc/round-replacement.md, remaining rounds, step 2).
 #
 #  xlit_sequential_while_test.py <xlit binary> [--extended-testing]
 
@@ -40,6 +42,33 @@ GROUPS = [
       ("x" + "st" * 11 + "rpq", "a" + "T" * 11 + "Rq"),
       ("rpqx" + "st" * 10 + "pq", "Rqa" + "T" * 10 + "P"),
       ("x" + "st" * 700 + "pqr", "a" + "T" * 700 + "Pr")]),
+    # A string rule with a run (bc+: the run of c deleted), decided in the loop
+    # with a converted context, and a rule beginning within its run (cd).
+    ("x \u2192 a ;\n[aQ] { bc+ \u2192 Q ;\ncd \u2192 R ;\n",
+     [("xbccd", "aQd"),
+      ("ybccd", "ybcR"),
+      ("x" + "bc" * 12, "a" + "Q" * 12),
+      ("x" + "bc" * 12 + "cd", "a" + "Q" * 12 + "d"),
+      ("y" + "bc" * 3 + "cd", "ybcbcbcR"),
+      ("x" + "bc" * 11 + "bd", "a" + "Q" * 11 + "bd"),
+      ("xb" + "c" * 3000 + "d", "aQd"),
+      ("yb" + "c" * 3000 + "d", "yb" + "c" * 2999 + "R"),
+      ("x" + "bcc" * 700 + "cd", "a" + "Q" * 700 + "d")]),
+    # A run over the rule's own first set (s+), its candidates within its own
+    # runs, and a rule beginning within them (st), also where the run crosses
+    # a block boundary: the positions known clear of the runs are carried
+    # into the next block.
+    ("x \u2192 a ;\n[aS] { s+ \u2192 S ;\nst \u2192 T ;\nt \u2192 ;\n",
+     [("xssss", "aS"),
+      ("ysss", "ysss"),
+      ("x" + "sst" * 12, "a" + "S" * 12),
+      ("y" + "sst" * 3, "ysTsTsT"),
+      ("x" + "st" * 12 + "s", "a" + "S" * 13),
+      ("x" + "s" * 3000 + "t" + "s" * 5, "aSS"),
+      ("y" + "s" * 3000 + "t" + "s" * 5, "y" + "s" * 2999 + "T" + "s" * 5),
+      ("x" + "sst" * 700 + "st", "a" + "S" * 701),
+      ("yt" + "st" * 11, "y" + "T" * 11)]
+     + [("y" + "s" * n + "t", "y" + "s" * (n - 1) + "T") for n in (126, 127, 128, 129, 130, 255, 256, 257)]),
 ]
 
 CONFIGS = [[], ["-thread-num=4", "-segment-size=1"]] + ([["-thread-num=1"]] if EXTENDED else [])

@@ -5286,15 +5286,24 @@ static std::vector<bool> loopStringRules(const FusedRulesConfig & c) {
     return d;
 }
 
-static bool loopStringResolvable(const FusedRulesConfig & c, size_t r) {
+static bool loopStringResolvable(const FusedRulesConfig & c, size_t r, std::string * why = nullptr) {
     const FusedStringRule & s = c.strings[r];
-    if (!c.insertions.empty() || !s.run.empty() || !s.runStrings.empty() || s.keep >= 0) return false;
-    if (s.converted && s.match >= 0) return false;
+    auto no = [&](const char * reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    if (!c.insertions.empty()) return no("insertion rules in its group");
+    if (!s.runStrings.empty()) return no("a run of a set with strings");
+    if (!s.run.empty()) return no("a run");
+    if (s.keep >= 0) return no("a kept character with a replacement around it");
+    if (s.converted && s.match >= 0) return no("a before context matched by the engine");
     //  (A character kept, or deleted: at a position of the text, the first of its
     //  result.)
     for (size_t j = 0; j < s.replacement.size(); j++) {
         const char32_t ch = s.replacement[j];
-        if ((ch == ldml::StringRuleDeleted || ch == ldml::StringRuleKept) && j >= s.text.size()) return false;
+        if ((ch == ldml::StringRuleDeleted || ch == ldml::StringRuleKept) && j >= s.text.size()) {
+            return no("a kept or deleted character beyond its text");
+        }
     }
     return true;
 }
@@ -5322,9 +5331,12 @@ static bool resolvableByWhile(const FusedRulesConfig & c, std::string * why = nu
     const std::vector<bool> loop = loopStringRules(c);
     for (size_t r = 0; r < c.strings.size(); r++) {
         if (!loop[r]) continue;
-        if (!loopStringResolvable(c, r)) {
-            return no("a string rule decided in the loop with a run, a kept capture, a match by the engine, a kept or "
-                      "deleted character beyond its text, or insertion rules in its group");
+        std::string reason;
+        if (!loopStringResolvable(c, r, &reason)) {
+            size_t count = 0;
+            for (size_t q = 0; q < c.strings.size(); q++) count += loop[q] && !loopStringResolvable(c, q);
+            return no("string rule " + std::to_string(r) + " decided in the loop: " + reason + " (" + std::to_string(count)
+                      + " of " + std::to_string(c.strings.size()) + " such rules)");
         }
         if (c.strings[r].converted && !starsOk(c.strings[r].before)) return no("a string rule with " + stars);
         any = true;
@@ -5965,7 +5977,7 @@ private:
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
             if (c.staged) s += "T";
-            if (c.resolve) s += "W";
+            if (c.resolve) s += "W2";
             if (c.sequential) s += "Q";
             for (const FusedRulesConfig::Selection & sel : c.selection) {
                 s += "/" + std::to_string(sel.length) + (sel.selfOverlapping ? "s" : "");
@@ -6987,9 +6999,16 @@ void FusedRules::generatePabloMethod() {
             //  string rule decided in the loop the first positions of its matches
             //  without its before context (if converted) and its selection by the
             //  rules decided in the loop.
+            //
+            //  Two passes of settle: the first selects the static matches; the
+            //  second drops those beginning within an applied static match
+            //  (appliedWithin, from the first).  A further pass changes nothing:
+            //  firstOf only shrinks, a match dropped drops no other one (the
+            //  positions within applied matches only shrink as well), and the
+            //  selection of matches already selected keeps them.
             const size_t numGroups = mConfig.subgroups.size();
             resolvingStrings = true;
-            for (unsigned round = 0; round <= mConfig.rounds; round++) {
+            for (unsigned pass = 0; pass < 2; pass++) {
                 for (size_t g = 0; g < numGroups; g++) {
                     if (mConfig.subgroups[g].converted) atOf[g] = ats[g];
                 }
@@ -9625,6 +9644,10 @@ public:
         size_t kernels;
     };
     const std::vector<GroupCount> & groupCounts() const {return mGroupCounts;}
+    //  The groups (of the transform and those it invokes) whose string matches are
+    //  selected sequentially in staged rounds, not in the correction kernel's While
+    //  loop: their kernel labels and why (see --kernel-counts).
+    const std::vector<std::pair<std::string, std::string>> & stagedGroups() const {return mStagedGroups;}
     //  Mixed modes (see UTF8PipelineBuilder::unicodeSegment): the steps of a
     //  segment of a transform (a plan of those steps), or a whole transform,
     //  applied in Unicode mode with the masks given (converted from UTF-8
@@ -9871,6 +9894,7 @@ private:
     bool mInvokedWithFilter = false;
     unsigned mDepth = 0;
     std::vector<GroupCount> mGroupCounts;
+    std::vector<std::pair<std::string, std::string>> mStagedGroups;
     bool mOmitICUBuiltIns = false;
     //  The transform being applied, and its conversion group being applied
     //  (numbered from 1, as by --divcode-report), for the names of kernels.
@@ -12394,15 +12418,21 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         bool sequentialLoop = false;
         //  (Not a group with more string rules than --whole-group-rules, in the
         //  chunked staged rounds.)
+        std::string stagedWhy;
         if (step.sequentialSelection && SequentialWhile && numStringRules <= FusedMaxWholeGroupRules) {
             FusedRulesConfig trial = config;
             trial.selection.clear();
             trial.sequential = true;
-            sequentialLoop = resolvableByWhile(trial);
+            sequentialLoop = resolvableByWhile(trial, &stagedWhy);
             if (sequentialLoop) {
                 config.selection.clear();
                 config.sequential = true;
             }
+        } else if (step.sequentialSelection) {
+            stagedWhy = SequentialWhile ? "more string rules than --whole-group-rules" : "--sequential-while=0";
+        }
+        if (step.sequentialSelection && !sequentialLoop) {
+            mStagedGroups.emplace_back(mGroupLabel, (chunkedStaged(step) ? "chunked: " : "") + stagedWhy);
         }
         if (step.sequentialSelection && !sequentialLoop && chunkedStaged(step)) {
             //  The staged rounds below, in chunks (see StagedChunkRules).  The matches
@@ -15575,6 +15605,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     }
     toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                  << total << " kernels\n";
+    for (const auto & g : builder.stagedGroups()) toolio::out() << "staged rounds: " << g.first << ": " << g.second << "\n";
     return 0;
 }
 

@@ -442,6 +442,64 @@ its own.
   *Fixed locally* (2026-11-21, `2cc3c72b9`): the two expected results in
   `third_party/cldr` no longer end with a space.
 
+- **Greek-Latin's breathing rules (Latin→Greek) revisit captures of
+  variable length; a restatement without them (a possible submission,
+  2026-11-24).** The backward direction (Latn-Grek) writes the rough breathing
+  with 24 rules of the form `| $1 $rough ← h ($evowel $macron? $ddot? …)` (and
+  `H`, and titlecase forms `| A $1 $rough ← H a (…)`), and the smooth
+  breathing with 3 of the form `| $1 $smooth ← $notLetter { ($evowel $macron?
+  $evowel2 $macron?) } [^$smooth$rough]`. Each revisits its capture, a vowel
+  cluster of one to five characters, so that the rest of the rules then convert
+  it. What they do is a reordering: the rough breathing that `$rough ↔ h`
+  writes in place of the `h` is moved after the cluster, and the smooth
+  breathing is written after a cluster at the start of a word. Revisits of
+  variable-length captures are hard for implementations other than ICU's
+  (xlit's planner could not implement Latn-Grek because of exactly these 27
+  rules), and they make the order of the rules subtle: an `h` taken by a
+  digraph (`th`, `ph`, `rh`, `ch`) is never reached; `j`, `v`, `w` revisit to
+  vowels that the smooth breathing and the iota subscript rules then match
+  (`w̄i → ῡͅ`); a smooth breathing is written within a rough cluster with a
+  diaeresis at the start of a word (`hë → ἐ̈̔`) but not after a letter
+  (`ahë → ἀε̈̔`).
+
+  The same results come from rules without revisits, in groups of their own
+  before the conversions (Latin→Greek order, as `ldml_trules --backward`
+  prints the backward rules; xlit's `tools/ldml/prototypes/Latn-Grek-breathing.txt`
+  is the whole transform so restated):
+
+  ```
+  :: NFD ;
+  ([$evowel jJvwVW] $macron $accentMinus*) i → | $1 $iotasub ;     # (and I)
+  :: Null ;
+  ph → ph ;  th → th ;  rh → rh ;  ch → ch ;  …                     # the digraphs taking an h
+  h ($evowel $macron $ddot? $evowel2_i $macron?) → \uE000 $1 $rough ;
+  h ($evowel $ddot? $evowel2 $macron?) → \uE000 $1 $rough ;
+  h ($evowel $macron? $ddot?) → \uE000 $1 $rough ;
+  …                                                                # H, and the titlecase forms → \uE001 A $1 $rough
+  :: Null ;
+  $nlm = [^[:l:][:m:]\uE000\uE001] ;
+  $nlm [\uE000\uE001]? { ([Rr]) } [^$smooth$rough Hh\uE000\uE001] → $1 $smooth ;
+  $nlm [\uE000\uE001]? [$evowel jJ] $macron? $evowel2 { $macron } [^$smooth$rough] → $macron $smooth ;
+  $nlm [\uE000\uE001]? [$evowel jJ] $macron? { ($evowel2) } [^$macron$smooth$rough] → $1 $smooth ;
+  $nlm [\uE000\uE001]? [$evowel jJ] { $macron } [^$evowel2$smooth$rough] → $macron $smooth ;
+  $nlm [\uE000\uE001]? { ([$evowel jJ]) } [^$macron$evowel2$smooth$rough] → $1 $smooth ;
+  …                                                                # v, w before a macron or a non-vowel
+  :: Null ;
+  \uE000 → ;  \uE001 → ;                                           # then the rest of the rules
+  ```
+
+  The markers U+E000 and U+E001 stand where the `h` was, so that the rules
+  applied before it still see a letter there (`$beforeLetter` and the global
+  filter include them); the smooth rules look through them. This restatement
+  equals ICU4C's and ICU4J's Latn-Grek on 60,060 lines (random words, the first
+  2,000 lines of Twain, and random text dense in `h`/`H`, vowels, macrons,
+  diaereses, `j v w`, digraphs and punctuation). As a submission it would need
+  writing as backward-only rules of Greek-Latin.xml, placed so that the
+  forward direction keeps its groups, with markers that cannot occur in text
+  (noncharacters), and checking against CLDR's test data, which has no
+  Latin→Greek file. xlit's planner now derives this restatement from the
+  family's form (see doc/ldml-xlit-coverage.md).
+
 ## Flaws in documentation
 
 Read on 2026-11-22: UTS #35 Part 2, section Transforms (revision 79, CLDR 49,

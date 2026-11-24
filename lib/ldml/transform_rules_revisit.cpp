@@ -14,6 +14,7 @@
 #include <optional>
 #include <ldml/transform_plan.h>
 #include <ldml/transform_rules_printer.h>
+#include <ldml/transform_rules_parser.h>
 #include <re/adt/adt.h>
 #include "charset_analysis.h"
 #include <ucd/data/PropertyAliases.h>
@@ -3525,6 +3526,600 @@ bool ruleFirstChars(const ConversionRule * c, CharSetAnalysis & sets, UCD::Unico
     return textFirstChars(text, sets, firsts);
 }
 
+//  Breathing marks (see RewriteBreathingMarks).
+
+//  An item of a vowel cluster: a set, possibly optional (X?).
+struct BreathItem {
+    UCD::UnicodeSet chars;
+    bool optional = false;
+};
+
+//  The items of a cluster (sets and optional sets), or false.
+bool breathItems(RE * re, CharSetAnalysis & sets, std::vector<BreathItem> & items) {
+    items.clear();
+    for (RE * a : atomsOf(re)) {
+        BreathItem it;
+        if (frontRep(a, sets, 0, 1, it.chars)) {
+            it.optional = true;
+        } else if (!frontSet(a, sets, it.chars)) {
+            return false;
+        }
+        items.push_back(std::move(it));
+    }
+    return !items.empty();
+}
+
+//  t v? (C) → | V? $1 m ;  (the trigger t deleted, the cluster revisited, with
+//  v written V, and the mark m after it)
+struct RoughRule {
+    char32_t trigger = 0, vowel = 0, upper = 0, mark = 0;
+    std::vector<BreathItem> cluster;        // (with v first, if any)
+    RE * captured = nullptr;
+    std::string name;
+};
+
+bool roughRule(const ConversionRule * c, RoughRule & r) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    std::u32string completed;
+    std::vector<RE *> revisit;
+    if (!frontResult(result, completed, revisit) || !completed.empty()) return false;
+    CharSetAnalysis sets;
+    const std::vector<RE *> text = atomsOf(source->getText());
+    if (text.size() < 2 || text.size() > 3 || !frontChar(text[0], sets, r.trigger)) return false;
+    if (text.size() == 3 && !frontChar(text[1], sets, r.vowel)) return false;
+    Capture * const cap = dyn_cast<Capture>(text.back());
+    if (cap == nullptr || !breathItems(cap->getCapturedRE(), sets, r.cluster)) return false;
+    r.captured = cap->getCapturedRE();
+    r.name = cap->getName();
+    size_t k = 0;
+    if (revisit.size() == 3) {
+        if (!resultChar(revisit[0], r.upper)) return false;
+        k = 1;
+    } else if (revisit.size() != 2) {
+        return false;
+    }
+    if ((r.vowel != 0) != (r.upper != 0)) return false;
+    if (r.vowel) r.cluster.insert(r.cluster.begin(), BreathItem{UCD::UnicodeSet(r.vowel), false});
+    if (r.cluster.front().optional) return false;
+    const Reference * ref = dyn_cast<Reference>(revisit[k]);
+    return ref && ref->getName() == cap->getName() && resultChar(revisit[k + 1], r.mark);
+}
+
+//  A set, possibly with the text boundary, or false.
+bool boundarySet(RE * re, CharSetAnalysis & sets, UCD::UnicodeSet & chars, bool & boundary) {
+    if (!CharSetAnalysis::isSet(re) || hasStrings(re)) return false;
+    chars = sets.setOf(re, false);
+    boundary = hasBoundary(re);
+    return true;
+}
+
+//  B { (C) } A → | $1 m ;  (B and A sets)
+struct SmoothRule {
+    UCD::UnicodeSet before, after;
+    bool beforeStart = false, afterEnd = false;
+    std::vector<BreathItem> cluster;
+    char32_t mark = 0;
+};
+
+bool smoothRule(const ConversionRule * c, SmoothRule & r) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (!source->hasBeforeContext() || !source->hasAfterContext()) return false;
+    std::u32string completed;
+    std::vector<RE *> revisit;
+    if (!frontResult(result, completed, revisit) || !completed.empty() || revisit.size() != 2) return false;
+    CharSetAnalysis sets;
+    const std::vector<RE *> text = atomsOf(source->getText());
+    const std::vector<RE *> before = atomsOf(source->getBeforeContext());
+    const std::vector<RE *> after = atomsOf(source->getAfterContext());
+    if (text.size() != 1 || before.size() != 1 || after.size() != 1) return false;
+    if (!boundarySet(before[0], sets, r.before, r.beforeStart) || !boundarySet(after[0], sets, r.after, r.afterEnd)) return false;
+    const Capture * cap = dyn_cast<Capture>(text[0]);
+    if (cap == nullptr || !breathItems(cap->getCapturedRE(), sets, r.cluster) || r.cluster.front().optional) return false;
+    const Reference * ref = dyn_cast<Reference>(revisit[0]);
+    return ref && ref->getName() == cap->getName() && resultChar(revisit[1], r.mark);
+}
+
+//  (X ...) c → | $1 m ;  (a chain revisit marking a cluster before c)
+bool prefixRule(const ConversionRule * c, Capture *& cap, std::vector<RE *> & captured) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    std::u32string completed;
+    std::vector<RE *> revisit;
+    if (!frontResult(result, completed, revisit) || !completed.empty() || revisit.size() != 2) return false;
+    CharSetAnalysis sets;
+    const std::vector<RE *> text = atomsOf(source->getText());
+    char32_t ch = 0, mark = 0;
+    if (text.size() != 2 || !frontChar(text[1], sets, ch) || !resultChar(revisit[1], mark)) return false;
+    cap = dyn_cast<Capture>(text[0]);
+    if (cap == nullptr) return false;
+    const Reference * ref = dyn_cast<Reference>(revisit[0]);
+    if (ref == nullptr || ref->getName() != cap->getName()) return false;
+    captured = atomsOf(cap->getCapturedRE());
+    UCD::UnicodeSet first;
+    return !captured.empty() && frontSet(captured[0], sets, first);
+}
+
+//  The text of a rule as fixed items (sets), or false.
+bool fixedText(const ConversionRule * c, CharSetAnalysis & sets, std::vector<UCD::UnicodeSet> & items) {
+    items.clear();
+    for (RE * a : atomsOf(c->getSourceSide(Direction::Forward)->getText())) {
+        UCD::UnicodeSet s;
+        if (!frontSet(a, sets, s)) return false;
+        items.push_back(std::move(s));
+    }
+    return true;
+}
+
+//  The characters at which a rule's after context may begin, or false.
+bool afterFirst(const ConversionRule * c, CharSetAnalysis & sets, UCD::UnicodeSet & firsts, bool & end) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    if (!source->hasAfterContext()) return false;
+    const std::vector<RE *> after = atomsOf(source->getAfterContext());
+    if (after.empty()) return false;
+    if (Rep * rep = dyn_cast<Rep>(after[0])) {
+        (void) rep;
+        return false;
+    }
+    return boundarySet(after[0], sets, firsts, end);
+}
+
+//  The set with the markers added where it has characters of their triggers
+//  (an after context, in which a marker stands for its trigger).
+RE * withMarkers(RE * re, CharSetAnalysis & sets, const std::vector<std::pair<char32_t, char32_t>> & markers) {
+    if (re == nullptr) return nullptr;
+    if (CharSetAnalysis::isSet(re) && !hasStrings(re)) {
+        UCD::UnicodeSet chars = sets.setOf(re, false);
+        bool changed = false;
+        for (const auto & m : markers) {
+            if (chars.contains(m.first) && !chars.contains(m.second)) {
+                chars.insert(m.second);
+                changed = true;
+            }
+        }
+        if (!changed) return re;
+        RE * const cc = makeCC(chars);
+        return hasBoundary(re) ? Alt::Create({cc, makeEnd()}) : cc;
+    }
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items;
+        bool changed = false;
+        for (RE * a : *seq) {
+            items.push_back(withMarkers(a, sets, markers));
+            changed |= items.back() != a;
+        }
+        return changed ? makeSeq(items.begin(), items.end()) : re;
+    }
+    if (Rep * rep = dyn_cast<Rep>(re)) {
+        RE * const inner = withMarkers(rep->getRE(), sets, markers);
+        return inner == rep->getRE() ? re : makeRep(inner, rep->getLB(), rep->getUB(), rep->getKind());
+    }
+    if (Alt * alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> items;
+        bool changed = false;
+        for (RE * a : *alt) {
+            items.push_back(withMarkers(a, sets, markers));
+            changed |= items.back() != a;
+        }
+        return changed ? makeAlt(items.begin(), items.end()) : re;
+    }
+    if (Name * name = dyn_cast<Name>(re)) {
+        if (!isFunctionCall(name) && name->getDefinition()) {
+            RE * const def = withMarkers(name->getDefinition(), sets, markers);
+            return def == name->getDefinition() ? re : def;
+        }
+    }
+    return re;
+}
+
+//  A sequence of fixed items as an RE.
+RE * itemsSeq(const std::vector<UCD::UnicodeSet> & items) {
+    std::vector<RE *> res;
+    for (const UCD::UnicodeSet & s : items) res.push_back(makeCC(s));
+    return makeSeq(res.begin(), res.end());
+}
+
+//  The rewrite of one group (see RewriteBreathingMarks): the groups to put in
+//  its place, or false (with the reason).
+bool breathingGroups(const std::vector<Rule *> & group, std::vector<Rule *> & out, std::string & why) {
+    auto no = [&](const std::string & reason) {
+        why = reason;
+        return false;
+    };
+    CharSetAnalysis sets;
+    std::vector<ConversionRule *> conv;
+    std::vector<Rule *> defs;
+    for (Rule * r : group) {
+        if (ConversionRule * c = dyn_cast<ConversionRule>(r)) conv.push_back(c);
+        else defs.push_back(r);
+    }
+    //  The family: a run of rough rules, then a run of smooth rules.
+    RoughRule rough;
+    size_t b = 0;
+    while (b < conv.size() && !roughRule(conv[b], rough)) b++;
+    if (b == conv.size()) return no("");
+    std::vector<RoughRule> roughs;
+    size_t e1 = b;
+    for (RoughRule r; e1 < conv.size() && roughRule(conv[e1], r); e1++, r = RoughRule{}) roughs.push_back(r);
+    std::vector<SmoothRule> smooths;
+    size_t e2 = e1;
+    for (SmoothRule s; e2 < conv.size() && smoothRule(conv[e2], s); e2++, s = SmoothRule{}) smooths.push_back(s);
+    if (smooths.empty()) return no("rough rules without smooth rules after them");
+    //  The triggers, their markers, and the marks.
+    std::vector<std::pair<char32_t, char32_t>> markers;     // trigger, marker
+    UCD::UnicodeSet triggers, markerSet, clusterChars;
+    const char32_t roughMark = roughs.front().mark;
+    for (const RoughRule & r : roughs) {
+        if (r.mark != roughMark) return no("rough rules with different marks");
+        if (!triggers.contains(r.trigger)) {
+            if (markers.size() == BreathingMarkers) return no("too many triggers");
+            markers.emplace_back(r.trigger, BreathingMarker(static_cast<unsigned>(markers.size())));
+            triggers.insert(r.trigger);
+            markerSet.insert(markers.back().second);
+        }
+        for (const BreathItem & it : r.cluster) clusterChars = clusterChars + it.chars;
+    }
+    UCD::UnicodeSet smoothStarts;
+    for (const SmoothRule & s : smooths) {
+        if (!(s.before == smooths.front().before) || s.beforeStart != smooths.front().beforeStart) {
+            return no("smooth rules with different before contexts");
+        }
+        smoothStarts = smoothStarts + s.cluster.front().chars;
+        for (const BreathItem & it : s.cluster) clusterChars = clusterChars + it.chars;
+    }
+    const UCD::UnicodeSet marks = UCD::UnicodeSet(roughMark) + UCD::UnicodeSet(smooths.front().mark);
+    if (clusterChars.intersects(triggers) || clusterChars.intersects(marks) || clusterChars.intersects(markerSet)) {
+        return no("a trigger or mark among the cluster characters");
+    }
+    //  (Without the markers, which ICU's text does not have: the smooth rules look
+    //  through them.)
+    const UCD::UnicodeSet B = smooths.front().before - markerSet;
+    //  The rules before the family: chain revisits marking a cluster (applied
+    //  in a group before), and rules at other characters (applied with the rest,
+    //  first).
+    std::vector<Capture *> prefixCaps;
+    std::vector<std::vector<RE *>> prefixAtoms;
+    std::vector<ConversionRule *> chains, rest;
+    for (size_t k = 0; k < b; k++) {
+        UCD::UnicodeSet firsts;
+        if (!ruleFirstChars(conv[k], sets, firsts) || firsts.intersects(triggers)) return no("a rule before the family at a trigger");
+        Capture * cap = nullptr;
+        std::vector<RE *> atoms;
+        if (prefixRule(conv[k], cap, atoms)) {
+            chains.push_back(conv[k]);
+            prefixCaps.push_back(cap);
+            prefixAtoms.push_back(std::move(atoms));
+        } else {
+            rest.push_back(conv[k]);
+        }
+    }
+    //  The rest of the group.
+    rest.insert(rest.end(), conv.begin() + static_cast<std::ptrdiff_t>(e2), conv.end());
+    for (size_t k = 0; k + (conv.size() - e2) < rest.size(); k++) {
+        UCD::UnicodeSet firsts;
+        ruleFirstChars(rest[k], sets, firsts);
+        if (firsts.intersects(clusterChars)) return no("a rule before the family at a cluster character");
+    }
+    //  The characters revisited as cluster vowels (c → | d), with the after
+    //  contexts of the rules before them for c (where they do not apply).
+    struct Revisit {
+        char32_t from, to;
+        UCD::UnicodeSet notNext;
+    };
+    std::vector<Revisit> revisits;
+    UCD::UnicodeSet startChars = smoothStarts;
+    for (size_t k = 0; k < chains.size(); k++) {
+        UCD::UnicodeSet first;
+        frontSet(prefixAtoms[k][0], sets, first);
+        startChars = startChars + first;
+    }
+    for (size_t j = 0; j < rest.size(); j++) {
+        char32_t from = 0, to = 0;
+        if (!charRevisit(rest[j], from, to) || !startChars.contains(to)) continue;
+        if (triggers.contains(from) || marks.contains(from) || clusterChars.contains(from)) return no("a revisit from a cluster character");
+        Revisit rv{from, to, {}};
+        for (size_t i = 0; i < j; i++) {
+            UCD::UnicodeSet firsts;
+            if (!ruleFirstChars(rest[i], sets, firsts)) return no("a rule whose first characters are not known");
+            if (!firsts.contains(from)) continue;
+            std::vector<UCD::UnicodeSet> text;
+            UCD::UnicodeSet a;
+            bool end = false;
+            const RuleSide * source = rest[i]->getSourceSide(Direction::Forward);
+            if (source->hasBeforeContext() || !fixedText(rest[i], sets, text) || text.size() != 1 || !afterFirst(rest[i], sets, a, end)) {
+                return no("a rule before a revisit to a cluster vowel, not of the form c } A");
+            }
+            rv.notNext = rv.notNext + a;
+        }
+        revisits.push_back(std::move(rv));
+    }
+    //  Where ICU reaches a trigger: not where a rule takes it as the second
+    //  character of its text (a digraph X t, whose X is always reached and
+    //  taken by it).  The rules of the group, by their items.
+    std::vector<std::vector<UCD::UnicodeSet>> restText(rest.size());
+    for (size_t j = 0; j < rest.size(); j++) {
+        if (!fixedText(rest[j], sets, restText[j])) return no("a rule after the family whose text is not fixed");
+    }
+    //  The characters at a later position of the text of any rule.
+    UCD::UnicodeSet later;
+    for (const auto & t : restText) for (size_t i = 1; i < t.size(); i++) later = later + t[i];
+    for (size_t k = 0; k < chains.size(); k++) for (size_t i = 1; i < prefixAtoms[k].size(); i++) {
+        UCD::UnicodeSet s;
+        if (!frontSet(prefixAtoms[k][i], sets, s) && !frontRep(prefixAtoms[k][i], sets, 0, Rep::UNBOUNDED_REP, s)) {
+            return no("a chain revisit with an item that is not a set");
+        }
+        if (s.intersects(triggers)) return no("a chain revisit with a trigger");
+        later = later + s;
+    }
+    for (const BreathItem & it : roughs.front().cluster) later = later + it.chars;
+    //  Whether a rule whose text is X Y... (or X with its after context) always
+    //  applies where its text matches: X never at a later position, and every
+    //  earlier rule beginning with X differs at the second position.
+    auto alwaysApplies = [&](size_t j, const std::vector<UCD::UnicodeSet> & text) -> bool {
+        if (text.front().intersects(later)) return false;
+        const UCD::UnicodeSet second = text.size() > 1 ? text[1] : UCD::UnicodeSet();
+        for (size_t i = 0; i < j; i++) {
+            if (!restText[i].front().intersects(text.front())) continue;
+            if (text.size() < 2) return false;
+            if (restText[i].size() > 1) {
+                if (restText[i][1].intersects(second)) return false;
+            } else {
+                UCD::UnicodeSet a;
+                bool end = false;
+                if (!afterFirst(rest[i], sets, a, end) || a.intersects(second)) return false;
+            }
+        }
+        //  (The smooth rules come before them all.)
+        for (const SmoothRule & s : smooths) {
+            if (!s.cluster.front().chars.intersects(text.front())) continue;
+            if (s.cluster.size() > 1 || text.size() < 2 || s.after.intersects(second)) return false;
+        }
+        return true;
+    };
+    std::vector<std::vector<UCD::UnicodeSet>> digraphs;
+    for (size_t j = 0; j < rest.size(); j++) {
+        const auto & t = restText[j];
+        bool takes = false;
+        for (size_t i = 1; i < t.size(); i++) takes |= t[i].intersects(triggers);
+        if (!takes) continue;
+        const RuleSide * source = rest[j]->getSourceSide(Direction::Forward);
+        if (t.size() != 2 || !t[1].subset(triggers) || source->hasBeforeContext() || source->hasAfterContext() || !alwaysApplies(j, t)) {
+            return no("a rule taking a trigger not as a digraph that always applies");
+        }
+        digraphs.push_back(t);
+    }
+    //  The smooth rules' before context (B, matched against the converted text,
+    //  ICU's) on the text before the rough rules applied: the character before
+    //  a cluster, through a marker, in B; the rules after the family whose
+    //  last character is not in B but whose result's is (included, as their
+    //  text), and those whose last character is in B but whose result's is
+    //  not (X Y, Y excluded after X).
+    std::vector<std::vector<UCD::UnicodeSet>> included;
+    std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> excluded;
+    for (size_t j = 0; j < rest.size(); j++) {
+        const auto & t = restText[j];
+        if (t.empty()) continue;
+        const RuleSide * source = rest[j]->getSourceSide(Direction::Forward);
+        const RuleSide * result = rest[j]->getResultSide(Direction::Forward);
+        std::u32string done, again;
+        if (!resultString(result->getCompletedResult(), {}, done)) return no("a result that is not a string");
+        if (result->getResultToRevisit() && !resultString(result->getResultToRevisit(), {}, again)) return no("a result that is not a string");
+        const std::u32string res = done + again;
+        const UCD::UnicodeSet & last = t.back();
+        if (last.intersects(B) && !last.subset(B)) return no("a rule whose last character may or may not be in the before context");
+        const bool inText = last.subset(B);
+        if (res.empty()) {
+            UCD::UnicodeSet a;
+            bool end = false;
+            if (!afterFirst(rest[j], sets, a, end) || a.intersects(startChars)) return no("a deletion that a cluster may follow");
+            for (const Revisit & rv : revisits) if (a.contains(rv.from)) return no("a deletion that a cluster may follow");
+            continue;
+        }
+        const bool inResult = B.contains(static_cast<UCD::codepoint_t>(res.back()));
+        if (inText == inResult) continue;
+        if (source->hasBeforeContext() || source->hasAfterContext() || !alwaysApplies(j, t)) {
+            return no("a rule changing the before context of the smooth rules that may not apply");
+        }
+        if (!inText) {
+            included.push_back(t);
+        } else {
+            if (t.size() != 2) return no("a rule changing the before context of the smooth rules, of more than two characters");
+            for (const auto & x : excluded) if (x.second.intersects(t[1])) return no("overlapping exclusions");
+            excluded.emplace_back(t[0], t[1]);
+        }
+    }
+    //  The alternatives of the before context: items (a set, or the start of
+    //  the text where empty with start), then an optional marker.
+    struct StartItem {
+        UCD::UnicodeSet chars;
+        bool start = false;
+    };
+    std::vector<std::vector<StartItem>> alternatives;
+    {
+        UCD::UnicodeSet base = B;
+        for (const auto & x : excluded) base = base - x.second;
+        alternatives.push_back({StartItem{base, false}});
+        if (smooths.front().beforeStart) alternatives.push_back({StartItem{{}, true}});
+        for (const auto & x : excluded) {
+            alternatives.push_back({StartItem{UCD::UnicodeSet(0, 0x10FFFF) - x.first, false}, StartItem{x.second, false}});
+            alternatives.push_back({StartItem{{}, true}, StartItem{x.second, false}});
+        }
+        for (const auto & t : included) {
+            std::vector<StartItem> seq;
+            for (const UCD::UnicodeSet & u : t) seq.push_back(StartItem{u, false});
+            alternatives.push_back(std::move(seq));
+        }
+    }
+    //  (One rule for each alternative: the rule syntax has no alternatives in
+    //  contexts.)
+    //  The smooth rules on the last character of their clusters, for each
+    //  combination of the optional items (and the revisits beginning one): the
+    //  items as possessive matching takes them.
+    struct Pattern {
+        std::vector<UCD::UnicodeSet> items;
+        UCD::UnicodeSet after;
+        bool end;
+    };
+    std::vector<std::vector<Pattern>> patterns(smooths.size());
+    for (size_t k = 0; k < smooths.size(); k++) {
+        const SmoothRule & s = smooths[k];
+        std::vector<size_t> optional;
+        for (size_t i = 0; i < s.cluster.size(); i++) if (s.cluster[i].optional) optional.push_back(i);
+        if (optional.size() > 8) return no("too many optional items");
+        for (unsigned bits = 0; bits < (1u << optional.size()); bits++) {
+            std::vector<bool> present(s.cluster.size(), true);
+            for (size_t o = 0; o < optional.size(); o++) present[optional[o]] = (bits >> o) & 1;
+            Pattern p;
+            UCD::UnicodeSet skipped;
+            bool empty = false;
+            for (size_t i = 0; i < s.cluster.size(); i++) {
+                if (!present[i]) {
+                    skipped = skipped + s.cluster[i].chars;
+                    continue;
+                }
+                const UCD::UnicodeSet chars = s.cluster[i].chars - skipped;
+                if (chars.empty()) empty = true;
+                p.items.push_back(chars);
+                skipped = UCD::UnicodeSet();
+            }
+            p.after = s.after - skipped;
+            //  (After the rough rules, a trigger may be a marker: seen as it.)
+            for (const auto & m : markers) {
+                if (p.after.contains(m.first)) p.after.insert(m.second);
+                else p.after = p.after - UCD::UnicodeSet(m.second);
+            }
+            p.end = s.afterEnd;
+            if (empty || (p.after.empty() && !p.end)) continue;
+            patterns[k].push_back(p);
+            //  (A revisit beginning the cluster: c, where the character after it
+            //  is not among those of the rules before it for c.)
+            for (const Revisit & rv : revisits) {
+                if (!p.items.front().contains(rv.to)) continue;
+                Pattern q = p;
+                q.items.front() = UCD::UnicodeSet(rv.from);
+                if (q.items.size() > 1) {
+                    q.items[1] = q.items[1] - rv.notNext;
+                    if (q.items[1].empty()) continue;
+                } else {
+                    q.after = q.after - rv.notNext;
+                    if (q.after.empty() && !q.end) continue;
+                }
+                patterns[k].push_back(q);
+            }
+        }
+    }
+    //  (The smooth rules apply in order at a cluster: their patterns must not
+    //  overlap.)
+    auto overlap = [](const Pattern & x, const Pattern & y) {
+        const size_t n = std::min(x.items.size(), y.items.size());
+        for (size_t i = 0; i < n; i++) if (!x.items[i].intersects(y.items[i])) return false;
+        const Pattern & shorter = x.items.size() <= y.items.size() ? x : y;
+        const Pattern & longer = x.items.size() <= y.items.size() ? y : x;
+        if (shorter.items.size() == longer.items.size()) return shorter.after.intersects(longer.after) || (shorter.end && longer.end);
+        return shorter.after.intersects(longer.items[shorter.items.size()]);
+    };
+    for (size_t k = 0; k < smooths.size(); k++) {
+        for (size_t l = k + 1; l < smooths.size(); l++) {
+            for (const Pattern & x : patterns[k]) for (const Pattern & y : patterns[l]) {
+                if (overlap(x, y)) return no("smooth rules that may match at the same cluster");
+            }
+        }
+    }
+    //  The rules before the family, extended by the revisits.
+    std::vector<Rule *> prefix;
+    for (size_t k = 0; k < chains.size(); k++) {
+        UCD::UnicodeSet first, second;
+        frontSet(prefixAtoms[k][0], sets, first);
+        if (prefixAtoms[k].size() < 2 || !frontSet(prefixAtoms[k][1], sets, second)) {
+            if (!revisits.empty()) return no("a chain revisit whose cluster's second item is not a set");
+        }
+        UCD::UnicodeSet extended = first;
+        for (const Revisit & rv : revisits) {
+            if (!first.contains(rv.to)) continue;
+            if (second.intersects(rv.notNext)) return no("a chain revisit after a revisit that may not apply");
+            extended.insert(rv.from);
+        }
+        if (extended == first) {
+            prefix.push_back(chains[k]);
+            continue;
+        }
+        std::vector<RE *> captured = prefixAtoms[k];
+        captured[0] = makeCC(extended);
+        const RuleSide * source = chains[k]->getSourceSide(Direction::Forward);
+        const std::vector<RE *> text = atomsOf(source->getText());
+        const std::vector<RE *> revisit = atomsOf(chains[k]->getResultSide(Direction::Forward)->getResultToRevisit());
+        const std::string name = prefixCaps[k]->getName();
+        Capture * const cap = makeCapture(name, makeSeq(captured.begin(), captured.end()));
+        prefix.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq({cap, text[1]}), nullptr), Direction::Forward,
+                                            makeRuleSide(nullptr, makeSeq(), makeSeq({makeReference(name, cap, 0), revisit[1]}), 0, nullptr)));
+    }
+    auto markerOf = [&](char32_t t) {
+        for (const auto & m : markers) if (m.first == t) return m.second;
+        return char32_t{0};
+    };
+    //  The groups (the variable definitions first, once).
+    out.insert(out.end(), defs.begin(), defs.end());
+    if (!prefix.empty()) {
+        out.insert(out.end(), prefix.begin(), prefix.end());
+        out.push_back(makeTransformRule(TransformID("Null")));
+    }
+    //  The rough rules, without revisits, where ICU reaches the trigger.
+    for (const auto & t : digraphs) {
+        Capture * const cap = makeCapture("1", itemsSeq(t));
+        out.push_back(makeConversionRule(makeRuleSide(cap), Direction::Forward, makeRuleSide(makeReference(cap->getName(), cap, 0))));
+    }
+    for (const RoughRule & r : roughs) {
+        Capture * const cap = makeCapture(r.name, r.captured);
+        std::vector<RE *> text{makeCC(r.trigger)}, res{makeCC(markerOf(r.trigger))};
+        if (r.vowel) {
+            text.push_back(makeCC(r.vowel));
+            res.push_back(makeCC(r.upper));
+        }
+        text.push_back(cap);
+        res.push_back(makeReference(r.name, cap, 0));
+        res.push_back(makeCC(r.mark));
+        out.push_back(makeConversionRule(makeRuleSide(makeSeq(text.begin(), text.end())), Direction::Forward,
+                                         makeRuleSide(makeSeq(res.begin(), res.end()))));
+    }
+    out.push_back(makeTransformRule(TransformID("Null")));
+    //  The smooth rules, on the last characters of their clusters.
+    for (size_t k = 0; k < smooths.size(); k++) {
+        for (const Pattern & p : patterns[k]) {
+            for (const std::vector<StartItem> & start : alternatives) {
+                std::vector<RE *> before;
+                for (const StartItem & a : start) before.push_back(a.start ? makeBoundarySet(true) : makeCC(a.chars));
+                before.push_back(makeRep(makeCC(markerSet), 0, 1));
+                for (size_t i = 0; i + 1 < p.items.size(); i++) before.push_back(makeCC(p.items[i]));
+                Capture * const cap = makeCapture("1", makeCC(p.items.back()));
+                RE * after = makeCC(p.after);
+                if (p.end) after = Alt::Create({after, makeEnd()});
+                out.push_back(makeConversionRule(makeRuleSide(makeSeq(before.begin(), before.end()), makeSeq({cap}), after), Direction::Forward,
+                                                 makeRuleSide(makeSeq({makeReference(cap->getName(), cap, 0), makeCC(smooths[k].mark)}))));
+            }
+        }
+    }
+    out.push_back(makeTransformRule(TransformID("Null")));
+    //  The rest, the markers deleted first, and seen as their triggers by the
+    //  after contexts.
+    for (const auto & m : markers) {
+        out.push_back(makeConversionRule(makeRuleSide(makeCC(m.second)), Direction::Forward, makeRuleSide(makeSeq())));
+    }
+    for (ConversionRule * c : rest) {
+        const RuleSide * source = c->getSourceSide(Direction::Forward);
+        RE * const after = withMarkers(source->getAfterContext(), sets, markers);
+        if (after == source->getAfterContext()) {
+            out.push_back(c);
+        } else {
+            out.push_back(makeConversionRule(makeRuleSide(source->getBeforeContext(), source->getText(), after), Direction::Forward,
+                                             c->getResultSide(Direction::Forward)));
+        }
+    }
+    return true;
+}
+
 //  The family of the rules [first, end) of a group (conversion rules only),
 //  given the other rules of the group, or false.
 bool frontLetterFamily(const std::vector<const ConversionRule *> & group, size_t first, size_t end, FrontLetterRevisits & fam) {
@@ -3662,6 +4257,46 @@ FrontLetterFamilies SetAsideFrontLetterRevisits(std::vector<Rule *> & rules) {
     }
     rules = std::move(out);
     return families;
+}
+
+std::vector<Rule *> RewriteBreathingMarks(const std::vector<Rule *> & rules, std::string * reason) {
+    std::vector<Rule *> out;
+    bool any = false;
+    UCD::UnicodeSet markerChars;
+    for (size_t start = 0; start < rules.size(); ) {
+        if (isa<TransformRule>(rules[start]) || isa<FilterRule>(rules[start])) {
+            out.push_back(rules[start++]);
+            continue;
+        }
+        size_t end = start;
+        while (end < rules.size() && !isa<TransformRule>(rules[end]) && !isa<FilterRule>(rules[end])) end++;
+        const std::vector<Rule *> group(rules.begin() + static_cast<std::ptrdiff_t>(start), rules.begin() + static_cast<std::ptrdiff_t>(end));
+        std::vector<Rule *> rewritten;
+        std::string why;
+        if (breathingGroups(group, rewritten, why)) {
+            out.insert(out.end(), rewritten.begin(), rewritten.end());
+            any = true;
+        } else {
+            out.insert(out.end(), group.begin(), group.end());
+            if (reason && !why.empty()) *reason = why;
+        }
+        start = end;
+    }
+    if (!any) return rules;
+    if (reason) reason->clear();
+    //  (The markers within the global filter.)
+    for (unsigned k = 0; k < BreathingMarkers; k++) markerChars.insert(BreathingMarker(k));
+    for (Rule *& r : out) {
+        if (FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse()) {
+            r = FilterRule::Create(makeAlt({f->getFilterSet(), makeCC(markerChars)}), false);
+            break;
+        }
+    }
+    //  The rules as their text would parse: the later passes plan the rules as
+    //  built here differently from the same rules parsed (two pairs of rules
+    //  left order dependent in Latin-Greek, not found), and the printer and the
+    //  parser round-trip the rules of every CLDR transform.
+    return ExtractForwardRules(parseTransformRules({printRules(out)}));
 }
 
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats) {

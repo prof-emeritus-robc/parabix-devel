@@ -266,6 +266,12 @@ static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input a
                                              "data), in one run over the whole input, each line a region of a mask (region "
                                              "scope: see --plan --lines); the steps ICU applies, line by line"),
                            cl::init(false), cl::cat(XlitOptions));
+//  Latin-Greek's breathing marks restated without revisits (see
+//  ldml::RewriteBreathingMarks).
+static cl::opt<bool> BreathingMarks("breathing-marks", cl::desc("Restate the rough and smooth breathing rules of a group (Latin-Greek) "
+                                    "without revisits, in groups of their own before the rest"),
+                                    cl::init(true), cl::cat(XlitOptions));
+
 static cl::opt<bool> MixedModes("mixed-modes",
     cl::desc("In UTF-8 mode (--utf8-mode), apply the steps that need Unicode mode in segments of it, switching to it at the "
              "first such step and back to UTF-8 after the last of a run of them (doc/masked-transforms-plan.md step 13; "
@@ -1205,6 +1211,9 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
         const std::vector<ldml::Rule *> extracted = rules;
+        //  (First: the breathing marks are recognised by the form of the rules as
+        //  given; see ldml::RewriteBreathingMarks.)
+        if (BreathingMarks) rules = ldml::RewriteBreathingMarks(rules);
         //  (On the rules as given: the later passes restate rules with contexts
         //  of large sets, e.g. DisambiguateOrder's negated after contexts, which
         //  would join the components.)

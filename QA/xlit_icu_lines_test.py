@@ -5,7 +5,7 @@
 #  xlit --lines with the transforms or steps that ICU applies
 #  (doc/masked-transforms-plan.md, step 11): in one run, without a pipeline
 #  run (or a pipe) for each line.  A transform that ICU applies as a whole
-#  (Latn-Grek, a rules file xlit does not implement), and the built-ins ICU
+#  (a rules file xlit does not implement), and the built-ins ICU
 #  applies (Any-Name, Name-Any, Any-BreakInternal), are applied by ICU to each
 #  line as a text of its own, in the process (icuLinesRunner, as uconv -x
 #  does); a transform with ICU stages (Thai-Latn) has its xlit stages applied
@@ -29,7 +29,6 @@ CASES = [
      "\\N{CJK UNIFIED IDEOGRAPH-4E2D}\\N{SPACE}\\N{LATIN SMALL LETTER B}"),
     ("Name-Any", "\\N{LATIN SMALL LETTER A}x\n\\N{SPACE}\n\\N{GREEK CAPITAL LETTER SIGMA}", "ax\n \n\u03a3"),
     ("Any-BreakInternal", "\u0e01\u0e02\u0e04 \u0e07\u0e08\n\u0e09\u0e0a\n", "\u0e01\u0e02\u0e04 \u0e07\u0e08\n\u0e09\u0e0a\n"),
-    ("Latn-Grek", "abc\nkosmos\n", "\u1f00\u03b2\u03ba\n\u03ba\u03bf\u03c3\u03bc\u03bf\u03c2\n"),
     ("ab \u2192 | ba ;\nc \u2192 C ;\n", "abc\nca\nab", "baC\nCa\nba"),
 ]
 if EXTENDED:

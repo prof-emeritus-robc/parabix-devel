@@ -1156,6 +1156,11 @@ add_test(
   COMMAND python3 xlit_static_loop_test.py ${BIN_DIR}/xlit)
 
 add_test(
+  NAME xlit_breathing_marks_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 xlit_breathing_marks_test.py ${BIN_DIR}/xlit)
+
+add_test(
   NAME xlit_static_apply_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 xlit_static_apply_test.py ${BIN_DIR}/xlit)

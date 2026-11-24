@@ -1755,6 +1755,77 @@ The risks are in 2 (reaching through overlapping rules) and in the smooth
 rule's interplay with the rough marks already written. The size of the work is
 about that of the front-letter revisits.
 
+**Latn-Grek: a rule-level rewrite works (2026-11-24).** The family need not be
+a new mechanism: restated as rules that the planner already implements, in
+groups of their own before the main group, it gives ICU's results
+(`tools/ldml/prototypes/Latn-Grek-breathing.txt`, Latn-Grek's backward rules as
+`ldml_trules --backward` extracts them, rewritten; implementable as a rules
+file):
+- The iota subscript rules (chain revisits) in a group first, their vowel set
+  extended by `j J v w V W` (revisited to vowels: `w̄i → ῡͅ`).
+- The rough rules, in a group of their own, without revisits:
+  `h (cluster) → \uE000 $1 ̔` (U+E000 and U+E001, for `H`, are markers where
+  the trigger was), and identity rules for the digraphs that take an `h` before
+  ICU reaches it (`ph → ph`, `th`, `rh`, `ch` and their case forms), so that
+  the group's selection reaches the `h` where ICU's does.
+- The smooth rules, in a group of their own, as rules on the cluster's last
+  character (`$nlm [\uE000\uE001]? [$evowel jJ] $macron? { ($evowel2) }
+  [^$macron$smooth$rough] → $1 $smooth`, and the forms ending in a macron, a
+  single vowel, `r`, and `v`/`w` before a non-vowel or a macron): before
+  contexts on the text, looking through a marker (ICU sees the character before
+  the deleted `h`: `hë → ἐ̈̔` at the start of a word, `ahë → ἀε̈̔`).
+- In the main group, the markers deleted first, and added to the sets of after
+  contexts that contain the trigger (`$beforeLetter`) and to the global filter.
+Checks: the rewrite equals ICU4C's Latn-Grek on 5,030 lines (random words and
+the first 2,000 lines of Twain), on 5,030 and 50,000 lines of random text dense
+in `h`/`H`, vowels, macrons, diaereses, `j v w`, the digraphs, apostrophes and
+punctuation, also with four threads and one-stride segments, but for one line.
+That line, `hhs̱̄`, is an older difference, present without the family as
+well: `s̱` followed by a mark (`̄`, `́`) after `h`s (which become marks) gives
+`σ` where ICU gives `ς`: the before context `$afterLetter` (`[:l:]
+[[:m:]']*`) of `$afterLetter { s $underbar → σ` is matched as if the `h`s were
+still letters.
+
+**Latn-Grek implementable (2026-11-24): `ldml::RewriteBreathingMarks`.** The
+planner now derives the rewrite from the family's form, on the rules of a
+direction as extracted, before any other pass (`--breathing-marks`, default
+on): a run of rules `t v? (C) → | V? $1 m` (rough) followed by a run of rules
+`B { (C) } A → | $1 n` (smooth), C a sequence of sets and optional sets. It
+checks what the rewrite relies on, and leaves the group as it is otherwise
+(Latin-Greek is the only CLDR transform with the form):
+- the rules before the family are chain revisits marking clusters (moved to a
+  group first, their clusters' first sets extended by the characters the
+  group revisits to them, `c → | d`, with the after contexts of the rules
+  before them for `c`, `v } $vowel → | b`, where they do not apply), or rules
+  at other characters (left with the rest);
+- the rules that take a trigger after its first character are digraphs `X t`
+  that always apply (X never at a later position of a text, every earlier
+  rule for X different at the second position): identity rules in the rough
+  rules' group, so that its selection reaches a trigger where ICU's does;
+- the smooth rules' before context B, which ICU matches against the converted
+  text, is matched on the text before the rest of the group: a character in B
+  (through a marker), with the texts of the rules that turn a character not in
+  B into one in B (`\: $under → \:`) as further alternatives, and those that
+  turn one in B into one not in B (`N\' → Ν`) excluded (`'` only after a
+  character other than `N`); deletions may not be followed by a cluster; the
+  smooth rules' clusters do not overlap;
+- in the smooth rules' after contexts, a marker is seen as its trigger (`rHe
+  → ρἙ`, no smooth breathing on the `r`).
+The rewritten rules are printed and parsed again: as built in memory, the later
+passes left two pairs of rules order dependent (`s } $beforeLetter → σ`
+against the restated `$afterLetter { s … }`), not found; as parsed, none (the
+printer and the parser round-trip every CLDR transform).
+
+Checks: Latn-Grek equals ICU4C (and ICU4J where run) on the 5,030 lines of
+random words and Twain, on the cases above, and on two sets of 50,000 lines of
+random text dense in the family's cases (with `:̱`, `?̱`, `N'`, `rH` in the
+second), also with four threads and one-stride segments, except the older
+`hhs̱̄` (`$afterLetter`, see above). `QA/xlit_breathing_marks_test.py` (55
+cases, ICU4C's and ICU4J's results; with `--breathing-marks=0` Latn-Grek is
+not implementable). The prototype (`tools/ldml/prototypes/Latn-Grek-breathing.txt`)
+stays as the hand-written reference. The coverage table above has not been
+regenerated (Latn-Grek is still shown as blocked there).
+
 **Run moves** (`53121b04a`, `ldml::MarkRunMoves`). fa-fa_FONIPA's `([َ ِ ُ])ّ → ّ |
 $1` (NFD puts the vowel before the shadda) writes the shadda and revisits the
 vowel, which ICU then matches again, so that the whole run of shaddas is

@@ -1217,6 +1217,40 @@ struct FrontLetterRevisits {
 using FrontLetterFamilies = std::vector<std::pair<size_t, FrontLetterRevisits>>;
 FrontLetterFamilies SetAsideFrontLetterRevisits(std::vector<Rule *> & rules);
 
+//  Breathing marks (Latin-Greek's rough and smooth breathing, the backward
+//  direction of Greek-Latin): in a group, a run of rules
+//      t v? (C) → | V? $1 m ;          (rough: the trigger t deleted, the
+//                                        cluster C revisited, then the mark m)
+//  then a run of rules
+//      B { (C) } A → | $1 n ;          (smooth: the mark n after a cluster C
+//                                        at the start of a word, B and A sets)
+//  where C is a sequence of sets and optional sets (a vowel cluster), and the
+//  rules before them in the group are chain revisits marking clusters, (X ...)
+//  c → | $1 k.  ICU applies them where its cursor reaches t, or a cluster,
+//  then converts the cluster with the rest of the group.  They are restated
+//  without revisits, in groups of their own before the rest:
+//    - the chain revisits, their clusters' first sets extended by the
+//      characters the group revisits to them (c → | d, where the rules before
+//      it for c, c } A, do not apply);
+//    - the rough rules, t v? (C) → T V? $1 m, T a marker (BreathingMarker) for
+//      t, with identity rules for the digraphs that take a t before ICU's
+//      cursor reaches it (X t, always applying);
+//    - the smooth rules on the last characters of their clusters, P { (Y) } A'
+//      → $1 n, for each combination of their optional items, as possessive
+//      matching takes them, and for the revisits beginning a cluster; their
+//      before context B, which ICU matches against the converted text, on the
+//      text so far: a character in B followed by an optional marker, or the
+//      texts of the rules of the group that turn a character not in B into one
+//      in B (included), and not the texts X Y of those that turn one in B into
+//      one not in B (Y excluded after X);
+//    - the rest, the markers deleted first, and added to the sets of the
+//      after contexts that contain their triggers (and to the global filter).
+//  The rewrite requires that the conditions hold (the reason given otherwise);
+//  a group without the family is left as it is.
+constexpr unsigned BreathingMarkers = 4;
+inline UCD::codepoint_t BreathingMarker(unsigned k) {return 0xFDDA + k;}     // (noncharacters)
+std::vector<Rule *> RewriteBreathingMarks(const std::vector<Rule *> & rules, std::string * reason = nullptr);
+
 //  Expansion of function calls on captures of single characters.
 //
 //  A forward conversion rule whose result calls a transform on a capture of

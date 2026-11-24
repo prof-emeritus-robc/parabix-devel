@@ -13585,16 +13585,6 @@ public:
     //  by the lines: those groups in Unicode segments (see unicodeSegment).
     void boundRegions() {mBounded = true;}
 private:
-    //  Mixed modes (--mixed-modes, step 13).  Whether a step is applied in UTF-8
-    //  mode: a conversion group by a UTF-8 character map or DivCode on the bytes
-    //  (and line-bound, with bounded regions); a built-in of UTF-8 mode; another
-    //  transform (in mixed modes itself, unless applied by its shape groups).
-    bool utf8Step(const ldml::TransformStep & step);
-    //  The end of the Unicode segment from step i: the steps that need Unicode
-    //  mode, with those that read the state the segment's steps leave (the step
-    //  after prefix runs, past :: Null ;, reads the runs they deleted; the
-    //  front-letter revisits end in a later step).
-    size_t segmentEnd(const TransformAnalysis & a, size_t i);
     //  Steps [i, j) of an analysis (or a whole transform) in Unicode mode: the
     //  text decoded, the masks mapped to one position per character (each
     //  character's bit at its final byte) and back (spread over its bytes), as
@@ -13792,40 +13782,107 @@ StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, S
     return applyAnalysis(entry->canonicalName, mAnalyzer.analyze(entry), Basis);
 }
 
-bool UTF8PipelineBuilder::utf8Step(const ldml::TransformStep & step) {
-    return utf8StepProblem(mRegistry, mAnalyzer, step, mBounded).empty();
+//  Mixed modes: whether a step is applied wholly in UTF-8 mode, the transform
+//  it invokes too (every step of it, at every depth).
+static bool allUTF8Transform(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                             const ldml::TransformEntry * entry, bool bounded);
+static bool allUTF8Step(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                        const ldml::TransformStep & step, bool bounded) {
+    if (!utf8StepProblem(registry, analyzer, step, bounded).empty()) return false;
+    if (step.kind != ldml::TransformStep::Kind::Transform) return true;
+    const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
+    return used->isBuiltIn() || allUTF8Transform(registry, analyzer, used, bounded);
 }
-
-size_t UTF8PipelineBuilder::segmentEnd(const TransformAnalysis & a, size_t i) {
-    const std::vector<ldml::TransformStep> & steps = a.plan.steps;
-    size_t j = i + 1;
-    while (j < steps.size() && !utf8Step(steps[j])) j++;
-    auto isNull = [&](const ldml::TransformStep & s) {
-        if (s.kind != ldml::TransformStep::Kind::Transform || s.filter) return false;
-        const ldml::TransformEntry * const e = mRegistry.lookup(s.transform.getText());
-        return e && e->canonicalName == "Any-Null";
-    };
-    for (bool changed = true; changed; ) {
-        changed = false;
-        for (size_t k = i; k < j; k++) {
-            size_t need = j;
-            if (!steps[k].prefixRuns.empty()) {
-                size_t m = k + 1;
-                while (m < steps.size() && isNull(steps[m])) m++;
-                if (m < steps.size()) need = std::max(need, m + 1);
-            }
-            if (steps[k].hasFrontLetters) {
-                size_t m = k;
-                while (m < steps.size() && !steps[m].frontLettersEnd) m++;
-                need = std::max(need, std::min(m + 1, steps.size()));
-            }
-            if (need > j) {
-                j = need;
-                changed = true;
-            }
+static bool allUTF8Transform(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                             const ldml::TransformEntry * entry, bool bounded) {
+    static std::map<std::pair<const ldml::TransformEntry *, bool>, bool> known;
+    const auto key = std::make_pair(entry, bounded);
+    const auto f = known.find(key);
+    if (f != known.end()) return f->second;
+    bool all = true;
+    for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+        if (!allUTF8Step(registry, analyzer, step, bounded)) {
+            all = false;
+            break;
         }
     }
-    return j;
+    known.emplace(key, all);
+    return all;
+}
+
+//  Mixed modes: the segments of the steps of an analysis, in UTF-8 or Unicode
+//  mode.  Once the text is in Unicode mode, it goes back to UTF-8 mode only
+//  where all the rest of the work is in UTF-8 mode: a Unicode segment starts at
+//  a step not wholly in UTF-8 mode and ends where every later step is (or at
+//  the end).  A step invoking a transform in mixed modes itself, with only steps
+//  wholly in UTF-8 mode after it, stays in UTF-8 mode: the transform's own
+//  segments follow the same rule.  (A transform in mixed modes is invoked only
+//  with the rest of the work in UTF-8 mode after it, so the rest of the work of
+//  a transform is its own later steps.)  A Unicode segment also takes the steps
+//  that read the state its steps leave (the step after prefix runs, past
+//  :: Null ;, reads the runs they deleted; the front-letter revisits end in a
+//  later step).
+struct MixedSegment {
+    size_t begin;
+    size_t end;
+    bool unicode;
+    std::string why;    // of a Unicode segment: why its first step needs it
+};
+static std::vector<MixedSegment> mixedSegments(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                               const TransformAnalysis & a, bool bounded) {
+    const std::vector<ldml::TransformStep> & steps = a.plan.steps;
+    const size_t n = steps.size();
+    //  restUTF8[k]: steps [k, n) wholly in UTF-8 mode.
+    std::vector<bool> restUTF8(n + 1, true);
+    for (size_t k = n; k-- > 0; ) restUTF8[k] = restUTF8[k + 1] && allUTF8Step(registry, analyzer, steps[k], bounded);
+    auto isNull = [&](const ldml::TransformStep & s) {
+        if (s.kind != ldml::TransformStep::Kind::Transform || s.filter) return false;
+        const ldml::TransformEntry * const e = registry.lookup(s.transform.getText());
+        return e && e->canonicalName == "Any-Null";
+    };
+    std::vector<MixedSegment> segments;
+    for (size_t i = 0; i < n; ) {
+        const std::string problem = utf8StepProblem(registry, analyzer, steps[i], bounded);
+        if (problem.empty() && restUTF8[i + 1]) {
+            //  (Wholly in UTF-8 mode, or a transform in mixed modes itself.)
+            if (!segments.empty() && !segments.back().unicode) segments.back().end = i + 1;
+            else segments.push_back({i, i + 1, false, ""});
+            i++;
+            continue;
+        }
+        if (problem.empty() && allUTF8Step(registry, analyzer, steps[i], bounded)) {
+            if (!segments.empty() && !segments.back().unicode) segments.back().end = i + 1;
+            else segments.push_back({i, i + 1, false, ""});
+            i++;
+            continue;
+        }
+        size_t j = i + 1;
+        while (!restUTF8[j]) j++;
+        for (bool changed = true; changed; ) {
+            changed = false;
+            for (size_t k = i; k < j; k++) {
+                size_t need = j;
+                if (!steps[k].prefixRuns.empty()) {
+                    size_t m = k + 1;
+                    while (m < n && isNull(steps[m])) m++;
+                    if (m < n) need = std::max(need, m + 1);
+                }
+                if (steps[k].hasFrontLetters) {
+                    size_t m = k;
+                    while (m < n && !steps[m].frontLettersEnd) m++;
+                    need = std::max(need, std::min(m + 1, n));
+                }
+                if (need > j) {
+                    j = need;
+                    changed = true;
+                }
+            }
+        }
+        segments.push_back({i, j, true, problem.empty()
+            ? steps[i].transform.getText() + " in mixed modes, with steps in Unicode mode after it" : problem});
+        i = j;
+    }
+    return segments;
 }
 
 std::vector<TransformMask> UTF8PipelineBuilder::unicodeMasks(StreamSet * Basis) {
@@ -13911,10 +13968,17 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
     }
     size_t group = 0;
     mFrames->enter(a);
+    //  (Mixed modes: the Unicode segments, see mixedSegments.)
+    std::vector<size_t> unicodeEnd(a.plan.steps.size(), 0);
+    if (MixedModes) {
+        for (const MixedSegment & m : mixedSegments(mRegistry, mAnalyzer, a, mBounded)) {
+            if (m.unicode) unicodeEnd[m.begin] = m.end;
+        }
+    }
     for (size_t i = 0; i < a.plan.steps.size(); ) {
         const ldml::TransformStep & step = a.plan.steps[i];
-        if (MixedModes && !utf8Step(step)) {
-            const size_t j = segmentEnd(a, i);
+        if (unicodeEnd[i]) {
+            const size_t j = unicodeEnd[i];
             mFrames->begin(i, j, mRegistry);
             Basis = unicodeSegment(name + "U" + std::to_string(++mSegments), a, i, j, Basis);
             mFrames->end();
@@ -15939,15 +16003,11 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
     //  Mixed modes (step 13): the steps of the transform's own plan in UTF-8
     //  mode, and the segments in Unicode mode with the reason of their first step.
     if (UTF8Mode && MixedModes && unicodeSteps && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
-        const std::vector<ldml::TransformStep> & steps = analyzer.analyze(entry).plan.steps;
         toolio::out() << "  mode: mixed:";
-        for (size_t i = 0; i < steps.size(); ) {
-            const std::string problem = utf8StepProblem(analyzer.registry(), analyzer, steps[i], bounded);
-            size_t j = i + 1;
-            while (j < steps.size() && utf8StepProblem(analyzer.registry(), analyzer, steps[j], bounded).empty() == problem.empty()) j++;
+        for (const MixedSegment & m : mixedSegments(analyzer.registry(), analyzer, analyzer.analyze(entry), bounded)) {
+            const size_t i = m.begin, j = m.end;
             toolio::out() << (i ? ";" : "") << (j > i + 1 ? " steps " : " step ") << (i + 1) << (j > i + 1 ? "-" + std::to_string(j) : "")
-                         << (problem.empty() ? " UTF-8" : " Unicode (" + problem + ")");
-            i = j;
+                         << (m.unicode ? " Unicode (" + m.why + ")" : " UTF-8");
         }
         toolio::out() << "\n";
         return;

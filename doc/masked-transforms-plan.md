@@ -568,6 +568,24 @@ contexts see the characters outside the runs.
       costs a decode and an encode: compare kernels, then measure). `--plan`
       lists the segments, their modes and the reason for each Unicode
       segment, instead of one mode line.
+      **Revised (2026-11-24): one switch to Unicode mode.** Once a switch to
+      Unicode mode is made, the text goes back to UTF-8 mode only where all
+      the rest of the work is in UTF-8 mode, the transforms it invokes
+      included (`mixedSegments`): a Unicode segment runs from a step not
+      wholly in UTF-8 mode to the first step from which every step is, or to
+      the end. A step invoking a transform in mixed modes itself stays in
+      UTF-8 mode only where all the steps after it are wholly in UTF-8 mode
+      (its own segments then follow the same rule); otherwise the transform
+      is applied within the Unicode segment. Zawgyi-my went from four Unicode
+      segments (steps 10, 12, 14, 16, with UTF-8 steps between) to one
+      (steps 10-16); 24 transforms changed their segments (Latn-Grek,
+      ja_Latn-ru, cy-cy_FONIPA, …; Jpan-Latn and Latn-Thai no longer switch
+      within Hira-Latin and Latin-ThaiLogical). 22 of them give ICU's output
+      (CLDR test data, or 2,000 lines of their perf corpora); Han-Latin/Names
+      and Jpan-Latn give the output they had, which differs from ICU's on
+      full-width punctuation (xlit gives `!` for `！`, as before).
+      `--plan` reports the segments the pipeline uses (it did not show the
+      steps a segment takes after prefix runs or front-letter revisits).
     - **Switches.** UTF-8 to Unicode: the 21-bit basis decoded from the
       bytes; Unicode to UTF-8: encoded. These are stages with position maps
       (a character's code units to one position, and back).

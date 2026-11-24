@@ -14,7 +14,6 @@
 #include <optional>
 #include <ldml/transform_plan.h>
 #include <ldml/transform_rules_printer.h>
-#include <ldml/transform_rules_parser.h>
 #include <re/adt/adt.h>
 #include "charset_analysis.h"
 #include <ucd/data/PropertyAliases.h>
@@ -3715,6 +3714,32 @@ RE * withMarkers(RE * re, CharSetAnalysis & sets, const std::vector<std::pair<ch
     return re;
 }
 
+//  A copy of an RE with its own Seq, Alt, Rep, CC, Diff and Intersect objects
+//  (leaves such as names, properties and boundaries shared), as the parser
+//  builds the REs of each rule: the rewritten rules share no part of their
+//  patterns with each other or with the rules they come from.  (Shared, the
+//  repetition of $beforeLetter in the after contexts of s } $beforeLetter → σ
+//  and s $underbar } $beforeLetter → ς, rewritten with markers, left two
+//  pairs of rules order dependent after DisambiguateOrder in Latin-Greek.)
+RE * freshRE(RE * re) {
+    if (re == nullptr) return nullptr;
+    if (Seq * q = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items;
+        for (RE * x : *q) items.push_back(freshRE(x));
+        return makeSeq(items.begin(), items.end());
+    }
+    if (Alt * q = dyn_cast<Alt>(re)) {
+        std::vector<RE *> items;
+        for (RE * x : *q) items.push_back(freshRE(x));
+        return makeAlt(items.begin(), items.end());
+    }
+    if (Rep * q = dyn_cast<Rep>(re)) return makeRep(freshRE(q->getRE()), q->getLB(), q->getUB(), q->getKind());
+    if (CC * q = dyn_cast<CC>(re)) return makeCC(q, q);
+    if (Diff * q = dyn_cast<Diff>(re)) return makeDiff(freshRE(q->getLH()), freshRE(q->getRH()));
+    if (Intersect * q = dyn_cast<Intersect>(re)) return makeIntersect(freshRE(q->getLH()), freshRE(q->getRH()));
+    return re;
+}
+
 //  A sequence of fixed items as an RE.
 RE * itemsSeq(const std::vector<UCD::UnicodeSet> & items) {
     std::vector<RE *> res;
@@ -4052,9 +4077,10 @@ bool breathingGroups(const std::vector<Rule *> & group, std::vector<Rule *> & ou
         const std::vector<RE *> text = atomsOf(source->getText());
         const std::vector<RE *> revisit = atomsOf(chains[k]->getResultSide(Direction::Forward)->getResultToRevisit());
         const std::string name = prefixCaps[k]->getName();
+        for (RE *& x : captured) x = freshRE(x);
         Capture * const cap = makeCapture(name, makeSeq(captured.begin(), captured.end()));
-        prefix.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq({cap, text[1]}), nullptr), Direction::Forward,
-                                            makeRuleSide(nullptr, makeSeq(), makeSeq({makeReference(name, cap, 0), revisit[1]}), 0, nullptr)));
+        prefix.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq({cap, freshRE(text[1])}), nullptr), Direction::Forward,
+                                            makeRuleSide(nullptr, makeSeq(), makeSeq({makeReference(name, cap, 0), freshRE(revisit[1])}), 0, nullptr)));
     }
     auto markerOf = [&](char32_t t) {
         for (const auto & m : markers) if (m.first == t) return m.second;
@@ -4072,7 +4098,7 @@ bool breathingGroups(const std::vector<Rule *> & group, std::vector<Rule *> & ou
         out.push_back(makeConversionRule(makeRuleSide(cap), Direction::Forward, makeRuleSide(makeReference(cap->getName(), cap, 0))));
     }
     for (const RoughRule & r : roughs) {
-        Capture * const cap = makeCapture(r.name, r.captured);
+        Capture * const cap = makeCapture(r.name, freshRE(r.captured));
         std::vector<RE *> text{makeCC(r.trigger)}, res{makeCC(markerOf(r.trigger))};
         if (r.vowel) {
             text.push_back(makeCC(r.vowel));
@@ -4113,8 +4139,8 @@ bool breathingGroups(const std::vector<Rule *> & group, std::vector<Rule *> & ou
         if (after == source->getAfterContext()) {
             out.push_back(c);
         } else {
-            out.push_back(makeConversionRule(makeRuleSide(source->getBeforeContext(), source->getText(), after), Direction::Forward,
-                                             c->getResultSide(Direction::Forward)));
+            out.push_back(makeConversionRule(makeRuleSide(freshRE(source->getBeforeContext()), freshRE(source->getText()), freshRE(after)),
+                                             Direction::Forward, c->getResultSide(Direction::Forward)));
         }
     }
     return true;
@@ -4292,11 +4318,7 @@ std::vector<Rule *> RewriteBreathingMarks(const std::vector<Rule *> & rules, std
             break;
         }
     }
-    //  The rules as their text would parse: the later passes plan the rules as
-    //  built here differently from the same rules parsed (two pairs of rules
-    //  left order dependent in Latin-Greek, not found), and the printer and the
-    //  parser round-trip the rules of every CLDR transform.
-    return ExtractForwardRules(parseTransformRules({printRules(out)}));
+    return out;
 }
 
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats) {

@@ -1826,10 +1826,21 @@ checks what the rewrite relies on, and leaves the group as it is otherwise
   smooth rules' clusters do not overlap;
 - in the smooth rules' after contexts, a marker is seen as its trigger (`rHe
   → ρἙ`, no smooth breathing on the `r`).
-The rewritten rules are printed and parsed again: as built in memory, the later
-passes left two pairs of rules order dependent (`s } $beforeLetter → σ`
-against the restated `$afterLetter { s … }`), not found; as parsed, none (the
-printer and the parser round-trip every CLDR transform).
+The rewritten rules have patterns of their own (`freshRE`), as the parser
+builds them. A first version reused the unchanged parts of the rules it
+rewrote, so that the after contexts of `s } $beforeLetter → σ` and `s
+$underbar } $beforeLetter → ς`, rewritten with markers, shared the object of
+`$beforeLetter`'s repetition `[[:m:]']*` (with each other and with the
+variable's definition). `DisambiguateOrder` then left two pairs of rules order
+dependent, where the same rules with patterns of their own (structurally
+equal) are resolved: found by replacing the rules one by one with their
+parsed copies (only `s } … → σ` mattered), then with copies of their own
+objects (enough), and by comparing the rules after each pass (the first to
+differ is `DisambiguateOrder`). Which part of `DisambiguateOrder` depends on
+the sharing is not found (it has no cache or comparison by RE object; the RE
+library's inspectors and memoizing transformers identify REs structurally,
+`MemoizerComparator`). A pass that rewrites rules should therefore not share
+their pattern objects.
 
 Checks: Latn-Grek equals ICU4C (and ICU4J where run) on the 5,030 lines of
 random words and Twain, on the cases above, and on two sets of 50,000 lines of

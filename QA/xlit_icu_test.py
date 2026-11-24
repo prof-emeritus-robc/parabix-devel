@@ -34,8 +34,10 @@ CASES = [
     (["--use-ICU=Any-Upp.*", "Any-Upper"], "a\u00df", "ASS"),
     (["--rules-file={rules}"], "abbc abd", "X aYd"),
     (["--use-ICU=0", "--rules-file={rules}"], "abbc abd", None),
-    (["--plan", "Any-Name"], "", "Any-Name (built-in, applied by ICU): implementable\n"),
-    (["--plan", "Name-Any"], "", "Name-Any (built-in, applied by ICU): implementable\n"),
+    (["--plan", "Any-Name"], "", "Any-Name (built-in, applied by ICU): implementable\n"
+     "  mode: Unicode: the built-in Any-Name (applied by ICU)\n"),
+    (["--plan", "Name-Any"], "", "Name-Any (built-in, applied by ICU): implementable\n"
+     "  mode: Unicode: the built-in Name-Any (applied by ICU)\n"),
     (["--use-ICU=0", "--plan", "Any-BreakInternal"], "", None),
     (["Name-Any"], "\\N{LATIN SMALL LETTER SHARP S}", "\u00df"),
     (["--rules-file={breaks}"], "a\u0e35\u0e1e", "a\u0e35p"),

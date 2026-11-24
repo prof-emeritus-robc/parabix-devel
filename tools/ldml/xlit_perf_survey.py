@@ -23,6 +23,18 @@
 #      Results are appended to <dir>/results.jsonl as they are computed; a run
 #      interrupted resumes from there (transforms already in it are skipped,
 #      also when they were surveyed without --with-lines: use another <dir>).
+#      Each result records a digest of the --plan output (and of --plan --lines),
+#      the plan text going to <dir>/plans.
+#  xlit_perf_survey.py --xlit <xlit> --out <dir> run --update-changed-plans [--only NAME ...] [--with-lines]
+#      Updates the results of <dir>: plans every transform again and surveys
+#      again (replacing its result) each one whose plan changed, also those not
+#      yet in the results.  A plan is compared by its digest (the --plan output
+#      with the path of the rules file reduced to its file name; with --lines
+#      too where the result has the --lines runs, which are made again with
+#      it); a result without one (surveyed before the digests) by its status,
+#      mode, ICU steps and --lines scope, and when these are the same, the
+#      digest is recorded without surveying it again.  results.jsonl is
+#      rewritten after each transform, so an interrupted update resumes.
 #  xlit_perf_survey.py --out <dir> report [--table-doc PATH] [--csv PATH]
 #      Prints the summary, and with --table-doc writes the per-transform table
 #      between <!-- perf:table --> and <!-- /perf:table --> of PATH, and with
@@ -52,6 +64,7 @@
 #  Each input is repeated or cut (at a line end) to 20,000,000 bytes.
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -347,7 +360,82 @@ def kernels_of(text):
     return int(m.group(1)) if m and m.group(1) else None
 
 
+def plan_text(xlit, name, extra=()):
+    p = subprocess.run([xlit, '--plan'] + list(extra) + [name], capture_output=True, timeout=600)
+    return p.returncode, (p.stdout + p.stderr).decode('utf-8', 'replace')
+
+
+#  The digest of a plan: of its text with the paths (of the rules files)
+#  reduced to their file names, which do not depend on where the data is.
+def plan_digest(text):
+    norm = re.sub(r'/[^\s()]*/([^/\s()]+)', r'\1', text)
+    return hashlib.sha256(norm.encode('utf-8')).hexdigest()[:16]
+
+
+def save_plan(args, name, text, suffix=''):
+    d = os.path.join(args.out, 'plans')
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, name.replace('/', '%') + suffix + '.txt'), 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+#  The survey of one transform (the plans given where already made).
+def survey_one(args, name, entries, inputs, with_lines, plan=None, plan_lines=None):
+    r = dict(name=name, builtin=entries[name]['builtin'], internal=entries[name]['internal'],
+             input=inputs[name]['desc'])
+    rc, text = plan or plan_text(args.xlit, name)
+    save_plan(args, name, text)
+    r['plan_rc'] = rc
+    r['plan_digest'] = plan_digest(text)
+    r['mode'], r['scope'], r['icu'] = plan_info(text)
+    if rc != 0:
+        r['problems'] = [l for l in text.splitlines() if 'problem' in l.lower()][:5]
+    if with_lines:
+        _, tl = plan_lines or plan_text(args.xlit, name, ['--lines'])
+        save_plan(args, name, tl, '.lines')
+        r['plan_lines_digest'] = plan_digest(tl)
+        r['mode_lines'], r['scope_lines'], _ = plan_info(tl)
+    for key, extra in (('kernels', []), ('kernels_lines', ['--lines']))[:2 if with_lines else 1]:
+        k = subprocess.run([args.xlit, '--kernel-counts'] + extra + [name], capture_output=True, timeout=600)
+        r[key] = kernels_of((k.stdout + k.stderr).decode('utf-8', 'replace'))
+    if rc == 0:
+        cache = os.path.join(args.out, 'cache')
+        base = [args.xlit, '--compile-threads=3', '-thread-num=4']
+        corpus = inputs[name]['path']
+        for mode, extra in (('std', []), ('lines', ['--lines']))[:2 if with_lines else 1]:
+            shutil.rmtree(cache, ignore_errors=True)
+            os.makedirs(cache)
+            cmd = base + ['-object-cache-dir=' + cache] + extra + [name]
+            m = {}
+            m['cold'], rc2, err = timed(cmd + [corpus + '.line'], args.timeout)
+            if rc2 != 0:
+                m['error'] = '%s: %s' % (rc2, err.strip().splitlines()[-1] if err.strip() else '')
+                r[mode] = m
+                continue
+            m['warm'], rc2, err = timed(cmd + [corpus + '.line'], args.timeout)
+            full, rc2, err = timed(cmd + [corpus], args.run_timeout)
+            if rc2 != 0:
+                m['error'] = '20 MB run %s: %s' % (rc2, err.strip().splitlines()[-1] if err.strip() else '')
+            elif full < 10:
+                again, rc3, _ = timed(cmd + [corpus], args.run_timeout)
+                if rc3 == 0:
+                    full = min(full, again)
+            m['full'] = full
+            if full is not None and m['warm'] is not None:
+                m['run'] = max(full - m['warm'], 0.0)
+            r[mode] = m
+        shutil.rmtree(cache, ignore_errors=True)
+    return r
+
+
+def print_result(r, with_lines):
+    keys = ('name', 'plan_rc', 'mode', 'kernels', 'std') + (('lines',) if with_lines else ())
+    print(json.dumps({k: r.get(k) for k in keys}), flush=True)
+
+
 def run_survey(args):
+    if args.update_changed_plans:
+        return update_changed_plans(args)
     entries = list_transforms(args.xlit)
     with open(os.path.join(args.out, 'inputs.json')) as f:
         inputs = json.load(f)
@@ -356,55 +444,94 @@ def run_survey(args):
     if os.path.exists(path):
         with open(path) as f:
             done = {json.loads(l)['name'] for l in f if l.strip()}
-    names = args.only or list(entries)
-    cache = os.path.join(args.out, 'cache')
-    base = [args.xlit, '--compile-threads=3', '-thread-num=4']
-    for name in names:
+    for name in args.only or list(entries):
         if name in done:
             continue
-        r = dict(name=name, builtin=entries[name]['builtin'], internal=entries[name]['internal'],
-                 input=inputs[name]['desc'])
-        p = subprocess.run([args.xlit, '--plan', name], capture_output=True, timeout=600)
-        text = (p.stdout + p.stderr).decode('utf-8', 'replace')
-        r['plan_rc'] = p.returncode
-        r['mode'], r['scope'], r['icu'] = plan_info(text)
-        if p.returncode != 0:
-            r['problems'] = [l for l in text.splitlines() if 'problem' in l.lower()][:5]
-        if args.with_lines:
-            pl = subprocess.run([args.xlit, '--plan', '--lines', name], capture_output=True, timeout=600)
-            r['mode_lines'], r['scope_lines'], _ = plan_info((pl.stdout + pl.stderr).decode('utf-8', 'replace'))
-        for key, extra in (('kernels', []), ('kernels_lines', ['--lines']))[:2 if args.with_lines else 1]:
-            k = subprocess.run([args.xlit, '--kernel-counts'] + extra + [name], capture_output=True, timeout=600)
-            r[key] = kernels_of((k.stdout + k.stderr).decode('utf-8', 'replace'))
-        if p.returncode == 0:
-            corpus = inputs[name]['path']
-            for mode, extra in (('std', []), ('lines', ['--lines']))[:2 if args.with_lines else 1]:
-                shutil.rmtree(cache, ignore_errors=True)
-                os.makedirs(cache)
-                cmd = base + ['-object-cache-dir=' + cache] + extra + [name]
-                m = {}
-                m['cold'], rc, err = timed(cmd + [corpus + '.line'], args.timeout)
-                if rc != 0:
-                    m['error'] = '%s: %s' % (rc, err.strip().splitlines()[-1] if err.strip() else '')
-                    r[mode] = m
-                    continue
-                m['warm'], rc, err = timed(cmd + [corpus + '.line'], args.timeout)
-                full, rc, err = timed(cmd + [corpus], args.run_timeout)
-                if rc != 0:
-                    m['error'] = '20 MB run %s: %s' % (rc, err.strip().splitlines()[-1] if err.strip() else '')
-                elif full < 10:
-                    again, rc2, _ = timed(cmd + [corpus], args.run_timeout)
-                    if rc2 == 0:
-                        full = min(full, again)
-                m['full'] = full
-                if full is not None and m['warm'] is not None:
-                    m['run'] = max(full - m['warm'], 0.0)
-                r[mode] = m
-            shutil.rmtree(cache, ignore_errors=True)
+        r = survey_one(args, name, entries, inputs, args.with_lines)
         with open(path, 'a') as f:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
-        keys = ('name', 'plan_rc', 'mode', 'kernels', 'std') + (('lines',) if args.with_lines else ())
-        print(json.dumps({k: r.get(k) for k in keys}), flush=True)
+        print_result(r, args.with_lines)
+
+
+def write_results(path, rows):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + '\n')
+    os.replace(tmp, path)
+
+
+#  Whether the plan of a result changed: by the digests where the result has
+#  them, else by what it recorded of the plan (None: the same).
+def plan_change(r, plan, plan_lines):
+    rc, text = plan
+    if 'plan_digest' in r:
+        if r['plan_digest'] != plan_digest(text):
+            return 'plan'
+        if plan_lines is not None and r.get('plan_lines_digest') != plan_digest(plan_lines[1]):
+            return 'plan --lines'
+        return None
+    mode, scope, icu = plan_info(text)
+    old = (r['plan_rc'], r.get('mode'), r.get('scope'), bool(r.get('icu')))
+    new = (rc, mode, scope, icu)
+    if plan_lines is not None:
+        old += (r.get('mode_lines'), r.get('scope_lines'))
+        new += plan_info(plan_lines[1])[:2]
+    if old != new:
+        return 'recorded %s -> %s' % (old, new)
+    return None
+
+
+def update_changed_plans(args):
+    entries = list_transforms(args.xlit)
+    with open(os.path.join(args.out, 'inputs.json')) as f:
+        inputs = json.load(f)
+    path = os.path.join(args.out, 'results.jsonl')
+    rows = load(args) if os.path.exists(path) else []
+    index = {r['name']: i for i, r in enumerate(rows)}
+    counts = dict(unchanged=0, recorded=0, changed=0, new=0)
+    for name in args.only or list(entries):
+        if name not in inputs:
+            print('%s: no input in inputs.json (run corpora again); skipped' % name, file=sys.stderr)
+            continue
+        i = index.get(name)
+        old = rows[i] if i is not None else None
+        #  The --lines runs as the result has them (for a new one, as --with-lines says).
+        lines = has_lines([old]) if old is not None else args.with_lines
+        plan = plan_text(args.xlit, name)
+        plan_lines = plan_text(args.xlit, name, ['--lines']) if lines else None
+        if old is not None:
+            why = plan_change(old, plan, plan_lines)
+            if why is None:
+                if 'plan_digest' in old:
+                    counts['unchanged'] += 1
+                    continue
+                old['plan_digest'] = plan_digest(plan[1])
+                save_plan(args, name, plan[1])
+                if plan_lines is not None:
+                    old['plan_lines_digest'] = plan_digest(plan_lines[1])
+                    save_plan(args, name, plan_lines[1], '.lines')
+                counts['recorded'] += 1
+                write_results(path, rows)
+                continue
+            print('%s: changed (%s)' % (name, why), flush=True)
+        else:
+            print('%s: new' % name, flush=True)
+        r = survey_one(args, name, entries, inputs, lines, plan, plan_lines)
+        if i is None:
+            index[name] = len(rows)
+            rows.append(r)
+            counts['new'] += 1
+        else:
+            rows[i] = r
+            counts['changed'] += 1
+        write_results(path, rows)
+        print_result(r, lines)
+    gone = [r['name'] for r in rows if r['name'] not in entries]
+    print('plans: %(changed)d changed, %(new)d new, %(unchanged)d unchanged, '
+          '%(recorded)d unchanged by what was recorded (digest now recorded)' % counts)
+    if gone:
+        print('in the results but no longer listed by xlit (kept): ' + ', '.join(gone))
 
 
 def fmt(x, digits=2):
@@ -562,6 +689,8 @@ def main():
     ap.add_argument('--only', nargs='+')
     ap.add_argument('--with-lines', action='store_true',
                     help='run: also survey with --lines (--plan, --kernel-counts and the timed runs)')
+    ap.add_argument('--update-changed-plans', action='store_true',
+                    help='run: survey again only the transforms whose plan changed (and new ones)')
     ap.add_argument('--table-doc')
     ap.add_argument('--csv', help='report: write the per-transform table as CSV')
     ap.add_argument('command', choices=['corpora', 'run', 'report'])

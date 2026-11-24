@@ -3143,6 +3143,16 @@ static cl::opt<bool> StaticReplayOnce("static-replay", cl::desc("In the chunked 
                                       "string rules once and replay them in each round where selected"),
                                       cl::init(true), cl::cat(XlitOptions));
 
+//  A group in the chunked staged rounds whose static results are computed once
+//  (--static-replay) has its string matches selected in one correction kernel's
+//  While loop instead, where the loop can decide the core rules: the static rules
+//  as classes by the lengths of their texts, their candidates and results given
+//  (see FusedRulesConfig::staticClasses).  Unicode mode only.
+static cl::opt<bool> StaticLoop("static-loop", cl::desc("Select the string matches of a group in the chunked staged rounds "
+                                "in one correction kernel's While loop, with the static rules given by the lengths of their "
+                                "texts (doc/round-replacement.md, remaining rounds, step 3)"),
+                                cl::init(true), cl::cat(XlitOptions));
+
 static bool chunkedStaged(const ldml::TransformStep & step) {
     return step.sequentialSelection && step.stringRules.size() > StagedChunkRules;
 }
@@ -4489,14 +4499,16 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         //  (In the While loop where every string rule can be decided there: no runs, and
         //  results fixed at each position of their texts; see FusedRulesConfig::sequential.)
         const bool chunked = chunkedStaged(step);
+        const bool loop = SequentialWhile && (step.stringRules.size() <= FusedMaxWholeGroupRules || (chunked && StaticLoop));
         toolio::out() << "    string matches selected sequentially "
-                     << (SequentialWhile && step.stringRules.size() <= FusedMaxWholeGroupRules
-                         ? "in the correction kernel's While loop if its rules allow, otherwise " : "")
+                     << (loop ? "in the correction kernel's While loop if its rules allow, otherwise " : "")
                      << "between the " << ConvertedContextRounds + 1
                      << " rounds of matching before contexts against the converted text";
         if (chunked) {
-            toolio::out() << " (the rounds in chunks: the " << convertedRules << " string rules matched against the converted text "
-                         << "in each round, the other " << step.stringRules.size() - convertedRules << " matched once)";
+            toolio::out() << " (in chunks: the " << convertedRules << " string rules matched against the converted text "
+                         << "in the kernel, the other " << step.stringRules.size() - convertedRules << " matched once"
+                         << (loop ? ", in the loop by the lengths of their texts in Unicode mode where their results are "
+                                    "computed once" : "") << ")";
         }
         toolio::out() << "\n";
     }
@@ -4793,6 +4805,26 @@ struct FusedRulesConfig {
     //  leftmost-first selection of LeftmostMatches.  In place of the staged
     //  rounds (--sequential-while).
     bool sequential = false;
+    //  With sequential: the static string rules of a group in the chunked staged
+    //  rounds' layout (see RulePipelineBuilder::conversionGroup), decided in the
+    //  loop as classes by the lengths of their texts.  Their matches are given at
+    //  their first positions (starts, an index in sources; no two static rules
+    //  match at a position), and their results there (StartResults, laid out by
+    //  staticLayout, the streams from sources[staticResults]); sets, by offset,
+    //  the union of the sets of their texts.  A static candidate applies where no
+    //  match that may cover its first position applies (it has no before context
+    //  matched against the converted text), and its result at offset o is that of
+    //  its first position moved o positions on.  The kernel writes the first
+    //  positions of the static matches that apply (StaticSelected), and does not
+    //  apply them: StaticReplay does.
+    struct StaticClass {
+        unsigned length;
+        int starts;
+        std::vector<UCD::UnicodeSet> sets;
+    };
+    std::vector<StaticClass> staticClasses;
+    int staticResults = -1;
+    StartLayout staticLayout;
     //  The case mappings marked in the state given or by the subgroups (see
     //  CaseMapSplit), whose outcomes a correction kernel takes into account.
     std::set<unsigned> marks;
@@ -5936,6 +5968,7 @@ private:
             b.emplace_back("Spans", out.spans);
             b.emplace_back("Starts", out.starts);
         }
+        if (!c.staticClasses.empty()) b.emplace_back("StaticSelected", Firsts);
         return b;
     }
     static void appendSet(std::string & s, const UCD::UnicodeSet & set) {
@@ -5984,6 +6017,13 @@ private:
             if (c.staged) s += "T";
             if (c.resolve) s += "W2";
             if (c.sequential) s += "Q";
+            if (!c.staticClasses.empty()) {
+                s += "Z" + c.staticLayout.signature() + "r" + std::to_string(c.staticResults);
+                for (const FusedRulesConfig::StaticClass & k : c.staticClasses) {
+                    s += "/" + std::to_string(k.length) + "@" + std::to_string(k.starts);
+                    for (const UCD::UnicodeSet & set : k.sets) appendSet(s, set);
+                }
+            }
             for (const FusedRulesConfig::Selection & sel : c.selection) {
                 s += "/" + std::to_string(sel.length) + (sel.selfOverlapping ? "s" : "");
                 for (size_t p : sel.predecessors) s += "." + std::to_string(p);
@@ -6241,6 +6281,9 @@ void FusedRules::generatePabloMethod() {
     //  positions where the rules of the subgroups apply.  In a correction kernel,
     //  without their before contexts (matched against the converted text below).
     const bool correction = mConfig.rounds > 0;
+    //  The first positions of the static matches that apply (see
+    //  FusedRulesConfig::staticClasses).
+    PabloAST * staticSelected = zeroes;
     std::vector<PabloAST *> starts;
     for (const FusedStringRule & r : mConfig.strings) {
         if (r.match >= 0) {
@@ -6990,6 +7033,9 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
             return;
         }
+        if (!mConfig.staticClasses.empty() && (!mConfig.resolve || !mConfig.sequential || mConfig.absolute)) {
+            llvm::report_fatal_error("xlit: static classes outside a sequential, relative While loop");
+        }
         if (mConfig.resolve) {
             //  The before contexts of the converted subgroups resolved by a While
             //  loop (doc/round-replacement.md §1; the form of doc/ldml-divcode-plan.md
@@ -7035,10 +7081,13 @@ void FusedRules::generatePabloMethod() {
             //  replacement at o (none beyond it: deleted), and at the last position
             //  the rest of the replacement.  Where none applies, the position has its
             //  own outcome.
+            //  (Entries S + c: the static classes, see FusedRulesConfig::staticClasses.)
+            const size_t S = mConfig.strings.size();
+            const size_t numEntries = S + mConfig.staticClasses.size();
             std::vector<size_t> convStrings;
-            std::vector<PabloAST *> candS(mConfig.strings.size(), nullptr);
-            std::vector<Var *> DT(mConfig.strings.size(), nullptr), DF(mConfig.strings.size(), nullptr);
-            std::vector<std::vector<size_t>> coversOf(mConfig.strings.size());
+            std::vector<PabloAST *> candS(numEntries, nullptr);
+            std::vector<Var *> DT(numEntries, nullptr), DF(numEntries, nullptr);
+            std::vector<std::vector<size_t>> coversOf(numEntries);
             struct StringCover {
                 size_t rule;
                 unsigned offset;
@@ -7058,6 +7107,11 @@ void FusedRules::generatePabloMethod() {
                 PabloAST * runChars = nullptr;
                 PabloAST * passStatic = nullptr;
                 PabloAST * notRunBefore = nullptr;
+                //  A static class (stat): its result at the offset given by the
+                //  results at the first positions (last: the last offset of its
+                //  text, with the positions inserted).
+                bool stat = false;
+                bool last = false;
             };
             std::vector<StringCover> covers;
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
@@ -7108,6 +7162,43 @@ void FusedRules::generatePabloMethod() {
                     covers.push_back(std::move(sc));
                 }
             }
+            for (size_t c = 0; c < mConfig.staticClasses.size(); c++) {
+                const FusedRulesConfig::StaticClass & k = mConfig.staticClasses[c];
+                const size_t e = S + c;
+                convStrings.push_back(e);
+                candS[e] = source(k.starts);
+                DT[e] = pb.createVar("DT" + std::to_string(e), zeroes);
+                DF[e] = pb.createVar("DF" + std::to_string(e), zeroes);
+                for (unsigned o = 0; o < k.length; o++) {
+                    StringCover sc;
+                    sc.rule = e;
+                    sc.offset = o;
+                    sc.stat = true;
+                    sc.last = o + 1 == k.length;
+                    sc.cand = o ? pb.createAdvance(candS[e], o) : candS[e];
+                    sc.notCand = pb.createNot(sc.cand);
+                    if (o) {
+                        const std::string suffix = std::to_string(e) + "_" + std::to_string(o);
+                        sc.T = pb.createVar("ST" + suffix, zeroes);
+                        sc.F = pb.createVar("SF" + suffix, zeroes);
+                    }
+                    dep = pb.createOr(dep, sc.cand);
+                    coversOf[e].push_back(covers.size());
+                    covers.push_back(std::move(sc));
+                }
+            }
+            //  Whether a match of entry r may begin at the position of cover sc of
+            //  entry p (see mayBeginWithin; a static class by the sets of its texts).
+            auto textSets = [&](size_t e) -> const std::vector<UCD::UnicodeSet> & {
+                return e < S ? mConfig.strings[e].text : mConfig.staticClasses[e - S].sets;
+            };
+            auto mayBegin = [&](size_t r, size_t p, const StringCover & sc) -> bool {
+                const UCD::UnicodeSet & first = textSets(r).front();
+                if (sc.run) return first.intersects(mConfig.strings[p].run);
+                if (r < S && p < S) return mayBeginWithin(mConfig, r, p, sc.offset);
+                const std::vector<UCD::UnicodeSet> & sets = textSets(p);
+                return sc.offset > 0 && sc.offset < sets.size() && first.intersects(sets[sc.offset]);
+            };
             //  (And where an insertion rule may apply.)
             const size_t numIns = mConfig.insertions.size();
             std::vector<PabloAST *> notInsAfter(numIns);
@@ -7183,60 +7274,122 @@ void FusedRules::generatePabloMethod() {
             };
             //  The positions whose base outcome has length l >= j and settles item x
             //  at distance j as given (see replacementOutcome).
-            std::map<std::tuple<size_t, unsigned, unsigned, int>, PabloAST *> baseMemo;
-            auto baseOutcome = [&](size_t x, unsigned l, unsigned j, int outcome) -> PabloAST * {
-                PabloAST *& memo = baseMemo[std::make_tuple(x, l, j, outcome)];
+            //  An outcome model: the positions whose outcome has l characters
+            //  (length[l], l >= 1), those deleted, and whether slot i of the outcome
+            //  is in a set (in, or not).  Of the base outcome, and of each offset of
+            //  the static classes.
+            struct OutcomeModel {
+                std::vector<PabloAST *> length;
+                PabloAST * deleted;
+                std::function<PabloAST * (unsigned, const UCD::UnicodeSet &, bool)> in;
+                std::map<std::tuple<size_t, unsigned, unsigned, int>, PabloAST *> memo;
+            };
+            //  The positions whose outcome has length l >= j and settles item x at
+            //  distance j as given (see replacementOutcome).
+            auto modelOutcome = [&](OutcomeModel & md, size_t x, unsigned l, unsigned j, int outcome) -> PabloAST * {
+                PabloAST *& memo = md.memo[std::make_tuple(x, l, j, outcome)];
                 if (memo) return memo;
                 const ResolvedItem & item = items[x];
                 const int top = static_cast<int>(l - j);
                 PabloAST * r;
                 if (!item.run) {
-                    r = outcome == 2 ? zeroes : baseIn(top, item.chars, outcome == 1);
+                    r = outcome == 2 ? zeroes : md.in(top, item.chars, outcome == 1);
                 } else {
                     //  Going back from slot top: the first slot not in the set is in
                     //  the set beyond (1) or not (0), or all are in the set (2).
                     PabloAST * found[2] = {zeroes, zeroes};
                     PabloAST * all = ones;
                     for (int i = top; i >= 0; i--) {
-                        PabloAST * const inT = baseIn(i, item.chars, true);
+                        PabloAST * const inT = md.in(i, item.chars, true);
                         PabloAST * const first = pb.createAnd(all, pb.createNot(inT));
-                        PabloAST * const inX = baseIn(i, item.beyond, true);
+                        PabloAST * const inX = md.in(i, item.beyond, true);
                         found[1] = pb.createOr(found[1], pb.createAnd(first, inX));
                         found[0] = pb.createOr(found[0], pb.createAnd(first, pb.createNot(inX)));
                         all = pb.createAnd(all, inT);
                     }
                     r = outcome == 2 ? all : found[outcome];
                 }
-                memo = pb.createAnd(baseLength[l], r);
+                memo = pb.createAnd(md.length[l], r);
                 return memo;
             };
-            //  The positions whose base outcome passes over a run item at distance 1
-            //  (all its characters in the item's set).
-            auto baseThrough = [&](size_t x) -> PabloAST * {
+            //  The positions whose outcome passes over a run item at distance 1 (all
+            //  its characters in the item's set).
+            auto modelThrough = [&](OutcomeModel & md, size_t x) -> PabloAST * {
                 PabloAST * t = zeroes;
-                for (unsigned l = 1; l < baseLength.size(); l++) {
-                    if (baseLength[l] != zeroes) t = pb.createOr(t, baseOutcome(x, l, 1, 2));
+                for (unsigned l = 1; l < md.length.size(); l++) {
+                    if (md.length[l] != zeroes) t = pb.createOr(t, modelOutcome(md, x, l, 1, 2));
                 }
                 return t;
             };
             //  The value of item x at distance j (known in, or known out) for the
-            //  base outcome, given the items before the position (K, by distance).
-            //  At distance 1, a run item's passing over is left to the caller (the
+            //  outcome, given the items before the position (K, by distance).  At
+            //  distance 1, a run item's passing over is left to the caller (the
             //  positions passed over, through which K is carried).
-            auto baseValue = [&](PabloBuilder & b, size_t x, unsigned j, int in, const std::vector<PabloAST *> & K) -> PabloAST * {
+            auto modelValue = [&](OutcomeModel & md, PabloBuilder & b, size_t x, unsigned j, int in,
+                                  const std::vector<PabloAST *> & K) -> PabloAST * {
                 PabloAST * y = zeroes;
-                for (unsigned l = 1; l < baseLength.size(); l++) {
-                    if (baseLength[l] == zeroes) continue;
+                for (unsigned l = 1; l < md.length.size(); l++) {
+                    if (md.length[l] == zeroes) continue;
                     if (l >= j) {
-                        y = b.createOr(y, baseOutcome(x, l, j, in));
-                        if (items[x].run && j > 1) y = b.createOr(y, b.createAnd(baseOutcome(x, l, j, 2), K[0]));
+                        y = b.createOr(y, modelOutcome(md, x, l, j, in));
+                        if (items[x].run && j > 1) y = b.createOr(y, b.createAnd(modelOutcome(md, x, l, j, 2), K[0]));
                     } else {
-                        y = b.createOr(y, b.createAnd(baseLength[l], K[j - l - 1]));
+                        y = b.createOr(y, b.createAnd(md.length[l], K[j - l - 1]));
                     }
                 }
                 return y;
             };
-
+            OutcomeModel baseModel{baseLength, baseDeleted, baseIn, {}};
+            auto baseThrough = [&](size_t x) {return modelThrough(baseModel, x);};
+            auto baseValue = [&](PabloBuilder & b, size_t x, unsigned j, int in, const std::vector<PabloAST *> & K) {
+                return modelValue(baseModel, b, x, j, in, K);
+            };
+            //  The outcome models of the static classes, by offset (and whether the
+            //  last of the text): the results at the first positions moved to the
+            //  offset (as StaticReplay moves them).
+            std::map<std::pair<unsigned, bool>, std::unique_ptr<OutcomeModel>> staticModels;
+            std::deque<ConvertedSlots> staticSlots;
+            auto staticModel = [&](const StringCover & sc) -> OutcomeModel & {
+                std::unique_ptr<OutcomeModel> & md = staticModels[std::make_pair(sc.offset, sc.last)];
+                if (md) return *md;
+                const StartLayout & L = mConfig.staticLayout;
+                auto R = [&](unsigned i) {
+                    PabloAST * const v = source(mConfig.staticResults + static_cast<int>(i));
+                    return sc.offset ? pb.createAdvance(v, sc.offset) : v;
+                };
+                Results sr;
+                sr.changes.assign(sc.last ? L.slots : 1, std::vector<PabloAST *>(21, zeroes));
+                PabloAST * const at = R(L.changed(sc.offset));
+                for (unsigned b = 0; b < 21; b++) sr.changes[0][b] = pb.createAnd(at, pb.createXor(basis[b], R(L.target(sc.offset, b))));
+                if (sc.last) {
+                    for (unsigned i = 1; i < L.slots; i++) {
+                        for (unsigned b = 0; b < 21; b++) sr.changes[i][b] = R(L.mark(i, b));
+                    }
+                    for (size_t k = 0; k < L.insertCounts.size(); k++) sr.insert[L.insertCounts[k]] = R(L.insert(k));
+                }
+                sr.spans = sr.firsts = zeroes;
+                staticSlots.push_back(convertedSlots(sr));
+                const ConvertedSlots & cs = staticSlots.back();
+                md = std::make_unique<OutcomeModel>();
+                md->deleted = pb.createAnd(pb.createAnd(inText, pb.createNot(cs.anyInsert)),
+                                           pb.createAnd(cs.changed0, cs.slotClass(0, UCD::UnicodeSet(DeletionMark))));
+                md->length.assign(cs.maxInsert + 2, zeroes);
+                md->length[1] = pb.createAnd(pb.createAnd(inText, pb.createNot(md->deleted)), pb.createNot(cs.anyInsert));
+                for (const auto & k : cs.insert) md->length[k.first + 1] = pb.createOr(md->length[k.first + 1], k.second);
+                PabloAST * const changed0 = cs.changed0;
+                md->in = [&pb, &cs, &classAt, inText, changed0, replaced](unsigned i, const UCD::UnicodeSet & set, bool in) -> PabloAST * {
+                    const UCD::UnicodeSet inReplaced = set & replaced;
+                    PabloAST * m;
+                    if (i == 0) {
+                        m = pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, set)),
+                                        pb.createAnd(changed0, cs.slotClass(0, inReplaced)));
+                    } else {
+                        m = pb.createOr(cs.slotClass(i, inReplaced), cs.keptClass(i, set));
+                    }
+                    return in ? m : pb.createAnd(inText, pb.createNot(m));
+                };
+                return *md;
+            };
             //  The state, by item and distance j (1 .. depth): Y[1] and Y[0], the
             //  positions at which item x at distance j from the next position is
             //  known to hold, or known not to, given the converted text up to and
@@ -7382,7 +7535,7 @@ void FusedRules::generatePabloMethod() {
                 for (size_t r : convStrings) {
                     PabloAST * applies = candS[r];
                     PabloAST * rejected = zeroes;
-                    if (mConfig.strings[r].converted) {
+                    if (r < S && mConfig.strings[r].converted) {
                         const FusedContexts & before = mConfig.strings[r].before;
                         applies = knownBefore(wb, before, candS[r], true);
                         rejected = knownBefore(wb, before, candS[r], false);
@@ -7395,8 +7548,7 @@ void FusedRules::generatePabloMethod() {
                     for (size_t p : convStrings) {
                         for (size_t k : coversOf[p]) {
                             const StringCover & sc = covers[k];
-                            if (sc.run ? !mConfig.strings[r].text.front().intersects(mConfig.strings[p].run)
-                                       : !mayBeginWithin(mConfig, r, p, sc.offset)) continue;
+                            if (!mayBegin(r, p, sc)) continue;
                             if (p < r) {
                                 within = wb.createOr(within, covT[k]);
                                 notWithin = wb.createAnd(notWithin, covF[k]);
@@ -7461,11 +7613,11 @@ void FusedRules::generatePabloMethod() {
                 //  them is known to apply, with the value of its result there (given by
                 //  valueOf), or with their own value (own) where every match that may
                 //  cover them is known not to apply or has the same value.
-                auto withStrings = [&](PabloAST * own, const std::function<PabloAST *(const std::u32string &)> & valueOf) {
+                auto withStrings = [&](PabloAST * own, const std::function<PabloAST *(size_t)> & valueOf) {
                     PabloAST * any = zeroes;
                     PabloAST * all = own;
                     for (size_t k = 0; k < covers.size(); k++) {
-                        PabloAST * const v = valueOf(covers[k].result);
+                        PabloAST * const v = valueOf(k);
                         any = wb.createOr(any, wb.createAnd(covT[k], v));
                         all = wb.createAnd(all, wb.createOr(covF[k], v));
                     }
@@ -7552,8 +7704,9 @@ void FusedRules::generatePabloMethod() {
                 //  The positions known to be deleted.
                 std::vector<PabloAST *> cDel(numClasses);
                 for (size_t c = 0; c < numClasses; c++) cDel[c] = classAt(0, mappingLengthChars(outcomesOf[c].literal, 0));
-                PabloAST * const delChar = withStrings(settled(cDel, baseDeleted),
-                                                       [&](const std::u32string & w) {return constant(w.empty());});
+                PabloAST * const delChar = withStrings(settled(cDel, baseDeleted), [&](size_t k) {
+                    return covers[k].stat ? staticModel(covers[k]).deleted : constant(covers[k].result.empty());
+                });
                 //  The positions known to be passed over by each run item.
                 std::vector<PabloAST *> thru(items.size(), nullptr);
                 for (size_t x = 0; x < items.size(); x++) {
@@ -7566,7 +7719,9 @@ void FusedRules::generatePabloMethod() {
                         }
                         cThru[c] = t;
                     }
-                    thru[x] = withStrings(settled(cThru, baseThrough(x)), [&](const std::u32string & w) {return resultThrough(w, x);});
+                    thru[x] = withStrings(settled(cThru, baseThrough(x)), [&](size_t k) {
+                        return covers[k].stat ? modelThrough(staticModel(covers[k]), x) : resultThrough(covers[k].result, x);
+                    });
                 }
                 //  The outcome of the subgroups of class c for item x at distance j,
                 //  known in (in) or known out (!in).
@@ -7597,7 +7752,15 @@ void FusedRules::generatePabloMethod() {
                             if (items[x].run && j == 1) base = wb.createOr(base, wb.createAnd(baseThrough(x), K[0]));
                             std::vector<PabloAST *> byClass(numClasses);
                             for (size_t c = 0; c < numClasses; c++) byClass[c] = outcomeOf(c, x, j, in);
-                            auto stringValue = [&](const std::u32string & w) {return resultValue(w, x, j, in);};
+                            auto stringValue = [&](size_t q) -> PabloAST * {
+                                if (!covers[q].stat) return resultValue(covers[q].result, x, j, in);
+                                //  (As the base: deleted, the item before it; passed over by
+                                //  a run item at distance 1, as before it.)
+                                OutcomeModel & md = staticModel(covers[q]);
+                                PabloAST * v = wb.createOr(modelValue(md, wb, x, j, in, k), wb.createAnd(md.deleted, K[j - 1]));
+                                if (items[x].run && j == 1) v = wb.createOr(v, wb.createAnd(modelThrough(md, x), K[0]));
+                                return v;
+                            };
                             Var * const C = vars[x].C[in][j - 1];
                             newY.emplace_back(C, wb.createOr(C, withStrings(settled(byClass, base), stringValue)));
                         }
@@ -7723,6 +7886,13 @@ void FusedRules::generatePabloMethod() {
             //  positions), as settle has them.
             PabloAST * stringsWithin = zeroes;
             for (size_t r : convStrings) {
+                if (r >= S) {
+                    staticSelected = pb.createOr(staticSelected, DT[r]);
+                    for (unsigned o = 1; o < mConfig.staticClasses[r - S].length; o++) {
+                        stringsWithin = pb.createOr(stringsWithin, pb.createAdvance(DT[r], o));
+                    }
+                    continue;
+                }
                 firstOf[r] = DT[r];
                 stringsWithin = pb.createOr(stringsWithin, withinMatches(r, firstOf[r]));
             }
@@ -7742,6 +7912,7 @@ void FusedRules::generatePabloMethod() {
         }
     }
 
+    if (!mConfig.staticClasses.empty()) writeOutputStreamSet("StaticSelected", std::vector<PabloAST *>{staticSelected});
     Results res = stateIn();
     addResults(res, firstOf, atOf);
     addInsertions(res, insAt);
@@ -12647,7 +12818,79 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 if (std::find(coreLengths.begin(), coreLengths.end(), k) == coreLengths.end()) coreLengths.push_back(k);
             }
             StreamSet * const coreClasses = fusedClasses(core);
+            //  The results of the core kernel and of the static rules, at disjoint
+            //  positions, combined.
+            auto mergeResults = [&](const FusedState & out, const FusedState & staticOut) -> FusedState {
+                if (staticOut.changes.empty() && staticOut.insertions.empty() && staticOut.marks.empty()) return out;
+                FusedState merged;
+                for (size_t i = 0; i < std::max(out.changes.size(), staticOut.changes.size()); i++) {
+                    merged.changes.push_back(P.CreateStreamSet(21));
+                }
+                for (const FusedState * s : {&out, &staticOut}) {
+                    for (const auto & k : s->insertions) {
+                        if (!merged.insertions.count(k.first)) merged.insertions[k.first] = P.CreateStreamSet(1);
+                    }
+                    for (const auto & k : s->marks) {
+                        if (!merged.marks.count(k.first)) merged.marks[k.first] = P.CreateStreamSet(1);
+                    }
+                }
+                P.CreateKernelCall<MergeFusedResults>(MergeFusedResults::parts(staticOut.changes, staticOut.insertions, staticOut.marks),
+                                                      MergeFusedResults::parts(out.changes, out.insertions, out.marks),
+                                                      MergeFusedResults::parts(merged.changes, merged.insertions, merged.marks));
+                return merged;
+            };
+            //  The static results replayed where selected (with their coverage).
+            auto replayStatic = [&](StreamSet * selected) {
+                FusedState staticOut;
+                for (unsigned i = 0; i < startLayout.slots; i++) staticOut.changes.push_back(P.CreateStreamSet(21));
+                for (unsigned k : startLayout.insertCounts) staticOut.insertions[k] = P.CreateStreamSet(1);
+                staticOut.spans = P.CreateStreamSet(1);
+                staticOut.starts = P.CreateStreamSet(1);
+                P.CreateKernelCall<StaticReplay>(startLayout, staticLengths, absoluteResults, selected, staticStarts, startResults, U21,
+                                                 staticOut.changes, staticOut.insertions, staticOut.spans, staticOut.starts);
+                return staticOut;
+            };
             FusedState previous;
+            //  In one correction kernel's While loop (see StaticLoop).
+            bool staticLoop = false;
+            if (StaticLoop && SequentialWhile && replay && !absoluteResults) {
+                FusedRulesConfig loop = core;
+                loop.staged = false;
+                loop.sequential = true;
+                loop.selection.clear();
+                loop.staticLayout = startLayout;
+                loop.staticResults = static_cast<int>(loop.sources.size());
+                for (unsigned i = 0; i < startLayout.width(); i++) loop.sources.push_back(FusedMatchSource{startResults, i});
+                for (size_t x = 0; x < staticLengths.size(); x++) {
+                    FusedRulesConfig::StaticClass k{staticLengths[x], static_cast<int>(loop.sources.size()),
+                                                    std::vector<UCD::UnicodeSet>(staticLengths[x])};
+                    loop.sources.push_back(FusedMatchSource{staticStarts, static_cast<unsigned>(x)});
+                    for (size_t i : staticRules) {
+                        const FusedStringRule & r = config.strings[i];
+                        if (r.text.size() != staticLengths[x]) continue;
+                        for (unsigned o = 0; o < r.text.size(); o++) k.sets[o] = k.sets[o] + r.text[o];
+                    }
+                    loop.staticClasses.push_back(std::move(k));
+                }
+                if (resolvableByWhile(loop)) {
+                    staticLoop = true;
+                    loop.resolve = true;
+                    const FusedState none;
+                    const FusedLayout layout(loop, none);
+                    loop.marks = layout.marks;
+                    FusedState out;
+                    for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
+                    for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+                    for (unsigned k : layout.marks) out.marks[k] = P.CreateStreamSet(1);
+                    StreamSet * const selected = P.CreateStreamSet(1);
+                    loop.region = regions != nullptr;
+                    P.CreateKernelCall<FusedRules>(absolutely(std::move(loop), &core), U21, coreClasses, inText, mask, nullptr,
+                                                   none, out, selected);
+                    previous = mergeResults(out, replayStatic(selected));
+                    mStagedGroups.pop_back();       // (recorded above as staged)
+                }
+            }
+            if (!staticLoop) {
             for (unsigned round = 0; round <= ConvertedContextRounds; round++) {
                 std::vector<std::vector<SelectStringMatches::Source>> byLength = staticByLength;
                 if (!core.strings.empty()) {
@@ -12671,12 +12914,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 //  subgroups apply outside the matches).
                 FusedState staticOut;
                 if (replay) {
-                    for (unsigned i = 0; i < startLayout.slots; i++) staticOut.changes.push_back(P.CreateStreamSet(21));
-                    for (unsigned k : startLayout.insertCounts) staticOut.insertions[k] = P.CreateStreamSet(1);
-                    staticOut.spans = P.CreateStreamSet(1);
-                    staticOut.starts = P.CreateStreamSet(1);
-                    P.CreateKernelCall<StaticReplay>(startLayout, staticLengths, absoluteResults, selected, staticStarts, startResults, U21,
-                                                     staticOut.changes, staticOut.insertions, staticOut.spans, staticOut.starts);
+                    staticOut = replayStatic(selected);
                 } else {
                     const FusedState saved = state;
                     state = FusedState{};
@@ -12708,26 +12946,8 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                 applying.region = regions != nullptr;
                 P.CreateKernelCall<FusedRules>(absolutely(std::move(applying), &core), U21, coreClasses, inText, mask, allowedAt,
                                                previous, out, nullptr);
-                if (staticOut.changes.empty() && staticOut.insertions.empty() && staticOut.marks.empty()) {
-                    previous = out;
-                    continue;
-                }
-                FusedState merged;
-                for (size_t i = 0; i < std::max(out.changes.size(), staticOut.changes.size()); i++) {
-                    merged.changes.push_back(P.CreateStreamSet(21));
-                }
-                for (const FusedState * s : {static_cast<const FusedState *>(&out), static_cast<const FusedState *>(&staticOut)}) {
-                    for (const auto & k : s->insertions) {
-                        if (!merged.insertions.count(k.first)) merged.insertions[k.first] = P.CreateStreamSet(1);
-                    }
-                    for (const auto & k : s->marks) {
-                        if (!merged.marks.count(k.first)) merged.marks[k.first] = P.CreateStreamSet(1);
-                    }
-                }
-                P.CreateKernelCall<MergeFusedResults>(MergeFusedResults::parts(staticOut.changes, staticOut.insertions, staticOut.marks),
-                                                      MergeFusedResults::parts(out.changes, out.insertions, out.marks),
-                                                      MergeFusedResults::parts(merged.changes, merged.insertions, merged.marks));
-                previous = merged;
+                previous = mergeResults(out, staticOut);
+            }
             }
             state = previous;
         } else if (step.sequentialSelection && !sequentialLoop) {

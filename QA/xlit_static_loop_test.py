@@ -2,9 +2,9 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  xlit: a group in the chunked staged rounds (--staged-chunk-rules) whose
-#  string matches are selected in one correction kernel's While loop instead
-#  (--static-loop, doc/round-replacement.md, remaining rounds, step 3): the
+#  xlit: a group whose string matches are selected sequentially, with more
+#  string rules than --staged-chunk-rules, selected in one correction kernel's
+#  While loop (doc/round-replacement.md, remaining rounds, steps 3 and 3c): the
 #  string rules whose before contexts are matched against the converted text
 #  (the core) decided in the loop with the subgroups, the others (static)
 #  matched once in chunks and decided in the loop as classes by the lengths of
@@ -18,8 +18,10 @@
 #  inserting positions whose last character is in it (mn -> MNQ), one deleting
 #  its text (pq), and two-way overlaps among the static rules (cb, bcb) and
 #  with the core (bc); chains longer than the rounds, also across blocks.  The
-#  expected results are ICU4C's and ICU4J's (identical).  The staged rounds
-#  (--static-loop=0) fail the chains of 9 or more.
+#  expected results are ICU4C's and ICU4J's (identical); the staged rounds this
+#  replaced (removed in step 4) failed the chains of 9 or more.  With
+#  --extended-testing, also Latn-Deva (the cases of the former
+#  xlit_staged_chunks_test.py).
 #
 #  xlit_static_loop_test.py <xlit binary> [--extended-testing]
 
@@ -45,16 +47,27 @@ GROUPS = [
       ("pqbc", "bc"),
       ("xpqpqpqbc", "aQ"),
       ("cbcbcbmnbc", "RRRMNQQ")]),
-    # (The group of xlit_staged_chunks_test.py, with a subgroup matched against
-    # the converted text and an insertion count among the static rules.)
+    # (The group of the former xlit_staged_chunks_test.py, with a subgroup matched
+    # against the converted text and an insertion count among the static rules.)
     ("x \u2192 a ;\n[aQ] { bc \u2192 Q ;\ncb \u2192 R ;\nbcb \u2192 S ;\nmn \u2192 MNO ;\n"
      "k \u2192 kh ;\n[Q] { d \u2192 D ;\nd \u2192 e ;\n", 3,
      [("xbcbcd", "aQQD"),
       ("cbcbxbcd", "RRaQD"),
+      ("xbcmnbcbd", "aQMNOSe"),
+      ("kdxbcbcbcbcd", "kheaQQQQD"),
+      ("mnxbcbck", "MNOaQQkh"),
+      ("xbcbcbcbcbcbcbcd", "aQQQQQQQD"),
+      ("bcbdcbxbcd", "SeRaQD"),
       ("x" + "bc" * 12 + "d", "a" + "Q" * 12 + "D"),
       ("xbcmnbcd", "aQMNObce"),
       ("x" + "bc" * 700 + "d", "a" + "Q" * 700 + "D")]),
 ]
+
+# (Latin-InterIndic, through Latn-Deva: 2,388 string rules, its static rules in
+# chunks by default; whose before contexts were matched against the text itself
+# before the chunks: xi, hao.)
+LATN_DEVA = [("xi", "\u0915\u094d\u0938\u093f"), ("hao", "\u0939\u094a"),
+             ("kxi", "\u0915\u094d\u0915\u094d\u0938\u093f")]
 
 OPTIONS = ["--use-ICU=0", "--staged-chunk-rules=0"]
 MODES = [[], ["--utf8-mode=0"]]
@@ -88,6 +101,15 @@ def main():
                         failures += 1
                         print("FAIL %r %s with %r:\n  want %r\n  got  %r"
                               % (rules_text, " ".join(config), line[:40], want[:60], got[i][:60] if i < len(got) else None))
+        if EXTENDED:
+            with open(input, "w", encoding="utf-8") as f:
+                f.write("".join(line + "\n" for line, _ in LATN_DEVA))
+            run = subprocess.run([xlit, "--use-ICU=0", "--lines", "Latn-Deva", input], capture_output=True)
+            got = run.stdout.decode("utf-8", "replace").split("\n")
+            for i, (line, want) in enumerate(LATN_DEVA):
+                if run.returncode != 0 or i >= len(got) or got[i] != want:
+                    failures += 1
+                    print("FAIL Latn-Deva with %r: want %r, got %r" % (line, want, got[i] if i < len(got) else None))
     print("%d failures" % failures)
     return 1 if failures else 0
 

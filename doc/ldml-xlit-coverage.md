@@ -1710,6 +1710,51 @@ Greek-Latin's group in three, joined by `:: Null ;`). The decisions were checked
 against ICU's passes, rule by rule, on 50,000 random lines. Latn-Grek's mirror
 rules (`h ($evowel …) → | $1 $rough`) are not covered.
 
+**Latn-Grek: assessment (2026-11-24).** Its 87 plan problems come from 27 rules
+of Greek-Latin's backward direction: 24 rough breathing rules (`h ($evowel …) →
+| $1 $rough`, the `H` forms and 18 titlecase forms `H a (…) → | A $1 $rough`)
+and 3 smooth breathing rules (`$notLetter { ($evowel $macron? $evowel2
+$macron?) } [^$smooth$rough] → | $1 $smooth`, the single vowel and `[rR]`).
+With exactly these removed (a copy of the transforms with `PARABIX_CLDR_DIR`),
+Latn-Grek is implementable: the `j`, `v`, `w` revisits then compose. The rest
+is then identical to ICU4C and ICU4J on the same reduced rules, on 3,000
+random words and the first 2,000 lines of its perf corpus (Twain), also with
+four threads. But the family cannot be left out: with and without it, ICU's
+outputs differ on 3,517 of these 5,030 lines (1,837 of the 2,000 Twain lines),
+as every word beginning with a vowel takes a smooth breathing (`of → ὀφ`) and
+every `h` before a vowel a rough one (`whatsoever → ὐἁτσοεβερ`).
+
+The family mirrors the front-letter revisits: at a trigger that ICU's cursor
+reaches (`h`, `H`, or `H` and a vowel), delete it and write the mark (U+0314)
+after the vowel cluster that follows (a vowel, macron or diaeresis, a second
+vowel, macron: 1 to 5 characters, the alternatives in the rules' order, the
+titlecase forms writing the first vowel uppercase), then convert the cluster
+again; at a cluster (or `r`) whose character before in the converted text is
+not a letter, write U+0313 after it, unless a breathing follows (so not after
+a cluster of the rough rules, which come first). What implementing it needs:
+1. An analysis recognising the two forms (`ldml::FrontLetterRevisits` is the
+   model): the marks, triggers, the cluster's alternatives in order, the
+   titlecase mapping and the contexts, set aside before `ComposeRevisits`.
+2. Where ICU reaches a trigger: an `h` is not reached where an earlier match
+   covers it (`th`, `ph`, `ch`, `kh`, `rh`, …): the group's selection, static
+   (`SelectStringMatches`) where those rules' contexts are, otherwise decided
+   in the correction kernel's While loop.
+3. The smooth breathing's `$notLetter` is matched against the converted text:
+   a single item at distance 1, which the While loop decides; decided at the
+   cluster's start and moved to its end (at most four fixed lengths), as the
+   static classes' covers are (doc/round-replacement.md, step 3).
+4. Before the rest of the group: the trigger deleted, with a placeholder that
+   the rules applying before it still see (the front letters' placeholders,
+   mirrored); the mark inserted after the cluster's end (the insertion counts);
+   the titlecase vowel; the placeholders removed after the group.
+5. Unicode mode first (as the front letters; mixed modes apply it), UTF-8 later.
+6. Tests: Latn-Grek has no CLDR test data; ICU4C and ICU4J (which agree on all
+   the text tried) on random text dense in `h`/`H`, vowels, macrons,
+   diaereses, apostrophes and word boundaries, and the Twain corpus.
+The risks are in 2 (reaching through overlapping rules) and in the smooth
+rule's interplay with the rough marks already written. The size of the work is
+about that of the front-letter revisits.
+
 **Run moves** (`53121b04a`, `ldml::MarkRunMoves`). fa-fa_FONIPA's `([َ ِ ُ])ّ → ّ |
 $1` (NFD puts the vowel before the shadda) writes the shadda and revisits the
 vowel, which ICU then matches again, so that the whole run of shaddas is

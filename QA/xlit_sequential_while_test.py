@@ -5,13 +5,13 @@
 #  xlit: a whole group whose string matches are selected sequentially (two-way
 #  or cyclic overlaps, TransformStep::sequentialSelection), with string rules
 #  whose before contexts are matched against the converted text, selected in
-#  the correction kernel's While loop (FusedRulesConfig::sequential,
-#  --sequential-while; doc/round-replacement.md step 6) instead of staged
+#  the correction kernel's While loop (FusedRulesConfig::sequential;
+#  doc/round-replacement.md step 6) instead of staged
 #  rounds of matching, LeftmostMatches and applying kernels.  The loop is exact
 #  at any chain length: chains of conversions longer than the rounds, also
 #  across blocks.  The expected results are ICU's (createFromRules, each line
-#  a text; those with runs also ICU4J's).  With --sequential-while=0 the
-#  chains of 9 or more fail.  String rules with runs (of a set) are decided in
+#  a text; those with runs also ICU4J's).  The staged rounds (removed in
+#  step 4) failed the chains of 9 or more.  String rules with runs (of a set) are decided in
 #  the loop as well (doc/round-replacement.md, remaining rounds, step 2).
 #
 #  xlit_sequential_while_test.py <xlit binary> [--extended-testing]

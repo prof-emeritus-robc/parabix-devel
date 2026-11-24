@@ -1151,11 +1151,6 @@ add_test(
   COMMAND python3 xlit_sequential_while_test.py ${BIN_DIR}/xlit)
 
 add_test(
-  NAME xlit_staged_chunks_test
-  WORKING_DIRECTORY ${QA_DIR}
-  COMMAND python3 xlit_staged_chunks_test.py ${BIN_DIR}/xlit)
-
-add_test(
   NAME xlit_static_loop_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 xlit_static_loop_test.py ${BIN_DIR}/xlit)

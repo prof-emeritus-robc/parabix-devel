@@ -15952,6 +15952,13 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
         toolio::out() << "\n";
         return;
     }
+    //  (A built-in: UTF-8 where xlit applies it to the code units, see
+    //  utf8BuiltIn; the built-ins applied by ICU, to the code points.)
+    if (entry->isBuiltIn()) {
+        if (m.utf8) toolio::out() << "  mode: UTF-8" << (UTF8Mode ? "" : " (not used: --utf8-mode=0)") << "\n";
+        else toolio::out() << "  mode: Unicode: " << m.reason << (isICUBuiltIn(entry->canonicalName) ? " (applied by ICU)" : "") << "\n";
+        return;
+    }
     if (m.utf8) {
         toolio::out() << "  mode: UTF-8" << (UTF8Mode ? "" : " (not used: --utf8-mode=0)") << "\n";
         //  (The single-character rules with contexts of its own groups, and
@@ -17908,7 +17915,7 @@ static int run(int argc, char *argv[]) {
             return 2;
         }
         printPlan(label, a);
-        if (a.implementable && !entry->isBuiltIn()) printMode(analyzer, entry, Lines && regionScope(registry, analyzer, entry).bounded);
+        if (a.implementable) printMode(analyzer, entry, Lines && regionScope(registry, analyzer, entry).bounded);
         if (Lines) printRegionScope(regionScope(registry, analyzer, entry));
         return a.implementable ? 0 : 2;
     }

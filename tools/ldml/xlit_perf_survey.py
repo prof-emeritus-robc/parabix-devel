@@ -9,22 +9,28 @@
 #      Builds a 20 MB input in the source of each transform (see Corpora) in
 #      <dir>/corpora, and records which input each transform uses in
 #      <dir>/inputs.json.
-#  xlit_perf_survey.py --xlit <xlit> --out <dir> run [--only NAME ...]
-#      For each transform: xlit --plan and --plan --lines (status, mode,
-#      region scope), --kernel-counts and --kernel-counts --lines, and for each
-#      of the standard and --lines modes, with --compile-threads=3 and
-#      -thread-num=4, in an object cache of its own (emptied first):
+#  xlit_perf_survey.py --xlit <xlit> --out <dir> run [--only NAME ...] [--with-lines]
+#      For each transform: xlit --plan (status, mode), --kernel-counts, and
+#      the runs below; with --with-lines, also --plan --lines (region scope),
+#      --kernel-counts --lines and the runs with --lines (off by default).
+#      The runs, with --compile-threads=3 and -thread-num=4, in an object
+#      cache of their own (emptied first):
 #        cold   a run on a one-line input with the cache empty,
 #        warm   the same run again (the kernels now cached),
 #        run    the 20 MB input with the cache warm (best of two runs when the
 #               first takes less than 10 s); the run time is its wall time less
 #               the warm time.
 #      Results are appended to <dir>/results.jsonl as they are computed; a run
-#      interrupted resumes from there (transforms already in it are skipped).
+#      interrupted resumes from there (transforms already in it are skipped,
+#      also when they were surveyed without --with-lines: use another <dir>).
 #  xlit_perf_survey.py --out <dir> report [--table-doc PATH] [--csv PATH]
 #      Prints the summary, and with --table-doc writes the per-transform table
 #      between <!-- perf:table --> and <!-- /perf:table --> of PATH, and with
 #      --csv PATH the same table as CSV (times unrounded to the millisecond).
+#      The --lines columns are included where the results have them.
+#
+#  The mode (UTF-8, mixed, Unicode, or ICU for a built-in ICU applies) is the
+#  one xlit --plan reports, for the built-ins too.
 #
 #  Run one at a time, with nothing else running: the timings use the four
 #  performance cores.
@@ -364,14 +370,15 @@ def run_survey(args):
         r['mode'], r['scope'], r['icu'] = plan_info(text)
         if p.returncode != 0:
             r['problems'] = [l for l in text.splitlines() if 'problem' in l.lower()][:5]
-        pl = subprocess.run([args.xlit, '--plan', '--lines', name], capture_output=True, timeout=600)
-        r['mode_lines'], r['scope_lines'], _ = plan_info((pl.stdout + pl.stderr).decode('utf-8', 'replace'))
-        for key, extra in (('kernels', []), ('kernels_lines', ['--lines'])):
+        if args.with_lines:
+            pl = subprocess.run([args.xlit, '--plan', '--lines', name], capture_output=True, timeout=600)
+            r['mode_lines'], r['scope_lines'], _ = plan_info((pl.stdout + pl.stderr).decode('utf-8', 'replace'))
+        for key, extra in (('kernels', []), ('kernels_lines', ['--lines']))[:2 if args.with_lines else 1]:
             k = subprocess.run([args.xlit, '--kernel-counts'] + extra + [name], capture_output=True, timeout=600)
             r[key] = kernels_of((k.stdout + k.stderr).decode('utf-8', 'replace'))
         if p.returncode == 0:
             corpus = inputs[name]['path']
-            for mode, extra in (('std', []), ('lines', ['--lines'])):
+            for mode, extra in (('std', []), ('lines', ['--lines']))[:2 if args.with_lines else 1]:
                 shutil.rmtree(cache, ignore_errors=True)
                 os.makedirs(cache)
                 cmd = base + ['-object-cache-dir=' + cache] + extra + [name]
@@ -396,7 +403,8 @@ def run_survey(args):
             shutil.rmtree(cache, ignore_errors=True)
         with open(path, 'a') as f:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
-        print(json.dumps({k: r.get(k) for k in ('name', 'plan_rc', 'mode', 'kernels', 'std', 'lines')}), flush=True)
+        keys = ('name', 'plan_rc', 'mode', 'kernels', 'std') + (('lines',) if args.with_lines else ())
+        print(json.dumps({k: r.get(k) for k in keys}), flush=True)
 
 
 def fmt(x, digits=2):
@@ -408,15 +416,12 @@ def load(args):
         return [json.loads(l) for l in f if l.strip()]
 
 
-#  The built-ins applied in UTF-8 mode (doc/xlit-utf8-mode.md); --plan gives
-#  no mode for the built-ins.
-UTF8_BUILTINS = {'Any-Null', 'Any-NFD', 'Any-NFKD', 'Any-NFC', 'Any-NFKC', 'Any-Lower', 'Any-Upper'}
-
-
+#  The mode as xlit --plan reports it (for the built-ins too; a built-in that
+#  ICU applies, ICU).
 def utf8_label(mode, r=None):
+    if r is not None and r.get('builtin') and r.get('icu'):
+        return 'ICU'
     if mode is None:
-        if r is not None and r.get('builtin'):
-            return 'ICU' if r.get('icu') else ('UTF-8' if r['name'] in UTF8_BUILTINS else 'Unicode')
         return ''
     if mode.startswith('UTF-8'):
         return 'UTF-8'
@@ -425,18 +430,27 @@ def utf8_label(mode, r=None):
     return 'Unicode'
 
 
+def has_lines(rows):
+    return any('lines' in r or r.get('scope_lines') is not None for r in rows)
+
+
 def report(args):
     rows = load(args)
+    modes = ('std', 'lines') if has_lines(rows) else ('std',)
     if args.table_doc:
         out = []
-        out.append('| Transform | status | UTF-8 | --lines | input | kernels | cold s | warm s | run s | MB/s | cold s --lines | warm s --lines | run s --lines | MB/s --lines |')
-        out.append('|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+        if len(modes) == 2:
+            out.append('| Transform | status | UTF-8 | --lines | input | kernels | cold s | warm s | run s | MB/s | cold s --lines | warm s --lines | run s --lines | MB/s --lines |')
+            out.append('|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+        else:
+            out.append('| Transform | status | UTF-8 | input | kernels | cold s | warm s | run s | MB/s |')
+            out.append('|---|---|---|---|---:|---:|---:|---:|---:|')
         for r in sorted(rows, key=lambda r: (r['builtin'], r['name'].lower())):
             status = '**ok**' if r['plan_rc'] == 0 else 'blocked'
             if r.get('icu'):
                 status += ' (ICU steps)'
             cells = []
-            for mode in ('std', 'lines'):
+            for mode in modes:
                 m = r.get(mode, {})
                 if not m:
                     cells += ['', '', '', '']
@@ -463,10 +477,10 @@ def report(args):
             if r['plan_rc'] != 0:
                 scope = ''
             #  (xlit --kernel-counts --lines gives the same counts as without --lines.)
-            out.append('| %s | %s | %s | %s | %s | %s | %s |' % (
-                r['name'], status, utf8_label(r.get('mode'), r), scope,
+            fields = [r['name'], status, utf8_label(r.get('mode'), r)] + ([scope] if len(modes) == 2 else []) + [
                 re.sub(r'CLDR test sources of (\S+) \((\d+) distinct\)', r'CLDR tests of \1 (\2 words)', r['input']),
-                r.get('kernels') if r.get('kernels') is not None else '', ' | '.join(cells)))
+                str(r.get('kernels')) if r.get('kernels') is not None else '', ' | '.join(cells)]
+            out.append('| ' + ' | '.join(fields) + ' |')
         #  Between <!-- perf:table --> and <!-- /perf:table --> of the document
         #  (appended to it, with the markers, if it has none).
         block = '<!-- perf:table -->\n' + '\n'.join(out) + '\n<!-- /perf:table -->'
@@ -485,9 +499,10 @@ def report(args):
 #  where a run did not finish, failed, or is within the noise of the measurement.
 def write_csv(args, rows):
     import csv
-    head = ['transform', 'builtin', 'internal', 'status', 'icu_steps', 'utf8_mode', 'plan_mode', 'lines_scope',
-            'input', 'kernels']
-    for suffix in ('', '_lines'):
+    modes = ('std', 'lines') if has_lines(rows) else ('std',)
+    head = ['transform', 'builtin', 'internal', 'status', 'icu_steps', 'utf8_mode', 'plan_mode'] + (
+        ['lines_scope'] if len(modes) == 2 else []) + ['input', 'kernels']
+    for suffix in ('', '_lines')[:len(modes)]:
         head += [k + suffix for k in ('cold_s', 'warm_s', 'run_s', 'mb_per_s', 'note')]
     with open(args.csv, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
@@ -495,10 +510,10 @@ def write_csv(args, rows):
         for r in sorted(rows, key=lambda r: (r['builtin'], r['name'].lower())):
             row = [r['name'], int(r['builtin']), int(r['internal']), 'ok' if r['plan_rc'] == 0 else 'blocked',
                    int(bool(r.get('icu'))), utf8_label(r.get('mode'), r) if r['plan_rc'] == 0 else '',
-                   r.get('mode') or '', (r.get('scope_lines') or '') if r['plan_rc'] == 0 else '',
+                   r.get('mode') or ''] + ([(r.get('scope_lines') or '') if r['plan_rc'] == 0 else ''] if len(modes) == 2 else []) + [
                    re.sub(r'CLDR test sources of (\S+) \((\d+) distinct\)', r'CLDR tests of \1 (\2 words)', r['input']),
                    '' if r.get('kernels') is None else r['kernels']]
-            for mode in ('std', 'lines'):
+            for mode in modes:
                 m = r.get(mode, {})
                 run = m.get('run')
                 note = ''
@@ -526,7 +541,7 @@ def summary(rows):
     print('transforms %d, implementable %d' % (len(rows), len(ok)))
     from collections import Counter
     print('modes', Counter(utf8_label(r.get('mode'), r) for r in ok))
-    for mode in ('std', 'lines'):
+    for mode in ('std', 'lines') if has_lines(rows) else ('std',):
         ms = [r[mode] for r in ok if mode in r and r[mode].get('run') is not None]
         errs = [r['name'] for r in ok if mode in r and 'error' in r[mode]]
         print(mode, 'measured', len(ms), 'errors', len(errs), errs[:20])
@@ -545,6 +560,8 @@ def main():
     ap.add_argument('--timeout', type=int, default=900, help='for the compilations (s)')
     ap.add_argument('--run-timeout', type=int, default=300, help='for the 20 MB runs (s)')
     ap.add_argument('--only', nargs='+')
+    ap.add_argument('--with-lines', action='store_true',
+                    help='run: also survey with --lines (--plan, --kernel-counts and the timed runs)')
     ap.add_argument('--table-doc')
     ap.add_argument('--csv', help='report: write the per-transform table as CSV')
     ap.add_argument('command', choices=['corpora', 'run', 'report'])

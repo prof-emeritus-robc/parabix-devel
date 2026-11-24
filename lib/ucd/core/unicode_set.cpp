@@ -552,9 +552,8 @@ UnicodeSet UnicodeSet::operator^(const UnicodeSet & other) const noexcept {
  *
  * A total order on sets, consistent with set equality: the sets are compared
  * as sequences of quads.  The representation of a set is not necessarily
- * canonical (adjacent runs may have the same type and Mixed quads may be
- * empty or full), so the quads represented are compared, walking both run
- * lists together; Empty and Full runs compare as all-zero and all-one quads.
+ * unique (adjacent runs may have the same type), so the quads represented
+ * are compared, walking both run lists together; Empty and Full runs compare as all-zero and all-one quads.
  ** ------------------------------------------------------------------------------------------------------------- */
 int UnicodeSet::compare(const UnicodeSet & other) const noexcept {
     const run_t * ra = mRuns;
@@ -647,14 +646,17 @@ void UnicodeSet::insert(const codepoint_t cp) {
     if (LLVM_LIKELY(type == Mixed)) {
         quadIndex += offset;
         if (LLVM_UNLIKELY(mQuadCapacity == 0)) {
-            bitquad_t * const quads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(mQuadLength - 1);
-            copy_(quads, mQuads, (quadIndex - 1));
-            quads[quadIndex] = mQuads[quadIndex] | value;
-            const unsigned quadOffset = (quads[quadIndex] == FULL_QUAD_MASK) ? 1 : 0;
+            //  (The quads are shared: copied, with the quad changed, or without it
+            //  where it becomes full, so that every Mixed quad keeps both a 1 and
+            //  a 0 bit.)
+            const bitquad_t changed = mQuads[quadIndex] | value;
+            const unsigned quadOffset = (changed == FULL_QUAD_MASK) ? 1 : 0;
+            bitquad_t * const quads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(mQuadLength);
+            copy_(quads, mQuads, quadIndex);
+            if (quadOffset == 0) quads[quadIndex] = changed;
+            copy_(quads + quadIndex + 1 - quadOffset, mQuads + quadIndex + 1, (mQuadLength - quadIndex - 1));
             mQuadCapacity = mQuadLength;
             mQuadLength -= quadOffset;
-            ++quadIndex;
-            copy_(quads + quadIndex, mQuads + quadIndex + quadOffset, (mQuadLength - quadIndex));
             mQuads = quads;
             if (LLVM_LIKELY(quadOffset == 0)) {  // no change to runs needed
                 assert (verify(mRuns, mRunLength, mQuads, mQuadLength));
@@ -692,7 +694,13 @@ void UnicodeSet::insert(const codepoint_t cp) {
         return;
     }
 
-    if (LLVM_UNLIKELY(length == 1 && mRunCapacity != 0)) { // are we overwriting a 1-length run?
+    if (LLVM_UNLIKELY(length == 1)) { // are we overwriting a 1-length run?
+        if (mRunCapacity == 0) {    // (shared: copied first)
+            run_t * const runs = ThreadSafeSlabAllocator::allocate_array_of<run_t>(mRunLength);
+            copy_(runs, mRuns, mRunLength);
+            mRuns = runs;
+            mRunCapacity = mRunLength;
+        }
         std::get<0>(mRuns[runIndex]) = (type == Empty) ? Mixed : Full;
     } else {
         const unsigned remaining = length - (offset + 1);
@@ -1025,7 +1033,7 @@ bool UnicodeSet::intersects(const UnicodeSet & other) const noexcept {
             i1 += n;
             i2 += n;
         } else if (i1.type() == Full || i2.type() == Full) {
-            return true;
+            return true;    // (the other is Full or Mixed: never empty)
         } else { //both Mixed
             assert (i1.type() == Mixed && i2.type() == Mixed);
             for (; n; --n, ++i1, ++i2) {
@@ -1055,7 +1063,7 @@ bool UnicodeSet::subset(const UnicodeSet & other) const noexcept {
             // i1 is Full and i2 is Empty.
             return false;
         } else {
-            // Compare the quads (a Mixed quad may be empty or full).
+            // Compare the quads.
             for (; n; --n, ++i1, ++i2) {
                 const bitquad_t q1 = (i1.type() == Mixed) ? i1.quad() : FULL_QUAD_MASK;
                 const bitquad_t q2 = (i2.type() == Mixed) ? i2.quad() : 0;

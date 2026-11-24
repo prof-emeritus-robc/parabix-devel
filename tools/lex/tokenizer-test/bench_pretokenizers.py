@@ -141,7 +141,7 @@ def run_tokenizer(cmd: list) -> subprocess.CompletedProcess:
 
 def check_case(args, mode: str, path: str, text: str) -> dict:
     """Compare the complete pre-token lists. Returns the check record."""
-    out = run_tokenizer(parabix_cmd(args, mode, path, ["--pretok-separator=0x10FFFF"])).stdout
+    out = run_tokenizer(parabix_cmd(args, mode, path, [f"--pretok-separator=0x{ord(SEPARATOR):X}"])).stdout
     actual = [s for s in out.decode("utf-8").split(SEPARATOR) if s]
     expected = [s for s, _ in MODES[mode][2]().pre_tokenize_str(text)]
     check = {"match": actual == expected, "parabix_pretokens": len(actual),
@@ -180,8 +180,11 @@ def time_hf(pt, text: str, iters: int) -> list:
 def run_case(args, mode: str, path: str) -> dict:
     raw = open(path, "rb").read()
     text = raw.decode("utf-8")
-    if SEPARATOR in text:
-        raise RuntimeError(f"{path} contains U+10FFFF, the correctness run's separator")
+    global SEPARATOR
+    # A noncharacter absent from this input; U+10FFFF is used unless the input contains it.
+    SEPARATOR = next((c for c in ("\U0010FFFF", "\U0010FFFE", "\U0010FFFD") if c not in text), None)
+    if SEPARATOR is None:
+        raise RuntimeError(f"{path} contains U+10FFFD..U+10FFFF, the correctness run's separators")
     case = {"mode": mode, "input": os.path.basename(path), "path": path, "bytes": len(raw)}
     print(f"  {mode} on {case['input']}: checking", file=sys.stderr, flush=True)
     case["check"] = check_case(args, mode, path, text)

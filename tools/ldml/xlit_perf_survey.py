@@ -35,6 +35,12 @@
 #      mode, ICU steps and --lines scope, and when these are the same, the
 #      digest is recorded without surveying it again.  results.jsonl is
 #      rewritten after each transform, so an interrupted update resumes.
+#  xlit_perf_survey.py --xlit <xlit> --out <dir> run --seed-plans [--only NAME ...]
+#      Records the plan digests (and plan texts) of the results without them,
+#      from <xlit> built at the commit that made the results, without surveying
+#      anything: a result is given the digest only where its recorded status,
+#      mode, ICU steps, --lines scope and kernel counts are those of <xlit>;
+#      the others are listed (a sign that <xlit> is not what made them).
 #  xlit_perf_survey.py --out <dir> report [--table-doc PATH] [--csv PATH]
 #      Prints the summary, and with --table-doc writes the per-transform table
 #      between <!-- perf:table --> and <!-- /perf:table --> of PATH, and with
@@ -434,6 +440,8 @@ def print_result(r, with_lines):
 
 
 def run_survey(args):
+    if args.seed_plans:
+        return seed_plans(args)
     if args.update_changed_plans:
         return update_changed_plans(args)
     entries = list_transforms(args.xlit)
@@ -480,6 +488,48 @@ def plan_change(r, plan, plan_lines):
     if old != new:
         return 'recorded %s -> %s' % (old, new)
     return None
+
+
+def kernel_counts(xlit, name, extra=()):
+    k = subprocess.run([xlit, '--kernel-counts'] + list(extra) + [name], capture_output=True, timeout=600)
+    return kernels_of((k.stdout + k.stderr).decode('utf-8', 'replace'))
+
+
+def seed_plans(args):
+    path = os.path.join(args.out, 'results.jsonl')
+    rows = load(args)
+    only = set(args.only or [])
+    seeded, mismatched = 0, []
+    for n, r in enumerate(rows):
+        if 'plan_digest' in r or (only and r['name'] not in only):
+            continue
+        lines = has_lines([r])
+        plan = plan_text(args.xlit, r['name'])
+        plan_lines = plan_text(args.xlit, r['name'], ['--lines']) if lines else None
+        why = plan_change(r, plan, plan_lines)
+        if why is None:
+            kernels = (kernel_counts(args.xlit, r['name']),)
+            old = (r.get('kernels'),)
+            if lines:
+                kernels += (kernel_counts(args.xlit, r['name'], ['--lines']),)
+                old += (r.get('kernels_lines'),)
+            if kernels != old:
+                why = 'kernels %s -> %s' % (old, kernels)
+        if why is not None:
+            mismatched.append(r['name'])
+            print('%s: not seeded (%s)' % (r['name'], why), flush=True)
+            continue
+        r['plan_digest'] = plan_digest(plan[1])
+        save_plan(args, r['name'], plan[1])
+        if plan_lines is not None:
+            r['plan_lines_digest'] = plan_digest(plan_lines[1])
+            save_plan(args, r['name'], plan_lines[1], '.lines')
+        seeded += 1
+        if seeded % 25 == 0:
+            write_results(path, rows)
+            print('%d seeded (%d of %d)' % (seeded, n + 1, len(rows)), flush=True)
+    write_results(path, rows)
+    print('plans seeded: %d; not seeded: %d %s' % (seeded, len(mismatched), ' '.join(mismatched)))
 
 
 def update_changed_plans(args):
@@ -691,6 +741,8 @@ def main():
                     help='run: also survey with --lines (--plan, --kernel-counts and the timed runs)')
     ap.add_argument('--update-changed-plans', action='store_true',
                     help='run: survey again only the transforms whose plan changed (and new ones)')
+    ap.add_argument('--seed-plans', action='store_true',
+                    help='run: record the plan digests of the results without them, from the xlit that made them')
     ap.add_argument('--table-doc')
     ap.add_argument('--csv', help='report: write the per-transform table as CSV')
     ap.add_argument('command', choices=['corpora', 'run', 'report'])

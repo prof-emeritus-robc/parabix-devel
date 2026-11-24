@@ -3147,7 +3147,7 @@ static cl::opt<bool> StaticReplayOnce("static-replay", cl::desc("In the chunked 
 //  (--static-replay) has its string matches selected in one correction kernel's
 //  While loop instead, where the loop can decide the core rules: the static rules
 //  as classes by the lengths of their texts, their candidates and results given
-//  (see FusedRulesConfig::staticClasses).  Unicode mode only.
+//  (see FusedRulesConfig::staticClasses), in Unicode and UTF-8 mode.
 static cl::opt<bool> StaticLoop("static-loop", cl::desc("Select the string matches of a group in the chunked staged rounds "
                                 "in one correction kernel's While loop, with the static rules given by the lengths of their "
                                 "texts (doc/round-replacement.md, remaining rounds, step 3)"),
@@ -4507,8 +4507,8 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
         if (chunked) {
             toolio::out() << " (in chunks: the " << convertedRules << " string rules matched against the converted text "
                          << "in the kernel, the other " << step.stringRules.size() - convertedRules << " matched once"
-                         << (loop ? ", in the loop by the lengths of their texts in Unicode mode where their results are "
-                                    "computed once" : "") << ")";
+                         << (loop ? ", in the loop by the lengths of their texts where their results are computed once"
+                                  : "") << ")";
         }
         toolio::out() << "\n";
     }
@@ -7033,8 +7033,8 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
             return;
         }
-        if (!mConfig.staticClasses.empty() && (!mConfig.resolve || !mConfig.sequential || mConfig.absolute)) {
-            llvm::report_fatal_error("xlit: static classes outside a sequential, relative While loop");
+        if (!mConfig.staticClasses.empty() && (!mConfig.resolve || !mConfig.sequential)) {
+            llvm::report_fatal_error("xlit: static classes outside a sequential While loop");
         }
         if (mConfig.resolve) {
             //  The before contexts of the converted subgroups resolved by a While
@@ -7357,10 +7357,16 @@ void FusedRules::generatePabloMethod() {
                     PabloAST * const v = source(mConfig.staticResults + static_cast<int>(i));
                     return sc.offset ? pb.createAdvance(v, sc.offset) : v;
                 };
+                //  (With absolute results, UTF-8 mode: the targets are selectors,
+                //  written only where changed, and convertedSlots reads them by the
+                //  strings of the selectors; otherwise XORed with the character.)
+                PabloAST * const at = R(L.changed(sc.offset));
                 Results sr;
                 sr.changes.assign(sc.last ? L.slots : 1, std::vector<PabloAST *>(21, zeroes));
-                PabloAST * const at = R(L.changed(sc.offset));
-                for (unsigned b = 0; b < 21; b++) sr.changes[0][b] = pb.createAnd(at, pb.createXor(basis[b], R(L.target(sc.offset, b))));
+                for (unsigned b = 0; b < 21; b++) {
+                    PabloAST * const t = R(L.target(sc.offset, b));
+                    sr.changes[0][b] = mConfig.absolute ? t : pb.createAnd(at, pb.createXor(basis[b], t));
+                }
                 if (sc.last) {
                     for (unsigned i = 1; i < L.slots; i++) {
                         for (unsigned b = 0; b < 21; b++) sr.changes[i][b] = R(L.mark(i, b));
@@ -12857,7 +12863,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             bool staticLoop = false;
             std::string notLoop = !StaticLoop ? "--static-loop=0" : !SequentialWhile ? "--sequential-while=0"
                                   : !replay ? "static results not computed once (runs or kept characters, or --static-replay=0)"
-                                  : absoluteResults ? "UTF-8 mode (absolute results)" : "";
+                                  : "";
             if (notLoop.empty()) {
                 FusedRulesConfig loop = core;
                 loop.staged = false;
@@ -15862,8 +15868,9 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     P.CreateKernelCall<FDSourceKernel>(P.getInputScalar("useMMap"), fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     const size_t base = P.getNumOfKernelCalls();
-    //  (In UTF-8 mode, the kernels from the UTF-8 basis bits.)
-    if (UTF8Mode && !entry->isBuiltIn() && analyzer.mode(entry).utf8) {
+    //  (In UTF-8 mode, the kernels from the UTF-8 basis bits: as the transform is
+    //  applied, with mixed modes also a transform with steps in Unicode mode.)
+    if (UTF8Mode && !entry->isBuiltIn() && (MixedModes || analyzer.mode(entry).utf8)) {
         StreamSet * const Basis = BasisOf(P, ByteStream);
         const size_t from = P.getNumOfKernelCalls();
         std::vector<std::pair<size_t, size_t>> counts;
@@ -15874,7 +15881,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
             toolio::out() << "group " << (i + 1) << ": " << counts[i].first << " rules, " << counts[i].second << " kernels\n";
             groupKernels += counts[i].second;
         }
-        toolio::out() << "mode: UTF-8\n";
+        toolio::out() << (analyzer.mode(entry).utf8 ? "mode: UTF-8\n" : "mode: mixed\n");
         toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                      << (P.getNumOfKernelCalls() - from) << " kernels\n";
         for (const auto & g : staged) {

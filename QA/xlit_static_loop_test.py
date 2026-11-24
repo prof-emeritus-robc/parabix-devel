@@ -11,8 +11,9 @@
 #  their texts, their results read from StartResults; StaticReplay applies the
 #  static matches selected.  The groups here are small, so the chunked path is
 #  forced (--staged-chunk-rules=0, and --whole-group-rules with only the core
-#  and the subgroups within the limit) in Unicode mode (--utf8-mode=0; the loop is not used with the
-#  absolute results of UTF-8 mode).  Static results that a converted context
+#  and the subgroups within the limit), in UTF-8 mode (absolute results: the
+#  targets are selectors) and in Unicode mode (--utf8-mode=0: relative
+#  results).  Static results that a converted context
 #  reads: a static rule writing a character of the context's set (zz -> Q), one
 #  inserting positions whose last character is in it (mn -> MNQ), one deleting
 #  its text (pq), and two-way overlaps among the static rules (cb, bcb) and
@@ -55,8 +56,10 @@ GROUPS = [
       ("x" + "bc" * 700 + "d", "a" + "Q" * 700 + "D")]),
 ]
 
-OPTIONS = ["--use-ICU=0", "--utf8-mode=0", "--staged-chunk-rules=0"]
-CONFIGS = [[], ["-thread-num=4", "-segment-size=1"]] + ([["-thread-num=1"]] if EXTENDED else [])
+OPTIONS = ["--use-ICU=0", "--staged-chunk-rules=0"]
+MODES = [[], ["--utf8-mode=0"]]
+CONFIGS = [mode + threads for mode in MODES
+           for threads in [[], ["-thread-num=4", "-segment-size=1"]] + ([["-thread-num=1"]] if EXTENDED else [])]
 
 
 def main():

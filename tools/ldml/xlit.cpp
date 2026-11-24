@@ -9877,7 +9877,9 @@ public:
     const std::vector<GroupCount> & groupCounts() const {return mGroupCounts;}
     //  The groups (of the transform and those it invokes) whose string matches are
     //  selected sequentially in staged rounds, not in the correction kernel's While
-    //  loop: their kernel labels and why (see --kernel-counts).
+    //  loop: their kernel labels and why (see --kernel-counts); with no reason, a
+    //  chunked group selected in the loop with its static rules as classes
+    //  (StaticLoop).
     const std::vector<std::pair<std::string, std::string>> & stagedGroups() const {return mStagedGroups;}
     //  Mixed modes (see UTF8PipelineBuilder::unicodeSegment): the steps of a
     //  segment of a transform (a plan of those steps), or a whole transform,
@@ -12663,7 +12665,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             stagedWhy = SequentialWhile ? "more string rules than --whole-group-rules" : "--sequential-while=0";
         }
         if (step.sequentialSelection && !sequentialLoop) {
-            mStagedGroups.emplace_back(mGroupLabel, (chunkedStaged(step) ? "chunked: " : "") + stagedWhy);
+            mStagedGroups.emplace_back(mGroupLabel + (mBytes ? " (UTF-8)" : ""), (chunkedStaged(step) ? "chunked: " : "") + stagedWhy);
         }
         if (step.sequentialSelection && !sequentialLoop && chunkedStaged(step)) {
             //  The staged rounds below, in chunks (see StagedChunkRules).  The matches
@@ -12853,7 +12855,10 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             FusedState previous;
             //  In one correction kernel's While loop (see StaticLoop).
             bool staticLoop = false;
-            if (StaticLoop && SequentialWhile && replay && !absoluteResults) {
+            std::string notLoop = !StaticLoop ? "--static-loop=0" : !SequentialWhile ? "--sequential-while=0"
+                                  : !replay ? "static results not computed once (runs or kept characters, or --static-replay=0)"
+                                  : absoluteResults ? "UTF-8 mode (absolute results)" : "";
+            if (notLoop.empty()) {
                 FusedRulesConfig loop = core;
                 loop.staged = false;
                 loop.sequential = true;
@@ -12872,7 +12877,9 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                     }
                     loop.staticClasses.push_back(std::move(k));
                 }
-                if (resolvableByWhile(loop)) {
+                if (!resolvableByWhile(loop, &notLoop)) {
+                    //  (notLoop: the reason)
+                } else {
                     staticLoop = true;
                     loop.resolve = true;
                     const FusedState none;
@@ -12887,9 +12894,10 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
                     P.CreateKernelCall<FusedRules>(absolutely(std::move(loop), &core), U21, coreClasses, inText, mask, nullptr,
                                                    none, out, selected);
                     previous = mergeResults(out, replayStatic(selected));
-                    mStagedGroups.pop_back();       // (recorded above as staged)
+                    mStagedGroups.back().second = "";       // (recorded above as staged: in the loop)
                 }
             }
+            if (!staticLoop) mStagedGroups.back().second += "; not in the loop: " + notLoop;
             if (!staticLoop) {
             for (unsigned round = 0; round <= ConvertedContextRounds; round++) {
                 std::vector<std::vector<SelectStringMatches::Source>> byLength = staticByLength;
@@ -14079,6 +14087,12 @@ private:
     StreamSet * unicodeTransform(const ldml::TransformEntry * entry, StreamSet * Basis);
     std::vector<TransformMask> unicodeMasks(StreamSet * Basis);
     void utf8Masks(std::vector<TransformMask> && masks, StreamSet * Basis);
+public:
+    //  The staged groups of the groups applied (see RulePipelineBuilder::stagedGroups).
+    std::vector<std::pair<std::string, std::string>> stagedGroups() const {
+        return mUnicode ? mUnicode->stagedGroups() : std::vector<std::pair<std::string, std::string>>{};
+    }
+private:
     RulePipelineBuilder & unicode() {
         if (!mUnicode) {
             mUnicode = std::make_unique<RulePipelineBuilder>(mP, mRegistry, mAnalyzer, mFrames);
@@ -14820,7 +14834,8 @@ StreamSet * UTF8PipelineBuilder::hexEscapes(const HexEncoding & form, StreamSet 
 static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                                      const ldml::TransformEntry * entry, StreamSet * Basis,
                                      std::vector<std::pair<size_t, size_t>> * groupCounts = nullptr, bool regions = false,
-                                     bool bounded = false) {
+                                     bool bounded = false,
+                                     std::vector<std::pair<std::string, std::string>> * staged = nullptr) {
     UTF8PipelineBuilder builder(P, registry, analyzer, groupCounts);
     StreamSet * const text = kernel::WellFormedUTF8(P, Basis);
     if (regions) {
@@ -14828,7 +14843,9 @@ static StreamSet * utf8TransformText(PipelineBuilder & P, const ldml::TransformR
         builder.checkMasks("the regions", text);
     }
     if (bounded) builder.boundRegions();
-    return builder.transform(entry, text);
+    StreamSet * const result = builder.transform(entry, text);
+    if (staged) *staged = builder.stagedGroups();
+    return result;
 }
 
 static TransformFunctionType generateUTF8Pipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
@@ -15850,7 +15867,8 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
         StreamSet * const Basis = BasisOf(P, ByteStream);
         const size_t from = P.getNumOfKernelCalls();
         std::vector<std::pair<size_t, size_t>> counts;
-        utf8TransformText(P, registry, analyzer, entry, Basis, &counts);
+        std::vector<std::pair<std::string, std::string>> staged;
+        utf8TransformText(P, registry, analyzer, entry, Basis, &counts, false, false, &staged);
         size_t groupKernels = 0;
         for (size_t i = 0; i < counts.size(); i++) {
             toolio::out() << "group " << (i + 1) << ": " << counts[i].first << " rules, " << counts[i].second << " kernels\n";
@@ -15859,6 +15877,10 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
         toolio::out() << "mode: UTF-8\n";
         toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                      << (P.getNumOfKernelCalls() - from) << " kernels\n";
+        for (const auto & g : staged) {
+            if (g.second.empty()) toolio::out() << "static loop: " << g.first << "\n";
+            else toolio::out() << "staged rounds: " << g.first << ": " << g.second << "\n";
+        }
         return 0;
     }
     RulePipelineBuilder builder(P, registry, analyzer);
@@ -15885,7 +15907,10 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     }
     toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                  << total << " kernels\n";
-    for (const auto & g : builder.stagedGroups()) toolio::out() << "staged rounds: " << g.first << ": " << g.second << "\n";
+    for (const auto & g : builder.stagedGroups()) {
+        if (g.second.empty()) toolio::out() << "static loop: " << g.first << "\n";
+        else toolio::out() << "staged rounds: " << g.first << ": " << g.second << "\n";
+    }
     return 0;
 }
 

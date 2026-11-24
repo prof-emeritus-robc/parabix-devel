@@ -4467,7 +4467,10 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     bool wholeGroup = false;
     auto convertedString = [&](const ldml::StringRule & sr) {
         FusedContexts before, after;
-        return sr.engineBefore && fusedContexts(sr.engineBefore, true, before, true) && fusedContexts(sr.engineAfter, false, after)
+        //  (An after context the fused kernels cannot match, matched by the engine:
+        //  see FusedStringRule::afterMatch.)
+        const bool afterOk = fusedContexts(sr.engineAfter, false, after) || (AfterStreams && sr.engineAfter);
+        return sr.engineBefore && fusedContexts(sr.engineBefore, true, before, true) && afterOk
                && convertedContextMatters(before, outcomes);
     };
     const size_t convertedRules = std::count_if(step.stringRules.begin(), step.stringRules.end(), convertedString);
@@ -11276,15 +11279,25 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         std::any_of(maps.begin(), maps.end(), [](const std::vector<ldml::CharMapping> & m) {return !m.empty();});
     const bool correct = ConvertedContextRounds > 0;
     //  The string rules whose before contexts (possibly with repetitions) are
-    //  matched against the converted text, and their contexts.
+    //  matched against the converted text, and their contexts.  (Also those whose
+    //  after contexts the engine matches, see afterStreamed: otherwise their before
+    //  contexts were matched against the text itself, without a warning.)
     std::vector<bool> convertible(numStringRules, false);
     std::vector<FusedContexts> convertedBefores(numStringRules);
     for (size_t r = 0; r < numStringRules; r++) {
         const ldml::StringRule & rule = step.stringRules[r];
         FusedContexts after;
-        convertible[r] = correct && !texts[r].empty() && fusedContexts(rule.engineAfter, false, after)
+        //  (A before context with a repetition is a fused context only matched
+        //  against the converted text: its after context then streamed too.)
+        const bool fusedAfter = fusedContexts(rule.engineAfter, false, after);
+        const bool streamable = AfterStreams && rule.engineAfter != nullptr;
+        convertible[r] = correct && !texts[r].empty() && (fusedAfter || afterStreamed[r] || streamable)
                          && fusedContexts(rule.engineBefore, true, convertedBefores[r], true)
                          && convertedContextMatters(convertedBefores[r], outcomes);
+        if (convertible[r] && !fusedAfter && !afterStreamed[r]) {
+            afterStreamed[r] = true;
+            afters[r] = {FusedContext()};
+        }
     }
     //  The string rules applied only where earlier ones do not match at their
     //  first positions (see ldml::TransformStep::stringPriority), with their

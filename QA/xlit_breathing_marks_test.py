@@ -14,7 +14,8 @@
 #  text, which the rules of the group change (:̱ → :, N' → Ν), and sees the
 #  character before a deleted h; a smooth breathing within a rough cluster
 #  with a diaeresis at the start of a word (hë → ἐ̈̔).  Also long texts across
-#  blocks.  The expected results are ICU4C's and ICU4J's (identical).  With
+#  blocks, and s̱ followed by a mark after h (the restated rule's before context
+#  matched against the converted text, its after context by the engine).  The expected results are ICU4C's and ICU4J's (identical).  With
 #  --breathing-marks=0, Latn-Grek is not implementable.
 #
 #  xlit_breathing_marks_test.py <xlit binary> [--extended-testing]
@@ -27,6 +28,16 @@ import tempfile
 from xlit_test_mode import EXTENDED
 
 CASES = [
+    # (s̱ followed by a mark after h, which becomes a mark: the before context of
+    # $afterLetter { s $underbar → σ, matched against the converted text.)
+    ('hhs̱', '̔̔ς'),
+    ('hhs̱̄', '̔̔ς̄'),
+    ('hs̱̄', '̔ς̄'),
+    ('hhhs̱̄', '̔̔̔ς̄'),
+    (' hhs̱̄', ' ̔̔ς̄'),
+    ('ahhs̱̄', 'ἀ̔̔σ̄'),
+    ("hh's̱̄", "̔̔'ς̄"),
+    ('hhś̱', '̔̔ς́'),
     ('ha', 'ἁ'),
     ('hai', 'αἱ'),
     ('hëa', 'ἐ̈̔α'),

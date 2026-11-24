@@ -1784,7 +1784,22 @@ That line, `hhs̱̄`, is an older difference, present without the family as
 well: `s̱` followed by a mark (`̄`, `́`) after `h`s (which become marks) gives
 `σ` where ICU gives `ς`: the before context `$afterLetter` (`[:l:]
 [[:m:]']*`) of `$afterLetter { s $underbar → σ` is matched as if the `h`s were
-still letters.
+still letters. *Fixed (2026-11-24):* the pieces of that rule (and of `s
+$underbar → ς`) that order disambiguation restates for an `s̱` followed by a
+mark have an after context with a repetition (`[[:m:]']* […]`), which the fused
+kernels cannot match, and a before context with one, which they match only
+against the converted text. Such a string rule was not taken as matched
+against the converted text (that required a fused after context), and its
+before context was matched against the text itself, without a warning. Its
+after context is now matched by the engine (`FusedStringRule::afterMatch`,
+`--after-streams`) and its before context against the converted text.
+Of the 92 transforms named in doc/round-replacement.md, the plans of four
+change (Latn-Grek, Latn-Grek/UNGEGN, Latn-Cyrl, Zawgyi-my); on 3,000 random
+words each the output of the other three is unchanged (Latn-Cyrl equals
+ICU4C, Zawgyi-my differs from it on the same 13 lines as before), and
+Latn-Grek/UNGEGN and Zawgyi-my now warn for one group each whose rules cannot
+all be in one correction kernel (silently matched against the text itself
+before).
 
 **Latn-Grek implementable (2026-11-24): `ldml::RewriteBreathingMarks`.** The
 planner now derives the rewrite from the family's form, on the rules of a
@@ -1819,9 +1834,9 @@ printer and the parser round-trip every CLDR transform).
 Checks: Latn-Grek equals ICU4C (and ICU4J where run) on the 5,030 lines of
 random words and Twain, on the cases above, and on two sets of 50,000 lines of
 random text dense in the family's cases (with `:̱`, `?̱`, `N'`, `rH` in the
-second), also with four threads and one-stride segments, except the older
-`hhs̱̄` (`$afterLetter`, see above). `QA/xlit_breathing_marks_test.py` (55
-cases, ICU4C's and ICU4J's results; with `--breathing-marks=0` Latn-Grek is
+second), also with four threads and one-stride segments (since the
+`$afterLetter` fix above, without exception). `QA/xlit_breathing_marks_test.py`
+(63 cases, ICU4C's and ICU4J's results; with `--breathing-marks=0` Latn-Grek is
 not implementable). The prototype (`tools/ldml/prototypes/Latn-Grek-breathing.txt`)
 stays as the hand-written reference. The coverage table above has not been
 regenerated (Latn-Grek is still shown as blocked there).

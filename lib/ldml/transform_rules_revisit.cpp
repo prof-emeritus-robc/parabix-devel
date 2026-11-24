@@ -3719,8 +3719,12 @@ RE * withMarkers(RE * re, CharSetAnalysis & sets, const std::vector<std::pair<ch
 //  builds the REs of each rule: the rewritten rules share no part of their
 //  patterns with each other or with the rules they come from.  (Shared, the
 //  repetition of $beforeLetter in the after contexts of s } $beforeLetter → σ
-//  and s $underbar } $beforeLetter → ς, rewritten with markers, left two
-//  pairs of rules order dependent after DisambiguateOrder in Latin-Greek.)
+//  and s $underbar } $beforeLetter → ς, rewritten with markers, made
+//  DisambiguateOrder build a negated after context by another union, an equal
+//  set built through UCD::UnicodeSet::insert of a code point into a set whose
+//  quads were shared, which left a Mixed quad with no bits: two pairs of rules
+//  were left order dependent in Latin-Greek.  The bug is fixed; the copies
+//  keep the rewritten rules as the parser would build them.)
 RE * freshRE(RE * re) {
     if (re == nullptr) return nullptr;
     if (Seq * q = dyn_cast<Seq>(re)) {

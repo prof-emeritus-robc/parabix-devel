@@ -1836,11 +1836,27 @@ dependent, where the same rules with patterns of their own (structurally
 equal) are resolved: found by replacing the rules one by one with their
 parsed copies (only `s } … → σ` mattered), then with copies of their own
 objects (enough), and by comparing the rules after each pass (the first to
-differ is `DisambiguateOrder`). Which part of `DisambiguateOrder` depends on
-the sharing is not found (it has no cache or comparison by RE object; the RE
-library's inspectors and memoizing transformers identify REs structurally,
-`MemoizerComparator`). A pass that rewrites rules should therefore not share
-their pattern objects.
+differ is `DisambiguateOrder`). *Traced (2026-11-24):* not a cache by RE
+object, nor the RE library's memoization (disabling `RE_MemoizingTransformer`
+and the inspectors' skipping of objects seen changes nothing). With the
+objects shared, `DisambiguateOrder` builds the negated after context of the
+restated `[:l:] [[:m:]']* { s } [^…] → ς` from a union of its sets without a
+duplicate `[:m:]` (it collects the sets of the earlier rules' edges once per
+object), and on that path a code point is inserted with
+`UCD::UnicodeSet::insert(cp)` into a set whose quads are still shared (static
+UCD data or a copy). That path was wrong: it allocated one quad too few,
+copied one quad too few (the quad before the changed one was left as the new
+allocation held it) and wrote past the end of the copy; it also added a run
+instead of retyping a shared 1-length run. The set was left with a Mixed quad
+with no bits, breaking the invariant that every Mixed quad has both a 1 and
+a 0 bit. `intersects` relies on it (a Full quad against a Mixed one
+intersects), so `RuleOverlapAnalysis::mayOverlap` found the letters and
+markers of `s } [L+markers] → σ` meeting that set, while their `&` was empty,
+and the pair stayed order dependent. `insert(cp)` now keeps the
+representation canonical (2026-11-24); no `UnicodeSet` operation left a
+non-canonical quad in `--plan` of 92 transforms and a few icgrep property
+patterns. The copies
+are kept: the rewritten rules as the parser would build them.
 
 Checks: Latn-Grek equals ICU4C (and ICU4J where run) on the 5,030 lines of
 random words and Twain, on the cases above, and on two sets of 50,000 lines of

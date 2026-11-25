@@ -1471,3 +1471,273 @@ with string rules outside the scope: ru-ru_Latn/BGN #2 (rounds before),
 und_FONIPA-chr #1 and vec-vec_FONIPA #2 (no converted contexts). The other 10
 stay on the regular plan: az-Title, tr-Title, el-Title and lt-Title (U+0345,
 step 2), the 5 groups of step 4, and ConjoiningJamo-Latin.
+
+## 13. Plan: the DivCode technique in every conversion-group kernel
+
+Status: plan, 2026-11-25. Nothing below is implemented.
+
+### 13.1 Two layers
+
+DivCode as built in §§1–12 has two layers, and only the second has the
+eligibility limits that `--divcode-report` lists:
+
+1. **The class layer.** The Div32 (Div64) code of the characters the rules
+   mention, the k + s-bit pseudo-basis over which every set is an ordinary CC,
+   the external streams for property and very large sets, and an If-hierarchy
+   keyed on the code bits, so that the logic for characters absent from a block
+   is not executed. Nothing in this layer depends on how the rules are selected.
+2. **DivCode's translation logic.** The Count, Translate and Converted kernels:
+   one-way overlap stages (§9), converted before contexts resolved by the
+   Converted kernel (§§10–12), covering families and their completion (§11).
+   The "problems" of `--divcode-report` (two-way and self overlaps, non-covering
+   families, a converted rule beginning within another string rule's text) are
+   limits of this layer: cases its selection logic was not extended to.
+
+Everything the regular plan does in Pablo kernels (the fused kernels, the
+correction kernel and its While loop, the subgroups, the yields, the classes
+they read) works on character classes and on the decisions of rules, so the
+class layer and the If-hierarchy apply to all of it. This section plans that:
+the class layer and rule-level Ifs everywhere, the While loop reduced to what
+propagates, and one implementation of the selection semantics instead of two.
+
+### 13.2 The driver: und_FONIPA-ar group 3
+
+`und_FONIPA-ar` (UTF-8 mode) on `tools/ldml/xlit-coverage/perf/corpora/pool-und_FONIPA.txt`
+(20 MB, 14.0M characters). Group 3 is the main pass, the rules between the two
+`::NULL;` (line 44 to 140 of the file).
+
+**Cost.** `-EnableCycleCounter`, default threads:
+
+- The group's correction kernel, `FusedRules_3092fc37…` (kernel #289), has 70.1%
+  of all cycles and 94% of all execution cycles (EXEC). 53% of its own cycles are
+  SYNC: the other threads wait to enter it.
+- Two `RunMerge` kernels and a `streamExpand` (21.5%, 2.0% and 4.2% of all
+  cycles) are almost all SYNC and PIPE, held back by #289.
+- By category: FusedRules 70.6% of cycles (95.5% of EXEC); focus filter/merge
+  23.6% (0.4% of EXEC); all compress/expand kernels 5.0% (2.0% of EXEC); all
+  character-class kernels (`cc_`, `UCD:`) 0.3%; normalization logic 0.2%.
+
+**Iterations** (`-pablo-count-while-iterations=FusedRules_3092`, committed in
+0d8edbdff; provisional strides counted once): 108,664 blocks, 255,385
+iterations, 2.35 per block; 70,607 blocks take 2 iterations and 38,057 take 3,
+none fewer or more. The loop is not deep: the cost is its body.
+
+**Size** (`-ShowOptimizedPablo`): 55,111 Pablo statements, no If anywhere.
+
+| part | statements | main operations |
+|---|--:|---|
+| before the loop | 7,359 | And 1,486, Or 1,869, Advance 772, Not 288, Lookahead 49 |
+| the While body | 43,655 | And 19,568, Or 12,206, Not 7,887, Advance 1,576, MatchStar 8 |
+| after the loop | 4,097 | Or 2,933, Advance 820, And 315 |
+
+Its inputs are 7 class streams (`Classes`), `InText` and the matches of the 57
+static string rules (`Source0`); its output is the 21 change bits. So the
+classes are already compact and cheap (the class kernels are 0.3% of cycles):
+about 2.35 × 43,655 + 11,456 ≈ 114,000 statements are executed per
+128-position block, almost all of them rule decisions.
+
+**Rules.** 440 string rules (383 with before contexts matched against the
+converted text, 57 static) and 100 single-character subgroups (79 converted),
+from about 70 source rules. The converted string rules form 149 families
+(§11): 54 covering (125 rules) and 95 not covering (258 rules). 3 families
+propagate (`ʔɵ̞`, `ʔɵ`, `ɵ̞`). String overlaps: 960 pairs, 939 one-way, 15
+two-way, 6 self, all 21 two-way and self pairs from the one source rule
+`$AVowel ː? ʔ $AVowel ː? → اءا`, to which order disambiguation adds a
+not-at-a-boundary before context: its text begins and ends with `$AVowel`, so
+`aʔaʔa` chains.
+
+**The before contexts.** All converted before contexts are one item, one of:
+`$Boundary` (`[^[:L:][:M:][:N:]]`) or the text start; not `$Boundary`; or not
+`$Boundary` less some vowels (added by order disambiguation). Every non-empty
+result of the group is Arabic letters and marks (general categories Lo and Mn
+only), none of them in `$Boundary` or in the vowel sets, so a converted
+character before a position settles every item the same way (a character no
+rule converts keeps its own class); what changes the contexts is deletion (`ʔ → ;`,
+`$SchwaVowel → ;`, and the inner units of shortening string rules), through
+which the item before is carried.
+
+**The non-covering families** come from two source shapes (the
+`--divcode-report` reasons: the before contexts miss characters or the text
+boundary, 81 families; an after context of several items whose before
+contexts miss characters, 14; 58 of the 95 also "not completed: a match beyond
+the text"):
+
+- word-initial rules, `$Boundary {ʔ? V ː} → …`, `$Boundary {ʔ? V} → …` (V each
+  vowel class). Where the boundary fails, the text goes to the single-character
+  rule of its first unit (`ʔ → ;`) and the rules starting at the next unit (the
+  generic `V ː? → …`, or `{V ː? ʔ} …`);
+- vowel-and-glottal-stop rules, `{V ʔ} $Boundary`, `{V ː ʔ} $Boundary`,
+  `{V ː ʔ} [$Vowel]`, `V ː? ʔ V ː?`, given not-`$Boundary` before contexts by
+  disambiguation (the word-initial rules take the boundary case). Where those
+  fail, the word-initial rules apply, then the rest.
+
+Completion (§11 fallback 2) fails for 58 of them because a match extends
+beyond the family's text.
+
+**Characters and texts in the corpus** (per 128-character block of the corpus
+as given; group 3 sees it after groups 1 and 2 and the focus filter, so these are
+approximations of its blocks):
+
+- The first characters of the rules are common: `a` in 100% of blocks, `ː`
+  99%, `ɪ` 94%, `i` 93%, `ɛ` 93%, `o` 91%, `ə` 90%, `ɑ` 83%, `ʔ` 35%. The Div32
+  blocks of the vowels (0x60, 0x240–0x2DF) are in 100% of blocks. An
+  If-hierarchy on the first character's code alone skips almost nothing here.
+- The rule texts are rare: 142 of the 149 families never match in the corpus,
+  and on average 3.1 families (9.0 of the 383 converted string rules) have any
+  match in a block. The loop decides all 383 in every iteration.
+
+**Across the CLDR transforms** (`--divcode-report` on all 453, 2026-11-25): 245
+groups with string rules in 168 transforms; 122 are eligible for DivCode, 123
+are not. The problems of those 123 (a group may have several): two-way or self
+overlaps 61; a converted rule that may begin within another string rule's text
+27; string rules keeping characters of their texts 25; contexts that are not
+fixed sequences of sets 24; runs 23; captures 22; string rules with converted
+before contexts 18; self-overlapping string rules 17; conversions changing the
+repeated set of a before context 10; before contexts of two or more converted
+items 9; context sets with strings 4; others 8. These are the groups the class
+layer reaches only through the regular plan's kernels (13.4).
+
+### 13.3 What follows
+
+1. **Rule-level Ifs.** The If-hierarchy of the class layer, extended one level:
+   by the code of the first character (as DivCode's leaves), then by the
+   static matches of the rule's text (the candidates, computed once before the
+   loop). Inside the loop, a rule's decision is `candidates ∧ …`, so an If on
+   its candidates (or on the union of a family's) satisfies the If invariant:
+   every statement depends on the condition, and the Vars only gain bits that
+   are within it. For und_FONIPA-ar, about 97% of the converted string rules'
+   loop logic would be skipped per block. The subgroups' first characters are
+   common, so their logic is not skipped; how much of the 43,655 statements
+   they and the cover tests (`mayBeginWithin`, pairwise over 960 overlaps)
+   take is step 0's question.
+2. **The loop holds what propagates.** A rule or subgroup whose outcomes all
+   settle the items the same way (a consumer, §10) is decided after the loop,
+   once, from the final known state. Here every non-empty result settles every
+   item the same way, so the loop needs only the deletions and the rules that
+   decide them (the 3 propagating families, `ʔ → ;`, `$SchwaVowel → ;`, and the
+   string rules that cover a `ʔ` or a schwa).
+3. **Separate kernels.** The decisions after the loop read only the final state
+   (K1/K0 per item, deletions) and the static matches: they become a kernel of
+   their own, with no loop carries, which can run on concurrent segments
+   (LocalCarries where its CarryExtent allows) while the loop kernel, which
+   cannot, stays small. The loop kernel outputs its state as streams.
+4. **The class layer is already cheap here.** The gain is in skipping and moving
+   rule logic, not in computing classes. Elsewhere (many classes, scripts in
+   separate Div32 blocks, as the §12 measurements show) the class layer itself
+   gains; both apply.
+
+### 13.4 Design
+
+**One selection implementation.** Today the regular plan (FusedRules, the
+correction kernel's loop, `stringPriority`, yields, coverage, sequential
+selection, static classes) and DivCode's Translate and Converted kernels each
+implement ICU's matching. The class layer and the rule-level Ifs are added to
+the regular plan's kernels; DivCode's kernels are then the regular plan's with
+a pseudo-basis and an If-hierarchy. The two paths converge, and the
+eligibility problems disappear as each case is covered by the one
+implementation. `--divcode-groups` becomes the switch of the class layer.
+
+**The class layer as the input of every fused kernel.**
+
+- One code kernel per group (or per partial group): the Div32Code bixnum, named
+  by a hash of its classes and code assignment (as `Div32Code_h…` now). Groups
+  with the same classes share it.
+- Sets that are properties (`[:L:]`, `$Boundary`) or span more than a limit of
+  blocks stay external streams, as DivCode's external sets now.
+- A criterion, structural, for using the layer: the number of explicit classes,
+  their blocks, the code bits and the external sets (not a single-config
+  timing; `doc` §6 measurements are reported, not used as gates). A group of
+  one or two small classes reads its classes as now.
+- Code numbering: classes that occur together (one script; the first
+  characters of the same rules) share high code bits, so subtrees are skipped
+  together.
+
+**The If-hierarchy in the fused kernels.**
+
+- Level 1, the first character's code (DivCode's leaves). Level 2, a rule or
+  family's static candidates. A rule whose first set spans leaves goes in each
+  (restricted) or at their common ancestor; a negated or property first set at
+  the top.
+- Context streams that do not depend on a leaf's condition (an Advance of a
+  property class) are computed outside the hierarchy and ANDed in.
+- In the loop: the same hierarchy, with the decisions accumulated into Vars
+  declared outside it. The order of the sequential selection is kept: an If
+  does not reorder decisions, it skips those without candidates.
+- The cover tests (`within`/`notWithin` over the rules that may begin within a
+  rule) go inside the If of the covered rule's candidates.
+
+**The loop's contents** (extending §10's `propagates` to the regular plan):
+
+- Classify each rule and subgroup outcome (as `classifyConverted` does) by how
+  it settles each resolved item; a rule all of whose outcomes agree for every
+  item is a consumer.
+- The loop holds the decisions of propagating rules and those they depend on
+  (a rule whose candidates may cover a propagating one's). Everything else is
+  decided after the loop from the final K1/K0 and the deletions.
+- A family whose fallback is "the first unit's single-character rule, then the
+  rules from the next unit" (the two shapes of 13.2) needs no completion: its
+  decision at the anchor, given K, is either the family's rule or that
+  fallback, both static.
+
+**Self-overlap chains** (`V ː? ʔ V ː?`). The loop takes an iteration per
+candidate of a run of a rule overlapping itself. A chain of candidates each
+beginning within the previous one is resolved leftmost-first by alternation
+along the chain: the first applies, the next does not, and so on, which a
+carry-propagating form computes without iterating where the chain's links have
+fixed structure. Measured first: whether any block's third iteration comes
+from such chains.
+
+**UTF-8 mode.** und_FONIPA-ar runs in UTF-8 mode, as do most mixed-mode
+transforms. The class layer works at code units as in DivCode phase 2 (§6,
+"UTF-8 mode"): the code at the first byte, the low bits at the last; a set
+position whose characters have different UTF-8 lengths expands the rule by
+lengths or keeps the set external. The hybrid groups (selectors applied on
+bytes, `FusedRulesConfig::absolute`) keep their output form; only how classes
+and decisions are computed changes.
+
+**Kernel names.** Every new or changed kernel is named by a hash of its
+content (classes, code assignment, rule plan, If structure), so each
+configuration has its own object-cache entries.
+
+### 13.5 Steps
+
+0. **Attribution.** An option reporting, for each fused kernel, the Pablo
+   statements by part (before, loop, after) and by rule, family, subgroup and
+   cover test, from the generator. Run on und_FONIPA-ar #3 and the survey's
+   largest correction kernels. For attribution: what each later step removes,
+   and how much of the loop is subgroup logic and pairwise cover tests, which
+   neither step 1 nor step 2 addresses.
+
+Steps 1 and 2 are independent: a rule's If is emitted the same way whether its
+decision is in the loop or after it, so Ifs added first move with the code in
+step 2, and the end state is the same in either order. Each step's measured gain
+depends on whether the other is in (step 1 saves less in the loop once the
+consumers have left it; step 2 saves less once their logic is skipped by Ifs),
+which affects the reporting only. Step 1 comes first for convenience: it is a
+local change to how a decision is emitted, while step 2 restructures the loop,
+its state and the kernel boundary, and then starts from a smaller kernel.
+
+1. **Rule-level Ifs in the correction kernel** (level 2 only, on the static
+   candidates), inside and outside the loop. Check: identical output and ICU
+   agreement on the perf corpora and the loop tests; the iteration counts
+   unchanged; statement counts and cycles reported.
+2. **Consumers out of the loop**, decided after it in the same kernel; then
+   (step 3) in a kernel of their own.
+3. **The post-loop kernel**, separate, with the loop kernel's state as streams;
+   LocalCarries where its CarryExtent allows. Measured at 4 threads (SYNC and
+   PIPE of the loop kernel and its neighbours).
+4. **The class layer in the regular plan's fused kernels** (code kernel,
+   pseudo-basis CCs, level-1 Ifs), by the criterion; Unicode mode first, then
+   UTF-8 mode.
+5. **Convergence.** DivCode's Translate and Converted kernels replaced by the
+   regular plan's kernels with the class layer, group by group, each checked
+   against the other path (outputs identical) before the old one is removed.
+6. **Self-overlap chains without iterations**, if step 0 or the iteration counts
+   show they matter.
+
+Checks at every step: the loop tests (`QA/xlit_converted_*while_test.py`,
+`xlit_sequential_while_test.py`, `xlit_static_loop_test.py`,
+`xlit_static_apply_test.py`), the DivCode tests, all xlit and ldml tests, ICU
+agreement on the perf corpora of the transforms changed, and every timing
+comparison with its outputs compared. Compile time and kernel counts are
+reported against the test time limits. Multithreaded timings at 4 threads.

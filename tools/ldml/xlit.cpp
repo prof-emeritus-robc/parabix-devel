@@ -274,8 +274,8 @@ static cl::opt<bool> BreathingMarks("breathing-marks", cl::desc("Restate the rou
 
 static cl::opt<bool> MixedModes("mixed-modes",
     cl::desc("In UTF-8 mode (--utf8-mode), apply the steps that need Unicode mode in segments of it, switching to it at the "
-             "first such step and back to UTF-8 after the last of a run of them (doc/masked-transforms-plan.md step 13; "
-             "default on; off: a transform with any such step wholly in Unicode mode)"),
+             "first such step and back to UTF-8 only where all the rest of the work is in UTF-8 mode (doc/masked-transforms-plan.md "
+             "step 13; default on; off: a transform with any such step wholly in Unicode mode)"),
     cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> HybridGroups("hybrid-groups",
     cl::desc("In UTF-8 mode, apply the conversion groups of string rules that need Unicode mode in the hybrid of "
@@ -13799,12 +13799,12 @@ static bool allUTF8Transform(const ldml::TransformRegistry & registry, Transform
     const auto key = std::make_pair(entry, bounded);
     const auto f = known.find(key);
     if (f != known.end()) return f->second;
-    bool all = true;
+    //  (A transform not by the regular plan, or by its shape groups, is applied
+    //  in Unicode mode as a whole, see UTF8PipelineBuilder::transform.)
+    bool all = analyzer.analyze(entry).implementable && !(ApplyShapeGroups && shapeChoice(registry, analyzer, entry).any());
     for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
-        if (!allUTF8Step(registry, analyzer, step, bounded)) {
-            all = false;
-            break;
-        }
+        if (!all) break;
+        if (!allUTF8Step(registry, analyzer, step, bounded)) all = false;
     }
     known.emplace(key, all);
     return all;
@@ -15455,7 +15455,10 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
             toolio::out() << "group " << (i + 1) << ": " << counts[i].first << " rules, " << counts[i].second << " kernels\n";
             groupKernels += counts[i].second;
         }
-        toolio::out() << (analyzer.mode(entry).utf8 ? "mode: UTF-8\n" : "mode: mixed\n");
+        //  (Mixed modes: UTF-8 where no step needs Unicode mode, see printMode.)
+        const bool shapes = ApplyShapeGroups && a.implementable && shapeChoice(registry, analyzer, entry).any();
+        const bool utf8 = MixedModes ? allUTF8Transform(registry, analyzer, entry, false) : analyzer.mode(entry).utf8;
+        toolio::out() << (MixedModes && shapes ? "mode: Unicode (by its shape groups)\n" : utf8 ? "mode: UTF-8\n" : "mode: mixed\n");
         toolio::out() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
                      << (P.getNumOfKernelCalls() - from) << " kernels\n";
         for (const std::string & g : staticLoop) toolio::out() << "static loop: " << g << "\n";
@@ -15994,20 +15997,51 @@ static int run(int argc, char *argv[]);
 //  groups of UTF-8 mode do not support, see utf8StepProblem.)
 static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry * entry, bool bounded) {
     const TransformAnalyzer::Mode & m = analyzer.mode(entry);
-    bool unicodeSteps = !m.utf8;
-    if (bounded && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
-        for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
-            if (!utf8StepProblem(analyzer.registry(), analyzer, step, true).empty()) unicodeSteps = true;
-        }
+    //  Mixed modes (step 13): "mixed" where some step, of the transform or of
+    //  one it invokes, needs Unicode mode: the steps of the transform's own
+    //  plan in UTF-8 mode, and the segments in Unicode mode with the reason of
+    //  their first step.  Otherwise UTF-8 mode: the text stays in UTF-8, also
+    //  where the hybrid applies a group (which TransformAnalyzer::mode, the
+    //  mode without mixed modes, does not count as UTF-8 mode).
+    bool utf8 = m.utf8;
+    //  (A transform applied by its shape groups is in Unicode mode as a whole,
+    //  see UTF8PipelineBuilder::transform.)
+    if (UTF8Mode && MixedModes && !entry->isBuiltIn() && analyzer.analyze(entry).implementable
+        && ApplyShapeGroups && shapeChoice(analyzer.registry(), analyzer, entry).any()) {
+        toolio::out() << "  mode: Unicode: applied by its shape groups\n";
+        return;
     }
-    //  Mixed modes (step 13): the steps of the transform's own plan in UTF-8
-    //  mode, and the segments in Unicode mode with the reason of their first step.
-    if (UTF8Mode && MixedModes && unicodeSteps && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
+    if (UTF8Mode && MixedModes && !entry->isBuiltIn() && analyzer.analyze(entry).implementable
+        && allUTF8Transform(analyzer.registry(), analyzer, entry, bounded)) {
+        utf8 = true;
+    } else if (UTF8Mode && MixedModes && !entry->isBuiltIn() && analyzer.analyze(entry).implementable) {
+        //  (Within the segments of UTF-8 mode, a step invoking a transform in
+        //  mixed modes itself, whose own segments are in its plan: "mixed".)
+        const std::vector<ldml::TransformStep> & steps = analyzer.analyze(entry).plan.steps;
+        auto range = [&](size_t i, size_t j) {
+            return std::string(j > i + 1 ? " steps " : " step ") + std::to_string(i + 1) + (j > i + 1 ? "-" + std::to_string(j) : "");
+        };
         toolio::out() << "  mode: mixed:";
+        const char * sep = "";
         for (const MixedSegment & m : mixedSegments(analyzer.registry(), analyzer, analyzer.analyze(entry), bounded)) {
-            const size_t i = m.begin, j = m.end;
-            toolio::out() << (i ? ";" : "") << (j > i + 1 ? " steps " : " step ") << (i + 1) << (j > i + 1 ? "-" + std::to_string(j) : "")
-                         << (m.unicode ? " Unicode (" + m.why + ")" : " UTF-8");
+            if (m.unicode) {
+                toolio::out() << sep << range(m.begin, m.end) << " Unicode (" << m.why << ")";
+                sep = ";";
+                continue;
+            }
+            for (size_t i = m.begin; i < m.end; ) {
+                if (!allUTF8Step(analyzer.registry(), analyzer, steps[i], bounded)) {
+                    toolio::out() << sep << range(i, i + 1) << " mixed (" << steps[i].transform.getText() << ")";
+                    sep = ";";
+                    i++;
+                    continue;
+                }
+                size_t j = i + 1;
+                while (j < m.end && allUTF8Step(analyzer.registry(), analyzer, steps[j], bounded)) j++;
+                toolio::out() << sep << range(i, j) << " UTF-8";
+                sep = ";";
+                i = j;
+            }
         }
         toolio::out() << "\n";
         return;
@@ -16019,7 +16053,7 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
         else toolio::out() << "  mode: Unicode: " << m.reason << (isICUBuiltIn(entry->canonicalName) ? " (applied by ICU)" : "") << "\n";
         return;
     }
-    if (m.utf8) {
+    if (utf8) {
         toolio::out() << "  mode: UTF-8" << (UTF8Mode ? "" : " (not used: --utf8-mode=0)") << "\n";
         //  (The single-character rules with contexts of its own groups, and
         //  how the engine matches them, see RE_Plan.)

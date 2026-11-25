@@ -586,6 +586,18 @@ contexts see the characters outside the runs.
       full-width punctuation (xlit gives `!` for `！`, as before).
       `--plan` reports the segments the pipeline uses (it did not show the
       steps a segment takes after prefix runs or front-letter revisits).
+      **Mode labels (2026-11-24).** `--plan` and `--kernel-counts` say
+      `mixed` only where some step, of the transform or of one it invokes,
+      needs Unicode mode, and `UTF-8` otherwise: a group the hybrid applies
+      keeps the text in UTF-8 indexed mode, which is UTF-8 mode
+      (`TransformAnalyzer::mode`, the mode without mixed modes, does not count
+      it, so 197 transforms had been labelled `mixed: steps 1-n UTF-8`). A step
+      invoking a transform with its own Unicode segment is shown as `step k
+      mixed (<transform>)` (Hira-Latn: `step 3 mixed (Katakana-Latin)`), and
+      a transform applied by its shape groups, which the pipeline applies in
+      Unicode mode as a whole, as `Unicode: applied by its shape groups`
+      (NumericPinyin-Latin). Of the 453 transforms: 373 UTF-8, 61 mixed, 19
+      Unicode.
     - **Switches.** UTF-8 to Unicode: the 21-bit basis decoded from the
       bytes; Unicode to UTF-8: encoded. These are stages with position maps
       (a character's code units to one position, and back).

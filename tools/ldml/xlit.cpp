@@ -5762,6 +5762,43 @@ static ConsumerOrder consumerOrder(const FusedRulesConfig & c, const LoopConsume
     return co;
 }
 
+//  Why a fused kernel cannot have LocalCarries (empty if it can), and its
+//  extent: the most positions a carry reaches back (a before context and a
+//  text's length; 0: none, and no LocalCarries attribute is needed).  Other
+//  than a correction kernel, a kernel matches fixed sequences of sets (Advances
+//  only), unless a string rule deletes the run following its text (a
+//  MatchStar; not in a matching kernel).  A correction kernel: only a post kernel (see
+//  FusedRulesConfig::loopPart), with no While loop of its consumers and no
+//  selection of a rule overlapping itself (MatchStar).
+static std::string localCarriesBlocker(const FusedRulesConfig & c, unsigned & extent) {
+    extent = 0;
+    if (c.rounds > 0) {
+        if (c.loopPart != 2) return "correction loop";
+        for (const FusedRulesConfig::Selection & sel : c.selection) if (sel.selfOverlapping) return "self-overlap selection";
+        if (!consumerOrder(c, loopConsumers(c)).iterated.empty()) return "consumer loop";
+    }
+    auto beforeLength = [](const FusedContexts & before) {
+        unsigned B = 0;
+        for (const FusedContext & alt : before) B = std::max(B, static_cast<unsigned>(alt.size()));
+        return B;
+    };
+    auto yieldExtent = [&](const std::vector<FusedYield> & yields) {
+        for (const FusedYield & y : yields) extent = std::max(extent, beforeLength(y.before) + static_cast<unsigned>(y.text.size()) - 1);
+    };
+    for (const FusedStringRule & r : c.strings) {
+        //  (A matching kernel only finds the first positions: it does not
+        //  delete the runs.)
+        if (!r.run.empty() && !c.matchOnly) return "run";
+        extent = std::max(extent, beforeLength(r.before) + static_cast<unsigned>(r.text.size()) - 1);
+        yieldExtent(r.yields);
+    }
+    for (const FusedSubgroup & g : c.subgroups) {
+        extent = std::max(extent, beforeLength(g.before));
+        yieldExtent(g.yields);
+    }
+    return "";
+}
+
 //  The streams of a loop kernel's state, for its post kernel (see
 //  FusedRulesConfig::loopPart): K, known in and known out, by item, polarity
 //  (out, in) and distance; the union of known-applied positions and the
@@ -6379,36 +6416,9 @@ private:
           return v;
       }()),
       mSignature(std::move(sig)) {
-        if (LLVM_UNLIKELY(ClassLayerReport)) reportClassLayer();
-        //  Other than a correction kernel, a kernel matches fixed sequences of sets (Advances
-        //  only), unless a string rule deletes the run following its text.
-        //  (A correction kernel: only a post kernel, see FusedRulesConfig::loopPart,
-        //  with no While loop of its consumers and no selection of a rule
-        //  overlapping itself.)
-        if (mConfig.rounds > 0) {
-            if (mConfig.loopPart != 2) return;
-            for (const FusedRulesConfig::Selection & sel : mConfig.selection) if (sel.selfOverlapping) return;
-            if (!consumerOrder(mConfig, loopConsumers(mConfig)).iterated.empty()) return;
-        }
-        auto beforeLength = [](const FusedContexts & before) {
-            unsigned B = 0;
-            for (const FusedContext & alt : before) B = std::max(B, static_cast<unsigned>(alt.size()));
-            return B;
-        };
         unsigned extent = 0;
-        auto yieldExtent = [&](const std::vector<FusedYield> & yields) {
-            for (const FusedYield & y : yields) extent = std::max(extent, beforeLength(y.before) + static_cast<unsigned>(y.text.size()) - 1);
-        };
-        for (const FusedStringRule & r : mConfig.strings) {
-            if (!r.run.empty()) return;
-            extent = std::max(extent, beforeLength(r.before) + static_cast<unsigned>(r.text.size()) - 1);
-            yieldExtent(r.yields);
-        }
-        for (const FusedSubgroup & g : mConfig.subgroups) {
-            extent = std::max(extent, beforeLength(g.before));
-            yieldExtent(g.yields);
-        }
-        if (extent > 0) addAttribute(kernel::LocalCarries(extent));
+        if (localCarriesBlocker(mConfig, extent).empty() && extent > 0) addAttribute(kernel::LocalCarries(extent));
+        if (LLVM_UNLIKELY(ClassLayerReport)) reportClassLayer();
     }
     static Bindings inputs(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * U21, StreamSet * Classes,
                            StreamSet * InText, StreamSet * Mask, StreamSet * Allowed, const FusedState & in) {
@@ -8661,6 +8671,8 @@ void FusedRules::generatePabloMethod() {
 //  (string rules and subgroups) in a leaf, and the rules whose first sets are
 //  external (at the top of the hierarchy).
 void FusedRules::reportClassLayer() const {
+    unsigned extent = 0;
+    const std::string blocker = localCarriesBlocker(mConfig, extent);
     const unsigned shift = 5, maxSetBlocks = 16;
     auto blocksOf = [&](const UCD::UnicodeSet & set) {
         std::set<UCD::codepoint_t> b;
@@ -8719,7 +8731,9 @@ void FusedRules::reportClassLayer() const {
            << ", \"string_rules\": " << mConfig.strings.size() << ", \"subgroups\": " << mConfig.subgroups.size()
            << ", \"classes\": " << sets.size() << ", \"external\": " << external << ", \"blocks\": " << blocks.size()
            << ", \"code_bits\": " << codeBits << ", \"leaves\": " << leaves.size() << ", \"max_leaf\": " << maxLeaf
-           << ", \"top\": " << top << ", \"rules\": " << rules << "}\n";
+           << ", \"top\": " << top << ", \"rules\": " << rules << ", \"local_carries\": "
+           << (hasAttribute(kernel::Attribute::KindId::LocalCarries) ? "true" : "false") << ", \"carry_extent\": " << extent
+           << ", \"blocker\": \"" << blocker << "\"}\n";
 }
 
 void FusedRules::reportStatements(const void * attribution) const {

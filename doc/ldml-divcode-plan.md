@@ -2171,3 +2171,43 @@ case is compared with the regular plan only.
 Not yet: timing (the drivers at 4 threads, with the outputs compared), the
 compile time of the leaves, a nested If-hierarchy on the code's high bits (the
 leaves are flat: one If per block).
+
+### 13.15 LocalCarries in the fused kernels (2026-11-25): survey
+
+A kernel with `LocalCarries` can run on concurrent segments (it rebuilds its
+carries from the strides before a segment); its carries must come from Advances
+of bounded distance only (the CarryExtent check, at compile time). Step 6 does
+not lead there: its carry-propagating form of self-overlap chains is itself
+unbounded (as `settle`'s MatchStar alternation is).
+
+`--class-layer-report` now also gives each FusedRules kernel's status
+(`local_carries`, `carry_extent`) and what prevents it (`blocker`, from
+`localCarriesBlocker`, which the constructor uses). On all 453 transforms
+(default options, nothing compiled): 962 distinct kernels in 297 transforms
+(Thai-Latn fails: `Any-BreakInternal` is not implemented).
+
+| status | kernels | rules | transforms |
+|---|--:|--:|--:|
+| LocalCarries | 605 | 36,914 | 177 |
+| no carries (extent 0) | 244 | 933 | 240 |
+| correction loop | 62 | 3,584 | 153 |
+| run (deleted after a string rule's text) | 46 | 367 | 87 |
+| consumer loop (post kernel) | 4 | 336 | 25 |
+| self-overlap selection (post kernel) | 1 | 16 | 5 |
+
+- **Correction loops** (51 whole correction kernels, 11 loop kernels): the
+  blocker that matters. Shared kernels reach many transforms: und_FONIPA-ar's
+  loop kernel is in 22 `*-ar` transforms, und_FONIPA-fa's in 22 `*-fa`. Their
+  dependencies are unbounded by the semantics (item values through runs of
+  deleted characters, chains of converted contexts, self-overlap chains), not
+  by any one operation; LocalCarries would need a static bound on the chains
+  of a group, or speculative local execution with a serial fallback (new
+  pipeline machinery).
+- **Runs**: small kernels (1–6 string rules), shared. Half were matching
+  kernels, which only find first positions and do not delete the runs: no
+  longer blocked (the fix with this survey; they now have LocalCarries, extent
+  1, checked on ro-ro_FONIPA, es_FONIPA-ja and ug-Latin, the same output with 4
+  threads and segments of one stride). The other 22 (applying) need the run's
+  deletion in a kernel of its own.
+- **Consumer loops and self-overlap selection** (5 post kernels): likewise, a
+  kernel of their own for the unbounded part.

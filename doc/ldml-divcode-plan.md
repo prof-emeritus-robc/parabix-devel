@@ -1838,3 +1838,50 @@ Remaining loop statements after 1a: string cover updates 8,644, string
 decisions 5,382, string cover tests 5,181, item values and deletions 4,303,
 subgroup decisions 763, before contexts 766. The per-rule parts (19,207) are
 step 1's.
+
+### 13.8 Status of step 1 (2026-11-25, in progress)
+
+In the correction kernel's While loop, each string rule decided there is
+decided in an If on its candidates (`--fused-rule-ifs`, default on; in the
+kernel's signature when off). In the If: the rule's before context (known in,
+known out), its cover tests, its decision, and the updates of its covers that
+are not runs. Where the If is skipped (no candidate in the block, no pending
+carry), nothing it assigns would change: applies and rejected are within the
+candidates, the decisions DT and DF are, and the cover updates are Advances of
+them. The covers of runs are updated after the If, from the Vars (they read
+static streams, `passStatic`).
+
+- The covers' values cross the Ifs as Vars: a cover's T (DT at offset 0) and
+  CF (`notCand ∨ F`). A cover test reads the Var: as decided in this iteration
+  for a rule before it, in the previous one otherwise, as before.
+- Without the If (`--fused-rule-ifs=0`), the covers are given as the
+  expressions just built, as before step 1: reading the Vars there let the
+  builder's CSE reuse a cover test's chain built before a cover's assignment
+  for a rule after it (a stale value). In the
+  Ifs, each chain is in its own rule's If, so none is reused.
+- The before contexts are computed once per context and iteration, outside
+  the Ifs (they read only K, which the decisions do not change).
+- The decision progress is a Var, `Decided`.
+
+und_FONIPA-ar #3, statements before optimization:
+
+| | step 1a | step 1, `--fused-rule-ifs=0` | step 1 |
+|---|--:|--:|--:|
+| the loop | 25,110 | 24,744 | 62,701 |
+| of which the string rules | 19,207 | 19,606 | 58,829 (in 440 Ifs) |
+| the kernel | 37,680 | 38,575 | 76,532 |
+
+The static count grows: without the Ifs, the builder shared parts of the
+cover-test chains among rules (the same covers, before any of them was
+decided); in separate Ifs each rule builds its own. Per iteration, what runs
+is the 3,872 statements outside the Ifs, 440 If tests, and the bodies of the
+rules with candidates in the block (9 of 383 converted rules on average,
+13.2), about 134 statements each: roughly 5,500 statements instead of about
+24,700. The output on `pool-und_FONIPA.txt` is identical with and without the
+Ifs; the iterations are unchanged.
+
+Open:
+- The static size (compile time) of the rule bodies: the cover tests could
+  share chains among the rules that test the same covers, decided in the same
+  order, or test them by groups (as step 1a groups the covers).
+- Timing at 4 threads, with the outputs compared.

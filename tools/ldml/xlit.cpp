@@ -340,6 +340,12 @@ static cl::opt<bool> DivCodeReport("divcode-report",
 //  the correction kernel's While loop, in it, after it) and by what emits them
 //  (each string rule, subgroup and cover test, the state), to stderr.  (doc/
 //  ldml-divcode-plan.md §13.5, step 0.)
+//  In a correction kernel's While loop, each string rule decided there in an If
+//  on its candidates (doc/ldml-divcode-plan.md §13.5, step 1).
+static cl::opt<bool> FusedRuleIfs("fused-rule-ifs",
+    cl::desc("Decide each string rule in a correction kernel's While loop within an If on its candidates "
+             "(default on; 0 for the loop without them)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> FusedStatementReport("fused-statement-report",
     cl::desc("Report the Pablo statements of each FusedRules kernel generated, by part and by the rule, subgroup or "
              "step emitting them (kernels loaded from the object cache are not generated)"),
@@ -5999,6 +6005,7 @@ private:
         }
         if (c.rounds) {
             s += "R" + std::to_string(c.rounds);
+            if (!FusedRuleIfs) s += "nI";
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
             if (c.resolve) s += "W2";
@@ -7285,6 +7292,13 @@ void FusedRules::generatePabloMethod() {
                 }
             }
             const size_t numClasses = classes.size();
+            //  (The loop's string decisions: CF of each cover, notCand or F, and
+            //  whether a decision was added in the iteration.)
+            std::vector<Var *> coverF(covers.size());
+            for (size_t k = 0; k < covers.size(); k++) {
+                coverF[k] = pb.createVar("CF" + std::to_string(k), covers[k].notCand);
+            }
+            Var * const decided = pb.createVar("Decided", zeroes);
             PabloBuilder wb = pb.createScope();
             attr.startLoop(wb.getPabloBlock());
             attr.mark("subgroup decisions");
@@ -7312,89 +7326,147 @@ void FusedRules::generatePabloMethod() {
                 //  match is known to apply (covT) or none is (covF).  (The decisions
                 //  and those shifted to the offsets are accumulated: the carries of
                 //  the previous block reach the first iteration only.)
+                //  covT and covF are Vars: the cover's T (the decisions DT at offset
+                //  0) and CF (notCand or F), assigned where its rule is decided.  A
+                //  rule decided before this one in the iteration has them as just
+                //  decided, one after it (or itself) as in the previous iteration.
+                //  (Reading the Vars, rather than building expressions over them
+                //  again, keeps the builder from reusing an expression built before
+                //  an assignment.)
                 std::vector<PabloAST *> covT(covers.size()), covF(covers.size());
-                PabloAST * decisionProgress = zeroes;
-                for (size_t r : convStrings) {
-                    attr.mark("string before contexts", static_cast<long>(r));
-                    PabloAST * applies = candS[r];
-                    PabloAST * rejected = zeroes;
-                    if (r < S && mConfig.strings[r].converted) {
-                        const FusedContexts & before = mConfig.strings[r].before;
-                        applies = knownBefore(wb, before, candS[r], true);
-                        rejected = knownBefore(wb, before, candS[r], false);
+                for (size_t k = 0; k < covers.size(); k++) {
+                    covT[k] = covers[k].offset == 0 ? static_cast<PabloAST *>(DT[covers[k].rule]) : covers[k].T;
+                    covF[k] = coverF[k];
+                }
+                wb.createAssign(decided, zeroes);
+                //  The before contexts of the converted string rules, known to hold
+                //  or known not to, once for each context (they read only K, which
+                //  the decisions do not change), outside the rules' Ifs.
+                std::map<std::pair<std::string, bool>, PabloAST *> contextMemo;
+                auto contextKnown = [&](const FusedContexts & before, bool in) -> PabloAST * {
+                    std::string key;
+                    for (const FusedContext & alt : before) {
+                        const unsigned B = static_cast<unsigned>(alt.size());
+                        for (unsigned k = 0; k < B; k++) {
+                            ResolvedItem at;
+                            if (!resolvedItemAt(alt, k, at)) continue;
+                            key += std::to_string(itemIndex.at(at.key())) + "@" + std::to_string(B - k - 1) + ",";
+                        }
+                        key += "|";
                     }
-                    //  The matches that may cover its first position: of the rules
-                    //  decided before it in this iteration, as just decided; of the
-                    //  others (itself among them), as in the previous iteration.
-                    attr.mark("string cover tests", static_cast<long>(r));
-                    PabloAST * within = zeroes;
-                    PabloAST * notWithin = ones;
-                    for (size_t p : convStrings) {
-                        for (size_t k : coversOf[p]) {
-                            const StringCover & sc = covers[k];
-                            if (!mayBegin(r, p, sc)) continue;
-                            if (p < r) {
-                                within = wb.createOr(within, covT[k]);
-                                notWithin = wb.createAnd(notWithin, covF[k]);
-                            } else {
-                                within = wb.createOr(within, sc.T);
-                                notWithin = wb.createAnd(notWithin, wb.createOr(sc.notCand, sc.F));
+                    PabloAST *& m = contextMemo[{key, in}];
+                    if (!m) m = knownBefore(wb, before, ones, in);
+                    return m;
+                };
+                for (size_t r : convStrings) {
+                    //  With --fused-rule-ifs, in an If on the rule's candidates (doc/
+                    //  ldml-divcode-plan.md §13.5, step 1): every value assigned there
+                    //  is within them (applies, rejected) or moved from them (the cover
+                    //  updates, Advances of t and f), so where the If is skipped (no
+                    //  candidate in the block, no pending carry) it would not change.
+                    //  The covers of a run are updated after it, from the Vars: they
+                    //  read static streams (passStatic).
+                    attr.mark("string rules", static_cast<long>(r));
+                    //  (Without the If, the covers of the rule are given as the
+                    //  expressions just built, as before step 1: an expression over
+                    //  the Vars built again after their assignment would be the one
+                    //  built before it.  In an If, the Vars are read after it: the
+                    //  cover tests are each in their rule's If, so none is reused.)
+                    auto decide = [&](PabloBuilder & ib, bool fresh) {
+                        PabloAST * applies = candS[r];
+                        PabloAST * rejected = zeroes;
+                        if (r < S && mConfig.strings[r].converted) {
+                            const FusedContexts & before = mConfig.strings[r].before;
+                            applies = ib.createAnd(candS[r], contextKnown(before, true));
+                            rejected = ib.createAnd(candS[r], contextKnown(before, false));
+                        }
+                        //  The matches that may cover its first position.
+                        PabloAST * within = zeroes;
+                        PabloAST * notWithin = ones;
+                        for (size_t p : convStrings) {
+                            for (size_t k : coversOf[p]) {
+                                const StringCover & sc = covers[k];
+                                if (!mayBegin(r, p, sc)) continue;
+                                within = ib.createOr(within, covT[k]);
+                                notWithin = ib.createAnd(notWithin, covF[k]);
                             }
                         }
+                        applies = ib.createAnd(applies, notWithin);
+                        rejected = ib.createOr(rejected, within);
+                        rejected = ib.createAnd(candS[r], rejected);
+                        PabloAST * const t = ib.createOr(DT[r], applies);
+                        PabloAST * const f = ib.createOr(DF[r], rejected);
+                        ib.createAssign(decided, ib.createOr(decided, ib.createOr(ib.createAnd(t, ib.createNot(DT[r])),
+                                                                                  ib.createAnd(f, ib.createNot(DF[r])))));
+                        ib.createAssign(DT[r], t);
+                        ib.createAssign(DF[r], f);
+                        for (size_t k : coversOf[r]) {
+                            const StringCover & sc = covers[k];
+                            if (sc.run) continue;
+                            if (sc.offset == 0) {
+                                PabloAST * const cf = ib.createOr(sc.notCand, f);
+                                ib.createAssign(coverF[k], cf);
+                                if (fresh) {
+                                    covT[k] = t;
+                                    covF[k] = cf;
+                                }
+                                continue;
+                            }
+                            PabloAST * const st = ib.createOr(sc.T, ib.createAdvance(t, sc.offset));
+                            PabloAST * const sf = ib.createOr(sc.F, ib.createAdvance(f, sc.offset));
+                            ib.createAssign(sc.T, st);
+                            ib.createAssign(sc.F, sf);
+                            PabloAST * const cf = ib.createOr(sc.notCand, sf);
+                            ib.createAssign(coverF[k], cf);
+                            if (fresh) {
+                                covT[k] = st;
+                                covF[k] = cf;
+                            }
+                        }
+                    };
+                    if (candS[r] != zeroes) {
+                        if (FusedRuleIfs) {
+                            PabloBuilder ib = wb.createScope();
+                            decide(ib, false);
+                            wb.createIf(candS[r], ib);
+                        } else {
+                            decide(wb, true);
+                        }
                     }
-                    attr.mark("string decisions", static_cast<long>(r));
-                    applies = wb.createAnd(applies, notWithin);
-                    rejected = wb.createOr(rejected, within);
-                    rejected = wb.createAnd(candS[r], rejected);
-                    PabloAST * const t = wb.createOr(DT[r], applies);
-                    PabloAST * const f = wb.createOr(DF[r], rejected);
-                    decisionProgress = wb.createOr(decisionProgress, wb.createOr(wb.createAnd(t, wb.createNot(DT[r])),
-                                                                                 wb.createAnd(f, wb.createNot(DF[r]))));
-                    wb.createAssign(DT[r], t);
-                    wb.createAssign(DF[r], f);
-                    attr.mark("string cover updates", static_cast<long>(r));
                     for (size_t k : coversOf[r]) {
                         const StringCover & sc = covers[k];
-                        if (sc.offset == 0) {
-                            covT[k] = t;
-                            covF[k] = wb.createOr(sc.notCand, f);
-                            continue;
-                        }
-                        if (sc.run) {
-                            //  Covered: the run after the text of a match known to apply.
-                            //  Known clear: a position of the run after one not the end
-                            //  of a candidate that may apply, and either not of the run
-                            //  or itself known clear.  Both are carried from the positions
-                            //  already known (T, F) as well as from their seeds: the
-                            //  carries of the previous block reach the first iteration
-                            //  only, so a run continued from the previous block is
-                            //  continued from what the earlier iterations found.
-                            const unsigned n = sc.offset;
-                            PabloAST * const ends = n > 1 ? wb.createAdvance(t, n - 1) : t;
-                            PabloAST * const tail = wb.createMatchStar(wb.createOr(wb.createAdvance(ends, 1), sc.T), sc.runChars);
-                            PabloAST * const rt = wb.createOr(sc.T, wb.createAnd(tail, sc.runChars));
-                            //  (The positions known clear pass: at the first position of a
-                            //  block, the Advance gives the previous block's only in the
-                            //  first iteration.)
-                            PabloAST * const pass = wb.createOr(wb.createOr(sc.passStatic, sc.F),
-                                                                wb.createAnd(sc.runChars, wb.createAdvance(f, n)));
-                            PabloAST * const seeds = wb.createOr(wb.createAnd(pass, sc.notRunBefore), sc.F);
-                            PabloAST * const clear = wb.createAnd(wb.createMatchStar(seeds, pass), pass);
-                            PabloAST * const rf = wb.createOr(sc.F, clear);
-                            wb.createAssign(sc.T, rt);
-                            wb.createAssign(sc.F, rf);
-                            covT[k] = rt;
-                            covF[k] = wb.createOr(sc.notCand, rf);
-                            continue;
-                        }
-                        PabloAST * const st = wb.createOr(sc.T, wb.createAdvance(t, sc.offset));
-                        PabloAST * const sf = wb.createOr(sc.F, wb.createAdvance(f, sc.offset));
-                        wb.createAssign(sc.T, st);
-                        wb.createAssign(sc.F, sf);
-                        covT[k] = st;
-                        covF[k] = wb.createOr(sc.notCand, sf);
+                        if (!sc.run) continue;
+                        //  Covered: the run after the text of a match known to apply.
+                        //  Known clear: a position of the run after one not the end
+                        //  of a candidate that may apply, and either not of the run
+                        //  or itself known clear.  Both are carried from the positions
+                        //  already known (T, F) as well as from their seeds: the
+                        //  carries of the previous block reach the first iteration
+                        //  only, so a run continued from the previous block is
+                        //  continued from what the earlier iterations found.
+                        PabloAST * const t = DT[r];
+                        PabloAST * const f = DF[r];
+                        const unsigned n = sc.offset;
+                        PabloAST * const ends = n > 1 ? wb.createAdvance(t, n - 1) : t;
+                        PabloAST * const tail = wb.createMatchStar(wb.createOr(wb.createAdvance(ends, 1), sc.T), sc.runChars);
+                        PabloAST * const rt = wb.createOr(sc.T, wb.createAnd(tail, sc.runChars));
+                        //  (The positions known clear pass: at the first position of a
+                        //  block, the Advance gives the previous block's only in the
+                        //  first iteration.)
+                        PabloAST * const pass = wb.createOr(wb.createOr(sc.passStatic, sc.F),
+                                                            wb.createAnd(sc.runChars, wb.createAdvance(f, n)));
+                        PabloAST * const seeds = wb.createOr(wb.createAnd(pass, sc.notRunBefore), sc.F);
+                        PabloAST * const clear = wb.createAnd(wb.createMatchStar(seeds, pass), pass);
+                        PabloAST * const rf = wb.createOr(sc.F, clear);
+                        wb.createAssign(sc.T, rt);
+                        wb.createAssign(sc.F, rf);
+                        PabloAST * const cf = wb.createOr(sc.notCand, rf);
+                        wb.createAssign(coverF[k], cf);
+                        covT[k] = rt;
+                        covF[k] = cf;
                     }
                 }
+                PabloAST * const decisionProgress = decided;
                 //  The positions known to have a value: where a string match covering
                 //  them is known to apply, with the value of its result there (given by
                 //  valueOf), or with their own value (own) where every match that may

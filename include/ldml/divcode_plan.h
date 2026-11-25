@@ -63,7 +63,7 @@ struct DivCodeOptions {
     // Whether the before contexts that ICU matches against the converted text
     // (see DivRule::converted) are matched against it, resolved by the
     // Converted kernel's While loop (doc/ldml-divcode-plan.md §10); if not,
-    // against the text itself, as with xlit --converted-context-rounds=0.
+    // against the text itself, as with xlit --correction-kernels=0.
     bool convertedContexts = true;
     // Whether a before context (as given for the regular expression engine)
     // may match differently in the text as converted by the group, against

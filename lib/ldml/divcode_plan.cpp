@@ -1126,8 +1126,8 @@ DivCodePlan planDivCodeGroup(const TransformStep & step, const DivCodeOptions & 
     classifyConverted(plan);
     //  A group without string rules is applied by DivCode only for its rules
     //  with before contexts matched against the converted text, which the
-    //  Converted kernel resolves instead of rounds (doc/ldml-divcode-plan.md
-    //  §12); otherwise its present plan applies it.
+    //  Converted kernel resolves, as a correction kernel does (doc/ldml-divcode-
+    //  plan.md §12); otherwise its present plan applies it.
     if (step.stringRules.empty() && !plan.dependent()) problem("no string rules");
 
     for (const auto & p : problems) {

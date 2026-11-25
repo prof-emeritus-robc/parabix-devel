@@ -157,10 +157,10 @@ static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML trans
                                       cl::init(""), cl::cat(XlitOptions));
 static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known transform names and exit"),
                                     cl::init(false), cl::cat(XlitOptions));
-static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
-    cl::desc("Before contexts that the conversions of a group may change: matched against the converted text (resolved by "
-             "the correction kernel's While loop, exact at any chain length) if nonzero, against the text itself if 0"),
-    cl::init(8), cl::cat(XlitOptions));
+static cl::opt<bool> CorrectionKernels("correction-kernels",
+    cl::desc("Match the before contexts that the conversions of a group may change against the converted text, in "
+             "correction kernels (their While loops, exact at any chain length) (default on; 0: against the text itself)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> NormalizationPeephole("normalization-peephole",
     cl::desc("Omit a normalization step (NFD or NFC) whose result the next step normalizes again (NFD, NFC, NFKD or NFKC, "
              "over the same characters or more, a set closed under canonical equivalence), across the transforms invoked: "
@@ -3702,7 +3702,7 @@ static bool divCodeApplies(const ldml::DivCodePlan & plan) {
 //  against the text itself), are not known to be covering: the single-character
 //  rules then apply only outside the applied matches of the string rules.
 static bool hasConvertedSubgroup(const ldml::TransformStep & step, const std::vector<ConversionOutcome> & outcomes) {
-    if (ConvertedContextRounds == 0 || step.stringRules.empty()) return false;
+    if (!CorrectionKernels || step.stringRules.empty()) return false;
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         FusedContexts before, after;
         if (s.engineBefore && fusedContexts(s.engineAfter, false, after) && fusedContexts(s.engineBefore, true, before, true)
@@ -3843,9 +3843,9 @@ static void insertionContextProblems(const ldml::TransformStep & step, std::vect
     if (step.insertions.empty() || insertionsOnly(step)) return;
     for (const ldml::InsertionRule & ins : step.insertions) {
         FusedContexts before;
-        if (ConvertedContextRounds == 0) {
+        if (!CorrectionKernels) {
             problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but before contexts are not matched "
-                               "against the converted text: --converted-context-rounds=0)");
+                               "against the converted text: --correction-kernels=0)");
         } else if (!fusedContexts(ins.engineBefore, true, before, true)) {
             problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but its before context is not a sequence "
                                "of sets and repeated sets)");
@@ -4316,7 +4316,7 @@ static void translateCaptureContexts(ldml::TransformPlan & plan) {
 //  pipeline then warns (see RulePipelineBuilder::conversionGroup), with this
 //  reason, the first such rule and why the group cannot be in one kernel.
 static std::string wholeGroupProblem(const ldml::TransformStep & step) {
-    if (ConvertedContextRounds == 0 || step.stringRules.empty()) return "";
+    if (!CorrectionKernels || step.stringRules.empty()) return "";
     const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
     bool changing = false;
     for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
@@ -4785,19 +4785,19 @@ struct FusedRulesConfig {
     //  Also the spans and first positions of the matches of the string rules
     //  (Spans and Starts), for the coverage of the single-character rules.
     bool coverage = false;
-    //  A correction kernel (rounds > 0): its rules have before contexts that the
-    //  conversions of the group may make match differently in the converted
-    //  text, against which ICU matches them.  Given the results of the other
-    //  rules of the group (in the state), it matches their before contexts
-    //  against the converted text, in this many rounds (see FusedRules).
+    //  A correction kernel: its rules have before contexts that the conversions
+    //  of the group may make match differently in the converted text, against
+    //  which ICU matches them.  Given the results of the other rules of the
+    //  group (in the state), it matches their before contexts against the
+    //  converted text (see resolve, and FusedRules).
     //  replacementChars: the characters of all the replacements of the group.
-    unsigned rounds = 0;
+    bool correction = false;
     UCD::UnicodeSet replacementChars;
     //  In a correction kernel for a whole group: the string rules, in the order to
     //  apply them, with their selection (see SelectStringMatches; empty if their
     //  matches do not overlap), and whether the single-character rules apply only
     //  where not covered by the matches of the string rules that apply (and within
-    //  Allowed, or the mask).  These are then computed in each round.
+    //  Allowed, or the mask).  These are then computed in the correction kernel.
     struct Selection {
         unsigned length;
         std::vector<size_t> predecessors;
@@ -4811,11 +4811,11 @@ struct FusedRulesConfig {
     //  A correction kernel whose rules matched against the converted text have
     //  before contexts of fixed items, possibly with a repeated set, as do its
     //  insertion rules (see resolvableByWhile): their before contexts are
-    //  resolved by a While loop, exactly, instead of in rounds, with the
-    //  selection of the string matches that depends on them (see
-    //  loopStringRules and FusedRules::generatePabloMethod).  The rounds remain
-    //  for the selection of the other string matches, which does not depend on
-    //  the converted text.
+    //  resolved by a While loop, exactly, with the selection of the string
+    //  matches that depends on them (see loopStringRules and
+    //  FusedRules::generatePabloMethod); the selection of the other string
+    //  matches does not depend on the converted text.  (Every correction kernel:
+    //  one that the loop cannot resolve is not built, see applyFused.)
     bool resolve = false;
     //  With resolve, a whole group whose string matches are selected sequentially
     //  (see TransformStep::sequentialSelection): every string rule is decided in
@@ -5314,7 +5314,7 @@ struct FusedSubgroupPlan {
 //  Selection) is decided in the loop, or their first character may be at a
 //  later position of the text of one (where ICU, having applied it, applies no
 //  rule; the overlap order has only the rules matching within the text, and
-//  the rounds drop such matches, see appliedWithin).  The positions of their
+//  the correction kernel drops such matches, see appliedWithin).  The positions of their
 //  matches do not depend on the converted text; which apply does, and the
 //  loop decides each match at its first position: from its before context, if
 //  converted, as it decides a subgroup's, and from the matches decided in the
@@ -5383,7 +5383,7 @@ static bool loopStringResolvable(const FusedRulesConfig & c, size_t r, std::stri
 }
 
 static bool resolvableByWhile(const FusedRulesConfig & c, std::string * why = nullptr) {
-    if (c.rounds == 0 || c.matchOnly) return false;
+    if (!c.correction || c.matchOnly) return false;
     auto no = [&](const std::string & reason) {
         if (why) *why = reason;
         return false;
@@ -5554,7 +5554,7 @@ static LoopConsumers loopConsumers(const FusedRulesConfig & c) {
     lc.coversOf.resize(numEntries);
     lc.consumer.assign(numEntries, false);
     lc.coverSetOf.assign(numEntries, -1);
-    if (!c.resolve || c.rounds == 0 || c.matchOnly) return lc;
+    if (!c.resolve || !c.correction || c.matchOnly) return lc;
     const std::vector<bool> loopRule = loopStringRules(c);
     for (size_t r = 0; r < S; r++) {
         if (!loopRule[r]) continue;
@@ -5772,7 +5772,7 @@ static ConsumerOrder consumerOrder(const FusedRulesConfig & c, const LoopConsume
 //  selection of a rule overlapping itself (MatchStar).
 static std::string localCarriesBlocker(const FusedRulesConfig & c, unsigned & extent) {
     extent = 0;
-    if (c.rounds > 0) {
+    if (c.correction) {
         if (c.loopPart != 2) return "correction loop";
         for (const FusedRulesConfig::Selection & sel : c.selection) if (sel.selfOverlapping) return "self-overlap selection";
         if (!consumerOrder(c, loopConsumers(c)).iterated.empty()) return "consumer loop";
@@ -5988,7 +5988,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         for (const auto & k : plan.byInsertion) add(k.second);
         if (plan.caseMap >= 0) add(plan.literalAll);
     }
-    if (c.rounds > 0 && !c.marks.empty()) {
+    if (c.correction && !c.marks.empty()) {
         //  The outcomes of the positions marked for case mappings (their lengths,
         //  and whether their characters are in the sets of the items).
         const std::vector<UCD::UnicodeSet> itemSets = convertedItemSets(c);
@@ -6191,7 +6191,7 @@ static ClassLayerLeaves classLayerLeaves(const FusedRulesConfig & c) {
 //  with more than half of them; not a correction kernel, and with no insertion
 //  rules or marked case mappings.
 static bool classLayerCriterion(const FusedRulesConfig & c) {
-    if (c.rounds > 0 || !c.insertions.empty() || !c.marks.empty()) return false;
+    if (c.correction || !c.insertions.empty() || !c.marks.empty()) return false;
     for (const FusedSubgroup & g : c.subgroups) if (g.caseMaps) return false;
     const ClassLayerLeaves l = classLayerLeaves(c);
     return l.rules >= 20 && l.rulesIn.size() >= 4 && 2 * l.maxLeaf() <= l.rules;
@@ -6513,8 +6513,8 @@ private:
                 for (char32_t ch : w) s += std::to_string(ch) + ",";
             }
         }
-        if (c.rounds) {
-            s += "R" + std::to_string(c.rounds);
+        if (c.correction) {
+            s += "C";
             if (!FusedRuleIfs) s += "nI";
             if (!FusedLoopConsumers) s += "nC";
             if (c.loopPart) s += "P" + std::to_string(c.loopPart);
@@ -6910,7 +6910,7 @@ void FusedRules::generatePabloMethod() {
     //  The matches of the string rules, at their first positions, and the
     //  positions where the rules of the subgroups apply.  In a correction kernel,
     //  without their before contexts (matched against the converted text below).
-    const bool correction = mConfig.rounds > 0;
+    const bool correction = mConfig.correction;
     //  The first positions of the static matches that apply (see
     //  FusedRulesConfig::staticClasses).
     PabloAST * staticSelected = zeroes;
@@ -7059,8 +7059,8 @@ void FusedRules::generatePabloMethod() {
     }
 
     //  The insertion rules: where their after contexts match (from the next
-    //  position) and they are eligible, and where they apply (given by the rounds
-    //  below).
+    //  position) and they are eligible, and where they apply (given by the
+    //  correction kernel below).
     attr.mark("insertion rules");
     std::vector<PabloAST *> insAfter, insAt(mConfig.insertions.size(), zeroes);
     for (const FusedInsertion & ins : mConfig.insertions) {
@@ -7502,7 +7502,7 @@ void FusedRules::generatePabloMethod() {
             //  §10), exact at any chain length.
             //
             //  The string matches that apply, and the positions of the subgroups not
-            //  covered by them, as after the rounds: they do not depend on the
+            //  covered by them, as settled statically: they do not depend on the
             //  converted text, except for the string rules decided in the loop (see
             //  loopStringRules), which are not selected by each other, and neither
             //  cover positions nor drop matches here.  The candidates of a converted
@@ -8723,7 +8723,7 @@ void FusedRules::reportClassLayer() const {
     }
     size_t maxLeaf = 0;
     for (const auto & l : leaves) maxLeaf = std::max(maxLeaf, l.second);
-    const char * kind = mConfig.matchOnly ? "match" : mConfig.rounds == 0 ? "regular"
+    const char * kind = mConfig.matchOnly ? "match" : !mConfig.correction ? "regular"
                         : mConfig.loopPart == 1 ? "loop" : mConfig.loopPart == 2 ? "post" : "correction";
     errs() << "{\"kernel\": \"" << getName() << "\", \"kind\": \"" << kind << "\", \"absolute\": "
            << (mConfig.absolute ? "true" : "false") << ", \"coded\": " << (mConfig.classCodes.empty() ? "false" : "true")
@@ -8747,7 +8747,7 @@ void FusedRules::reportStatements(const void * attribution) const {
     std::string out;
     raw_string_ostream os(out);
     os << getName() << ": " << total << " Pablo statements before optimization (" << mConfig.strings.size()
-       << " string rules, " << mConfig.subgroups.size() << " subgroups" << (mConfig.rounds ? ", correction kernel" : "") << ")";
+       << " string rules, " << mConfig.subgroups.size() << " subgroups" << (mConfig.correction ? ", correction kernel" : "") << ")";
     for (const char * part : {"before", "loop", "after"}) {
         if (parts.count(part)) os << "; " << part << " " << parts[part];
     }
@@ -10995,7 +10995,7 @@ private:
             }
         }
         //  (A correction kernel reads the strings of the selectors.)
-        if (c.absolute && c.rounds > 0) c.selectorStrings = mSelectorStrings;
+        if (c.absolute && c.correction) c.selectorStrings = mSelectorStrings;
         //  (The classes as codes, see FusedRulesConfig::classCodes and classCodes.)
         //  The codes are those of the multiplexed code of the stream's classes
         //  (see fusedClasses in RulePipelineBuilder::conversionGroup), for each of
@@ -12406,7 +12406,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         ldml::DivCodeOptions options;
         options.shift = DivCodeShift;
         options.convertedBefore = convertedBeforeContext;
-        options.convertedContexts = ConvertedContextRounds > 0;
+        options.convertedContexts = CorrectionKernels;
         const ldml::DivCodePlan & plan = cachedDivCodePlan(step, options);
         if (divCodeApplies(plan)) return divCodeGroup(plan, U21);
     }
@@ -12532,13 +12532,13 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
     };
     //  The rules whose before contexts the conversions of the group may make match
     //  differently in the converted text: matched against it by a correction
-    //  kernel (FusedRules with rounds), after the other rules; or, if such string
+    //  kernel (FusedRulesConfig::correction), after the other rules; or, if such string
     //  rules must be selected or other rules need their coverage, together with
     //  all the rules of the group (see wholeGroup below).
     const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
     const bool needCoverage = (step.coverStringRules || hasConvertedSubgroup(step, outcomes)) &&
         std::any_of(maps.begin(), maps.end(), [](const std::vector<ldml::CharMapping> & m) {return !m.empty();});
-    const bool correct = ConvertedContextRounds > 0;
+    const bool correct = CorrectionKernels;
     //  The string rules whose before contexts (possibly with repetitions) are
     //  matched against the converted text, and their contexts.  (Also those whose
     //  after contexts the engine matches, see afterStreamed: otherwise their before
@@ -12927,10 +12927,10 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  doc/round-replacement.md step 7 removed the rounds.)
         std::string why;
         config.resolve = resolvableByWhile(config, &why);
-        if (config.rounds > 0 && !config.matchOnly && !config.resolve) {
+        if (config.correction && !config.matchOnly && !config.resolve) {
             llvm::report_fatal_error(llvm::StringRef("xlit: before contexts matched against the converted text that the "
                                                      "correction kernel's While loop cannot resolve (" + why + "); "
-                                                     "--converted-context-rounds=0 matches them against the text itself"));
+                                                     "--correction-kernels=0 matches them against the text itself"));
         }
         const FusedLayout layout(config, state);
         config.marks = layout.marks;
@@ -13568,7 +13568,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             }
             config.subgroups.push_back(std::move(fg));
         }
-        config.rounds = ConvertedContextRounds;
+        config.correction = CorrectionKernels;
         for (const ConversionOutcome & o : outcomes) {
             config.replacementChars = config.replacementChars + o.resultChars();
         }
@@ -13593,7 +13593,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         };
         auto cannotSelect = [&](const std::string & why) {
             llvm::report_fatal_error(llvm::StringRef("xlit: string matches selected sequentially that the correction kernel's "
-                                                     "While loop cannot decide (" + why + "); --converted-context-rounds=0 "
+                                                     "While loop cannot decide (" + why + "); --correction-kernels=0 "
                                                      "matches their before contexts against the text itself"));
         };
         //  (The whole group in the loop where it fits --whole-group-rules and the loop
@@ -14263,7 +14263,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             }
         }
         if (!correction.strings.empty() || !correction.subgroups.empty() || !correction.insertions.empty()) {
-            correction.rounds = ConvertedContextRounds;
+            correction.correction = CorrectionKernels;
             for (const ConversionOutcome & o : outcomes) {
                 correction.replacementChars = correction.replacementChars + o.resultChars();
             }
@@ -14719,7 +14719,7 @@ static ldml::DivCodePlan utf8DivCodePlan(const ldml::TransformStep & step) {
     ldml::DivCodeOptions options;
     options.shift = DivCodeShift;
     options.convertedBefore = convertedBeforeContext;
-    options.convertedContexts = ConvertedContextRounds > 0;
+    options.convertedContexts = CorrectionKernels;
     options.utf8 = true;
     return cachedDivCodePlan(step, options);
 }
@@ -16580,7 +16580,7 @@ static int printDivCodeReportOf(const std::string & name, const TransformAnalysi
         group++;
         ldml::DivCodeOptions options;
         options.convertedBefore = convertedBeforeContext;
-        options.convertedContexts = ConvertedContextRounds > 0;
+        options.convertedContexts = CorrectionKernels;
         options.shift = 5;
         const ldml::DivCodePlan p32 = ldml::planDivCodeGroup(step, options);
         //  (A group without string rules: only with rules whose before contexts
@@ -16797,7 +16797,7 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 //  4): its contexts are then bounded by the regions (bounded, see
 //  RulePipelineBuilder::boundRegions), in the fused kernels (see
 //  FusedRulesConfig::region; also the before contexts matched against the
-//  converted text, in rounds or by the While loop) and by the engine (region
+//  converted text, by the correction kernel's While loop) and by the engine (region
 //  starts and follows), and it is not applied by DivCode, shape groups or in
 //  UTF-8 mode.  So is a group with MultipleCaptureMultipleReplacement rules,
 //  which the engine matches, bounded likewise (before, each line was a run of
@@ -18969,7 +18969,7 @@ static int divCodeCodes(const ldml::TransformRegistry & registry, const ldml::Tr
     ldml::DivCodeOptions options;
     options.shift = DivCodeShift;
     options.convertedBefore = convertedBeforeContext;
-    options.convertedContexts = ConvertedContextRounds > 0;
+    options.convertedContexts = CorrectionKernels;
     const ldml::DivCodePlan plan = ldml::planDivCodeGroup(*step, options);
     if (plan.blocks.empty() || plan.codeBits > 10 || plan.externalSets.size() > 6) {
         llvm::errs() << "Error: the alphabet of group " << DivCodeCodes << " has " << plan.blocks.size() << " blocks and "

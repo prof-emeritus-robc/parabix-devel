@@ -741,7 +741,8 @@ segment sizes 1 to 3, 1 to 3 threads, and `-EnableAsserts -VerifyIR`.
 
 **Regression of the converted-text contexts.** On the same 1,975 runs:
 
-- with `--converted-context-rounds=0` (the correction off), the output is
+- with the correction off (`--correction-kernels=0`, then
+  `--converted-context-rounds=0`), the output is
   identical to the xlit before fusion, other than ja_Hrkt-ja_Latn/BGN;
 - with the correction, 117 outputs change, in 25 transforms, and every one of
   them is identical to ICU 78.3.
@@ -859,14 +860,15 @@ doc/ldml-divcode-plan.md §10):
 A `While` loop can be used because the state only accumulates: an `Advance`
 inside the loop takes the previous block's carry only in the first iteration,
 so the values carried across blocks are kept in Vars that the iterations only
-add to. `--converted-context-rounds=0` turns the correction off (the before
+add to. `--correction-kernels=0` turns the correction off (the before
 contexts are matched against the text itself). A group that the loop cannot
 resolve (a repeated set in a before context that is not of the form `X T*`;
 string rules decided in the loop with runs, kept captures, matches found by the
 regular expression engine, or insertion rules beside them) is reported as an
 error. Until 2026-11, these rules were applied
-in fixed rounds instead (`--converted-context-rounds`, default 8), exact only
-for chains of up to that many rules (doc/round-replacement.md step 7).
+in fixed rounds instead (`--converted-context-rounds`, default 8, now the switch
+`--correction-kernels`), exact only for chains of up to that many rules
+(doc/round-replacement.md step 7).
 
 **Cost.** It is small:
 
@@ -883,8 +885,8 @@ Where the matches must be selected sequentially (two-way or cyclic overlaps),
 they are selected in the loop if it can decide every string rule of the group;
 otherwise (string rules with runs: InterIndic-Arabic, Latin-ASCII,
 ro-ro_FONIPA, xh-xh_FONIPA) in staged rounds, each a matching kernel,
-`LeftmostMatches` and an applying kernel (§4.2), exact for chains of up to
-`--converted-context-rounds` (default 8). (Groups of more than 256 string rules or subgroups keep their
+`LeftmostMatches` and an applying kernel (§4.2), exact for chains of up to 8
+(until 2026-11-24, see doc/round-replacement.md). (Groups of more than 256 string rules or subgroups keep their
 before contexts matched against the text.) For example, pl-pl_FONIPA's
 `$voiceless { rz → ʂ` sees `W` converted to the voiceless `f` (`Wrz` gives `fʂ`).
 A before context matched against the converted text may also let a string rule

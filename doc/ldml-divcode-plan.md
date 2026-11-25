@@ -1804,3 +1804,37 @@ What this shows:
 So step 1 is preceded by a step **1a, shared cover unions**: a change to
 `withStrings` (and the cover tests), exact, with no If; it shrinks the loop by
 up to about half by itself, and makes step 1's per-rule Ifs smaller.
+
+### 13.7 Status of step 1a (2026-11-25)
+
+`withStrings` (the item values and the deletions of the correction kernel's
+state update) groups the covers by their value, in the order of first
+appearance, and builds each group's union of `covT` and intersection of `covF`
+once per iteration, shared by every call with the same group; a group whose
+value is 0 needs no union, one whose value is 1 no intersection. Exact: the
+same terms, reassociated.
+
+und_FONIPA-ar #3, statements before optimization (`--fused-statement-report`):
+
+| | before 1a | after 1a |
+|---|--:|--:|
+| item values | 29,717 | 2,348 |
+| deletions (values and outcomes) | 1,296 | 1,955 (the shared unions are built here, first) |
+| the loop | 51,820 | 25,110 |
+| the kernel | 64,390 | 37,680 |
+
+The output on `pool-und_FONIPA.txt` is identical; the iterations are unchanged
+(108,664 blocks, 255,385 iterations: 2 in 70,607 blocks, 3 in 38,057).
+
+Found on the way: the pipeline's signature (its cache key) took a kernel's
+signature, where it has one, without its name, so annotations of the name (a
+Pablo kernel's carry mode, `-LocalCarries`, `+WhileCounts`) did not reach it:
+a pipeline cached by a run without `-pablo-count-while-iterations` was reused
+by a run with it, and called kernels by names that run did not build ("JIT
+session error: Symbols not found"). `PipelineBuilder` now adds the name before
+the signature.
+
+Remaining loop statements after 1a: string cover updates 8,644, string
+decisions 5,382, string cover tests 5,181, item values and deletions 4,303,
+subgroup decisions 763, before contexts 766. The per-rule parts (19,207) are
+step 1's.

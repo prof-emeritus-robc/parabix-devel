@@ -7400,18 +7400,45 @@ void FusedRules::generatePabloMethod() {
                 //  valueOf), or with their own value (own) where every match that may
                 //  cover them is known not to apply or has the same value.
                 attr.mark("values and outcomes (deletions)");
+                //  The covers are grouped by their value (in the order of first
+                //  appearance), and each group's union of covT (positions covered by a
+                //  match known to apply) and intersection of covF (known not to be) is
+                //  built once in the iteration and shared by every call with the same
+                //  group (doc/ldml-divcode-plan.md §13.6, step 1a): the item values and
+                //  the deletions mostly group the covers alike, with few values each.
                 std::vector<size_t> distinctCoverValues;    // (--fused-statement-report)
+                std::map<std::vector<size_t>, PabloAST *> coveredUnion, clearIntersection;
                 auto withStrings = [&](PabloAST * own, const std::function<PabloAST *(size_t)> & valueOf) {
-                    PabloAST * any = zeroes;
-                    PabloAST * all = own;
-                    std::set<PabloAST *> values;
+                    std::vector<std::pair<PabloAST *, std::vector<size_t>>> groups;
+                    std::map<PabloAST *, size_t> groupOf;
                     for (size_t k = 0; k < covers.size(); k++) {
                         PabloAST * const v = valueOf(k);
-                        if (LLVM_UNLIKELY(attr.on)) values.insert(v);
-                        any = wb.createOr(any, wb.createAnd(covT[k], v));
-                        all = wb.createAnd(all, wb.createOr(covF[k], v));
+                        const auto f = groupOf.emplace(v, groups.size());
+                        if (f.second) groups.emplace_back(v, std::vector<size_t>{});
+                        groups[f.first->second].second.push_back(k);
                     }
-                    if (LLVM_UNLIKELY(attr.on)) distinctCoverValues.push_back(values.size());
+                    if (LLVM_UNLIKELY(attr.on)) distinctCoverValues.push_back(groups.size());
+                    PabloAST * any = zeroes;
+                    PabloAST * all = own;
+                    for (const auto & g : groups) {
+                        PabloAST * const v = g.first;
+                        if (v != zeroes) {
+                            PabloAST *& u = coveredUnion[g.second];
+                            if (!u) {
+                                u = zeroes;
+                                for (size_t k : g.second) u = wb.createOr(u, covT[k]);
+                            }
+                            any = wb.createOr(any, wb.createAnd(u, v));
+                        }
+                        if (v != ones) {
+                            PabloAST *& c = clearIntersection[g.second];
+                            if (!c) {
+                                c = ones;
+                                for (size_t k : g.second) c = wb.createAnd(c, covF[k]);
+                            }
+                            all = wb.createAnd(all, wb.createOr(c, v));
+                        }
+                    }
                     return wb.createOr(any, all);
                 };
                 auto constant = [&](bool v) -> PabloAST * {return v ? ones : zeroes;};

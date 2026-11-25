@@ -4884,6 +4884,9 @@ struct FusedRulesConfig {
     //  kernel that meets the criterion (classLayerCriterion) then decides its
     //  rules in Ifs by the blocks of their first characters (level 1).
     std::vector<UCD::codepoint_t> classBlocks;
+    //  With classBlocks: for each class, -1, or the index of its stream after
+    //  the bits of the code (an external set, see div32Classes).
+    std::vector<int> classExternal;
     //  A correction kernel split in two (doc/ldml-divcode-plan.md §13.5, step 3;
     //  see --fused-loop-split): 0, the whole kernel; 1, the loop kernel (the
     //  setup, the While loop and the results of the rules decided in it other
@@ -6107,22 +6110,40 @@ static UCD::UnicodeSet pseudoCodes(const UCD::UnicodeSet & set, const std::vecto
     return all - other.second;
 }
 
-//  The class layer of a kernel's classes, if every set is explicit (see
-//  layerBlocks) and the codes fit in ClassLayerMaxCodeBits: the blocks, the
-//  classes of the bits of the pseudo-codepoint (the low 5 bits: the characters
-//  of the blocks with the bit; above: those of the blocks whose code has the
-//  bit), and the pseudo-codepoints of each set.
+//  The class layer of a kernel's classes, if the codes of its explicit sets
+//  (see layerBlocks) fit in ClassLayerMaxCodeBits: the blocks, the classes of
+//  the bits of the pseudo-codepoint (the low 5 bits: the characters of the
+//  blocks with the bit; above: those of the blocks whose code has the bit),
+//  and the pseudo-codepoints of each set.  A set that is not explicit (a
+//  property, a very large set) is external: given as a class stream of its own,
+//  after the bits of the code (external: by set, its index among these, or
+//  -1), as DivCode's external sets.
 struct ClassLayerCoding {
     std::vector<UCD::codepoint_t> blocks;
     std::vector<UCD::UnicodeSet> bits;
     std::vector<UCD::UnicodeSet> codes;
+    std::vector<int> external;
+    std::vector<UCD::UnicodeSet> externalSets;
 };
+
+//  The number of bits of the class layer's code with these blocks.
+static unsigned classLayerCodeBits(size_t blocks) {
+    unsigned codeBits = 0;
+    while ((1u << codeBits) <= blocks) codeBits++;
+    return ClassLayerShift + codeBits;
+}
 
 static bool div32Classes(const std::vector<UCD::UnicodeSet> & sets, ClassLayerCoding & coding) {
     std::set<UCD::codepoint_t> all;
-    for (const UCD::UnicodeSet & set : sets) {
+    coding.external.assign(sets.size(), -1);
+    coding.externalSets.clear();
+    for (size_t i = 0; i < sets.size(); i++) {
         std::set<UCD::codepoint_t> b;
-        if (!layerBlocks(set, b)) return false;
+        if (!layerBlocks(sets[i], b)) {
+            coding.external[i] = static_cast<int>(coding.externalSets.size());
+            coding.externalSets.push_back(sets[i]);
+            continue;
+        }
         all.insert(b.begin(), b.end());
     }
     if (all.empty() || all.size() >= (1u << ClassLayerMaxCodeBits)) return false;
@@ -6142,7 +6163,9 @@ static bool div32Classes(const std::vector<UCD::UnicodeSet> & sets, ClassLayerCo
         }
     }
     coding.codes.clear();
-    for (const UCD::UnicodeSet & set : sets) coding.codes.push_back(pseudoCodes(set, coding.blocks));
+    for (size_t i = 0; i < sets.size(); i++) {
+        coding.codes.push_back(coding.external[i] < 0 ? pseudoCodes(sets[i], coding.blocks) : UCD::UnicodeSet());
+    }
     return true;
 }
 
@@ -6541,6 +6564,7 @@ private:
             s += "D";
             for (UCD::codepoint_t b : c.classBlocks) s += std::to_string(b) + ",";
             if (!c.absolute) for (const UCD::UnicodeSet & codes : c.classCodes) s += setKey(codes) + ";";
+            for (int e : c.classExternal) s += "e" + std::to_string(e);
         }
         if (c.absolute) {
             s += "Ab" + std::to_string(c.deletionSelector);
@@ -6776,7 +6800,11 @@ void FusedRules::generatePabloMethod() {
         if (c) return c;
         std::vector<PabloAST *> & bits = codeBits[offset];
         if (bits.empty()) {
-            for (PabloAST * v : getInputStreamSet("Classes")) bits.push_back(offset ? pb.createLookahead(v, offset) : v);
+            //  (With the class layer, only the bits of the code: its external sets
+            //  follow them.)
+            std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+            if (!mConfig.classBlocks.empty()) classes.resize(classLayerCodeBits(mConfig.classBlocks.size()));
+            for (PabloAST * v : classes) bits.push_back(offset ? pb.createLookahead(v, offset) : v);
             bits.resize(std::max<size_t>(bits.size(), 21), zeroes);
         }
         auto & compiler = codeCompilers[{scope, offset}];
@@ -6787,6 +6815,12 @@ void FusedRules::generatePabloMethod() {
         if (set.empty()) return zeroes;
         const auto f = mClassIndex.find(setKey(set));
         if (!mConfig.classCodes.empty()) {
+            //  (An external set of the class layer: its stream, after the bits.)
+            if (f != mClassIndex.end() && !mConfig.classExternal.empty() && mConfig.classExternal[f->second] >= 0) {
+                const unsigned i = classLayerCodeBits(mConfig.classBlocks.size()) + static_cast<unsigned>(mConfig.classExternal[f->second]);
+                PabloAST * const c = getInputStreamSet("Classes")[i];
+                return offset ? pb.createLookahead(c, offset) : c;
+            }
             if (f != mClassIndex.end()) return codeClassIn(b, scope, offset, mConfig.classCodes[f->second]);
             if (!mConfig.classBlocks.empty()) return codeClassIn(b, scope, offset, pseudoCodes(set, mConfig.classBlocks));
         }
@@ -11017,6 +11051,7 @@ private:
                     const auto f = at.find(setKey(set));
                     if (LLVM_UNLIKELY(f == at.end())) llvm::report_fatal_error("absolutely: a class not in the classes stream");
                     c.classCodes.push_back(codes[f->second]);
+                    if (layered) c.classExternal.push_back(layer.external[f->second]);
                 }
             }
         }
@@ -12731,6 +12766,8 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             std::vector<re::CC *> bits;
             const std::vector<UCD::UnicodeSet> bitSets = layered ? layer.bits : multiplexedClasses(sets).first;
             for (const UCD::UnicodeSet & b : bitSets) bits.push_back(re::makeCC(b, &cc::Unicode));
+            //  (The class layer's external sets, after the bits of its code.)
+            if (layered) for (const UCD::UnicodeSet & e : layer.externalSets) bits.push_back(re::makeCC(e, &cc::Unicode));
             StreamSet * const codes = P.CreateStreamSet(bits.size());
             classKernel(bits, U21, codes);
             return codes;

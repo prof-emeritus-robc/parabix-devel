@@ -2211,3 +2211,33 @@ unbounded (as `settle`'s MatchStar alternation is).
   deletion in a kernel of its own.
 - **Consumer loops and self-overlap selection** (5 post kernels): likewise, a
   kernel of their own for the unbounded part.
+
+### 13.16 Step 4d (2026-11-25): external sets in the class layer
+
+The class layer is not tied to DivCode's translation logic (13.1): a kernel
+DivCode cannot take (such as und_FONIPA-ar's correction kernel, #289) can still
+have the layer. Steps 4d–4f extend it to the correction kernels:
+
+- **4d** (this step): external sets. A set that neither it nor its complement
+  fits in 16 Div32 blocks (a property, such as `$Boundary`,
+  `[^[:L:][:M:][:N:]]`) no longer keeps a kernel out of the layer: it is
+  external, a class stream of its own after the bits of the code (as DivCode's
+  external sets), computed by the same class kernel (`div32Classes`:
+  `external`, `externalSets`; `FusedRulesConfig::classExternal`, in the
+  signature). The code's blocks are those of the explicit sets; `classAt`
+  reads an external set's stream (looked ahead in the entry scope), and the
+  code's compiler only the code's bits. A rule whose first set is external is
+  at the top of the leaves, as before.
+- **4e**: the correction kernels in the layer (the criterion admitting them),
+  with leaf Ifs on their static matching and each rule's cover setup in an If
+  on its candidates.
+- **4f**: a second level of Ifs, on the first character within a block.
+
+On all 453 transforms: 46 kernels layered, 2 of them with external sets (both
+Hant-Hans subgroup kernels, with 1 and 2). und_FONIPA-ar's #289 (4 external
+sets) can now be coded, once 4e admits correction kernels.
+
+Checks: `xlit_class_layer_test.py` has rules with external sets (a before
+context `[^[:L:]]`, an after context `[:N:]`) in a layered kernel, in both
+modes, against the regular plan and ICU; Hant-Hans on `nat-zh.txt` is the same
+with the layer and without it, in both modes.

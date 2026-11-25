@@ -8,7 +8,8 @@
 #  Div32 blocks, none with more than half of them, reads its classes as Div32
 #  pseudo-codepoints and decides its rules in Ifs by the blocks of their first
 #  characters.  For rules files of string rules and single-character rules over
-#  several scripts (before and after contexts, a negated set, deletions,
+#  several scripts (before and after contexts, a negated set, properties given
+#  as streams of their own (external sets), deletions,
 #  expansions, a rule that a string rule yields to, a filter), on random text
 #  of their characters and others (1 to 4 UTF-8 bytes), with long lines and
 #  sparse matches (blocks where an If is skipped before and after a match, and
@@ -62,6 +63,9 @@ def string_rules(seed, pairs, extras):
             lines.append("%s } %s3 \u2192 Q ;" % (chr(firsts[-3]), chr(seconds[2])))
             lines.append("%s%s \u2192 R ;" % (chr(firsts[-3]), chr(seconds[2])))
             lines.append("[^\u0e01] { %s%s \u2192 Z ;" % (chr(firsts[-4]), chr(seconds[3])))
+            # (Sets the class layer gives as streams of their own: external.)
+            lines.append("[^[:L:]] { %s%s \u2192 W ;" % (chr(firsts[-5]), chr(seconds[4])))
+            lines.append("%s%s } [:N:] \u2192 N ;" % (chr(firsts[-6]), chr(seconds[5])))
     return "\n".join(sorted(set(lines), key=lines.index)) + "\n"
 
 

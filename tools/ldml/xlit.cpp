@@ -358,6 +358,13 @@ static cl::opt<bool> FusedLoopSplit("fused-loop-split",
     cl::desc("Split a correction kernel whose While loop has consumers into a loop kernel and a post kernel "
              "(default on; 0 for one kernel)"),
     cl::init(true), cl::cat(XlitOptions));
+//  For each FusedRules kernel constructed: what the class layer would be (doc/
+//  ldml-divcode-plan.md §13.5, step 4a), one JSON object per line on stderr.
+//  With --kernel-counts, nothing is compiled.
+static cl::opt<bool> ClassLayerReport("class-layer-report",
+    cl::desc("Report, for each FusedRules kernel constructed, its classes as a DivCode class layer would have them "
+             "(explicit and external sets, Div32 blocks, code bits, level-1 leaves), to stderr"),
+    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> FusedStatementReport("fused-statement-report",
     cl::desc("Report the Pablo statements of each FusedRules kernel generated, by part and by the rule, subgroup or "
              "step emitting them (kernels loaded from the object cache are not generated)"),
@@ -6174,6 +6181,7 @@ public:
 protected:
     void generatePabloMethod() override;
     void reportStatements(const void * attribution) const;
+    void reportClassLayer() const;
 private:
     FusedRules(LLVMTypeSystemInterface & ts, FusedRulesConfig && config, FusedLayout && layout, StreamSet * U21, StreamSet * Classes,
                StreamSet * InText, StreamSet * Mask, StreamSet * Allowed, const FusedState & in, const FusedState & out,
@@ -6209,6 +6217,7 @@ private:
           return v;
       }()),
       mSignature(std::move(sig)) {
+        if (LLVM_UNLIKELY(ClassLayerReport)) reportClassLayer();
         //  Other than a correction kernel, a kernel matches fixed sequences of sets (Advances
         //  only), unless a string rule deletes the run following its text.
         //  (A correction kernel: only a post kernel, see FusedRulesConfig::loopPart,
@@ -8308,6 +8317,76 @@ void FusedRules::generatePabloMethod() {
         attr.mark("end");
         reportStatements(&attr);
     }
+}
+
+//  --class-layer-report (doc/ldml-divcode-plan.md §13.5, step 4a): the kernel's
+//  classes (fusedClassSets) as DivCode's class layer would have them: a set is
+//  explicit if it, or its complement, spans at most 16 Div32 blocks (as
+//  ldml::DivCodeOptions::maxSetBlocks), else external; the blocks of the
+//  explicit sets (as they or their complements), the code bits for them; and
+//  the level-1 leaves, the blocks of the first characters of the string rules
+//  and of the subgroups' characters (explicit first sets), with the most rules
+//  (string rules and subgroups) in a leaf, and the rules whose first sets are
+//  external (at the top of the hierarchy).
+void FusedRules::reportClassLayer() const {
+    const unsigned shift = 5, maxSetBlocks = 16;
+    auto blocksOf = [&](const UCD::UnicodeSet & set) {
+        std::set<UCD::codepoint_t> b;
+        for (const auto & r : set) {
+            for (UCD::codepoint_t k = r.first >> shift; k <= (r.second >> shift); k++) {
+                b.insert(k);
+                if (b.size() > maxSetBlocks) return b;
+            }
+        }
+        return b;
+    };
+    //  The blocks of a set as the class layer has it (of the set or of its
+    //  complement), and whether it is explicit.
+    auto layerBlocks = [&](const UCD::UnicodeSet & set, std::set<UCD::codepoint_t> & b) {
+        b = blocksOf(set);
+        if (b.size() <= maxSetBlocks) return true;
+        b = blocksOf(~set);
+        return b.size() <= maxSetBlocks;
+    };
+    const std::vector<UCD::UnicodeSet> sets = fusedClassSets(mConfig);
+    std::set<UCD::codepoint_t> blocks;
+    size_t external = 0, explicitChars = 0;
+    for (const UCD::UnicodeSet & set : sets) {
+        std::set<UCD::codepoint_t> b;
+        if (!layerBlocks(set, b)) { external++; continue; }
+        blocks.insert(b.begin(), b.end());
+        explicitChars += set.size() <= (maxSetBlocks << shift) ? set.size() : 0;
+    }
+    unsigned codeBits = 0;
+    while ((1u << codeBits) <= blocks.size()) codeBits++;
+    std::map<UCD::codepoint_t, size_t> leaves;
+    size_t top = 0, rules = 0;
+    auto addFirst = [&](const UCD::UnicodeSet & first) {
+        rules++;
+        std::set<UCD::codepoint_t> b = blocksOf(first);
+        if (b.size() > maxSetBlocks) { top++; return; }
+        for (UCD::codepoint_t k : b) leaves[k]++;
+    };
+    for (const FusedStringRule & r : mConfig.strings) {
+        if (r.match >= 0 || r.text.empty()) { top++; rules++; continue; }
+        addFirst(r.text.front());
+    }
+    for (const FusedSubgroup & g : mConfig.subgroups) {
+        UCD::UnicodeSet all;
+        for (const ldml::CharMapping & m : g.mappings) all = all + m.chars;
+        if (g.match >= 0 || all.empty()) { top++; rules++; continue; }
+        addFirst(all);
+    }
+    size_t maxLeaf = 0;
+    for (const auto & l : leaves) maxLeaf = std::max(maxLeaf, l.second);
+    const char * kind = mConfig.matchOnly ? "match" : mConfig.rounds == 0 ? "regular"
+                        : mConfig.loopPart == 1 ? "loop" : mConfig.loopPart == 2 ? "post" : "correction";
+    errs() << "{\"kernel\": \"" << getName() << "\", \"kind\": \"" << kind << "\", \"absolute\": "
+           << (mConfig.absolute ? "true" : "false") << ", \"coded\": " << (mConfig.classCodes.empty() ? "false" : "true")
+           << ", \"string_rules\": " << mConfig.strings.size() << ", \"subgroups\": " << mConfig.subgroups.size()
+           << ", \"classes\": " << sets.size() << ", \"external\": " << external << ", \"blocks\": " << blocks.size()
+           << ", \"code_bits\": " << codeBits << ", \"leaves\": " << leaves.size() << ", \"max_leaf\": " << maxLeaf
+           << ", \"top\": " << top << ", \"rules\": " << rules << "}\n";
 }
 
 void FusedRules::reportStatements(const void * attribution) const {

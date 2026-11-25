@@ -2062,3 +2062,48 @@ unsplit, and with the default options, and is now a group of
 Not yet: timing at 4 threads (whole against split, with the outputs compared),
 and the compile time of the post kernel's dead setup.
 
+
+### 13.13 Step 4a (2026-11-25): what the class layer would be in the regular plan's kernels
+
+`--class-layer-report` (with `--kernel-counts`, nothing is compiled) prints,
+for each FusedRules kernel constructed, its classes as DivCode's class layer
+would have them: explicit sets (the set or its complement within 16 Div32
+blocks, as `maxSetBlocks`) and external ones, the blocks and code bits, and the
+level-1 leaves (the Div32 blocks of the rules' first characters; a subgroup
+counts as one rule), with the most rules in a leaf and the rules whose first
+sets are external.
+
+Run on the 88 implementable transforms with groups that DivCode cannot take
+(the 123 groups of 13.2), default options (UTF-8 mode where it applies): 961
+kernels, 872 distinct.
+
+- Most are small: the regular kernels have a median of 4 rules and 1 leaf,
+  the matching kernels 17–22 rules and 1 leaf.
+- In UTF-8 mode most already compile their classes in the kernel from the
+  bits of a multiplexed code of the classes (`classCodes`, the hybrid): 280 of
+  504 regular kernels, 228 of 307 matching kernels, all the loop and post
+  kernels. The class streams are cheap where they are not.
+- Kernels where level-1 Ifs could skip much (20 or more rules, 4 or more
+  leaves, no leaf with more than half of them): 50, in 9 transforms, all of
+  them coded (UTF-8 mode): Hant-Hans (16 kernels, 2,205 rules, up to 129
+  leaves), am_Ethi-am_Ethi/Geminate (12, 2,388 rules, up to 11 leaves),
+  Hans-Hant (7, 1,107 rules, up to 128 leaves), und_FONIPA-ar and -fa (5 each:
+  the matching kernels and the loop and post kernels, up to 13 leaves),
+  nv-nv_FONIPA (2), Latin-InterIndic, am_FONIPA-am and und_FONIPA-chr (1
+  each). In und_FONIPA-ar the leaves are structurally many but the vowels'
+  blocks occur in every block of text (13.2), so this criterion, which is
+  structural, overstates it there.
+
+What this changes in step 4:
+
+- The candidates run in UTF-8 mode, where the classes are already a code
+  computed apart and compiled in the kernel; "Unicode mode first" would build
+  the layer where it is not used by default. The If-hierarchy needs a code
+  whose high bits are the Div32 block of the first character (the multiplexed
+  class code is not ordered by blocks), so in UTF-8 mode the multiplexed code
+  would be replaced by (or ordered as) the Div32 code at code units, as
+  DivCode phase 2 computes it.
+- The gain is the level-1 Ifs in about 50 kernels, mostly the CJK
+  conversions (Hant-Hans, Hans-Hant: rare blocks, many leaves) and Ethiopic
+  gemination; the pseudo-basis CCs alone change little where classes are
+  already coded.

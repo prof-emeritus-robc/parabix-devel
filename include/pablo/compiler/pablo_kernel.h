@@ -155,6 +155,8 @@ public:
     // MaxCountedWhiles Whiles (in the order compiled; later ones are added to the
     // last), each with the number of blocks by the iterations in a block (the last
     // bucket for WhileCountBuckets - 1 or more), and reported by the finalize method.
+    // A provisional stride's counts are restored away with the rest of its state, so a
+    // stride redone is counted once: the counts are those the logic requires.
     bool countsWhileIterations() const { return mCountWhileIterations; }
     static constexpr unsigned MaxCountedWhiles = 8;
     static constexpr unsigned WhileCountBuckets = 17;

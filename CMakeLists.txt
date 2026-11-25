@@ -1171,6 +1171,11 @@ add_test(
   COMMAND python3 xlit_split_components_test.py ${BIN_DIR}/xlit)
 
 add_test(
+  NAME xlit_class_layer_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 xlit_class_layer_test.py ${BIN_DIR}/xlit)
+
+add_test(
   NAME u8u16_test
   WORKING_DIRECTORY ${QA_DIR}/u8u16
   COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")

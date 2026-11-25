@@ -361,6 +361,14 @@ static cl::opt<bool> FusedLoopSplit("fused-loop-split",
 //  For each FusedRules kernel constructed: what the class layer would be (doc/
 //  ldml-divcode-plan.md §13.5, step 4a), one JSON object per line on stderr.
 //  With --kernel-counts, nothing is compiled.
+//  In UTF-8 mode, the classes of a fused kernel that meets the criterion
+//  (classLayerCriterion) as the Div32 code of DivCode's class layer, and its
+//  rules decided in Ifs by the blocks of their first characters (doc/
+//  ldml-divcode-plan.md §13.5, step 4).
+static cl::opt<bool> ClassLayer("class-layer",
+    cl::desc("In UTF-8 mode, give a fused kernel with many rules over many Div32 blocks its classes as Div32 codes and "
+             "decide its rules in Ifs by the blocks of their first characters (default on)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> ClassLayerReport("class-layer-report",
     cl::desc("Report, for each FusedRules kernel constructed, its classes as a DivCode class layer would have them "
              "(explicit and external sets, Div32 blocks, code bits, level-1 leaves), to stderr"),
@@ -4869,6 +4877,13 @@ struct FusedRulesConfig {
     //  cc::MultiplexedAlphabet), and classCodes the codes of each class, by
     //  which the kernel compiles it from the bits.
     std::vector<UCD::UnicodeSet> classCodes;
+    //  With classCodes: if not empty, the code is DivCode's class layer (doc/
+    //  ldml-divcode-plan.md §13.5, step 4; see div32Classes): the Div32
+    //  pseudo-codepoint of each character, (code << 5) | (cp & 31), the code of
+    //  the block classBlocks[i] being i + 1, 0 for every other character.  A
+    //  kernel that meets the criterion (classLayerCriterion) then decides its
+    //  rules in Ifs by the blocks of their first characters (level 1).
+    std::vector<UCD::codepoint_t> classBlocks;
     //  A correction kernel split in two (doc/ldml-divcode-plan.md §13.5, step 3;
     //  see --fused-loop-split): 0, the whole kernel; 1, the loop kernel (the
     //  setup, the While loop and the results of the rules decided in it other
@@ -5998,6 +6013,153 @@ static std::pair<std::vector<UCD::UnicodeSet>, std::vector<UCD::UnicodeSet>> mul
     return result;
 }
 
+//  DivCode's class layer (doc/ldml-divcode-plan.md §13.5, step 4): the Div32
+//  blocks of a set as the layer has it, of the set or, if that spans more than
+//  ClassLayerMaxSetBlocks blocks, of its complement; false if both do (the set
+//  would be external).
+static constexpr unsigned ClassLayerShift = 5;
+static constexpr unsigned ClassLayerMaxSetBlocks = 16;
+static constexpr unsigned ClassLayerMaxCodeBits = 10;
+
+static std::set<UCD::codepoint_t> setBlocks(const UCD::UnicodeSet & set, size_t limit) {
+    std::set<UCD::codepoint_t> b;
+    for (const auto & r : set) {
+        for (UCD::codepoint_t k = r.first >> ClassLayerShift; k <= (r.second >> ClassLayerShift); k++) {
+            b.insert(k);
+            if (b.size() > limit) return b;
+        }
+    }
+    return b;
+}
+
+static bool layerBlocks(const UCD::UnicodeSet & set, std::set<UCD::codepoint_t> & b, bool * complemented = nullptr) {
+    b = setBlocks(set, ClassLayerMaxSetBlocks);
+    if (complemented) *complemented = false;
+    if (b.size() <= ClassLayerMaxSetBlocks) return true;
+    b = setBlocks(~set, ClassLayerMaxSetBlocks);
+    if (complemented) *complemented = true;
+    return b.size() <= ClassLayerMaxSetBlocks;
+}
+
+//  The pseudo-codepoints of a set, given the blocks of the layer (ascending):
+//  a set within its blocks, those of its characters; a set given by its
+//  complement, all codes but those of the complement's characters (including
+//  code 0, that of every character outside the blocks).
+static UCD::UnicodeSet pseudoCodes(const UCD::UnicodeSet & set, const std::vector<UCD::codepoint_t> & blocks) {
+    auto codesOf = [&](const UCD::UnicodeSet & s) {
+        UCD::UnicodeSet codes;
+        for (const auto & r : s) {
+            for (UCD::codepoint_t lo = r.first; lo <= r.second; ) {
+                const UCD::codepoint_t block = lo >> ClassLayerShift;
+                const UCD::codepoint_t hi = std::min(r.second, ((block + 1) << ClassLayerShift) - 1);
+                const auto f = std::lower_bound(blocks.begin(), blocks.end(), block);
+                if (f == blocks.end() || *f != block) return std::make_pair(false, codes);
+                const UCD::codepoint_t base = static_cast<UCD::codepoint_t>((f - blocks.begin()) + 1) << ClassLayerShift;
+                codes.insert_range(base | (lo & 31), base | (hi & 31));
+                lo = hi + 1;
+            }
+        }
+        return std::make_pair(true, codes);
+    };
+    const auto own = codesOf(set);
+    if (own.first) return own.second;
+    const auto other = codesOf(~set);
+    if (LLVM_UNLIKELY(!other.first)) llvm::report_fatal_error("pseudoCodes: a set outside the class layer");
+    UCD::UnicodeSet all;
+    all.insert_range(0, ((static_cast<UCD::codepoint_t>(blocks.size()) + 1) << ClassLayerShift) - 1);
+    return all - other.second;
+}
+
+//  The class layer of a kernel's classes, if every set is explicit (see
+//  layerBlocks) and the codes fit in ClassLayerMaxCodeBits: the blocks, the
+//  classes of the bits of the pseudo-codepoint (the low 5 bits: the characters
+//  of the blocks with the bit; above: those of the blocks whose code has the
+//  bit), and the pseudo-codepoints of each set.
+struct ClassLayerCoding {
+    std::vector<UCD::codepoint_t> blocks;
+    std::vector<UCD::UnicodeSet> bits;
+    std::vector<UCD::UnicodeSet> codes;
+};
+
+static bool div32Classes(const std::vector<UCD::UnicodeSet> & sets, ClassLayerCoding & coding) {
+    std::set<UCD::codepoint_t> all;
+    for (const UCD::UnicodeSet & set : sets) {
+        std::set<UCD::codepoint_t> b;
+        if (!layerBlocks(set, b)) return false;
+        all.insert(b.begin(), b.end());
+    }
+    if (all.empty() || all.size() >= (1u << ClassLayerMaxCodeBits)) return false;
+    coding.blocks.assign(all.begin(), all.end());
+    unsigned codeBits = 0;
+    while ((1u << codeBits) <= coding.blocks.size()) codeBits++;
+    coding.bits.assign(ClassLayerShift + codeBits, UCD::UnicodeSet());
+    for (size_t i = 0; i < coding.blocks.size(); i++) {
+        const UCD::codepoint_t base = coding.blocks[i] << ClassLayerShift;
+        for (unsigned j = 0; j < ClassLayerShift; j++) {
+            for (UCD::codepoint_t c = 0; c < (1u << ClassLayerShift); c++) {
+                if ((c >> j) & 1) coding.bits[j].insert(base | c);
+            }
+        }
+        for (unsigned j = 0; j < codeBits; j++) {
+            if (((i + 1) >> j) & 1) coding.bits[ClassLayerShift + j].insert_range(base, base + (1u << ClassLayerShift) - 1);
+        }
+    }
+    coding.codes.clear();
+    for (const UCD::UnicodeSet & set : sets) coding.codes.push_back(pseudoCodes(set, coding.blocks));
+    return true;
+}
+
+//  The level-1 leaves of a fused kernel's rules: by the Div32 block of the
+//  first characters of its string rules matched in the kernel and of the
+//  characters of its subgroups (a rule whose first set is not within
+//  ClassLayerMaxSetBlocks blocks, or that is given by a stream, at the top).
+struct ClassLayerLeaves {
+    std::map<UCD::codepoint_t, size_t> rulesIn;     // by block
+    size_t top = 0, rules = 0;
+    size_t maxLeaf() const {
+        size_t m = 0;
+        for (const auto & l : rulesIn) m = std::max(m, l.second);
+        return m;
+    }
+};
+
+static UCD::UnicodeSet subgroupChars(const FusedSubgroup & g) {
+    UCD::UnicodeSet all;
+    for (const ldml::CharMapping & m : g.mappings) all = all + m.chars;
+    return all;
+}
+
+static ClassLayerLeaves classLayerLeaves(const FusedRulesConfig & c) {
+    ClassLayerLeaves l;
+    auto addFirst = [&](const UCD::UnicodeSet & first) {
+        l.rules++;
+        const std::set<UCD::codepoint_t> b = setBlocks(first, ClassLayerMaxSetBlocks);
+        if (b.size() > ClassLayerMaxSetBlocks) { l.top++; return; }
+        for (UCD::codepoint_t k : b) l.rulesIn[k]++;
+    };
+    for (const FusedStringRule & r : c.strings) {
+        if (r.match >= 0 || r.text.empty()) { l.top++; l.rules++; continue; }
+        addFirst(r.text.front());
+    }
+    for (const FusedSubgroup & g : c.subgroups) {
+        const UCD::UnicodeSet all = subgroupChars(g);
+        if (g.match >= 0 || g.afterMatch >= 0 || all.empty()) { l.top++; l.rules++; continue; }
+        addFirst(all);
+    }
+    return l;
+}
+
+//  Whether a fused kernel has its rules decided in Ifs by blocks (structural,
+//  doc/ldml-divcode-plan.md §13.13): 20 or more rules in 4 or more leaves, none
+//  with more than half of them; not a correction kernel, and with no insertion
+//  rules or marked case mappings.
+static bool classLayerCriterion(const FusedRulesConfig & c) {
+    if (c.rounds > 0 || !c.insertions.empty() || !c.marks.empty()) return false;
+    for (const FusedSubgroup & g : c.subgroups) if (g.caseMaps) return false;
+    const ClassLayerLeaves l = classLayerLeaves(c);
+    return l.rules >= 20 && l.rulesIn.size() >= 4 && 2 * l.maxLeaf() <= l.rules;
+}
+
 //  The Unicode properties of a conversion group's rules, each computed by a
 //  kernel of its own (UnicodePropertyKernelBuilder: named by the property, so
 //  shared, and cached, across transforms), from whose streams the classes of the
@@ -6370,6 +6532,10 @@ private:
                 s += "Mx";
                 for (const UCD::UnicodeSet & codes : c.classCodes) s += setKey(codes) + ";";
             }
+            if (!c.classBlocks.empty()) {
+                s += "D";
+                for (UCD::codepoint_t b : c.classBlocks) s += std::to_string(b) + ",";
+            }
             for (const std::u32string & w : c.selectorStrings) {
                 s += "s";
                 for (char32_t ch : w) s += std::to_string(ch) + ",";
@@ -6571,32 +6737,53 @@ void FusedRules::generatePabloMethod() {
     PabloAST * const ones = pb.createOnes();
     PabloAST * const zeroes = pb.createZeroes();
 
+    //  The current builder: the entry scope's, or, with the class layer's Ifs
+    //  (see classLayerCriterion), that of the If of a leaf (leafScope > 0) while
+    //  its rules are built.  What is built in a leaf's scope is memoized for it
+    //  only; what is built in the entry scope, for all.  (Carries: an Advance
+    //  in an If must depend on its condition, so the before contexts, the text
+    //  and region boundaries are built in the entry scope.)
+    PabloBuilder * cb = &pb;
+    unsigned leafScope = 0;
     //  The class of a set (in Classes, within the text) at an offset after the
     //  position.
-    //  (With classCodes: compiled from the code bits, looked ahead by the offset,
-    //  once for each class and offset.)
-    std::map<unsigned, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> codeCompilers;
-    std::map<std::pair<unsigned, unsigned>, PabloAST *> codeClasses;
-    auto classAt = [&](unsigned offset, const UCD::UnicodeSet & set) -> PabloAST * {
+    //  (With classCodes: compiled from the code bits, looked ahead by the offset
+    //  in the entry scope, once for each class, offset and scope.  With the class
+    //  layer, also a set not among the classes: its pseudo-codepoints.)
+    std::map<unsigned, std::vector<PabloAST *>> codeBits;
+    std::map<std::pair<unsigned, unsigned>, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> codeCompilers;
+    std::map<std::tuple<unsigned, unsigned, std::string>, PabloAST *> codeClasses;
+    auto codeClassIn = [&](PabloBuilder & b, unsigned scope, unsigned offset, const UCD::UnicodeSet & codes) -> PabloAST * {
+        if (codes.empty()) return zeroes;
+        const std::string key = setKey(codes);
+        if (scope) {
+            const auto f = codeClasses.find(std::make_tuple(0u, offset, key));
+            if (f != codeClasses.end()) return f->second;
+        }
+        PabloAST *& c = codeClasses[std::make_tuple(scope, offset, key)];
+        if (c) return c;
+        std::vector<PabloAST *> & bits = codeBits[offset];
+        if (bits.empty()) {
+            for (PabloAST * v : getInputStreamSet("Classes")) bits.push_back(offset ? pb.createLookahead(v, offset) : v);
+            bits.resize(std::max<size_t>(bits.size(), 21), zeroes);
+        }
+        auto & compiler = codeCompilers[{scope, offset}];
+        if (!compiler) compiler = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
+        return c = compiler->compileCC(re::makeCC(codes, &cc::Unicode), b);
+    };
+    auto classIn = [&](PabloBuilder & b, unsigned scope, unsigned offset, const UCD::UnicodeSet & set) -> PabloAST * {
         if (set.empty()) return zeroes;
         const auto f = mClassIndex.find(setKey(set));
-        if (LLVM_UNLIKELY(f == mClassIndex.end())) llvm::report_fatal_error("FusedRules: a class not in fusedClassSets");
         if (!mConfig.classCodes.empty()) {
-            PabloAST *& c = codeClasses[{offset, f->second}];
-            if (c) return c;
-            const UCD::UnicodeSet & codes = mConfig.classCodes[f->second];
-            if (codes.empty()) return c = zeroes;
-            auto & compiler = codeCompilers[offset];
-            if (!compiler) {
-                std::vector<PabloAST *> bits;
-                for (PabloAST * b : getInputStreamSet("Classes")) bits.push_back(offset ? pb.createLookahead(b, offset) : b);
-                bits.resize(std::max<size_t>(bits.size(), 21), zeroes);
-                compiler = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
-            }
-            return c = compiler->compileCC(re::makeCC(codes, &cc::Unicode), pb);
+            if (f != mClassIndex.end()) return codeClassIn(b, scope, offset, mConfig.classCodes[f->second]);
+            if (!mConfig.classBlocks.empty()) return codeClassIn(b, scope, offset, pseudoCodes(set, mConfig.classBlocks));
         }
+        if (LLVM_UNLIKELY(f == mClassIndex.end())) llvm::report_fatal_error("FusedRules: a class not in fusedClassSets");
         PabloAST * const c = getInputStreamSet("Classes")[f->second];
         return offset ? pb.createLookahead(c, offset) : c;
+    };
+    auto classAt = [&](unsigned offset, const UCD::UnicodeSet & set) -> PabloAST * {
+        return classIn(*cb, leafScope, offset, set);
     };
     //  With regions (see FusedRulesConfig::region): the positions whose region
     //  extends to the positions at each offset after (or before) them.
@@ -6636,6 +6823,8 @@ void FusedRules::generatePabloMethod() {
     //  The positions at which a before context matches the B items of one of
     //  its alternatives before them, and an after context those of one of its
     //  alternatives from an offset after them.
+    //  (The before contexts in the entry scope: their Advances do not depend
+    //  on a leaf's condition.  The after contexts in the current scope.)
     auto contexts = [&](const FusedContexts & before, const FusedContexts & after, unsigned afterOffset) {
         PabloAST * beforeMatch = zeroes;
         for (const FusedContext & alt : before) {
@@ -6643,7 +6832,7 @@ void FusedRules::generatePabloMethod() {
             const unsigned B = alt.size();
             for (unsigned k = 0; k < B; k++) {
                 const unsigned d = B - k;
-                PabloAST * item = pb.createAdvance(classAt(0, alt[k].chars), d);
+                PabloAST * item = pb.createAdvance(classIn(pb, 0, 0, alt[k].chars), d);
                 if (mConfig.region) item = pb.createAnd(item, withinBehind(d));
                 if (alt[k].boundary) item = pb.createOr(item, beforeStart(d));
                 m = pb.createAnd(m, item);
@@ -6656,13 +6845,13 @@ void FusedRules::generatePabloMethod() {
             for (unsigned k = 0; k < alt.size(); k++) {
                 const unsigned o = afterOffset + k;
                 PabloAST * item = classAt(o, alt[k].chars);
-                if (mConfig.region) item = pb.createAnd(item, withinAhead(o));
-                if (alt[k].boundary) item = pb.createOr(item, pastEnd(o));
-                m = pb.createAnd(m, item);
+                if (mConfig.region) item = cb->createAnd(item, withinAhead(o));
+                if (alt[k].boundary) item = cb->createOr(item, pastEnd(o));
+                m = cb->createAnd(m, item);
             }
-            afterMatch = pb.createOr(afterMatch, m);
+            afterMatch = cb->createOr(afterMatch, m);
         }
-        return pb.createAnd(beforeMatch, afterMatch);
+        return cb->createAnd(beforeMatch, afterMatch);
     };
     auto source = [&](int match) -> PabloAST * {
         const FusedMatchSource & src = mConfig.sources[match];
@@ -6678,15 +6867,16 @@ void FusedRules::generatePabloMethod() {
     //  their prefixes, or their whole texts with different contexts: the
     //  syllables of Latin-Bopomofo.)
     std::map<std::string, PabloAST *> textPrefixes;
+    //  (In the current scope, memoized for it: see leafScope.)
     auto textAt = [&](const std::vector<UCD::UnicodeSet> & text, bool masked) -> PabloAST * {
         PabloAST * m = ones;
-        std::string key = masked ? "M" : "U";
+        std::string key = std::to_string(leafScope) + (masked ? "M" : "U");
         for (unsigned j = 0; j < text.size(); j++) {
             key += "|" + setKey(text[j]);
             PabloAST *& p = textPrefixes[key];
             if (p == nullptr) {
-                p = pb.createAnd(m, classAt(j, text[j]));
-                if (masked) p = pb.createAnd(p, j ? pb.createLookahead(mask, j) : mask);
+                p = cb->createAnd(m, classAt(j, text[j]));
+                if (masked) p = cb->createAnd(p, j ? pb.createLookahead(mask, j) : mask);
             }
             m = p;
         }
@@ -6699,10 +6889,10 @@ void FusedRules::generatePabloMethod() {
         PabloAST * earlier = zeroes;
         for (const FusedYield & y : yields) {
             const unsigned n = y.text.size();
-            PabloAST * const m = pb.createAnd(textAt(y.text, mask && y.masked), contexts(y.before, y.after, n));
-            earlier = pb.createOr(earlier, m);
+            PabloAST * const m = cb->createAnd(textAt(y.text, mask && y.masked), contexts(y.before, y.after, n));
+            earlier = cb->createOr(earlier, m);
         }
-        return pb.createNot(earlier);
+        return cb->createNot(earlier);
     };
 
     //  The matches of the string rules, at their first positions, and the
@@ -6712,27 +6902,34 @@ void FusedRules::generatePabloMethod() {
     //  The first positions of the static matches that apply (see
     //  FusedRulesConfig::staticClasses).
     PabloAST * staticSelected = zeroes;
-    std::vector<PabloAST *> starts;
-    for (const FusedStringRule & r : mConfig.strings) {
-        attr.mark("string matches", static_cast<long>(starts.size()));
-        if (r.match >= 0) {
-            starts.push_back(source(r.match));
-            continue;
-        }
+    //  (In the current scope.  first: the first set of its text, or a part of it,
+    //  in a leaf of the class layer.)
+    auto stringStart = [&](const FusedStringRule & r, const UCD::UnicodeSet & first) -> PabloAST * {
+        if (r.match >= 0) return source(r.match);
         const unsigned n = r.text.size();
-        PabloAST * m = pb.createAnd(textAt(r.text, mask != nullptr),
-                                    contexts((correction && r.converted) ? FusedContexts{FusedContext()} : r.before, r.after, n));
+        std::vector<UCD::UnicodeSet> text = r.text;
+        text[0] = first;
+        PabloAST * m = cb->createAnd(textAt(text, mask != nullptr),
+                                     contexts((correction && r.converted) ? FusedContexts{FusedContext()} : r.before, r.after, n));
         if (r.afterMatch >= 0) {
             PabloAST * const a = source(r.afterMatch);
-            m = pb.createAnd(m, n > 1 ? pb.createLookahead(a, n - 1) : a);
+            m = cb->createAnd(m, n > 1 ? pb.createLookahead(a, n - 1) : a);
         }
-        if (PabloAST * const free = notYielded(r.yields)) m = pb.createAnd(m, free);
-        starts.push_back(m);
+        if (PabloAST * const free = notYielded(r.yields)) m = cb->createAnd(m, free);
+        return m;
+    };
+    //  (The class layer, see classLayerCriterion: the leaves.)
+    const bool layered = !mConfig.classBlocks.empty() && classLayerCriterion(mConfig);
+    std::vector<PabloAST *> starts;
+    for (const FusedStringRule & r : mConfig.strings) {
+        if (layered) break;
+        attr.mark("string matches", static_cast<long>(starts.size()));
+        starts.push_back(stringStart(r, r.text.empty() ? UCD::UnicodeSet() : r.text.front()));
     }
     if (mConfig.selected >= 0) {
         for (PabloAST *& m : starts) m = pb.createAnd(m, source(mConfig.selected));
     }
-    if (mConfig.matchOnly) {
+    if (mConfig.matchOnly && !layered) {
         Var * const firsts = getOutputStreamVar("Firsts");
         if (!mConfig.startsByLength.empty()) {
             for (size_t k = 0; k < mConfig.startsByLength.size(); k++) {
@@ -6749,19 +6946,104 @@ void FusedRules::generatePabloMethod() {
         }
         return;
     }
-    std::vector<PabloAST *> ats;
-    for (const FusedSubgroup & g : mConfig.subgroups) {
-        attr.mark("subgroup matches", static_cast<long>(ats.size()));
-        const FusedSubgroupPlan plan(g, mConfig.absolute);
+    //  (In the current scope.  chars: the characters of the subgroup, or a part
+    //  of them, in a leaf of the class layer.)
+    auto subgroupAt = [&](const FusedSubgroup & g, const UCD::UnicodeSet & chars) -> PabloAST * {
         const FusedContexts & before = (correction && g.converted) ? FusedContexts{FusedContext()} : g.before;
         PabloAST * at = g.match >= 0 ? source(g.match)
-                        : g.afterMatch >= 0 ? pb.createAnd(source(g.afterMatch), contexts(before, FusedContexts{FusedContext()}, 1))
-                        : pb.createAnd(classAt(0, plan.all), contexts(before, g.after, 1));
+                        : g.afterMatch >= 0 ? cb->createAnd(source(g.afterMatch), contexts(before, FusedContexts{FusedContext()}, 1))
+                        : cb->createAnd(classAt(0, chars), contexts(before, g.after, 1));
         if (g.match < 0) {
-            if (PabloAST * const free = notYielded(g.yields)) at = pb.createAnd(at, free);
+            if (PabloAST * const free = notYielded(g.yields)) at = cb->createAnd(at, free);
         }
-        if (allowed && !mConfig.groupCoverage) at = pb.createAnd(at, allowed);
-        ats.push_back(at);
+        if (allowed && !mConfig.groupCoverage) at = cb->createAnd(at, allowed);
+        return at;
+    };
+    //  The leaves of the class layer (see classLayerCriterion): by the Div32
+    //  block of the first characters, each rule's first set (each subgroup's
+    //  characters) split by blocks; the rules whose first sets span more than
+    //  ClassLayerMaxSetBlocks blocks, or given by streams, at the top (in the
+    //  entry scope).  forLeaves builds the body for each, a leaf's in an If on
+    //  the characters of its block.
+    struct ClassLeaf {
+        UCD::codepoint_t block = 0;
+        std::vector<std::pair<size_t, UCD::UnicodeSet>> strings, subgroups;
+    };
+    std::map<UCD::codepoint_t, ClassLeaf> classLeaves;
+    ClassLeaf topLeaf;
+    if (layered) {
+        auto place = [&](bool string, size_t i, const UCD::UnicodeSet & first, bool top) {
+            const std::set<UCD::codepoint_t> b = setBlocks(first, ClassLayerMaxSetBlocks);
+            if (top || b.size() > ClassLayerMaxSetBlocks) {
+                (string ? topLeaf.strings : topLeaf.subgroups).emplace_back(i, first);
+                return;
+            }
+            for (UCD::codepoint_t k : b) {
+                UCD::UnicodeSet block;
+                block.insert_range(k << ClassLayerShift, ((k + 1) << ClassLayerShift) - 1);
+                ClassLeaf & l = classLeaves[k];
+                l.block = k;
+                (string ? l.strings : l.subgroups).emplace_back(i, first & block);
+            }
+        };
+        for (size_t r = 0; r < mConfig.strings.size(); r++) {
+            const FusedStringRule & rule = mConfig.strings[r];
+            place(true, r, rule.text.empty() ? UCD::UnicodeSet() : rule.text.front(), rule.match >= 0 || rule.text.empty());
+        }
+        for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
+            const FusedSubgroup & sg = mConfig.subgroups[g];
+            place(false, g, FusedSubgroupPlan(sg, mConfig.absolute).all, sg.match >= 0 || sg.afterMatch >= 0);
+        }
+    }
+    unsigned scopes = 0;
+    auto forLeaves = [&](const std::function<void (const ClassLeaf &)> & body) {
+        if (!topLeaf.strings.empty() || !topLeaf.subgroups.empty()) body(topLeaf);
+        for (const auto & e : classLeaves) {
+            const ClassLeaf & l = e.second;
+            UCD::UnicodeSet block;
+            block.insert_range(l.block << ClassLayerShift, ((l.block + 1) << ClassLayerShift) - 1);
+            PabloAST * const condition = classIn(pb, 0, 0, block);
+            PabloBuilder ib = pb.createScope();
+            cb = &ib;
+            leafScope = ++scopes;
+            body(l);
+            cb = &pb;
+            leafScope = 0;
+            pb.createIf(condition, ib);
+        }
+    };
+    if (mConfig.matchOnly && layered) {
+        //  The first positions, by rule (or by length), accumulated in Vars over
+        //  the leaves.
+        Var * const firsts = getOutputStreamVar("Firsts");
+        const size_t n = mConfig.startsByLength.empty() ? mConfig.strings.size() : mConfig.startsByLength.size();
+        std::vector<Var *> acc(n);
+        for (size_t k = 0; k < n; k++) acc[k] = pb.createVar("F" + std::to_string(k), zeroes);
+        forLeaves([&](const ClassLeaf & l) {
+            std::vector<PabloAST *> u(n, zeroes);
+            for (const auto & e : l.strings) {
+                PabloAST * m = stringStart(mConfig.strings[e.first], e.second);
+                if (mConfig.selected >= 0) m = cb->createAnd(m, source(mConfig.selected));
+                if (mConfig.startsByLength.empty()) {
+                    u[e.first] = cb->createOr(u[e.first], m);
+                    continue;
+                }
+                for (size_t k = 0; k < n; k++) {
+                    if (mConfig.startsByLength[k].includes(mConfig.strings[e.first])) u[k] = cb->createOr(u[k], m);
+                }
+            }
+            for (size_t k = 0; k < n; k++) {
+                if (u[k] != zeroes) cb->createAssign(acc[k], cb->createOr(acc[k], u[k]));
+            }
+        });
+        for (size_t k = 0; k < n; k++) pb.createAssign(pb.createExtract(firsts, pb.getInteger(k)), pb.createInFile(acc[k]));
+        return;
+    }
+    std::vector<PabloAST *> ats;
+    for (const FusedSubgroup & g : mConfig.subgroups) {
+        if (layered) break;
+        attr.mark("subgroup matches", static_cast<long>(ats.size()));
+        ats.push_back(subgroupAt(g, FusedSubgroupPlan(g, mConfig.absolute).all));
     }
 
     //  The insertion rules: where their after contexts match (from the next
@@ -6804,9 +7086,9 @@ void FusedRules::generatePabloMethod() {
     //  The run following the text of a rule (within the mask), given the last
     //  positions of its applied matches.
     auto runTail = [&](const FusedStringRule & rule, PabloAST * last) -> PabloAST * {
-        PabloAST * runChars = rule.runStrings.empty() ? classAt(0, rule.run) : runPositions(pb, rule.runSingles, rule.runStrings, classAt);
-        if (mask) runChars = pb.createAnd(runChars, mask);
-        return pb.createAnd(pb.createMatchStar(pb.createAdvance(last, 1), runChars), runChars);
+        PabloAST * runChars = rule.runStrings.empty() ? classAt(0, rule.run) : runPositions(*cb, rule.runSingles, rule.runStrings, classAt);
+        if (mask) runChars = cb->createAnd(runChars, mask);
+        return cb->createAnd(cb->createMatchStar(cb->createAdvance(last, 1), runChars), runChars);
     };
     auto addResults = [&](Results & res, const std::vector<PabloAST *> & firstOf, const std::vector<PabloAST *> & atOf) {
         //  At the positions of At: changing the character there to the target
@@ -6815,30 +7097,31 @@ void FusedRules::generatePabloMethod() {
         auto changeChar = [&](PabloAST * at, UCD::codepoint_t target, const UCD::UnicodeSet * known) {
             if (mConfig.absolute) {
                 for (unsigned b = 0; b < 21; b++) {
-                    if ((target >> b) & 1) res.changes[0][b] = pb.createOr(res.changes[0][b], at);
+                    if ((target >> b) & 1) res.changes[0][b] = cb->createOr(res.changes[0][b], at);
                 }
             } else if (known && known->count() == 1) {
                 const UCD::codepoint_t diff = known->front().first ^ target;
                 for (unsigned b = 0; b < 21; b++) {
-                    if ((diff >> b) & 1) res.changes[0][b] = pb.createOr(res.changes[0][b], at);
+                    if ((diff >> b) & 1) res.changes[0][b] = cb->createOr(res.changes[0][b], at);
                 }
             } else {
                 for (unsigned b = 0; b < 21; b++) {
-                    PabloAST * const bit = ((target >> b) & 1) ? pb.createNot(basis[b]) : basis[b];
-                    res.changes[0][b] = pb.createOr(res.changes[0][b], pb.createAnd(at, bit));
+                    PabloAST * const bit = ((target >> b) & 1) ? cb->createNot(basis[b]) : basis[b];
+                    res.changes[0][b] = cb->createOr(res.changes[0][b], cb->createAnd(at, bit));
                 }
             }
         };
         auto changeMark = [&](unsigned i, PabloAST * at, UCD::codepoint_t target) {
             const UCD::codepoint_t diff = (mConfig.absolute ? 0 : DeletionMark) ^ target;
             for (unsigned b = 0; b < 21; b++) {
-                if ((diff >> b) & 1) res.changes[i][b] = pb.createOr(res.changes[i][b], at);
+                if ((diff >> b) & 1) res.changes[i][b] = cb->createOr(res.changes[i][b], at);
             }
         };
         for (size_t r = 0; r < mConfig.strings.size(); r++) {
             const FusedStringRule & rule = mConfig.strings[r];
             const unsigned n = rule.text.size(), m = rule.replacement.size();
             PabloAST * const first = firstOf[r];
+            if (first == zeroes) continue;
             if (rule.keep >= 0) {
                 needsBasis("a character kept within a replacement");
                 //  The character kept at index keep of the result, and the
@@ -6849,15 +7132,15 @@ void FusedRules::generatePabloMethod() {
                     if (j == k) {
                         if (j == 0) continue;
                         for (unsigned b = 0; b < 21; b++) {
-                            PabloAST * const bit = ((DeletionMark >> b) & 1) ? pb.createNot(basis[b]) : basis[b];
-                            res.changes[j][b] = pb.createOr(res.changes[j][b], pb.createAnd(first, bit));
+                            PabloAST * const bit = ((DeletionMark >> b) & 1) ? cb->createNot(basis[b]) : basis[b];
+                            res.changes[j][b] = cb->createOr(res.changes[j][b], cb->createAnd(first, bit));
                         }
                         continue;
                     }
                     const UCD::codepoint_t target = static_cast<UCD::codepoint_t>(rule.replacement[j < k ? j : j - 1]);
                     if (j == 0) changeChar(first, target, nullptr); else changeMark(j, first, target);
                 }
-                if (total > 1) res.insert[total - 1] = pb.createOr(res.insert[total - 1], first);
+                if (total > 1) res.insert[total - 1] = cb->createOr(res.insert[total - 1], first);
                 continue;
             }
             //  The characters of the text change to those of the replacement (or
@@ -6865,8 +7148,8 @@ void FusedRules::generatePabloMethod() {
             //  are written at the positions inserted after the last.
             PabloAST * last = first;
             for (unsigned j = 0; j < n; j++) {
-                PabloAST * const at = j ? pb.createAdvance(first, j) : first;
-                if (mConfig.coverage) res.spans = pb.createOr(res.spans, at);
+                PabloAST * const at = j ? cb->createAdvance(first, j) : first;
+                if (mConfig.coverage) res.spans = cb->createOr(res.spans, at);
                 //  (A character kept: no change; see ldml::StringRule::kept.)
                 if (j >= m || rule.replacement[j] != ldml::StringRuleKept) {
                     changeChar(at, j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark, &rule.text[j]);
@@ -6874,23 +7157,24 @@ void FusedRules::generatePabloMethod() {
                 last = at;
             }
             for (unsigned j = n; j < m; j++) changeMark(j - n + 1, last, static_cast<UCD::codepoint_t>(rule.replacement[j]));
-            if (m > n) res.insert[m - n] = pb.createOr(res.insert[m - n], last);
+            if (m > n) res.insert[m - n] = cb->createOr(res.insert[m - n], last);
             if (!rule.run.empty()) {
                 //  The run following the text (within the mask) is deleted.
                 PabloAST * const tail = runTail(rule, last);
                 changeChar(tail, mConfig.absolute ? mConfig.deletionSelector : DeletionMark, nullptr);
-                if (mConfig.coverage) res.spans = pb.createOr(res.spans, tail);
+                if (mConfig.coverage) res.spans = cb->createOr(res.spans, tail);
             }
-            if (mConfig.coverage) res.firsts = pb.createOr(res.firsts, first);
+            if (mConfig.coverage) res.firsts = cb->createOr(res.firsts, first);
         }
         for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
+            if (atOf[g] == zeroes) continue;
             const FusedSubgroupPlan plan(mConfig.subgroups[g], mConfig.absolute);
             PabloAST * const at = atOf[g];
             if (plan.caseMap >= 0) {
                 //  The positions of the characters of the case mapping, marked.
                 PabloAST *& m = res.marks[static_cast<unsigned>(plan.caseMap)];
                 if (m == nullptr) m = zeroes;
-                m = pb.createOr(m, plan.literalAll.empty() ? at : pb.createAnd(at, pb.createNot(classAt(0, plan.literalAll))));
+                m = cb->createOr(m, plan.literalAll.empty() ? at : cb->createAnd(at, cb->createNot(classAt(0, plan.literalAll))));
             }
             if (plan.multiplexed) {
                 //  (Absolute: the targets at position 0 as they are; the other
@@ -6903,32 +7187,32 @@ void FusedRules::generatePabloMethod() {
                 cc::Parabix_CC_Compiler_Builder indexCompiler(index);
                 auto indexSet = [&](const UCD::UnicodeSet & set) -> PabloAST * {
                     if (set.empty()) return zeroes;
-                    return indexCompiler.compileCC(re::makeCC(set, &cc::Unicode), pb);
+                    return indexCompiler.compileCC(re::makeCC(set, &cc::Unicode), *cb);
                 };
                 for (size_t i = 0; i < plan.indexBits.size(); i++) {
                     for (unsigned c = 0; c < 21; c++) {
                         PabloAST * bit = indexSet(plan.indexBits[i][c]);
-                        if (i == 0 && !mConfig.absolute) bit = pb.createXor(bit, basis[c]);
-                        if (bit != zeroes) res.changes[i][c] = pb.createOr(res.changes[i][c], pb.createAnd(at, bit));
+                        if (i == 0 && !mConfig.absolute) bit = cb->createXor(bit, basis[c]);
+                        if (bit != zeroes) res.changes[i][c] = cb->createOr(res.changes[i][c], cb->createAnd(at, bit));
                     }
                 }
                 for (const auto & k : plan.insertIndices) {
-                    res.insert[k.first] = pb.createOr(res.insert[k.first], pb.createAnd(at, indexSet(k.second)));
+                    res.insert[k.first] = cb->createOr(res.insert[k.first], cb->createAnd(at, indexSet(k.second)));
                 }
                 continue;
             }
             for (size_t i = 0; i < plan.bitSets.size(); i++) {
                 for (unsigned b = 0; b < 21; b++) {
                     const UCD::UnicodeSet & set = plan.bitSets[i][b];
-                    if (!set.empty()) res.changes[i][b] = pb.createOr(res.changes[i][b], pb.createAnd(at, classAt(0, set)));
+                    if (!set.empty()) res.changes[i][b] = cb->createOr(res.changes[i][b], cb->createAnd(at, classAt(0, set)));
                 }
             }
             for (const FusedSubgroupPlan::Large & l : plan.large) {
-                PabloAST * const charsAt = pb.createAnd(at, classAt(0, l.chars));
+                PabloAST * const charsAt = cb->createAnd(at, classAt(0, l.chars));
                 if (l.position == 0) changeChar(charsAt, l.target, nullptr); else changeMark(l.position, charsAt, l.target);
             }
             for (const auto & k : plan.byInsertion) {
-                res.insert[k.first] = pb.createOr(res.insert[k.first], pb.createAnd(at, classAt(0, k.second)));
+                res.insert[k.first] = cb->createOr(res.insert[k.first], cb->createAnd(at, classAt(0, k.second)));
             }
         }
     };
@@ -6983,6 +7267,52 @@ void FusedRules::generatePabloMethod() {
             }
         }
     };
+
+    //  The class layer (see classLayerCriterion): the results of the rules
+    //  accumulated in Vars over the leaves, each leaf's in its If (every value
+    //  added there is at or moved from the first positions of its rules, within
+    //  its condition).
+    std::unique_ptr<Results> layeredResults;
+    if (layered) {
+        Results acc = stateIn();
+        unsigned v = 0;
+        auto toVar = [&](PabloAST *& x) {
+            if (x) x = pb.createVar("R" + std::to_string(v++), x);
+        };
+        for (std::vector<PabloAST *> & position : acc.changes) for (PabloAST *& x : position) toVar(x);
+        for (auto & k : acc.insert) toVar(k.second);
+        for (auto & k : acc.marks) toVar(k.second);
+        toVar(acc.spans);
+        toVar(acc.firsts);
+        forLeaves([&](const ClassLeaf & l) {
+            std::vector<PabloAST *> fo(mConfig.strings.size(), zeroes), ao(mConfig.subgroups.size(), zeroes);
+            for (const auto & e : l.strings) {
+                PabloAST * m = stringStart(mConfig.strings[e.first], e.second);
+                if (mConfig.selected >= 0) m = cb->createAnd(m, source(mConfig.selected));
+                fo[e.first] = m;
+            }
+            for (const auto & e : l.subgroups) ao[e.first] = subgroupAt(mConfig.subgroups[e.first], e.second);
+            Results added = acc;
+            addResults(added, fo, ao);
+            auto update = [&](PabloAST * var, PabloAST * value) {
+                if (value != var) cb->createAssign(llvm::cast<Var>(var), value);
+            };
+            for (size_t i = 0; i < acc.changes.size(); i++) {
+                for (size_t b = 0; b < acc.changes[i].size(); b++) update(acc.changes[i][b], added.changes[i][b]);
+            }
+            for (const auto & k : added.insert) {
+                if (LLVM_UNLIKELY(acc.insert.count(k.first) == 0)) llvm::report_fatal_error("FusedRules: an insertion count not in the state");
+                update(acc.insert[k.first], k.second);
+            }
+            for (const auto & k : added.marks) {
+                if (LLVM_UNLIKELY(acc.marks.count(k.first) == 0)) llvm::report_fatal_error("FusedRules: a case mapping not in the state");
+                update(acc.marks[k.first], k.second);
+            }
+            update(acc.spans, added.spans);
+            update(acc.firsts, added.firsts);
+        });
+        layeredResults = std::make_unique<Results>(acc);
+    }
 
     attr.mark("selection");
     std::vector<PabloAST *> firstOf = starts, atOf = ats;
@@ -8300,8 +8630,8 @@ void FusedRules::generatePabloMethod() {
     if (!mConfig.staticClasses.empty() && mConfig.loopPart != 2) {
         writeOutputStreamSet("StaticSelected", std::vector<PabloAST *>{staticSelected});
     }
-    Results res = stateIn();
-    addResults(res, firstOf, atOf);
+    Results res = layeredResults ? *layeredResults : stateIn();
+    if (!layeredResults) addResults(res, firstOf, atOf);
     addInsertions(res, insAt);
     for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), res.changes[i]);
     for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
@@ -8383,6 +8713,7 @@ void FusedRules::reportClassLayer() const {
                         : mConfig.loopPart == 1 ? "loop" : mConfig.loopPart == 2 ? "post" : "correction";
     errs() << "{\"kernel\": \"" << getName() << "\", \"kind\": \"" << kind << "\", \"absolute\": "
            << (mConfig.absolute ? "true" : "false") << ", \"coded\": " << (mConfig.classCodes.empty() ? "false" : "true")
+           << ", \"layered\": " << (!mConfig.classBlocks.empty() && classLayerCriterion(mConfig) ? "true" : "false")
            << ", \"string_rules\": " << mConfig.strings.size() << ", \"subgroups\": " << mConfig.subgroups.size()
            << ", \"classes\": " << sets.size() << ", \"external\": " << external << ", \"blocks\": " << blocks.size()
            << ", \"code_bits\": " << codeBits << ", \"leaves\": " << leaves.size() << ", \"max_leaf\": " << maxLeaf
@@ -10629,6 +10960,13 @@ private:
         P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowed, in, mid, firsts);
         P.CreateKernelCall<FusedRules>(std::move(post), U21, classes, inText, mask, allowed, mid, out, firsts);
     }
+    //  Whether the classes stream of a fused kernel (of streamConfig, with the
+    //  sets given) is DivCode's class layer (--class-layer; UTF-8 mode, where the
+    //  classes are coded), and its coding.  (The same for the kernel's codes, in
+    //  absolutely, and for the stream, in fusedClasses.)
+    bool classLayerCoding(const FusedRulesConfig & streamConfig, const std::vector<UCD::UnicodeSet> & sets, ClassLayerCoding & coding) {
+        return ClassLayer && mBytes != nullptr && classLayerCriterion(streamConfig) && div32Classes(sets, coding);
+    }
     //  (classesOf: the config of the classes stream the kernel reads, if it is
     //  not the kernel's own, as the matching kernel of a sequential selection,
     //  whose classes are a part of those of the stream.)
@@ -10649,7 +10987,11 @@ private:
             const std::vector<UCD::UnicodeSet> sets = fusedClassSets(c);
             const std::vector<UCD::UnicodeSet> streamSets = classesOf ? fusedClassSets(absolutely(*classesOf)) : sets;
             if (codedClasses(streamSets)) {
-                const std::vector<UCD::UnicodeSet> codes = multiplexedClasses(streamSets).second;
+                //  (Or the class layer's Div32 codes, see classLayerCoding.)
+                ClassLayerCoding layer;
+                const bool layered = classLayerCoding(classesOf ? *classesOf : c, streamSets, layer);
+                if (layered) c.classBlocks = layer.blocks;
+                const std::vector<UCD::UnicodeSet> codes = layered ? layer.codes : multiplexedClasses(streamSets).second;
                 std::map<std::string, size_t> at;
                 for (size_t i = 0; i < streamSets.size(); i++) at.emplace(setKey(streamSets[i]), i);
                 for (const UCD::UnicodeSet & set : sets) {
@@ -12365,7 +12707,9 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  classCodes), computed on the bytes and compressed.
         if (mBytes && codedClasses(sets)) {
             std::vector<re::CC *> bits;
-            for (const UCD::UnicodeSet & b : multiplexedClasses(sets).first) bits.push_back(re::makeCC(b, &cc::Unicode));
+            ClassLayerCoding layer;
+            const std::vector<UCD::UnicodeSet> bitSets = classLayerCoding(config, sets, layer) ? layer.bits : multiplexedClasses(sets).first;
+            for (const UCD::UnicodeSet & b : bitSets) bits.push_back(re::makeCC(b, &cc::Unicode));
             StreamSet * const codes = P.CreateStreamSet(bits.size());
             classKernel(bits, U21, codes);
             return codes;

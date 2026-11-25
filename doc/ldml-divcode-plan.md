@@ -2107,3 +2107,62 @@ What this changes in step 4:
   conversions (Hant-Hans, Hans-Hant: rare blocks, many leaves) and Ethiopic
   gemination; the pseudo-basis CCs alone change little where classes are
   already coded.
+
+### 13.14 Status of step 4 (2026-11-25): the class layer and level-1 Ifs in the regular kernels
+
+`--class-layer` (default on): in UTF-8 mode, a fused kernel that meets the
+criterion of 13.13 (`classLayerCriterion`: not a correction kernel, no
+insertion rules or marked case mappings; 20 or more rules in 4 or more Div32
+leaves, none with more than half) reads its classes as DivCode's class layer,
+and decides its rules in Ifs by the blocks of their first characters.
+
+- **The code** (`div32Classes`): the Div32 pseudo-codepoint of each character,
+  `(code << 5) | (cp & 31)`, code i + 1 for the i-th block of the classes (a
+  set, or its complement, within 16 blocks; otherwise the kernel keeps the
+  multiplexed code), 0 for every other character. It replaces the multiplexed
+  class code of the hybrid (`classCodes`): the classes stream holds its bits
+  (computed on the bytes and compressed, as before), and each class's codes
+  are its pseudo-codepoints (`pseudoCodes`), compiled in the kernel as before.
+  `FusedRulesConfig::classBlocks` (in the signature) holds the blocks. The
+  decision is the same for the stream (`fusedClasses`) and the kernel
+  (`absolutely`): `RulePipelineBuilder::classLayerCoding`.
+- **The leaves** (`generatePabloMethod`, `forLeaves`): each string rule's
+  first set and each subgroup's characters are split by blocks; a leaf holds
+  the parts in its block, and is built in an If on the block's codes (the
+  high bits of the pseudo-codepoint). Rules whose first sets span more than
+  16 blocks, or given by streams, are built in the entry scope. The first
+  positions (a match kernel) or the results (an apply kernel) are ORed into
+  Vars, each leaf's in its If.
+- **What is built where**: a current builder (`cb`), the entry's or a leaf's,
+  and memos by scope (a leaf reuses what the entry scope built, never what a
+  sibling built). The before contexts, the text and region boundaries are
+  built in the entry scope (an Advance in an If must depend on its condition);
+  the after contexts, the texts (Lookaheads of the code bits, looked ahead in
+  the entry scope), the yields and the results in the leaf's.
+- A class not among the kernel's classes (a first set restricted to a block)
+  is compiled from its pseudo-codepoints.
+
+Of 13.13's 872 kernels, 43 are layered, in the same 9 transforms (Hant-Hans
+14, am_Ethi-am_Ethi/Geminate 12, Hans-Hant 6, und_FONIPA-ar and -fa 3 each,
+nv-nv_FONIPA 2, Latin-InterIndic, am_FONIPA-am and und_FONIPA-chr 1 each);
+the other 7 of the 50 are correction kernels (the loop and post kernels of
+und_FONIPA-ar and -fa, and one of Hans-Hant), which the criterion leaves out.
+
+Checks: the outputs of Hant-Hans and Hans-Hant on `nat-zh.txt` and of
+am_Ethi-am_Ethi/Geminate on `pool-am.txt` are identical with the layer and
+without it (`--class-layer=0`); und_FONIPA-ar's (whose matching kernels are
+layered) is identical to step 1's. `xlit_class_layer_test.py` (new): rules
+files of string rules over five scripts, with before and after contexts, a
+negated set, a rule a string rule yields to, deletions, expansions and a
+filter, kernels of up to 40 string rules or 20 subgroups layered, on random
+text with long lines and sparse matches; the output that of the regular plan
+and ICU's, with the default threads and with four threads and segments of one
+stride.
+
+Found on the way (not changed): with a rules file, `--use-ICU` ignores the
+global filter (`:: [x] ;` converts characters outside it), so the filtered
+case is compared with the regular plan only.
+
+Not yet: timing (the drivers at 4 threads, with the outputs compared), the
+compile time of the leaves, a nested If-hierarchy on the code's high bits (the
+leaves are flat: one If per block), and the class layer in Unicode mode.

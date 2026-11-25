@@ -1741,3 +1741,66 @@ Checks at every step: the loop tests (`QA/xlit_converted_*while_test.py`,
 agreement on the perf corpora of the transforms changed, and every timing
 comparison with its outputs compared. Compile time and kernel counts are
 reported against the test time limits. Multithreaded timings at 4 threads.
+
+### 13.6 Status of step 0 (2026-11-25)
+
+`xlit --fused-statement-report` reports, for each FusedRules kernel generated
+(compiled, not loaded from the object cache: use it with
+`-enable-object-cache=0` or a salt), its Pablo statements before Pablo's
+optimization, by part (before the While, in it, after it) and by what emits
+them: each string rule's matches, cover setup, before contexts, cover tests,
+decisions and cover updates; each subgroup; the item values and the
+deletions of the state update; the static selection; the results. It also
+gives the number of resolved items, item values (item, known in or out,
+distance) and string covers (a rule's text offsets) of a correction kernel, and
+the number of distinct values the covers have for each item value.
+
+**und_FONIPA-ar #3** (`FusedRules_3092…`): 64,390 statements before
+optimization (55,111 after); before the loop 8,497, in it 51,820, after it
+4,073. 4 resolved items, 8 item values, 1,260 string covers, 17 subgroup
+classes.
+
+| part / emitted by | statements | |
+|---|--:|---|
+| loop / state update: item values | 29,717 | 57% of the loop: 8 item values × 1,260 covers |
+| loop / string cover updates | 8,644 | 440 rules, at most 57 each |
+| loop / string decisions | 5,382 | 440 rules, at most 13 each |
+| loop / string cover tests | 5,181 | 66 rules; rule 0 (`ʔe̞ː`) alone 1,155 |
+| loop / deletions (values and outcomes) | 1,296 | |
+| loop / string before contexts | 766 | 383 rules, at most 2 each |
+| loop / subgroup decisions | 763 | 17 classes |
+| loop / deletions and K | 71 | |
+| before / cover setup | 5,708 | 440 rules |
+| before / string matches | 1,452 | |
+| before / subgroup matches | 584 | |
+| before / base results, static selection | 733 | |
+| after / results, final decisions | 4,073 | |
+
+What this shows:
+
+- **The item values dominate.** `withStrings` computes, for each item value, an
+  OR and an AND over all 1,260 covers (`covT[k] ∧ v`, `covF[k] ∨ v`), every
+  iteration. The value `v` of a cover for an item comes from its rule's result,
+  and the covers have only 2 distinct values for each of the 8 item values and
+  for the deletions (the report gives them: "distinct values of the 1260 covers,
+  by item value: 2 2 2 2 2 2 2 2 2"), as 13.2 leads one to expect. Two
+  remedies, independent of each other:
+  - **Shared cover unions.** Group the covers by their value for an item; OR
+    (AND) each group's `covT` (`covF`) once, and share the unions among the
+    items whose groupings agree. Here each item value needs 2 unions, shared
+    where the groupings agree, instead of 1,260 terms.
+  - **Rule-level Ifs (step 1)** apply only if the item values are accumulated
+    per rule, under the rule's If (`any_x |= covT ∧ v` inside the If of the
+    rule's candidates), not per item over all covers.
+- **Cover updates and decisions** (27% of the loop) are per rule and small for
+  each: step 1's Ifs cover them directly.
+- **Cover tests** are pairwise: a rule's test ORs over every cover of every rule
+  that may begin within it. They are concentrated (66 rules; rule 0 has 1,155
+  statements). Under step 1 they go in the covered rule's If; grouping the
+  covering rules (as for the item values) shortens them as well.
+- **Subgroups are small** (1,347 statements in all): the concern of 13.3 that
+  their common first characters keep them from being skipped matters little.
+
+So step 1 is preceded by a step **1a, shared cover unions**: a change to
+`withStrings` (and the cover tests), exact, with no If; it shrinks the loop by
+up to about half by itself, and makes step 1's per-rule Ifs smaller.

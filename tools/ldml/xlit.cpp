@@ -335,6 +335,15 @@ static cl::opt<bool> DivCodeReport("divcode-report",
     cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
              "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
     cl::init(false), cl::cat(XlitOptions));
+//  For each FusedRules kernel generated (compiled, not loaded from the object
+//  cache): its Pablo statements, before Pablo's optimization, by part (before
+//  the correction kernel's While loop, in it, after it) and by what emits them
+//  (each string rule, subgroup and cover test, the state), to stderr.  (doc/
+//  ldml-divcode-plan.md §13.5, step 0.)
+static cl::opt<bool> FusedStatementReport("fused-statement-report",
+    cl::desc("Report the Pablo statements of each FusedRules kernel generated, by part and by the rule, subgroup or "
+             "step emitting them (kernels loaded from the object cache are not generated)"),
+    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> KernelCounts("kernel-counts", cl::desc("Report the conversion groups of the transform (with their rules and "
                                   "kernels) and the kernels of its pipeline, built without compiling it, and exit"),
                                   cl::init(false), cl::cat(XlitOptions));
@@ -5838,6 +5847,7 @@ public:
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
     void generatePabloMethod() override;
+    void reportStatements(const void * attribution) const;
 private:
     FusedRules(LLVMTypeSystemInterface & ts, FusedRulesConfig && config, FusedLayout && layout, StreamSet * U21, StreamSet * Classes,
                StreamSet * InText, StreamSet * Mask, StreamSet * Allowed, const FusedState & in, const FusedState & out,
@@ -6102,8 +6112,108 @@ private:
     const std::string mSignature;
 };
 
+//  --fused-statement-report: the statements emitted between marks, attributed to
+//  the label of the earlier mark (a kind, and the rule or subgroup if any), by
+//  part: the entry block before the While, the While body, the entry block after.
+namespace {
+struct StatementAttribution {
+    bool on = false;
+    const pablo::PabloBlock * entry = nullptr;
+    const pablo::PabloBlock * loop = nullptr;
+    bool afterLoop = false;
+    size_t lastEntry = 0, lastLoop = 0;
+    std::string kind = "setup";
+    long item = -1;
+    //  (part, kind) -> statements; (kind, item) -> statements
+    std::map<std::pair<std::string, std::string>, size_t> byKind;
+    std::map<std::pair<std::string, long>, size_t> byItem;
+    static size_t count(const pablo::PabloBlock * b) {
+        size_t n = 0;
+        for (const pablo::Statement * s : *b) {
+            n++;
+            if (const pablo::Branch * br = llvm::dyn_cast<pablo::Branch>(s)) n += count(br->getBody());
+        }
+        return n;
+    }
+    void take() {
+        const size_t e = count(entry);
+        size_t l = 0;
+        if (loop && !afterLoop) l = count(loop);
+        //  (The While statement, and its body once attached, are not counted again.)
+        size_t de = e >= lastEntry ? e - lastEntry : 0;
+        const size_t dl = l >= lastLoop ? l - lastLoop : 0;
+        if (de) {
+            byKind[{afterLoop ? "after" : "before", kind}] += de;
+            byItem[{kind, item}] += de;
+        }
+        if (dl) {
+            byKind[{"loop", kind}] += dl;
+            byItem[{kind, item}] += dl;
+        }
+        lastEntry = e;
+        lastLoop = l;
+    }
+    void mark(const char * k, long i = -1) {
+        if (!on) return;
+        take();
+        kind = k;
+        item = i;
+    }
+    void startLoop(const pablo::PabloBlock * body) {
+        if (!on) return;
+        take();
+        loop = body;
+        lastLoop = count(body);
+    }
+    //  (Before the While statement is created: the body's statements so far.)
+    void endLoop() {
+        if (!on) return;
+        take();
+        afterLoop = true;
+    }
+    //  (After it: the While, with its body, is now in the entry block.)
+    void whileCreated() {
+        if (!on) return;
+        lastEntry = count(entry);
+        lastLoop = 0;
+    }
+};
+}
+
+static std::string utf8Of(char32_t c) {
+    std::string out;
+    if (c < 0x80) out += static_cast<char>(c);
+    else if (c < 0x800) { out += static_cast<char>(0xC0 | (c >> 6)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+    else if (c < 0x10000) { out += static_cast<char>(0xE0 | (c >> 12)); out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+                            out += static_cast<char>(0x80 | (c & 0x3F)); }
+    else { out += static_cast<char>(0xF0 | (c >> 18)); out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+           out += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+    return out;
+}
+
+//  A short form of the sets of a text: a single character as itself, a set as
+//  its first characters.
+static std::string shortText(const std::vector<UCD::UnicodeSet> & text) {
+    std::string out;
+    for (const UCD::UnicodeSet & set : text) {
+        if (set.size() == 1) { out += utf8Of(set.front().first); continue; }
+        out += "[";
+        unsigned shown = 0;
+        for (const auto & range : set) {
+            for (UCD::codepoint_t c = range.first; c <= range.second && shown < 4; c++, shown++) out += utf8Of(c);
+            if (shown >= 4) break;
+        }
+        if (set.size() > 4) out += "…";
+        out += "]";
+    }
+    return out;
+}
+
 void FusedRules::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
+    StatementAttribution attr;
+    attr.on = FusedStatementReport;
+    attr.entry = getEntryScope();
     //  (With absolute results, no basis: the paths that read it are refused.)
     std::vector<PabloAST *> basis;
     if (!mConfig.absolute) basis = getInputStreamSet("U21");
@@ -6257,6 +6367,7 @@ void FusedRules::generatePabloMethod() {
     PabloAST * staticSelected = zeroes;
     std::vector<PabloAST *> starts;
     for (const FusedStringRule & r : mConfig.strings) {
+        attr.mark("string matches", static_cast<long>(starts.size()));
         if (r.match >= 0) {
             starts.push_back(source(r.match));
             continue;
@@ -6293,6 +6404,7 @@ void FusedRules::generatePabloMethod() {
     }
     std::vector<PabloAST *> ats;
     for (const FusedSubgroup & g : mConfig.subgroups) {
+        attr.mark("subgroup matches", static_cast<long>(ats.size()));
         const FusedSubgroupPlan plan(g, mConfig.absolute);
         const FusedContexts & before = (correction && g.converted) ? FusedContexts{FusedContext()} : g.before;
         PabloAST * at = g.match >= 0 ? source(g.match)
@@ -6308,6 +6420,7 @@ void FusedRules::generatePabloMethod() {
     //  The insertion rules: where their after contexts match (from the next
     //  position) and they are eligible, and where they apply (given by the rounds
     //  below).
+    attr.mark("insertion rules");
     std::vector<PabloAST *> insAfter, insAt(mConfig.insertions.size(), zeroes);
     for (const FusedInsertion & ins : mConfig.insertions) {
         PabloAST * a = ins.match >= 0 ? source(ins.match) : contexts(FusedContexts{FusedContext()}, ins.after, 1);
@@ -6524,6 +6637,7 @@ void FusedRules::generatePabloMethod() {
         }
     };
 
+    attr.mark("selection");
     std::vector<PabloAST *> firstOf = starts, atOf = ats;
     //  In a correction kernel for a whole group, given the matches of the string
     //  rules and the positions where the rules of the subgroups match: the matches
@@ -6714,6 +6828,7 @@ void FusedRules::generatePabloMethod() {
             //  firstOf only shrinks, a match dropped drops no other one (the
             //  positions within applied matches only shrink as well), and the
             //  selection of matches already selected keeps them.
+            attr.mark("static selection");
             const size_t numGroups = mConfig.subgroups.size();
             resolvingStrings = true;
             for (unsigned pass = 0; pass < 2; pass++) {
@@ -6774,6 +6889,7 @@ void FusedRules::generatePabloMethod() {
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
                 const FusedStringRule & rule = mConfig.strings[r];
                 if (!loopRule[r]) continue;
+                attr.mark("cover setup", static_cast<long>(r));
                 convStrings.push_back(r);
                 candS[r] = firstOf[r];
                 firstOf[r] = zeroes;
@@ -6866,6 +6982,7 @@ void FusedRules::generatePabloMethod() {
             //  The base outcome of each position: where no converted subgroup
             //  applies (the state given, the string rules and the other subgroups),
             //  its length and its characters.
+            attr.mark("base results");
             Results base = stateIn();
             addResults(base, firstOf, atBase);
             if (numIns) needsBasis("insertion rules in the While loop");
@@ -7169,6 +7286,8 @@ void FusedRules::generatePabloMethod() {
             }
             const size_t numClasses = classes.size();
             PabloBuilder wb = pb.createScope();
+            attr.startLoop(wb.getPabloBlock());
+            attr.mark("subgroup decisions");
             {
                 //  Where a subgroup of each class is known to apply (TC), and where
                 //  every one is known not to or is not a candidate (RC).
@@ -7196,6 +7315,7 @@ void FusedRules::generatePabloMethod() {
                 std::vector<PabloAST *> covT(covers.size()), covF(covers.size());
                 PabloAST * decisionProgress = zeroes;
                 for (size_t r : convStrings) {
+                    attr.mark("string before contexts", static_cast<long>(r));
                     PabloAST * applies = candS[r];
                     PabloAST * rejected = zeroes;
                     if (r < S && mConfig.strings[r].converted) {
@@ -7206,6 +7326,7 @@ void FusedRules::generatePabloMethod() {
                     //  The matches that may cover its first position: of the rules
                     //  decided before it in this iteration, as just decided; of the
                     //  others (itself among them), as in the previous iteration.
+                    attr.mark("string cover tests", static_cast<long>(r));
                     PabloAST * within = zeroes;
                     PabloAST * notWithin = ones;
                     for (size_t p : convStrings) {
@@ -7221,6 +7342,7 @@ void FusedRules::generatePabloMethod() {
                             }
                         }
                     }
+                    attr.mark("string decisions", static_cast<long>(r));
                     applies = wb.createAnd(applies, notWithin);
                     rejected = wb.createOr(rejected, within);
                     rejected = wb.createAnd(candS[r], rejected);
@@ -7230,6 +7352,7 @@ void FusedRules::generatePabloMethod() {
                                                                                  wb.createAnd(f, wb.createNot(DF[r]))));
                     wb.createAssign(DT[r], t);
                     wb.createAssign(DF[r], f);
+                    attr.mark("string cover updates", static_cast<long>(r));
                     for (size_t k : coversOf[r]) {
                         const StringCover & sc = covers[k];
                         if (sc.offset == 0) {
@@ -7276,14 +7399,19 @@ void FusedRules::generatePabloMethod() {
                 //  them is known to apply, with the value of its result there (given by
                 //  valueOf), or with their own value (own) where every match that may
                 //  cover them is known not to apply or has the same value.
+                attr.mark("values and outcomes (deletions)");
+                std::vector<size_t> distinctCoverValues;    // (--fused-statement-report)
                 auto withStrings = [&](PabloAST * own, const std::function<PabloAST *(size_t)> & valueOf) {
                     PabloAST * any = zeroes;
                     PabloAST * all = own;
+                    std::set<PabloAST *> values;
                     for (size_t k = 0; k < covers.size(); k++) {
                         PabloAST * const v = valueOf(k);
+                        if (LLVM_UNLIKELY(attr.on)) values.insert(v);
                         any = wb.createOr(any, wb.createAnd(covT[k], v));
                         all = wb.createAnd(all, wb.createOr(covF[k], v));
                     }
+                    if (LLVM_UNLIKELY(attr.on)) distinctCoverValues.push_back(values.size());
                     return wb.createOr(any, all);
                 };
                 auto constant = [&](bool v) -> PabloAST * {return v ? ones : zeroes;};
@@ -7403,8 +7531,17 @@ void FusedRules::generatePabloMethod() {
                     }
                     return v;
                 };
+                attr.mark("state update");
                 std::vector<std::pair<Var *, PabloAST *>> newY;
+                if (LLVM_UNLIKELY(attr.on)) {
+                    unsigned values = 0;
+                    for (const ResolvedItem & item : items) values += 2 * item.depth;
+                    errs() << getName() << ": " << items.size() << " resolved items, " << values << " item values (item, "
+                           << "known in or out, distance), " << covers.size() << " string covers, " << numClasses
+                           << " subgroup classes\n";
+                }
                 for (size_t x = 0; x < items.size(); x++) {
+                    attr.mark("state update: item values", static_cast<long>(-2 - static_cast<long>(x)));
                     for (int in = 0; in <= 1; in++) {
                         const std::vector<Var *> & K = vars[x].K[in];
                         const std::vector<PabloAST *> k(K.begin(), K.end());
@@ -7429,6 +7566,12 @@ void FusedRules::generatePabloMethod() {
                         }
                     }
                 }
+                if (LLVM_UNLIKELY(attr.on)) {
+                    errs() << getName() << ": distinct values of the " << covers.size() << " covers, by item value:";
+                    for (size_t n : distinctCoverValues) errs() << " " << n;
+                    errs() << "\n";
+                }
+                attr.mark("state update: deletions and K");
                 PabloAST * del = delChar;
                 if (numIns) {
                     //  The insertion rules, decided on the characters' outcomes; then
@@ -7538,7 +7681,10 @@ void FusedRules::generatePabloMethod() {
                 //  overlapping itself may be decided without changing any item.)
                 wb.createAssign(Progress, wb.createOr(progress, decisionProgress));
             }
+            attr.endLoop();
             pb.createWhile(Progress, wb);
+            attr.whileCreated();
+            attr.mark("final decisions");
             //  The converted subgroups apply where their before contexts hold, and
             //  each insertion rule where its contexts hold and no earlier one's do.
             for (size_t g = 0; g < numGroups; g++) {
@@ -7575,6 +7721,7 @@ void FusedRules::generatePabloMethod() {
         }
     }
 
+    attr.mark("results");
     if (!mConfig.staticClasses.empty()) writeOutputStreamSet("StaticSelected", std::vector<PabloAST *>{staticSelected});
     Results res = stateIn();
     addResults(res, firstOf, atOf);
@@ -7589,6 +7736,75 @@ void FusedRules::generatePabloMethod() {
         writeOutputStreamSet("Spans", std::vector<PabloAST *>{res.spans});
         writeOutputStreamSet("Starts", std::vector<PabloAST *>{res.firsts});
     }
+    if (LLVM_UNLIKELY(attr.on)) {
+        attr.mark("end");
+        reportStatements(&attr);
+    }
+}
+
+void FusedRules::reportStatements(const void * attribution) const {
+    const StatementAttribution & attr = *static_cast<const StatementAttribution *>(attribution);
+    std::map<std::string, size_t> parts;
+    size_t total = 0;
+    for (const auto & e : attr.byKind) {
+        parts[e.first.first] += e.second;
+        total += e.second;
+    }
+    std::string out;
+    raw_string_ostream os(out);
+    os << getName() << ": " << total << " Pablo statements before optimization (" << mConfig.strings.size()
+       << " string rules, " << mConfig.subgroups.size() << " subgroups" << (mConfig.rounds ? ", correction kernel" : "") << ")";
+    for (const char * part : {"before", "loop", "after"}) {
+        if (parts.count(part)) os << "; " << part << " " << parts[part];
+    }
+    os << "\n";
+    //  By part and kind, largest first, with the number of rules or subgroups and the largest.
+    std::vector<std::pair<size_t, std::pair<std::string, std::string>>> kinds;
+    for (const auto & e : attr.byKind) kinds.push_back({e.second, e.first});
+    std::sort(kinds.rbegin(), kinds.rend());
+    auto describe = [&](const std::string & kind, long item) -> std::string {
+        if (item <= -2) return "item " + std::to_string(-2 - item);
+        if (item < 0) return "";
+        if (kind.compare(0, 8, "subgroup") == 0) {
+            const FusedSubgroup & g = mConfig.subgroups[static_cast<size_t>(item)];
+            return "subgroup " + std::to_string(item) + " (" + std::to_string(g.mappings.size()) + " mappings"
+                   + (g.converted ? ", converted" : "") + ")";
+        }
+        if (static_cast<size_t>(item) < mConfig.strings.size()) {
+            const FusedStringRule & r = mConfig.strings[static_cast<size_t>(item)];
+            return "rule " + std::to_string(item) + " " + shortText(r.text) + (r.converted ? " (converted)" : "");
+        }
+        return "entry " + std::to_string(item);
+    };
+    for (const auto & k : kinds) {
+        const std::string & kind = k.second.second;
+        size_t items = 0, maxN = 0;
+        long maxItem = -1;
+        for (const auto & e : attr.byItem) {
+            if (e.first.first != kind || e.first.second == -1) continue;
+            items++;
+            if (e.second > maxN) { maxN = e.second; maxItem = e.first.second; }
+        }
+        os << "  " << k.second.first << " / " << kind << ": " << k.first;
+        if (items) os << " (" << items << " items; largest " << maxN << ", " << describe(kind, maxItem) << ")";
+        os << "\n";
+    }
+    //  The rules and subgroups with the most statements, over all kinds.
+    std::map<std::pair<bool, long>, size_t> perItem;
+    for (const auto & e : attr.byItem) {
+        if (e.first.second < 0) continue;
+        perItem[{e.first.first.compare(0, 8, "subgroup") == 0, e.first.second}] += e.second;
+    }
+    std::vector<std::pair<size_t, std::pair<bool, long>>> top;
+    for (const auto & e : perItem) top.push_back({e.second, e.first});
+    std::sort(top.rbegin(), top.rend());
+    os << "  largest rules and subgroups:";
+    for (size_t i = 0; i < top.size() && i < 12; i++) {
+        os << (i ? "; " : " ") << top[i].first << " "
+           << describe(top[i].second.first ? "subgroup" : "string", top[i].second.second);
+    }
+    os << "\n";
+    errs() << os.str();
 }
 
 //  The chunks of the string rules of a conversion group for fused kernels:

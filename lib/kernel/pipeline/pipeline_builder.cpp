@@ -296,7 +296,10 @@ Kernel * PipelineBuilder::makeKernel() {
                 }
                 sig << 'K';
                 if (obj->hasSignature()) {
-                    sig << obj->getSignature();
+                    //  (The name as well: it carries annotations the signature may not,
+                    //  such as a Pablo kernel's carry mode or -pablo-count-while-iterations,
+                    //  and the pipeline calls the kernel by its name.)
+                    sig << obj->getName() << ':' << obj->getSignature();
                 } else {
                     sig << obj->getName();
                 }

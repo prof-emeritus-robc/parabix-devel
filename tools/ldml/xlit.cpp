@@ -6526,15 +6526,17 @@ private:
         }
         if (c.coverage) s += "V";
         if (c.region) s += "Rg";
+        //  (The class layer's codes, in either mode: see FusedRulesConfig::classBlocks.)
+        if (!c.classBlocks.empty()) {
+            s += "D";
+            for (UCD::codepoint_t b : c.classBlocks) s += std::to_string(b) + ",";
+            if (!c.absolute) for (const UCD::UnicodeSet & codes : c.classCodes) s += setKey(codes) + ";";
+        }
         if (c.absolute) {
             s += "Ab" + std::to_string(c.deletionSelector);
             if (!c.classCodes.empty()) {
                 s += "Mx";
                 for (const UCD::UnicodeSet & codes : c.classCodes) s += setKey(codes) + ";";
-            }
-            if (!c.classBlocks.empty()) {
-                s += "D";
-                for (UCD::codepoint_t b : c.classBlocks) s += std::to_string(b) + ",";
             }
             for (const std::u32string & w : c.selectorStrings) {
                 s += "s";
@@ -10961,11 +10963,12 @@ private:
         P.CreateKernelCall<FusedRules>(std::move(post), U21, classes, inText, mask, allowed, mid, out, firsts);
     }
     //  Whether the classes stream of a fused kernel (of streamConfig, with the
-    //  sets given) is DivCode's class layer (--class-layer; UTF-8 mode, where the
-    //  classes are coded), and its coding.  (The same for the kernel's codes, in
+    //  sets given) is DivCode's class layer (--class-layer; in UTF-8 mode in
+    //  place of the multiplexed code of the classes, in Unicode mode of a stream
+    //  for each), and its coding.  (The same for the kernel's codes, in
     //  absolutely, and for the stream, in fusedClasses.)
     bool classLayerCoding(const FusedRulesConfig & streamConfig, const std::vector<UCD::UnicodeSet> & sets, ClassLayerCoding & coding) {
-        return ClassLayer && mBytes != nullptr && classLayerCriterion(streamConfig) && div32Classes(sets, coding);
+        return ClassLayer && classLayerCriterion(streamConfig) && div32Classes(sets, coding);
     }
     //  (classesOf: the config of the classes stream the kernel reads, if it is
     //  not the kernel's own, as the matching kernel of a sequential selection,
@@ -10983,13 +10986,15 @@ private:
         //  The codes are those of the multiplexed code of the stream's classes
         //  (see fusedClasses in RulePipelineBuilder::conversionGroup), for each of
         //  the kernel's classes.
-        if (c.absolute) {
+        //  (In Unicode mode, only the class layer's: the other kernels read a
+        //  stream for each class.)
+        {
             const std::vector<UCD::UnicodeSet> sets = fusedClassSets(c);
             const std::vector<UCD::UnicodeSet> streamSets = classesOf ? fusedClassSets(absolutely(*classesOf)) : sets;
-            if (codedClasses(streamSets)) {
-                //  (Or the class layer's Div32 codes, see classLayerCoding.)
-                ClassLayerCoding layer;
-                const bool layered = classLayerCoding(classesOf ? *classesOf : c, streamSets, layer);
+            //  (Or the class layer's Div32 codes, see classLayerCoding.)
+            ClassLayerCoding layer;
+            const bool layered = codedClasses(streamSets) && classLayerCoding(classesOf ? *classesOf : c, streamSets, layer);
+            if (codedClasses(streamSets) && (c.absolute || layered)) {
                 if (layered) c.classBlocks = layer.blocks;
                 const std::vector<UCD::UnicodeSet> codes = layered ? layer.codes : multiplexedClasses(streamSets).second;
                 std::map<std::string, size_t> at;
@@ -12705,10 +12710,12 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         //  The hybrid (see selectorGroup): the bits of a multiplexed code of the
         //  classes, from which the kernel compiles them (FusedRulesConfig::
         //  classCodes), computed on the bytes and compressed.
-        if (mBytes && codedClasses(sets)) {
+        //  (Or the class layer's Div32 code, in either mode: see classLayerCoding.)
+        ClassLayerCoding layer;
+        const bool layered = codedClasses(sets) && classLayerCoding(config, sets, layer);
+        if ((mBytes && codedClasses(sets)) || layered) {
             std::vector<re::CC *> bits;
-            ClassLayerCoding layer;
-            const std::vector<UCD::UnicodeSet> bitSets = classLayerCoding(config, sets, layer) ? layer.bits : multiplexedClasses(sets).first;
+            const std::vector<UCD::UnicodeSet> bitSets = layered ? layer.bits : multiplexedClasses(sets).first;
             for (const UCD::UnicodeSet & b : bitSets) bits.push_back(re::makeCC(b, &cc::Unicode));
             StreamSet * const codes = P.CreateStreamSet(bits.size());
             classKernel(bits, U21, codes);

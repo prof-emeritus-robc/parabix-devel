@@ -2110,7 +2110,7 @@ What this changes in step 4:
 
 ### 13.14 Status of step 4 (2026-11-25): the class layer and level-1 Ifs in the regular kernels
 
-`--class-layer` (default on): in UTF-8 mode, a fused kernel that meets the
+`--class-layer` (default on): a fused kernel that meets the
 criterion of 13.13 (`classLayerCriterion`: not a correction kernel, no
 insertion rules or marked case mappings; 20 or more rules in 4 or more Div32
 leaves, none with more than half) reads its classes as DivCode's class layer,
@@ -2119,11 +2119,15 @@ and decides its rules in Ifs by the blocks of their first characters.
 - **The code** (`div32Classes`): the Div32 pseudo-codepoint of each character,
   `(code << 5) | (cp & 31)`, code i + 1 for the i-th block of the classes (a
   set, or its complement, within 16 blocks; otherwise the kernel keeps the
-  multiplexed code), 0 for every other character. It replaces the multiplexed
-  class code of the hybrid (`classCodes`): the classes stream holds its bits
-  (computed on the bytes and compressed, as before), and each class's codes
-  are its pseudo-codepoints (`pseudoCodes`), compiled in the kernel as before.
-  `FusedRulesConfig::classBlocks` (in the signature) holds the blocks. The
+  multiplexed code), 0 for every other character. In UTF-8 mode it replaces
+  the multiplexed class code of the hybrid (`classCodes`): the classes stream
+  holds its bits (computed on the bytes and compressed, as before), and each
+  class's codes are its pseudo-codepoints (`pseudoCodes`), compiled in the
+  kernel as before. In Unicode mode it replaces the stream of each class: the
+  classes stream holds the bits (a CharClassesKernel on the 21-bit basis), and
+  the kernel compiles its classes from them by `classCodes`, as the hybrid's.
+  `FusedRulesConfig::classBlocks` (in the signature, with the codes in Unicode
+  mode) holds the blocks. The
   decision is the same for the stream (`fusedClasses`) and the kernel
   (`absolutely`): `RulePipelineBuilder::classLayerCoding`.
 - **The leaves** (`generatePabloMethod`, `forLeaves`): each string rule's
@@ -2150,14 +2154,15 @@ und_FONIPA-ar and -fa, and one of Hans-Hant), which the criterion leaves out.
 
 Checks: the outputs of Hant-Hans and Hans-Hant on `nat-zh.txt` and of
 am_Ethi-am_Ethi/Geminate on `pool-am.txt` are identical with the layer and
-without it (`--class-layer=0`); und_FONIPA-ar's (whose matching kernels are
+without it (`--class-layer=0`), in UTF-8 mode and in Unicode mode (the same
+kernels layered: 14, 6 and 12); und_FONIPA-ar's (whose matching kernels are
 layered) is identical to step 1's. `xlit_class_layer_test.py` (new): rules
 files of string rules over five scripts, with before and after contexts, a
 negated set, a rule a string rule yields to, deletions, expansions and a
 filter, kernels of up to 40 string rules or 20 subgroups layered, on random
 text with long lines and sparse matches; the output that of the regular plan
 and ICU's, with the default threads and with four threads and segments of one
-stride.
+stride, in UTF-8 mode and in Unicode mode (`--utf8-mode=0`).
 
 Found on the way (not changed): with a rules file, `--use-ICU` ignores the
 global filter (`:: [x] ;` converts characters outside it), so the filtered
@@ -2165,4 +2170,4 @@ case is compared with the regular plan only.
 
 Not yet: timing (the drivers at 4 threads, with the outputs compared), the
 compile time of the leaves, a nested If-hierarchy on the code's high bits (the
-leaves are flat: one If per block), and the class layer in Unicode mode.
+leaves are flat: one If per block).

@@ -15,7 +15,8 @@
 #  contexts in them), the output must be that of the regular plan
 #  (--class-layer=0) and ICU's (but with the filter, see filtered_rules), with
 #  the default threads and with four threads
-#  and segments of one stride.  The layer must be used (--class-layer-report).
+#  and segments of one stride, in UTF-8 mode (the classes coded in place of the
+#  multiplexed code) and in Unicode mode (in place of a stream for each class).  The layer must be used (--class-layer-report).
 #
 #  xlit_class_layer_test.py <xlit binary> [--extended-testing]
 
@@ -129,39 +130,44 @@ def main():
             input_path = os.path.join(tmp, name + ".in")
             with open(input_path, "w", encoding="utf-8") as f:
                 f.write(make_text(rules, 7, lines))
-            # (The regular plan: these groups are eligible for DivCode's own kernels.)
-            common = ["--rules-file=" + rules_path, "--utf8-mode=1", "--divcode-groups=0"]
-            report = run(xlit, common + ["--use-ICU=0", "--class-layer-report", "-ForcePipelineRecompilation", input_path])
-            kernels = [json.loads(l) for l in report.stderr.decode("utf-8", "replace").split("\n") if l.startswith("{\"kernel\"")]
-            if not any(k.get("layered") for k in kernels):
-                failures += 1
-                print("FAIL %s: no kernel with the class layer (%d kernels)" % (name, len(kernels)))
-            regular = run(xlit, common + ["--use-ICU=0", "--class-layer=0", input_path])
-            if regular.returncode != 0:
-                failures += 1
-                print("FAIL %s: the regular plan: exit status %d\n%s" % (name, regular.returncode, regular.stderr.decode("utf-8", "replace")))
-                continue
-            icu = run(xlit, common + ["--use-ICU=.*", input_path]) if not rules.startswith("::") else None
-            if icu is not None and icu.returncode == 0 and icu.stdout != regular.stdout:
-                failures += 1
-                print("FAIL %s: the regular plan differs from ICU" % name)
-            for config in configs:
-                layered = run(xlit, common + config + ["--use-ICU=0", "--class-layer=1", input_path])
-                if layered.returncode != 0:
+            for mode in ("1", "0"):
+                label = "%s, --utf8-mode=%s" % (name, mode)
+                # (The regular plan: these groups are eligible for DivCode's own kernels.)
+                common = ["--rules-file=" + rules_path, "--utf8-mode=" + mode, "--divcode-groups=0"]
+                regular = run(xlit, common + ["--use-ICU=0", "--class-layer=0", input_path])
+                if regular.returncode != 0:
                     failures += 1
-                    print("FAIL %s %s: exit status %d\n%s" % (name, " ".join(config), layered.returncode,
-                                                            layered.stderr.decode("utf-8", "replace")))
+                    print("FAIL %s: the regular plan: exit status %d\n%s" % (label, regular.returncode, regular.stderr.decode("utf-8", "replace")))
                     continue
-                if layered.stdout != regular.stdout:
+                icu = run(xlit, common + ["--use-ICU=.*", input_path]) if not rules.startswith("::") and mode == "1" else None
+                if icu is not None and icu.returncode == 0 and icu.stdout != regular.stdout:
                     failures += 1
-                    got = layered.stdout.decode("utf-8", "replace").split("\n")
-                    want = regular.stdout.decode("utf-8", "replace").split("\n")
-                    for i, (g, w) in enumerate(zip(got, want)):
-                        if g != w:
-                            print("FAIL %s %s, line %d:\n  want %r\n  got  %r" % (name, " ".join(config), i + 1, w[:80], g[:80]))
-                            break
-                    else:
-                        print("FAIL %s %s: %d lines, want %d" % (name, " ".join(config), len(got), len(want)))
+                    print("FAIL %s: the regular plan differs from ICU" % label)
+                for config in configs:
+                    # (With the default threads, the kernels reported: one must be layered.)
+                    report = [] if config else ["--class-layer-report"]
+                    layered = run(xlit, common + config + report + ["--use-ICU=0", "--class-layer=1", input_path])
+                    if report:
+                        kernels = [json.loads(l) for l in layered.stderr.decode("utf-8", "replace").split("\n")
+                                   if l.startswith("{\"kernel\"")]
+                        if not any(k.get("layered") for k in kernels):
+                            failures += 1
+                            print("FAIL %s: no kernel with the class layer (%d kernels)" % (label, len(kernels)))
+                    if layered.returncode != 0:
+                        failures += 1
+                        print("FAIL %s %s: exit status %d\n%s" % (label, " ".join(config), layered.returncode,
+                                                                layered.stderr.decode("utf-8", "replace")))
+                        continue
+                    if layered.stdout != regular.stdout:
+                        failures += 1
+                        got = layered.stdout.decode("utf-8", "replace").split("\n")
+                        want = regular.stdout.decode("utf-8", "replace").split("\n")
+                        for i, (g, w) in enumerate(zip(got, want)):
+                            if g != w:
+                                print("FAIL %s %s, line %d:\n  want %r\n  got  %r" % (label, " ".join(config), i + 1, w[:80], g[:80]))
+                                break
+                        else:
+                            print("FAIL %s %s: %d lines, want %d" % (label, " ".join(config), len(got), len(want)))
     print("%d failures" % failures)
     return 1 if failures else 0
 

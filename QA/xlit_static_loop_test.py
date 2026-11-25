@@ -47,6 +47,24 @@ GROUPS = [
       ("pqbc", "bc"),
       ("xpqpqpqbc", "aQ"),
       ("cbcbcbmnbc", "RRRMNQQ")]),
+    # A consumer (doc/ldml-divcode-plan.md §13.5, steps 2 and 3): [a] { st, whose
+    # result has the item values of the text it replaces, decided after the loop
+    # in the post kernel of a correction kernel split in two, with the static
+    # classes in the loop kernel.
+    ("x \u2192 a ;\n[aQ] { bc \u2192 Q ;\ncb \u2192 R ;\nbcb \u2192 S ;\nmn \u2192 MNQ ;\nzz \u2192 Q ;\npq \u2192 ;\n"
+     "[a] { st \u2192 U ;\n", 3,
+     [("xst", "aU"),
+      ("ast", "aU"),
+      ("yst", "yst"),
+      ("xpqst", "aU"),
+      ("xbcst", "aQst"),
+      ("zzst", "Qst"),
+      ("x" + "st" * 12, "aU" + "st" * 11),
+      ("x" + "stbc" * 12, "aU" + "bcst" * 11 + "bc"),
+      ("x" + "pqst" * 700 + "st", "aU" + "st" * 700),
+      ("xsst", "asst"),
+      ("stxst", "staU"),
+      ("x" + "bc" * 5 + "st" + "pq" + "st", "aQQQQQstst")]),
     # (The group of the former xlit_staged_chunks_test.py, with a subgroup matched
     # against the converted text and an insertion count among the static rules.)
     ("x \u2192 a ;\n[aQ] { bc \u2192 Q ;\ncb \u2192 R ;\nbcb \u2192 S ;\nmn \u2192 MNO ;\n"

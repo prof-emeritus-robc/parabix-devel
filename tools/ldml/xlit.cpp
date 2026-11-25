@@ -352,6 +352,12 @@ static cl::opt<bool> FusedLoopConsumers("fused-loop-consumers",
     cl::desc("Decide the string rules of a correction kernel whose decisions its While loop does not need after the loop "
              "(default on; 0 to decide them in it)"),
     cl::init(true), cl::cat(XlitOptions));
+//  A correction kernel with consumers split in two kernels: the While loop, and
+//  the decisions after it (doc/ldml-divcode-plan.md §13.5, step 3).
+static cl::opt<bool> FusedLoopSplit("fused-loop-split",
+    cl::desc("Split a correction kernel whose While loop has consumers into a loop kernel and a post kernel "
+             "(default on; 0 for one kernel)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> FusedStatementReport("fused-statement-report",
     cl::desc("Report the Pablo statements of each FusedRules kernel generated, by part and by the rule, subgroup or "
              "step emitting them (kernels loaded from the object cache are not generated)"),
@@ -4856,6 +4862,14 @@ struct FusedRulesConfig {
     //  cc::MultiplexedAlphabet), and classCodes the codes of each class, by
     //  which the kernel compiles it from the bits.
     std::vector<UCD::UnicodeSet> classCodes;
+    //  A correction kernel split in two (doc/ldml-divcode-plan.md §13.5, step 3;
+    //  see --fused-loop-split): 0, the whole kernel; 1, the loop kernel (the
+    //  setup, the While loop and the results of the rules decided in it other
+    //  than the consumers, see loopConsumers), writing the loop's state
+    //  (FusedState::loopState, see LoopStateLayout); 2, the post kernel (the
+    //  consumers' decisions, the subgroups' final decisions and their results),
+    //  reading it.
+    unsigned loopPart = 0;
 };
 
 //  The text of a replacement of a fused kernel: with absolute results, the
@@ -4887,6 +4901,9 @@ struct FusedState {
     StreamSet * starts = nullptr;
     //  The positions marked for each case mapping (see CaseMapSplit).
     std::map<unsigned, StreamSet *> marks;
+    //  The state of a correction kernel's While loop, from its loop kernel to its
+    //  post kernel (see FusedRulesConfig::loopPart).
+    StreamSet * loopState = nullptr;
 };
 
 //  Case mappings applied at marked positions.  A subgroup of a fused kernel
@@ -5446,6 +5463,303 @@ static std::vector<ResolvedItem> resolvedItems(const FusedRulesConfig & c) {
     return items;
 }
 
+//  The covers of the entries decided in a correction kernel's While loop (the
+//  string rules decided in it, see loopStringRules, then the static classes,
+//  S + c): each position of their texts, by offset, and the run following the
+//  text of a rule (offset: the length of its text), in the order the kernel
+//  builds them (see FusedRules::generatePabloMethod).
+struct LoopCover {
+    size_t entry;
+    unsigned offset;
+    bool run;
+};
+
+static const std::vector<UCD::UnicodeSet> & entryTextSets(const FusedRulesConfig & c, size_t e) {
+    const size_t S = c.strings.size();
+    return e < S ? c.strings[e].text : c.staticClasses[e - S].sets;
+}
+
+//  Whether a match of entry r may begin at the position of cover sc (see
+//  mayBeginWithin; a static class by the sets of its texts).
+static bool loopCoverMayBegin(const FusedRulesConfig & c, size_t r, const LoopCover & sc) {
+    const size_t S = c.strings.size();
+    const UCD::UnicodeSet & first = entryTextSets(c, r).front();
+    if (sc.run) return first.intersects(c.strings[sc.entry].run);
+    if (r < S && sc.entry < S) return mayBeginWithin(c, r, sc.entry, sc.offset);
+    const std::vector<UCD::UnicodeSet> & sets = entryTextSets(c, sc.entry);
+    return sc.offset > 0 && sc.offset < sets.size() && first.intersects(sets[sc.offset]);
+}
+
+//  The consumers of a correction kernel's While loop (doc/ldml-divcode-plan.md
+//  §13.5, step 2): the string rules decided in the loop whose decisions the loop
+//  does not need, decided after it.  A rule is one if (A) at every offset of its
+//  text, for every resolved item, the value of the position (as the next
+//  position's item sees it) is the same constant whether or not it applies: its
+//  own result there, and every alternative, the outcomes of the subgroups'
+//  mappings of the characters there (and the character unchanged, unless a
+//  subgroup without contexts or yields maps it), and every string rule's offset
+//  that may hold the position; a deleted position takes the value of the
+//  position before it (unknown before the match); and (B) no rule that stays in
+//  the loop may begin within it.  Then the loop's state is the same without the
+//  consumers' covers (where one applies, the outcome it replaces has its value),
+//  and no decision in the loop reads theirs.  Conservative: kept characters, run
+//  items, items at distance 2 or more, insertion rules, case mappings, sets of
+//  more than 512 characters fail.  (The rules a static match may cover are not
+//  candidates where it applies: such a match covers their first positions, since
+//  none may begin within a rule of the loop.)  With --fused-loop-consumers=0,
+//  none (the analysis is still reported).
+//  coverSets: the distinct sets of the covers of the other entries that the
+//  consumers' cover tests read (non-empty, in the order of the consumers), and
+//  coverSetOf, the index of each consumer's (-1: none), which a loop kernel
+//  passes to its post kernel as their unions of known-applied positions and
+//  intersections of known-clear ones (see LoopStateLayout).
+struct LoopConsumers {
+    std::vector<size_t> entries;                    // decided in the loop, in order
+    std::vector<LoopCover> covers;
+    std::vector<std::vector<size_t>> coversOf;      // by entry
+    std::vector<bool> consumer;                     // by entry
+    std::vector<std::vector<size_t>> coverSets;
+    std::vector<int> coverSetOf;                    // by entry
+    size_t loopRules = 0, passA = 0, analysed = 0;
+    std::map<std::string, size_t> reasons;
+    bool any() const {return std::find(consumer.begin(), consumer.end(), true) != consumer.end();}
+};
+
+static LoopConsumers loopConsumers(const FusedRulesConfig & c) {
+    LoopConsumers lc;
+    const size_t S = c.strings.size();
+    const size_t numEntries = S + c.staticClasses.size();
+    lc.coversOf.resize(numEntries);
+    lc.consumer.assign(numEntries, false);
+    lc.coverSetOf.assign(numEntries, -1);
+    if (!c.resolve || c.rounds == 0 || c.matchOnly) return lc;
+    const std::vector<bool> loopRule = loopStringRules(c);
+    for (size_t r = 0; r < S; r++) {
+        if (!loopRule[r]) continue;
+        lc.entries.push_back(r);
+        for (unsigned o = 0; o < c.strings[r].text.size(); o++) {
+            lc.coversOf[r].push_back(lc.covers.size());
+            lc.covers.push_back(LoopCover{r, o, false});
+        }
+        if (!c.strings[r].run.empty()) {
+            lc.coversOf[r].push_back(lc.covers.size());
+            lc.covers.push_back(LoopCover{r, static_cast<unsigned>(c.strings[r].text.size()), true});
+        }
+    }
+    for (size_t k = 0; k < c.staticClasses.size(); k++) {
+        const size_t e = S + k;
+        lc.entries.push_back(e);
+        for (unsigned o = 0; o < c.staticClasses[k].length; o++) {
+            lc.coversOf[e].push_back(lc.covers.size());
+            lc.covers.push_back(LoopCover{e, o, false});
+        }
+    }
+    const std::vector<ResolvedItem> items = resolvedItems(c);
+    enum : int {No = 0, Yes = 1, Unknown = 2};
+    auto offsetResult = [&](size_t q, unsigned o, bool & deleted) -> std::u32string {
+        const FusedStringRule & rule = c.strings[q];
+        const unsigned n = static_cast<unsigned>(rule.text.size()), m = static_cast<unsigned>(rule.replacement.size());
+        std::u32string w;
+        if (o < m) w = o + 1 < n ? rule.replacement.substr(o, 1) : rule.replacement.substr(o);
+        if (!w.empty() && w[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) w.erase(0, 1);
+        w = selectedText(c, w);
+        deleted = w.empty();
+        return w;
+    };
+    //  The value for item x of an outcome w (non-empty; with absolute results,
+    //  the text of its selectors).
+    auto valueOf = [&](const std::u32string & w, size_t x) -> int {
+        const char32_t ch = w.back();
+        if (ch == ldml::StringRuleKept) return Unknown;
+        return items[x].chars.contains(static_cast<UCD::codepoint_t>(ch)) ? Yes : No;
+    };
+    //  The value of string rule q at offset o, for item x, if q applies; before:
+    //  the value of the position before its match.
+    std::function<int (size_t, unsigned, size_t, int)> ruleValue = [&](size_t q, unsigned o, size_t x, int before) -> int {
+        bool deleted;
+        const std::u32string w = offsetResult(q, o, deleted);
+        if (deleted) return o == 0 ? before : ruleValue(q, o - 1, x, before);
+        return valueOf(w, x);
+    };
+    //  By character: the outcomes of the subgroups' mappings of it (empty:
+    //  deleted), whether it always has one of them (a subgroup without contexts
+    //  or yields maps it), and the string rules' offsets that may hold it.
+    struct Alternatives {
+        std::vector<std::u32string> mapped;
+        bool always = false;
+        std::vector<std::pair<size_t, unsigned>> offsets;
+    };
+    std::map<UCD::codepoint_t, Alternatives> alternatives;
+    auto alternativesOf = [&](UCD::codepoint_t ch) -> const Alternatives & {
+        const auto f = alternatives.find(ch);
+        if (f != alternatives.end()) return f->second;
+        Alternatives & a = alternatives[ch];
+        for (const FusedSubgroup & g : c.subgroups) {
+            bool has = false;
+            for (const ldml::CharMapping & mp : g.mappings) {
+                if (!mp.chars.contains(ch)) continue;
+                has = true;
+                a.mapped.push_back(selectedText(c, mp.replacement));
+            }
+            const bool free = g.match < 0 && g.afterMatch < 0 && !g.converted && g.yields.empty()
+                              && g.before.size() == 1 && g.before[0].empty() && g.after.size() == 1 && g.after[0].empty();
+            if (free && has) a.always = true;
+        }
+        for (size_t q = 0; q < S; q++) {
+            const FusedStringRule & other = c.strings[q];
+            for (unsigned o2 = 0; o2 < other.text.size(); o2++) {
+                if (other.text[o2].contains(ch)) a.offsets.emplace_back(q, o2);
+            }
+        }
+        return a;
+    };
+    bool itemsOk = c.insertions.empty();
+    for (const ResolvedItem & item : items) itemsOk &= !item.run && item.depth == 1;
+    for (const FusedSubgroup & g : c.subgroups) itemsOk &= !g.caseMaps;
+    std::set<size_t> consumers;
+    for (size_t r : lc.entries) {
+        if (r >= S) continue;
+        lc.loopRules++;
+        const FusedStringRule & rule = c.strings[r];
+        std::string why;
+        if (!itemsOk) why = "items, insertions or case mappings outside the analysis";
+        for (unsigned o = 0; why.empty() && o < rule.text.size(); o++) {
+            const UCD::UnicodeSet & set = rule.text[o];
+            if (set.size() > 512) { why = "a set of more than 512 characters"; break; }
+            for (size_t x = 0; why.empty() && x < items.size(); x++) {
+                //  (The value of the position before, within the match: as the
+                //  rule's own value there, which the check at o - 1 makes that of
+                //  every alternative.)
+                const int before = o == 0 ? static_cast<int>(Unknown) : ruleValue(r, o - 1, x, Unknown);
+                const int e = ruleValue(r, o, x, Unknown);
+                if (e == Unknown) { why = o == 0 ? "its first position deleted or kept" : "a kept character"; break; }
+                for (const auto & range : set) {
+                    for (UCD::codepoint_t ch = range.first; why.empty() && ch <= range.second; ch++) {
+                        const Alternatives & a = alternativesOf(ch);
+                        for (const std::u32string & mw : a.mapped) {
+                            const int v = mw.empty() ? before : valueOf(mw, x);
+                            if (v == e) continue;
+                            why = mw.empty() ? (o == 0 ? "a character deleted at its first position" : "a deletion whose value differs")
+                                             : "a mapping with a different value";
+                            break;
+                        }
+                        if (why.empty() && !a.always) {
+                            const int v = items[x].chars.contains(ch) ? Yes : No;
+                            if (v != e) why = "the character unchanged, with a different value";
+                        }
+                        for (const auto & qo : a.offsets) {
+                            if (!why.empty()) break;
+                            if (ruleValue(qo.first, qo.second, x, before) != e) why = "a string rule holding the position with a different value";
+                        }
+                    }
+                    if (!why.empty()) break;
+                }
+            }
+        }
+        if (why.empty()) consumers.insert(r); else lc.reasons[why]++;
+    }
+    lc.passA = consumers.size();
+    //  (B): no rule staying in the loop may begin within a consumer.
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t r : std::vector<size_t>(consumers.begin(), consumers.end())) {
+            bool blocked = false;
+            for (size_t q : lc.entries) {
+                if (consumers.count(q)) continue;
+                for (size_t k : lc.coversOf[r]) {
+                    if (lc.covers[k].offset > 0 && loopCoverMayBegin(c, q, lc.covers[k])) { blocked = true; break; }
+                }
+                if (blocked) break;
+            }
+            if (blocked) { consumers.erase(r); changed = true; }
+        }
+    }
+    lc.analysed = consumers.size();
+    if (!FusedLoopConsumers) return lc;
+    for (size_t r : consumers) lc.consumer[r] = true;
+    std::map<std::vector<size_t>, int> setIndex;
+    for (size_t r : lc.entries) {
+        if (!lc.consumer[r]) continue;
+        std::vector<size_t> v;
+        for (size_t p : lc.entries) {
+            if (lc.consumer[p]) continue;
+            for (size_t k : lc.coversOf[p]) {
+                if (loopCoverMayBegin(c, r, lc.covers[k])) v.push_back(k);
+            }
+        }
+        if (v.empty()) continue;
+        const auto f = setIndex.emplace(v, static_cast<int>(lc.coverSets.size()));
+        if (f.second) lc.coverSets.push_back(v);
+        lc.coverSetOf[r] = f.first->second;
+    }
+    return lc;
+}
+
+//  The order in which the consumers are decided after the loop.  A consumer's
+//  decisions depend on those of the consumers whose matches may cover its first
+//  position: in an order where these come first (once), each is decided once,
+//  from final values.  Those in a cycle (a rule overlapping itself: a run of its
+//  matches takes an iteration for each), or after one (iterated), are decided
+//  in a While loop of their own, in the order of their selection.  readBy: the
+//  consumers whose covers another reads.
+struct ConsumerOrder {
+    std::vector<size_t> once, iterated;
+    std::vector<bool> readBy;
+};
+
+static ConsumerOrder consumerOrder(const FusedRulesConfig & c, const LoopConsumers & lc) {
+    ConsumerOrder co;
+    co.readBy.assign(lc.consumer.size(), false);
+    std::vector<size_t> consumers;
+    for (size_t r : lc.entries) if (lc.consumer[r]) consumers.push_back(r);
+    std::map<size_t, std::vector<size_t>> dependsOn;
+    for (size_t r : consumers) {
+        for (size_t p : consumers) {
+            for (size_t k : lc.coversOf[p]) {
+                if (!loopCoverMayBegin(c, r, lc.covers[k])) continue;
+                dependsOn[r].push_back(p);
+                co.readBy[p] = true;
+                break;
+            }
+        }
+    }
+    std::set<size_t> placed;
+    for (bool added = true; added; ) {
+        added = false;
+        for (size_t r : consumers) {
+            if (placed.count(r)) continue;
+            bool ready = true;
+            for (size_t p : dependsOn[r]) ready &= placed.count(p) > 0;
+            if (!ready) continue;
+            co.once.push_back(r);
+            placed.insert(r);
+            added = true;
+        }
+    }
+    for (size_t r : consumers) if (!placed.count(r)) co.iterated.push_back(r);
+    return co;
+}
+
+//  The streams of a loop kernel's state, for its post kernel (see
+//  FusedRulesConfig::loopPart): K, known in and known out, by item, polarity
+//  (out, in) and distance; the union of known-applied positions and the
+//  intersection of known-clear ones of each of the consumers' cover sets (see
+//  LoopConsumers); and the positions within the applied matches of the entries
+//  decided in the loop (other than the consumers), after their first positions.
+struct LoopStateLayout {
+    unsigned kCount = 0;
+    unsigned sets = 0;
+    LoopStateLayout(const FusedRulesConfig & c, const LoopConsumers & lc) {
+        for (const ResolvedItem & item : resolvedItems(c)) kCount += 2 * item.depth;
+        sets = static_cast<unsigned>(lc.coverSets.size());
+    }
+    unsigned k(unsigned i) const {return i;}
+    unsigned covered(unsigned set) const {return kCount + 2 * set;}
+    unsigned clear(unsigned set) const {return kCount + 2 * set + 1;}
+    unsigned within() const {return kCount + 2 * sets;}
+    unsigned width() const {return within() + 1;}
+};
+
 //  Of the characters of the mappings of a subgroup: those whose replacements
 //  have a length (0: deleted), and of these, those whose replacements have a
 //  character in a set (in), or not (!in), at an index.
@@ -5897,7 +6211,14 @@ private:
       mSignature(std::move(sig)) {
         //  Other than a correction kernel, a kernel matches fixed sequences of sets (Advances
         //  only), unless a string rule deletes the run following its text.
-        if (mConfig.rounds > 0) return;
+        //  (A correction kernel: only a post kernel, see FusedRulesConfig::loopPart,
+        //  with no While loop of its consumers and no selection of a rule
+        //  overlapping itself.)
+        if (mConfig.rounds > 0) {
+            if (mConfig.loopPart != 2) return;
+            for (const FusedRulesConfig::Selection & sel : mConfig.selection) if (sel.selfOverlapping) return;
+            if (!consumerOrder(mConfig, loopConsumers(mConfig)).iterated.empty()) return;
+        }
         auto beforeLength = [](const FusedContexts & before) {
             unsigned B = 0;
             for (const FusedContext & alt : before) B = std::max(B, static_cast<unsigned>(alt.size()));
@@ -5951,6 +6272,7 @@ private:
                 b.emplace_back("SpansIn", in.spans);
                 b.emplace_back("StartsIn", in.starts);
             }
+            if (c.loopPart == 2) b.emplace_back("LoopState", in.loopState);
         }
         return b;
     }
@@ -5967,7 +6289,8 @@ private:
             b.emplace_back("Spans", out.spans);
             b.emplace_back("Starts", out.starts);
         }
-        if (!c.staticClasses.empty()) b.emplace_back("StaticSelected", Firsts);
+        if (!c.staticClasses.empty() && c.loopPart != 2) b.emplace_back("StaticSelected", Firsts);
+        if (c.loopPart == 1) b.emplace_back("LoopState", out.loopState);
         return b;
     }
     static void appendSet(std::string & s, const UCD::UnicodeSet & set) {
@@ -6013,6 +6336,7 @@ private:
             s += "R" + std::to_string(c.rounds);
             if (!FusedRuleIfs) s += "nI";
             if (!FusedLoopConsumers) s += "nC";
+            if (c.loopPart) s += "P" + std::to_string(c.loopPart);
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
             if (c.resolve) s += "W2";
@@ -6870,6 +7194,16 @@ void FusedRules::generatePabloMethod() {
             //  (Entries S + c: the static classes, see FusedRulesConfig::staticClasses.)
             const size_t S = mConfig.strings.size();
             const size_t numEntries = S + mConfig.staticClasses.size();
+            //  The consumers (see loopConsumers), decided after the loop.  In a
+            //  post kernel (see FusedRulesConfig::loopPart), the others were decided
+            //  by the loop kernel: their candidates here are none, and what the
+            //  consumers read of their decisions is in LoopState.
+            const LoopConsumers lc = loopConsumers(mConfig);
+            const std::vector<bool> & consumer = lc.consumer;
+            const unsigned part = mConfig.loopPart;
+            std::vector<PabloAST *> loopState;
+            if (part == 2) loopState = getInputStreamSet("LoopState");
+            const LoopStateLayout loopLayout(mConfig, lc);
             std::vector<size_t> convStrings;
             std::vector<PabloAST *> candS(numEntries, nullptr);
             std::vector<Var *> DT(numEntries, nullptr), DF(numEntries, nullptr);
@@ -6905,7 +7239,7 @@ void FusedRules::generatePabloMethod() {
                 if (!loopRule[r]) continue;
                 attr.mark("cover setup", static_cast<long>(r));
                 convStrings.push_back(r);
-                candS[r] = firstOf[r];
+                candS[r] = (part == 2 && !consumer[r]) ? zeroes : firstOf[r];
                 firstOf[r] = zeroes;
                 DT[r] = pb.createVar("DT" + std::to_string(r), zeroes);
                 DF[r] = pb.createVar("DF" + std::to_string(r), zeroes);
@@ -6953,7 +7287,7 @@ void FusedRules::generatePabloMethod() {
                 const FusedRulesConfig::StaticClass & k = mConfig.staticClasses[c];
                 const size_t e = S + c;
                 convStrings.push_back(e);
-                candS[e] = source(k.starts);
+                candS[e] = part == 2 ? zeroes : source(k.starts);
                 DT[e] = pb.createVar("DT" + std::to_string(e), zeroes);
                 DF[e] = pb.createVar("DF" + std::to_string(e), zeroes);
                 for (unsigned o = 0; o < k.length; o++) {
@@ -6974,17 +7308,12 @@ void FusedRules::generatePabloMethod() {
                     covers.push_back(std::move(sc));
                 }
             }
+            //  (The covers as loopConsumers has them.)
+            if (LLVM_UNLIKELY(covers.size() != lc.covers.size())) llvm::report_fatal_error("FusedRules: the covers of loopConsumers differ");
             //  Whether a match of entry r may begin at the position of cover sc of
-            //  entry p (see mayBeginWithin; a static class by the sets of its texts).
-            auto textSets = [&](size_t e) -> const std::vector<UCD::UnicodeSet> & {
-                return e < S ? mConfig.strings[e].text : mConfig.staticClasses[e - S].sets;
-            };
+            //  entry p (see loopCoverMayBegin).
             auto mayBegin = [&](size_t r, size_t p, const StringCover & sc) -> bool {
-                const UCD::UnicodeSet & first = textSets(r).front();
-                if (sc.run) return first.intersects(mConfig.strings[p].run);
-                if (r < S && p < S) return mayBeginWithin(mConfig, r, p, sc.offset);
-                const std::vector<UCD::UnicodeSet> & sets = textSets(p);
-                return sc.offset > 0 && sc.offset < sets.size() && first.intersects(sets[sc.offset]);
+                return loopCoverMayBegin(mConfig, r, LoopCover{p, sc.offset, sc.run});
             };
             //  (And where an insertion rule may apply.)
             const size_t numIns = mConfig.insertions.size();
@@ -7209,7 +7538,18 @@ void FusedRules::generatePabloMethod() {
             };
             std::vector<ItemVars> vars(items.size());
             unsigned varCount = 0;
-            for (size_t x = 0; x < items.size(); x++) {
+            //  (A post kernel: K as the loop kernel ended it, in LoopState; no loop.)
+            for (size_t x = 0; part == 2 && x < items.size(); x++) {
+                for (int in = 0; in <= 1; in++) {
+                    for (unsigned j = 1; j <= items[x].depth; j++) {
+                        const std::string suffix = std::to_string(varCount);
+                        vars[x].K[in].push_back(pb.createVar("K" + suffix, loopState[loopLayout.k(varCount++)]));
+                        vars[x].Y[in].push_back(pb.createVar("Y" + suffix, zeroes));
+                        vars[x].C[in].push_back(vars[x].Y[in].back());
+                    }
+                }
+            }
+            for (size_t x = 0; part != 2 && x < items.size(); x++) {
                 const ResolvedItem & item = items[x];
                 PabloAST * over1 = del0;
                 if (item.run) {
@@ -7299,168 +7639,24 @@ void FusedRules::generatePabloMethod() {
                 }
             }
             const size_t numClasses = classes.size();
-            //  The consumers (doc/ldml-divcode-plan.md §13.5, step 2): the string
-            //  rules decided in the loop whose decisions the loop does not need,
-            //  decided after it.  A rule is one if (A) at every offset of its text,
-            //  for every resolved item, the value of the position (as the next
-            //  position's item sees it) is the same constant whether or not it
-            //  applies: its own result there, and every alternative, the outcomes
-            //  of the subgroups' mappings of the characters there (and the
-            //  character unchanged, unless a subgroup without contexts or yields
-            //  maps it), and every string rule's offset that may hold the
-            //  position; a deleted position takes the value of the position before
-            //  it (unknown before the match); and (B) no rule that stays in the
-            //  loop may begin within it.  Then the loop's state is the same without
-            //  the consumers' covers (where one applies, the outcome it replaces
-            //  has its value), and no decision in the loop reads theirs.
-            //  Conservative: kept characters, run items, items at distance 2 or
-            //  more, insertion rules, case mappings, sets of more than 512
-            //  characters fail.  (The rules a static match may cover are not
-            //  candidates where it applies: such a match covers their first
-            //  positions, since none may begin within a rule of the loop.)
-            std::vector<bool> consumer(numEntries, false);
-            if (FusedLoopConsumers || LLVM_UNLIKELY(attr.on)) {
-                enum : int {No = 0, Yes = 1, Unknown = 2};
-                auto offsetResult = [&](size_t q, unsigned o, bool & deleted) -> std::u32string {
-                    const FusedStringRule & rule = mConfig.strings[q];
-                    const unsigned n = static_cast<unsigned>(rule.text.size()), m = static_cast<unsigned>(rule.replacement.size());
-                    std::u32string w;
-                    if (o < m) w = o + 1 < n ? rule.replacement.substr(o, 1) : rule.replacement.substr(o);
-                    if (!w.empty() && w[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) w.erase(0, 1);
-                    w = selectedText(mConfig, w);
-                    deleted = w.empty();
-                    return w;
-                };
-                //  The value for item x of an outcome w (non-empty; with absolute
-                //  results, the text of its selectors).
-                auto valueOf = [&](const std::u32string & w, size_t x) -> int {
-                    const char32_t c = w.back();
-                    if (c == ldml::StringRuleKept) return Unknown;
-                    return items[x].chars.contains(static_cast<UCD::codepoint_t>(c)) ? Yes : No;
-                };
-                //  The value of string rule q at offset o, for item x, if q applies;
-                //  before: the value of the position before its match.
-                std::function<int (size_t, unsigned, size_t, int)> ruleValue = [&](size_t q, unsigned o, size_t x, int before) -> int {
-                    bool deleted;
-                    const std::u32string w = offsetResult(q, o, deleted);
-                    if (deleted) return o == 0 ? before : ruleValue(q, o - 1, x, before);
-                    return valueOf(w, x);
-                };
-                //  By character: the outcomes of the subgroups' mappings of it (empty:
-                //  deleted), whether it always has one of them (a subgroup without
-                //  contexts or yields maps it), and the string rules' offsets that
-                //  may hold it.
-                struct Alternatives {
-                    std::vector<std::u32string> mapped;
-                    bool always = false;
-                    std::vector<std::pair<size_t, unsigned>> offsets;
-                };
-                std::map<UCD::codepoint_t, Alternatives> alternatives;
-                auto alternativesOf = [&](UCD::codepoint_t ch) -> const Alternatives & {
-                    const auto f = alternatives.find(ch);
-                    if (f != alternatives.end()) return f->second;
-                    Alternatives & a = alternatives[ch];
-                    for (const FusedSubgroup & g : mConfig.subgroups) {
-                        bool has = false;
-                        for (const ldml::CharMapping & mp : g.mappings) {
-                            if (!mp.chars.contains(ch)) continue;
-                            has = true;
-                            a.mapped.push_back(selectedText(mConfig, mp.replacement));
-                        }
-                        const bool free = g.match < 0 && g.afterMatch < 0 && !g.converted && g.yields.empty()
-                                          && g.before.size() == 1 && g.before[0].empty() && g.after.size() == 1 && g.after[0].empty();
-                        if (free && has) a.always = true;
-                    }
-                    for (size_t q = 0; q < S; q++) {
-                        const FusedStringRule & other = mConfig.strings[q];
-                        for (unsigned o2 = 0; o2 < other.text.size(); o2++) {
-                            if (other.text[o2].contains(ch)) a.offsets.emplace_back(q, o2);
-                        }
-                    }
-                    return a;
-                };
-                bool itemsOk = numIns == 0;
-                for (const ResolvedItem & item : items) itemsOk &= !item.run && item.depth == 1;
-                for (const FusedSubgroup & g : mConfig.subgroups) itemsOk &= !g.caseMaps;
-                std::vector<size_t> loopRules;
-                for (size_t r : convStrings) if (r < S) loopRules.push_back(r);
-                std::map<std::string, size_t> reasons;
-                std::set<size_t> consumers;
-                for (size_t r : loopRules) {
-                    const FusedStringRule & rule = mConfig.strings[r];
-                    std::string why;
-                    if (!itemsOk) why = "items, insertions or case mappings outside the analysis";
-                    for (unsigned o = 0; why.empty() && o < rule.text.size(); o++) {
-                        const UCD::UnicodeSet & set = rule.text[o];
-                        if (set.size() > 512) { why = "a set of more than 512 characters"; break; }
-                        for (size_t x = 0; why.empty() && x < items.size(); x++) {
-                            //  (The value of the position before, within the match: as the
-                            //  rule's own value there, which the check at o - 1 makes
-                            //  that of every alternative.)
-                            const int before = o == 0 ? static_cast<int>(Unknown) : ruleValue(r, o - 1, x, Unknown);
-                            const int e = ruleValue(r, o, x, Unknown);
-                            if (e == Unknown) { why = o == 0 ? "its first position deleted or kept" : "a kept character"; break; }
-                            for (const auto & range : set) {
-                                for (UCD::codepoint_t ch = range.first; why.empty() && ch <= range.second; ch++) {
-                                    const Alternatives & a = alternativesOf(ch);
-                                    for (const std::u32string & mw : a.mapped) {
-                                        const int v = mw.empty() ? before : valueOf(mw, x);
-                                        if (v == e) continue;
-                                        why = mw.empty() ? (o == 0 ? "a character deleted at its first position" : "a deletion whose value differs")
-                                                         : "a mapping with a different value";
-                                        break;
-                                    }
-                                    if (why.empty() && !a.always) {
-                                        const int v = items[x].chars.contains(ch) ? Yes : No;
-                                        if (v != e) why = "the character unchanged, with a different value";
-                                    }
-                                    for (const auto & qo : a.offsets) {
-                                        if (!why.empty()) break;
-                                        if (ruleValue(qo.first, qo.second, x, before) != e) why = "a string rule holding the position with a different value";
-                                    }
-                                }
-                                if (!why.empty()) break;
-                            }
-                        }
-                    }
-                    if (why.empty()) consumers.insert(r); else reasons[why]++;
+            //  (--fused-statement-report: the analysis of loopConsumers.)
+            if (LLVM_UNLIKELY(attr.on) && part != 2) {
+                std::string out;
+                raw_string_ostream os(out);
+                os << getName() << ": step 2: of " << lc.loopRules << " string rules decided in the loop, " << lc.passA
+                   << " have the same value at every position whether or not they apply (A); " << lc.analysed
+                   << " of them also have no rule staying in the loop that may begin within them (B)"
+                   << (FusedLoopConsumers ? ", decided after the loop" : "") << "\n";
+                for (const auto & e : lc.reasons) os << "  not (A): " << e.first << ": " << e.second << "\n";
+                os << "  consumers:";
+                unsigned shown = 0;
+                for (size_t r : lc.entries) {
+                    if (!consumer[r]) continue;
+                    if (shown++ == 20) { os << " ..."; break; }
+                    os << " " << shortText(mConfig.strings[r].text);
                 }
-                const size_t passA = consumers.size();
-                //  (B): no rule staying in the loop may begin within a consumer.
-                for (bool changed = true; changed; ) {
-                    changed = false;
-                    for (size_t r : std::vector<size_t>(consumers.begin(), consumers.end())) {
-                        bool blocked = false;
-                        for (size_t q : convStrings) {
-                            if (consumers.count(q)) continue;
-                            for (size_t k : coversOf[r]) {
-                                if (covers[k].offset > 0 && mayBegin(q, r, covers[k])) { blocked = true; break; }
-                            }
-                            if (blocked) break;
-                        }
-                        if (blocked) { consumers.erase(r); changed = true; }
-                    }
-                }
-                if (LLVM_UNLIKELY(attr.on)) {
-                    std::string out;
-                    raw_string_ostream os(out);
-                    os << getName() << ": step 2: of " << loopRules.size() << " string rules decided in the loop, " << passA
-                       << " have the same value at every position whether or not they apply (A); " << consumers.size()
-                       << " of them also have no rule staying in the loop that may begin within them (B)"
-                       << (FusedLoopConsumers ? ", decided after the loop" : "") << "\n";
-                    for (const auto & e : reasons) os << "  not (A): " << e.first << ": " << e.second << "\n";
-                    os << "  consumers:";
-                    unsigned shown = 0;
-                    for (size_t r : consumers) {
-                        if (shown++ == 20) { os << " ..."; break; }
-                        os << " " << shortText(mConfig.strings[r].text);
-                    }
-                    os << "\n";
-                    errs() << os.str();
-                }
-                if (FusedLoopConsumers) {
-                    for (size_t r : consumers) consumer[r] = true;
-                }
+                os << "\n";
+                errs() << os.str();
             }
             //  (The loop's string decisions: CF of each cover, notCand or F, and
             //  whether a decision was added in the iteration.)
@@ -7498,10 +7694,16 @@ void FusedRules::generatePabloMethod() {
                     applies = ib.createAnd(candS[r], contextKnown(before, true));
                     rejected = ib.createAnd(candS[r], contextKnown(before, false));
                 }
-                //  The matches that may cover its first position.
+                //  The matches that may cover its first position.  (In a post
+                //  kernel, those decided by the loop kernel as LoopState gives them.)
                 PabloAST * within = zeroes;
                 PabloAST * notWithin = ones;
+                if (part == 2 && lc.coverSetOf[r] >= 0) {
+                    within = loopState[loopLayout.covered(static_cast<unsigned>(lc.coverSetOf[r]))];
+                    notWithin = loopState[loopLayout.clear(static_cast<unsigned>(lc.coverSetOf[r]))];
+                }
                 for (size_t p : convStrings) {
+                    if (part == 2 && !consumer[p]) continue;
                     for (size_t k : coversOf[p]) {
                         const StringCover & sc = covers[k];
                         if (!mayBegin(r, p, sc)) continue;
@@ -7627,10 +7829,13 @@ void FusedRules::generatePabloMethod() {
                     if (updateCovers(r)) updateRun(b, r, covT, covF);
                 }
             };
+            //  (Not in a post kernel: the loop kernel's.)
             PabloBuilder wb = pb.createScope();
-            attr.startLoop(wb.getPabloBlock());
-            attr.mark("subgroup decisions");
-            {
+            if (part != 2) {
+                attr.startLoop(wb.getPabloBlock());
+                attr.mark("subgroup decisions");
+            }
+            if (part != 2) {
                 //  Where a subgroup of each class is known to apply (TC), and where
                 //  every one is known not to or is not a candidate (RC).
                 std::vector<PabloAST *> TC(numClasses), RC(numClasses);
@@ -7982,47 +8187,18 @@ void FusedRules::generatePabloMethod() {
                 //  overlapping itself may be decided without changing any item.)
                 wb.createAssign(Progress, wb.createOr(progress, decisionProgress));
             }
-            attr.endLoop();
-            pb.createWhile(Progress, wb);
-            attr.whileCreated();
-            //  The consumers, decided after the loop from its final state.  A
-            //  consumer's decisions depend on those of the consumers whose matches
-            //  may cover its first position: in an order where these come first,
-            //  each is decided once (from final values).  Those in a cycle (a rule
-            //  overlapping itself: a run of its matches takes an iteration for
-            //  each), or after one, are decided in a While loop of their own, in
-            //  the order of their selection, as in the loop.
-            std::vector<size_t> consumers;
-            for (size_t r : convStrings) if (consumer[r]) consumers.push_back(r);
-            if (!consumers.empty()) {
+            if (part != 2) {
+                attr.endLoop();
+                pb.createWhile(Progress, wb);
+                attr.whileCreated();
+            }
+            //  The consumers, decided after the loop from its final state (see
+            //  consumerOrder).  (In a loop kernel, the post kernel's.)
+            if (lc.any() && part != 1) {
                 attr.mark("consumers");
-                std::map<size_t, std::vector<size_t>> dependsOn;
-                std::vector<bool> readByConsumer(numEntries, false);
-                for (size_t r : consumers) {
-                    for (size_t p : consumers) {
-                        for (size_t k : coversOf[p]) {
-                            if (!mayBegin(r, p, covers[k])) continue;
-                            dependsOn[r].push_back(p);
-                            readByConsumer[p] = true;
-                            break;
-                        }
-                    }
-                }
-                std::vector<size_t> once, iterated;
-                std::set<size_t> placed;
-                for (bool added = true; added; ) {
-                    added = false;
-                    for (size_t r : consumers) {
-                        if (placed.count(r)) continue;
-                        bool ready = true;
-                        for (size_t p : dependsOn[r]) ready &= placed.count(p) > 0;
-                        if (!ready) continue;
-                        once.push_back(r);
-                        placed.insert(r);
-                        added = true;
-                    }
-                }
-                for (size_t r : consumers) if (!placed.count(r)) iterated.push_back(r);
+                const ConsumerOrder co = consumerOrder(mConfig, lc);
+                const std::vector<size_t> & once = co.once, & iterated = co.iterated;
+                const std::vector<bool> & readByConsumer = co.readBy;
                 std::vector<PabloAST *> covT, covF;
                 decideRules(pb, once, false, [&](size_t r) {return readByConsumer[r];}, covT, covF);
                 if (!iterated.empty()) {
@@ -8035,7 +8211,7 @@ void FusedRules::generatePabloMethod() {
                     pb.createWhile(pending, cb);
                 }
                 if (LLVM_UNLIKELY(attr.on)) {
-                    errs() << getName() << ": " << consumers.size() << " consumers decided after the loop, " << iterated.size()
+                    errs() << getName() << ": " << once.size() + iterated.size() << " consumers decided after the loop, " << iterated.size()
                            << " of them in a While loop; " << std::count(readByConsumer.begin(), readByConsumer.end(), true)
                            << " read by others\n";
                 }
@@ -8049,8 +8225,14 @@ void FusedRules::generatePabloMethod() {
             //  The string rules decided in the loop apply where known to; the
             //  subgroups not within their matches applied (other than at their first
             //  positions), as settle has them.
-            PabloAST * stringsWithin = zeroes;
+            //  (A post kernel: the matches decided by the loop kernel as it gives
+            //  them, their results in the state given.)
+            PabloAST * stringsWithin = part == 2 ? loopState[loopLayout.within()] : zeroes;
             for (size_t r : convStrings) {
+                if (part == 2 && !consumer[r]) {
+                    if (r < S) firstOf[r] = zeroes;
+                    continue;
+                }
                 if (r >= S) {
                     staticSelected = pb.createOr(staticSelected, DT[r]);
                     for (unsigned o = 1; o < mConfig.staticClasses[r - S].length; o++) {
@@ -8061,7 +8243,35 @@ void FusedRules::generatePabloMethod() {
                 firstOf[r] = DT[r];
                 stringsWithin = pb.createOr(stringsWithin, withinMatches(r, firstOf[r]));
             }
-            if (mConfig.groupCoverage && stringsWithin != zeroes) {
+            if (part == 1) {
+                //  A loop kernel: its state for the post kernel (see LoopStateLayout),
+                //  and only the results of the rules decided in the loop (the
+                //  subgroups and the other string rules are the post kernel's).
+                std::vector<PabloAST *> out(loopLayout.width(), zeroes);
+                unsigned i = 0;
+                for (size_t x = 0; x < items.size(); x++) {
+                    for (int in = 0; in <= 1; in++) {
+                        for (Var * K : vars[x].K[in]) out[loopLayout.k(i++)] = K;
+                    }
+                }
+                for (unsigned set = 0; set < lc.coverSets.size(); set++) {
+                    PabloAST * covered = zeroes;
+                    PabloAST * clear = ones;
+                    for (size_t k : lc.coverSets[set]) {
+                        covered = pb.createOr(covered, covers[k].offset == 0 ? static_cast<PabloAST *>(DT[covers[k].rule]) : covers[k].T);
+                        clear = pb.createAnd(clear, coverF[k]);
+                    }
+                    out[loopLayout.covered(set)] = covered;
+                    out[loopLayout.clear(set)] = clear;
+                }
+                out[loopLayout.within()] = stringsWithin;
+                writeOutputStreamSet("LoopState", out);
+                std::vector<bool> decidedHere(S, false);
+                for (size_t r : convStrings) if (r < S) decidedHere[r] = true;
+                for (size_t r = 0; r < S; r++) if (!decidedHere[r]) firstOf[r] = zeroes;
+                for (size_t g = 0; g < numGroups; g++) atOf[g] = zeroes;
+            }
+            if (mConfig.groupCoverage && stringsWithin != zeroes && part != 1) {
                 PabloAST * const uncovered = pb.createNot(stringsWithin);
                 for (size_t g = 0; g < numGroups; g++) atOf[g] = pb.createAnd(atOf[g], uncovered);
             }
@@ -8078,7 +8288,9 @@ void FusedRules::generatePabloMethod() {
     }
 
     attr.mark("results");
-    if (!mConfig.staticClasses.empty()) writeOutputStreamSet("StaticSelected", std::vector<PabloAST *>{staticSelected});
+    if (!mConfig.staticClasses.empty() && mConfig.loopPart != 2) {
+        writeOutputStreamSet("StaticSelected", std::vector<PabloAST *>{staticSelected});
+    }
     Results res = stateIn();
     addResults(res, firstOf, atOf);
     addInsertions(res, insAt);
@@ -10301,6 +10513,43 @@ private:
         }
         return result;
     }
+    //  A fused kernel, from the state in to the state out; a correction kernel
+    //  whose While loop has consumers (see loopConsumers) as two, with
+    //  --fused-loop-split (doc/ldml-divcode-plan.md §13.5, step 3): the loop
+    //  kernel, to an intermediate state with the results of the rules decided in
+    //  the loop and the loop's state (FusedState::loopState), and the post kernel
+    //  from it (see FusedRulesConfig::loopPart).
+    void createFusedRules(FusedRulesConfig && config, StreamSet * U21, StreamSet * classes, StreamSet * inText,
+                          StreamSet * mask, StreamSet * allowed, const FusedState & in, const FusedState & out,
+                          StreamSet * firsts) {
+        PipelineBuilder & P = mP;
+        if (!FusedLoopSplit || !config.resolve || config.matchOnly || config.loopPart != 0) {
+            P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowed, in, out, firsts);
+            return;
+        }
+        const LoopConsumers lc = loopConsumers(config);
+        if (!lc.any()) {
+            P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowed, in, out, firsts);
+            return;
+        }
+        FusedState mid;
+        for (StreamSet * s : out.changes) mid.changes.push_back(s ? P.CreateStreamSet(21) : nullptr);
+        for (const auto & k : out.insertions) mid.insertions[k.first] = P.CreateStreamSet(1);
+        for (const auto & k : out.marks) mid.marks[k.first] = P.CreateStreamSet(1);
+        if (config.coverage) {
+            mid.spans = P.CreateStreamSet(1);
+            mid.starts = P.CreateStreamSet(1);
+        } else {
+            mid.spans = in.spans;
+            mid.starts = in.starts;
+        }
+        mid.loopState = P.CreateStreamSet(LoopStateLayout(config, lc).width());
+        FusedRulesConfig post = config;
+        config.loopPart = 1;
+        post.loopPart = 2;
+        P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowed, in, mid, firsts);
+        P.CreateKernelCall<FusedRules>(std::move(post), U21, classes, inText, mask, allowed, mid, out, firsts);
+    }
     //  (classesOf: the config of the classes stream the kernel reads, if it is
     //  not the kernel's own, as the matching kernel of a sequential selection,
     //  whose classes are a part of those of the stream.)
@@ -12254,7 +12503,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
         }
         StreamSet * const classes = fusedClasses(config);
         config.region = regions != nullptr;
-        P.CreateKernelCall<FusedRules>(absolutely(std::move(config)), U21, classes, inText, mask, allowedAt, state, out, nullptr);
+        createFusedRules(absolutely(std::move(config)), U21, classes, inText, mask, allowedAt, state, out, nullptr);
         state = out;
     };
     //  The matches of the MultipleCaptureMultipleReplacement rules (see below),
@@ -13080,8 +13329,7 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             for (unsigned k : layout.marks) out.marks[k] = P.CreateStreamSet(1);
             StreamSet * const selected = P.CreateStreamSet(1);
             loop.region = regions != nullptr;
-            P.CreateKernelCall<FusedRules>(absolutely(std::move(loop), &core), U21, coreClasses, inText, mask, nullptr,
-                                           none, out, selected);
+            createFusedRules(absolutely(std::move(loop), &core), U21, coreClasses, inText, mask, nullptr, none, out, selected);
             state = mergeResults(out, replayStatic(selected));
             mStaticLoopGroups.push_back(mGroupLabel + (mBytes ? " (UTF-8)" : ""));
         } else {

@@ -346,6 +346,12 @@ static cl::opt<bool> FusedRuleIfs("fused-rule-ifs",
     cl::desc("Decide each string rule in a correction kernel's While loop within an If on its candidates "
              "(default on; 0 for the loop without them)"),
     cl::init(true), cl::cat(XlitOptions));
+//  In a correction kernel, the string rules whose decisions the While loop does
+//  not need (consumers) decided after it (doc/ldml-divcode-plan.md §13.5, step 2).
+static cl::opt<bool> FusedLoopConsumers("fused-loop-consumers",
+    cl::desc("Decide the string rules of a correction kernel whose decisions its While loop does not need after the loop "
+             "(default on; 0 to decide them in it)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> FusedStatementReport("fused-statement-report",
     cl::desc("Report the Pablo statements of each FusedRules kernel generated, by part and by the rule, subgroup or "
              "step emitting them (kernels loaded from the object cache are not generated)"),
@@ -6006,6 +6012,7 @@ private:
         if (c.rounds) {
             s += "R" + std::to_string(c.rounds);
             if (!FusedRuleIfs) s += "nI";
+            if (!FusedLoopConsumers) s += "nC";
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
             if (c.resolve) s += "W2";
@@ -7292,6 +7299,169 @@ void FusedRules::generatePabloMethod() {
                 }
             }
             const size_t numClasses = classes.size();
+            //  The consumers (doc/ldml-divcode-plan.md §13.5, step 2): the string
+            //  rules decided in the loop whose decisions the loop does not need,
+            //  decided after it.  A rule is one if (A) at every offset of its text,
+            //  for every resolved item, the value of the position (as the next
+            //  position's item sees it) is the same constant whether or not it
+            //  applies: its own result there, and every alternative, the outcomes
+            //  of the subgroups' mappings of the characters there (and the
+            //  character unchanged, unless a subgroup without contexts or yields
+            //  maps it), and every string rule's offset that may hold the
+            //  position; a deleted position takes the value of the position before
+            //  it (unknown before the match); and (B) no rule that stays in the
+            //  loop may begin within it.  Then the loop's state is the same without
+            //  the consumers' covers (where one applies, the outcome it replaces
+            //  has its value), and no decision in the loop reads theirs.
+            //  Conservative: kept characters, run items, items at distance 2 or
+            //  more, insertion rules, case mappings, sets of more than 512
+            //  characters fail.  (The rules a static match may cover are not
+            //  candidates where it applies: such a match covers their first
+            //  positions, since none may begin within a rule of the loop.)
+            std::vector<bool> consumer(numEntries, false);
+            if (FusedLoopConsumers || LLVM_UNLIKELY(attr.on)) {
+                enum : int {No = 0, Yes = 1, Unknown = 2};
+                auto offsetResult = [&](size_t q, unsigned o, bool & deleted) -> std::u32string {
+                    const FusedStringRule & rule = mConfig.strings[q];
+                    const unsigned n = static_cast<unsigned>(rule.text.size()), m = static_cast<unsigned>(rule.replacement.size());
+                    std::u32string w;
+                    if (o < m) w = o + 1 < n ? rule.replacement.substr(o, 1) : rule.replacement.substr(o);
+                    if (!w.empty() && w[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) w.erase(0, 1);
+                    w = selectedText(mConfig, w);
+                    deleted = w.empty();
+                    return w;
+                };
+                //  The value for item x of an outcome w (non-empty; with absolute
+                //  results, the text of its selectors).
+                auto valueOf = [&](const std::u32string & w, size_t x) -> int {
+                    const char32_t c = w.back();
+                    if (c == ldml::StringRuleKept) return Unknown;
+                    return items[x].chars.contains(static_cast<UCD::codepoint_t>(c)) ? Yes : No;
+                };
+                //  The value of string rule q at offset o, for item x, if q applies;
+                //  before: the value of the position before its match.
+                std::function<int (size_t, unsigned, size_t, int)> ruleValue = [&](size_t q, unsigned o, size_t x, int before) -> int {
+                    bool deleted;
+                    const std::u32string w = offsetResult(q, o, deleted);
+                    if (deleted) return o == 0 ? before : ruleValue(q, o - 1, x, before);
+                    return valueOf(w, x);
+                };
+                //  By character: the outcomes of the subgroups' mappings of it (empty:
+                //  deleted), whether it always has one of them (a subgroup without
+                //  contexts or yields maps it), and the string rules' offsets that
+                //  may hold it.
+                struct Alternatives {
+                    std::vector<std::u32string> mapped;
+                    bool always = false;
+                    std::vector<std::pair<size_t, unsigned>> offsets;
+                };
+                std::map<UCD::codepoint_t, Alternatives> alternatives;
+                auto alternativesOf = [&](UCD::codepoint_t ch) -> const Alternatives & {
+                    const auto f = alternatives.find(ch);
+                    if (f != alternatives.end()) return f->second;
+                    Alternatives & a = alternatives[ch];
+                    for (const FusedSubgroup & g : mConfig.subgroups) {
+                        bool has = false;
+                        for (const ldml::CharMapping & mp : g.mappings) {
+                            if (!mp.chars.contains(ch)) continue;
+                            has = true;
+                            a.mapped.push_back(selectedText(mConfig, mp.replacement));
+                        }
+                        const bool free = g.match < 0 && g.afterMatch < 0 && !g.converted && g.yields.empty()
+                                          && g.before.size() == 1 && g.before[0].empty() && g.after.size() == 1 && g.after[0].empty();
+                        if (free && has) a.always = true;
+                    }
+                    for (size_t q = 0; q < S; q++) {
+                        const FusedStringRule & other = mConfig.strings[q];
+                        for (unsigned o2 = 0; o2 < other.text.size(); o2++) {
+                            if (other.text[o2].contains(ch)) a.offsets.emplace_back(q, o2);
+                        }
+                    }
+                    return a;
+                };
+                bool itemsOk = numIns == 0;
+                for (const ResolvedItem & item : items) itemsOk &= !item.run && item.depth == 1;
+                for (const FusedSubgroup & g : mConfig.subgroups) itemsOk &= !g.caseMaps;
+                std::vector<size_t> loopRules;
+                for (size_t r : convStrings) if (r < S) loopRules.push_back(r);
+                std::map<std::string, size_t> reasons;
+                std::set<size_t> consumers;
+                for (size_t r : loopRules) {
+                    const FusedStringRule & rule = mConfig.strings[r];
+                    std::string why;
+                    if (!itemsOk) why = "items, insertions or case mappings outside the analysis";
+                    for (unsigned o = 0; why.empty() && o < rule.text.size(); o++) {
+                        const UCD::UnicodeSet & set = rule.text[o];
+                        if (set.size() > 512) { why = "a set of more than 512 characters"; break; }
+                        for (size_t x = 0; why.empty() && x < items.size(); x++) {
+                            //  (The value of the position before, within the match: as the
+                            //  rule's own value there, which the check at o - 1 makes
+                            //  that of every alternative.)
+                            const int before = o == 0 ? static_cast<int>(Unknown) : ruleValue(r, o - 1, x, Unknown);
+                            const int e = ruleValue(r, o, x, Unknown);
+                            if (e == Unknown) { why = o == 0 ? "its first position deleted or kept" : "a kept character"; break; }
+                            for (const auto & range : set) {
+                                for (UCD::codepoint_t ch = range.first; why.empty() && ch <= range.second; ch++) {
+                                    const Alternatives & a = alternativesOf(ch);
+                                    for (const std::u32string & mw : a.mapped) {
+                                        const int v = mw.empty() ? before : valueOf(mw, x);
+                                        if (v == e) continue;
+                                        why = mw.empty() ? (o == 0 ? "a character deleted at its first position" : "a deletion whose value differs")
+                                                         : "a mapping with a different value";
+                                        break;
+                                    }
+                                    if (why.empty() && !a.always) {
+                                        const int v = items[x].chars.contains(ch) ? Yes : No;
+                                        if (v != e) why = "the character unchanged, with a different value";
+                                    }
+                                    for (const auto & qo : a.offsets) {
+                                        if (!why.empty()) break;
+                                        if (ruleValue(qo.first, qo.second, x, before) != e) why = "a string rule holding the position with a different value";
+                                    }
+                                }
+                                if (!why.empty()) break;
+                            }
+                        }
+                    }
+                    if (why.empty()) consumers.insert(r); else reasons[why]++;
+                }
+                const size_t passA = consumers.size();
+                //  (B): no rule staying in the loop may begin within a consumer.
+                for (bool changed = true; changed; ) {
+                    changed = false;
+                    for (size_t r : std::vector<size_t>(consumers.begin(), consumers.end())) {
+                        bool blocked = false;
+                        for (size_t q : convStrings) {
+                            if (consumers.count(q)) continue;
+                            for (size_t k : coversOf[r]) {
+                                if (covers[k].offset > 0 && mayBegin(q, r, covers[k])) { blocked = true; break; }
+                            }
+                            if (blocked) break;
+                        }
+                        if (blocked) { consumers.erase(r); changed = true; }
+                    }
+                }
+                if (LLVM_UNLIKELY(attr.on)) {
+                    std::string out;
+                    raw_string_ostream os(out);
+                    os << getName() << ": step 2: of " << loopRules.size() << " string rules decided in the loop, " << passA
+                       << " have the same value at every position whether or not they apply (A); " << consumers.size()
+                       << " of them also have no rule staying in the loop that may begin within them (B)"
+                       << (FusedLoopConsumers ? ", decided after the loop" : "") << "\n";
+                    for (const auto & e : reasons) os << "  not (A): " << e.first << ": " << e.second << "\n";
+                    os << "  consumers:";
+                    unsigned shown = 0;
+                    for (size_t r : consumers) {
+                        if (shown++ == 20) { os << " ..."; break; }
+                        os << " " << shortText(mConfig.strings[r].text);
+                    }
+                    os << "\n";
+                    errs() << os.str();
+                }
+                if (FusedLoopConsumers) {
+                    for (size_t r : consumers) consumer[r] = true;
+                }
+            }
             //  (The loop's string decisions: CF of each cover, notCand or F, and
             //  whether a decision was added in the iteration.)
             std::vector<Var *> coverF(covers.size());
@@ -7299,6 +7469,164 @@ void FusedRules::generatePabloMethod() {
                 coverF[k] = pb.createVar("CF" + std::to_string(k), covers[k].notCand);
             }
             Var * const decided = pb.createVar("Decided", zeroes);
+            //  The key of a before context, for the memos of the contexts known.
+            auto contextKey = [&](const FusedContexts & before) {
+                std::string key;
+                for (const FusedContext & alt : before) {
+                    const unsigned B = static_cast<unsigned>(alt.size());
+                    for (unsigned k = 0; k < B; k++) {
+                        ResolvedItem at;
+                        if (!resolvedItemAt(alt, k, at)) continue;
+                        key += std::to_string(itemIndex.at(at.key())) + "@" + std::to_string(B - k - 1) + ",";
+                    }
+                    key += "|";
+                }
+                return key;
+            };
+            //  The decision of string rule r, in ib (see the loop): from the covers
+            //  as read (covT, covF) and the before contexts known (contextKnown).
+            //  With progress, Decided is updated; with updateCovers, the covers of
+            //  its matches (other than its run); with fresh, covT and covF are set
+            //  to the expressions just built.
+            auto decideRule = [&](PabloBuilder & ib, size_t r, bool fresh, bool progress, bool updateCovers,
+                                  std::vector<PabloAST *> & covT, std::vector<PabloAST *> & covF,
+                                  const std::function<PabloAST *(const FusedContexts &, bool)> & contextKnown) {
+                PabloAST * applies = candS[r];
+                PabloAST * rejected = zeroes;
+                if (r < S && mConfig.strings[r].converted) {
+                    const FusedContexts & before = mConfig.strings[r].before;
+                    applies = ib.createAnd(candS[r], contextKnown(before, true));
+                    rejected = ib.createAnd(candS[r], contextKnown(before, false));
+                }
+                //  The matches that may cover its first position.
+                PabloAST * within = zeroes;
+                PabloAST * notWithin = ones;
+                for (size_t p : convStrings) {
+                    for (size_t k : coversOf[p]) {
+                        const StringCover & sc = covers[k];
+                        if (!mayBegin(r, p, sc)) continue;
+                        within = ib.createOr(within, covT[k]);
+                        notWithin = ib.createAnd(notWithin, covF[k]);
+                    }
+                }
+                applies = ib.createAnd(applies, notWithin);
+                rejected = ib.createOr(rejected, within);
+                rejected = ib.createAnd(candS[r], rejected);
+                PabloAST * const t = ib.createOr(DT[r], applies);
+                PabloAST * const f = ib.createOr(DF[r], rejected);
+                if (progress) {
+                    ib.createAssign(decided, ib.createOr(decided, ib.createOr(ib.createAnd(t, ib.createNot(DT[r])),
+                                                                              ib.createAnd(f, ib.createNot(DF[r])))));
+                }
+                ib.createAssign(DT[r], t);
+                ib.createAssign(DF[r], f);
+                if (!updateCovers) return;
+                for (size_t k : coversOf[r]) {
+                    const StringCover & sc = covers[k];
+                    if (sc.run) continue;
+                    if (sc.offset == 0) {
+                        PabloAST * const cf = ib.createOr(sc.notCand, f);
+                        ib.createAssign(coverF[k], cf);
+                        if (fresh) {
+                            covT[k] = t;
+                            covF[k] = cf;
+                        }
+                        continue;
+                    }
+                    PabloAST * const st = ib.createOr(sc.T, ib.createAdvance(t, sc.offset));
+                    PabloAST * const sf = ib.createOr(sc.F, ib.createAdvance(f, sc.offset));
+                    ib.createAssign(sc.T, st);
+                    ib.createAssign(sc.F, sf);
+                    PabloAST * const cf = ib.createOr(sc.notCand, sf);
+                    ib.createAssign(coverF[k], cf);
+                    if (fresh) {
+                        covT[k] = st;
+                        covF[k] = cf;
+                    }
+                }
+            };
+            //  The covers of the run of rule r, from its decisions, in b (outside
+            //  its If: they read static streams, passStatic).
+            //  Covered: the run after the text of a match known to apply.  Known
+            //  clear: a position of the run after one not the end of a candidate
+            //  that may apply, and either not of the run or itself known clear.
+            //  Both are carried from the positions already known (T, F) as well as
+            //  from their seeds: the carries of the previous block reach the first
+            //  iteration only, so a run continued from the previous block is
+            //  continued from what the earlier iterations found.
+            auto updateRun = [&](PabloBuilder & b, size_t r, std::vector<PabloAST *> & covT, std::vector<PabloAST *> & covF) {
+                for (size_t k : coversOf[r]) {
+                    const StringCover & sc = covers[k];
+                    if (!sc.run) continue;
+                    PabloAST * const t = DT[r];
+                    PabloAST * const f = DF[r];
+                    const unsigned n = sc.offset;
+                    PabloAST * const ends = n > 1 ? b.createAdvance(t, n - 1) : t;
+                    PabloAST * const tail = b.createMatchStar(b.createOr(b.createAdvance(ends, 1), sc.T), sc.runChars);
+                    PabloAST * const rt = b.createOr(sc.T, b.createAnd(tail, sc.runChars));
+                    //  (The positions known clear pass: at the first position of a
+                    //  block, the Advance gives the previous block's only in the
+                    //  first iteration.)
+                    PabloAST * const pass = b.createOr(b.createOr(sc.passStatic, sc.F),
+                                                       b.createAnd(sc.runChars, b.createAdvance(f, n)));
+                    PabloAST * const seeds = b.createOr(b.createAnd(pass, sc.notRunBefore), sc.F);
+                    PabloAST * const clear = b.createAnd(b.createMatchStar(seeds, pass), pass);
+                    PabloAST * const rf = b.createOr(sc.F, clear);
+                    b.createAssign(sc.T, rt);
+                    b.createAssign(sc.F, rf);
+                    PabloAST * const cf = b.createOr(sc.notCand, rf);
+                    b.createAssign(coverF[k], cf);
+                    covT[k] = rt;
+                    covF[k] = cf;
+                }
+            };
+            //  The rules decided in b, in the order of their selection, each with
+            //  --fused-rule-ifs in an If on its candidates (doc/ldml-divcode-plan.md
+            //  §13.5, step 1): every value assigned there is within them (applies,
+            //  rejected) or moved from them (the cover updates, Advances of t and
+            //  f), so where the If is skipped (no candidate in the block, no
+            //  pending carry) it would not change.  (Without the If, the covers of
+            //  the rule are given as the expressions just built, as before step 1:
+            //  an expression over the Vars built again after their assignment
+            //  would be the one built before it.  In an If, the Vars are read
+            //  after it: the cover tests are each in their rule's If, so none is
+            //  reused.)  The before contexts, known to hold or known not to, are
+            //  built once for each context in b (they read only K, which the
+            //  decisions do not change), outside the rules' Ifs.
+            //  covT and covF, set here: the cover's T (the decisions DT at offset 0)
+            //  and CF (notCand or F), as Vars, or as just built (see decideRule).
+            //  With progress, Decided is set to the decisions added; the covers are
+            //  updated for the rules for which updateCovers holds.
+            auto decideRules = [&](PabloBuilder & b, const std::vector<size_t> & rules, bool progress,
+                                   const std::function<bool (size_t)> & updateCovers,
+                                   std::vector<PabloAST *> & covT, std::vector<PabloAST *> & covF) {
+                covT.assign(covers.size(), nullptr);
+                covF.assign(covers.size(), nullptr);
+                for (size_t k = 0; k < covers.size(); k++) {
+                    covT[k] = covers[k].offset == 0 ? static_cast<PabloAST *>(DT[covers[k].rule]) : covers[k].T;
+                    covF[k] = coverF[k];
+                }
+                if (progress) b.createAssign(decided, zeroes);
+                std::map<std::pair<std::string, bool>, PabloAST *> contextMemo;
+                auto contextKnown = [&](const FusedContexts & before, bool in) -> PabloAST * {
+                    PabloAST *& m = contextMemo[{contextKey(before), in}];
+                    if (!m) m = knownBefore(b, before, ones, in);
+                    return m;
+                };
+                for (size_t r : rules) {
+                    attr.mark("string rules", static_cast<long>(r));
+                    if (candS[r] != zeroes) {
+                        if (FusedRuleIfs) {
+                            PabloBuilder ib = b.createScope();
+                            decideRule(ib, r, false, progress, updateCovers(r), covT, covF, contextKnown);
+                            b.createIf(candS[r], ib);
+                        } else {
+                            decideRule(b, r, true, progress, updateCovers(r), covT, covF, contextKnown);
+                        }
+                    }
+                    if (updateCovers(r)) updateRun(b, r, covT, covF);
+                }
+            };
             PabloBuilder wb = pb.createScope();
             attr.startLoop(wb.getPabloBlock());
             attr.mark("subgroup decisions");
@@ -7326,146 +7654,17 @@ void FusedRules::generatePabloMethod() {
                 //  match is known to apply (covT) or none is (covF).  (The decisions
                 //  and those shifted to the offsets are accumulated: the carries of
                 //  the previous block reach the first iteration only.)
-                //  covT and covF are Vars: the cover's T (the decisions DT at offset
-                //  0) and CF (notCand or F), assigned where its rule is decided.  A
-                //  rule decided before this one in the iteration has them as just
-                //  decided, one after it (or itself) as in the previous iteration.
-                //  (Reading the Vars, rather than building expressions over them
-                //  again, keeps the builder from reusing an expression built before
-                //  an assignment.)
-                std::vector<PabloAST *> covT(covers.size()), covF(covers.size());
-                for (size_t k = 0; k < covers.size(); k++) {
-                    covT[k] = covers[k].offset == 0 ? static_cast<PabloAST *>(DT[covers[k].rule]) : covers[k].T;
-                    covF[k] = coverF[k];
-                }
-                wb.createAssign(decided, zeroes);
-                //  The before contexts of the converted string rules, known to hold
-                //  or known not to, once for each context (they read only K, which
-                //  the decisions do not change), outside the rules' Ifs.
-                std::map<std::pair<std::string, bool>, PabloAST *> contextMemo;
-                auto contextKnown = [&](const FusedContexts & before, bool in) -> PabloAST * {
-                    std::string key;
-                    for (const FusedContext & alt : before) {
-                        const unsigned B = static_cast<unsigned>(alt.size());
-                        for (unsigned k = 0; k < B; k++) {
-                            ResolvedItem at;
-                            if (!resolvedItemAt(alt, k, at)) continue;
-                            key += std::to_string(itemIndex.at(at.key())) + "@" + std::to_string(B - k - 1) + ",";
-                        }
-                        key += "|";
-                    }
-                    PabloAST *& m = contextMemo[{key, in}];
-                    if (!m) m = knownBefore(wb, before, ones, in);
-                    return m;
-                };
-                for (size_t r : convStrings) {
-                    //  With --fused-rule-ifs, in an If on the rule's candidates (doc/
-                    //  ldml-divcode-plan.md §13.5, step 1): every value assigned there
-                    //  is within them (applies, rejected) or moved from them (the cover
-                    //  updates, Advances of t and f), so where the If is skipped (no
-                    //  candidate in the block, no pending carry) it would not change.
-                    //  The covers of a run are updated after it, from the Vars: they
-                    //  read static streams (passStatic).
-                    attr.mark("string rules", static_cast<long>(r));
-                    //  (Without the If, the covers of the rule are given as the
-                    //  expressions just built, as before step 1: an expression over
-                    //  the Vars built again after their assignment would be the one
-                    //  built before it.  In an If, the Vars are read after it: the
-                    //  cover tests are each in their rule's If, so none is reused.)
-                    auto decide = [&](PabloBuilder & ib, bool fresh) {
-                        PabloAST * applies = candS[r];
-                        PabloAST * rejected = zeroes;
-                        if (r < S && mConfig.strings[r].converted) {
-                            const FusedContexts & before = mConfig.strings[r].before;
-                            applies = ib.createAnd(candS[r], contextKnown(before, true));
-                            rejected = ib.createAnd(candS[r], contextKnown(before, false));
-                        }
-                        //  The matches that may cover its first position.
-                        PabloAST * within = zeroes;
-                        PabloAST * notWithin = ones;
-                        for (size_t p : convStrings) {
-                            for (size_t k : coversOf[p]) {
-                                const StringCover & sc = covers[k];
-                                if (!mayBegin(r, p, sc)) continue;
-                                within = ib.createOr(within, covT[k]);
-                                notWithin = ib.createAnd(notWithin, covF[k]);
-                            }
-                        }
-                        applies = ib.createAnd(applies, notWithin);
-                        rejected = ib.createOr(rejected, within);
-                        rejected = ib.createAnd(candS[r], rejected);
-                        PabloAST * const t = ib.createOr(DT[r], applies);
-                        PabloAST * const f = ib.createOr(DF[r], rejected);
-                        ib.createAssign(decided, ib.createOr(decided, ib.createOr(ib.createAnd(t, ib.createNot(DT[r])),
-                                                                                  ib.createAnd(f, ib.createNot(DF[r])))));
-                        ib.createAssign(DT[r], t);
-                        ib.createAssign(DF[r], f);
-                        for (size_t k : coversOf[r]) {
-                            const StringCover & sc = covers[k];
-                            if (sc.run) continue;
-                            if (sc.offset == 0) {
-                                PabloAST * const cf = ib.createOr(sc.notCand, f);
-                                ib.createAssign(coverF[k], cf);
-                                if (fresh) {
-                                    covT[k] = t;
-                                    covF[k] = cf;
-                                }
-                                continue;
-                            }
-                            PabloAST * const st = ib.createOr(sc.T, ib.createAdvance(t, sc.offset));
-                            PabloAST * const sf = ib.createOr(sc.F, ib.createAdvance(f, sc.offset));
-                            ib.createAssign(sc.T, st);
-                            ib.createAssign(sc.F, sf);
-                            PabloAST * const cf = ib.createOr(sc.notCand, sf);
-                            ib.createAssign(coverF[k], cf);
-                            if (fresh) {
-                                covT[k] = st;
-                                covF[k] = cf;
-                            }
-                        }
-                    };
-                    if (candS[r] != zeroes) {
-                        if (FusedRuleIfs) {
-                            PabloBuilder ib = wb.createScope();
-                            decide(ib, false);
-                            wb.createIf(candS[r], ib);
-                        } else {
-                            decide(wb, true);
-                        }
-                    }
-                    for (size_t k : coversOf[r]) {
-                        const StringCover & sc = covers[k];
-                        if (!sc.run) continue;
-                        //  Covered: the run after the text of a match known to apply.
-                        //  Known clear: a position of the run after one not the end
-                        //  of a candidate that may apply, and either not of the run
-                        //  or itself known clear.  Both are carried from the positions
-                        //  already known (T, F) as well as from their seeds: the
-                        //  carries of the previous block reach the first iteration
-                        //  only, so a run continued from the previous block is
-                        //  continued from what the earlier iterations found.
-                        PabloAST * const t = DT[r];
-                        PabloAST * const f = DF[r];
-                        const unsigned n = sc.offset;
-                        PabloAST * const ends = n > 1 ? wb.createAdvance(t, n - 1) : t;
-                        PabloAST * const tail = wb.createMatchStar(wb.createOr(wb.createAdvance(ends, 1), sc.T), sc.runChars);
-                        PabloAST * const rt = wb.createOr(sc.T, wb.createAnd(tail, sc.runChars));
-                        //  (The positions known clear pass: at the first position of a
-                        //  block, the Advance gives the previous block's only in the
-                        //  first iteration.)
-                        PabloAST * const pass = wb.createOr(wb.createOr(sc.passStatic, sc.F),
-                                                            wb.createAnd(sc.runChars, wb.createAdvance(f, n)));
-                        PabloAST * const seeds = wb.createOr(wb.createAnd(pass, sc.notRunBefore), sc.F);
-                        PabloAST * const clear = wb.createAnd(wb.createMatchStar(seeds, pass), pass);
-                        PabloAST * const rf = wb.createOr(sc.F, clear);
-                        wb.createAssign(sc.T, rt);
-                        wb.createAssign(sc.F, rf);
-                        PabloAST * const cf = wb.createOr(sc.notCand, rf);
-                        wb.createAssign(coverF[k], cf);
-                        covT[k] = rt;
-                        covF[k] = cf;
-                    }
-                }
+                //  covT and covF are Vars, assigned where its rule is decided (see
+                //  decideRules).  A rule decided before this one in the iteration has
+                //  them as just decided, one after it (or itself) as in the previous
+                //  iteration.  (Reading the Vars, rather than building expressions
+                //  over them again, keeps the builder from reusing an expression built
+                //  before an assignment.)
+                //  (Not the consumers: see consumer.)
+                std::vector<size_t> loopDecided;
+                for (size_t r : convStrings) if (!consumer[r]) loopDecided.push_back(r);
+                std::vector<PabloAST *> covT, covF;
+                decideRules(wb, loopDecided, true, [](size_t) {return true;}, covT, covF);
                 PabloAST * const decisionProgress = decided;
                 //  The positions known to have a value: where a string match covering
                 //  them is known to apply, with the value of its result there (given by
@@ -7484,6 +7683,9 @@ void FusedRules::generatePabloMethod() {
                     std::vector<std::pair<PabloAST *, std::vector<size_t>>> groups;
                     std::map<PabloAST *, size_t> groupOf;
                     for (size_t k = 0; k < covers.size(); k++) {
+                        //  (Not the consumers' covers: where one applies, the outcome
+                        //  it replaces has its value, see consumer.)
+                        if (consumer[covers[k].rule]) continue;
                         PabloAST * const v = valueOf(k);
                         const auto f = groupOf.emplace(v, groups.size());
                         if (f.second) groups.emplace_back(v, std::vector<size_t>{});
@@ -7783,6 +7985,61 @@ void FusedRules::generatePabloMethod() {
             attr.endLoop();
             pb.createWhile(Progress, wb);
             attr.whileCreated();
+            //  The consumers, decided after the loop from its final state.  A
+            //  consumer's decisions depend on those of the consumers whose matches
+            //  may cover its first position: in an order where these come first,
+            //  each is decided once (from final values).  Those in a cycle (a rule
+            //  overlapping itself: a run of its matches takes an iteration for
+            //  each), or after one, are decided in a While loop of their own, in
+            //  the order of their selection, as in the loop.
+            std::vector<size_t> consumers;
+            for (size_t r : convStrings) if (consumer[r]) consumers.push_back(r);
+            if (!consumers.empty()) {
+                attr.mark("consumers");
+                std::map<size_t, std::vector<size_t>> dependsOn;
+                std::vector<bool> readByConsumer(numEntries, false);
+                for (size_t r : consumers) {
+                    for (size_t p : consumers) {
+                        for (size_t k : coversOf[p]) {
+                            if (!mayBegin(r, p, covers[k])) continue;
+                            dependsOn[r].push_back(p);
+                            readByConsumer[p] = true;
+                            break;
+                        }
+                    }
+                }
+                std::vector<size_t> once, iterated;
+                std::set<size_t> placed;
+                for (bool added = true; added; ) {
+                    added = false;
+                    for (size_t r : consumers) {
+                        if (placed.count(r)) continue;
+                        bool ready = true;
+                        for (size_t p : dependsOn[r]) ready &= placed.count(p) > 0;
+                        if (!ready) continue;
+                        once.push_back(r);
+                        placed.insert(r);
+                        added = true;
+                    }
+                }
+                for (size_t r : consumers) if (!placed.count(r)) iterated.push_back(r);
+                std::vector<PabloAST *> covT, covF;
+                decideRules(pb, once, false, [&](size_t r) {return readByConsumer[r];}, covT, covF);
+                if (!iterated.empty()) {
+                    PabloAST * any = zeroes;
+                    for (size_t r : iterated) any = pb.createOr(any, candS[r]);
+                    Var * const pending = pb.createVar("ConsumerProgress", any);
+                    PabloBuilder cb = pb.createScope();
+                    decideRules(cb, iterated, true, [](size_t) {return true;}, covT, covF);
+                    cb.createAssign(pending, decided);
+                    pb.createWhile(pending, cb);
+                }
+                if (LLVM_UNLIKELY(attr.on)) {
+                    errs() << getName() << ": " << consumers.size() << " consumers decided after the loop, " << iterated.size()
+                           << " of them in a While loop; " << std::count(readByConsumer.begin(), readByConsumer.end(), true)
+                           << " read by others\n";
+                }
+            }
             attr.mark("final decisions");
             //  The converted subgroups apply where their before contexts hold, and
             //  each insertion rule where its contexts hold and no earlier one's do.

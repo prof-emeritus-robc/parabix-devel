@@ -1885,3 +1885,81 @@ Open:
   share chains among the rules that test the same covers, decided in the same
   order, or test them by groups (as step 1a groups the covers).
 - Timing at 4 threads, with the outputs compared.
+
+### 13.9 Status of step 2a (2026-11-25): which loop rules could be decided after it
+
+`--fused-statement-report` now also reports, for a correction kernel, which
+string rules decided in its loop could be decided after it, a static analysis
+(no change to the kernels). A rule qualifies if:
+
+- **(A)** at every offset of its text, for every resolved item, the value of
+  the position (the state the next position's item sees) is the same constant
+  whether or not it applies: its own result there; every alternative, namely
+  the outcomes of the subgroups' mappings of the characters there (and the
+  character unchanged, unless a subgroup without contexts maps it),
+  and every string rule's offset that may hold the position. A deleted position
+  takes the value of the position before it, which is unknown before the match.
+  With absolute results, the texts of the selectors.
+- **(B)** no rule that stays in the loop may begin within it (repeated until no
+  rule changes).
+
+Conservative: kept characters, run items, items at distance 2 or more,
+insertion rules and sets of more than 512 characters fail.
+
+und_FONIPA-ar #3: of the 440 string rules decided in the loop, 347 satisfy
+(A). The other 93: 92 because a character at their first position may be
+deleted (`ʔ → ;`, `$SchwaVowel → ;`), so that the value after it is that of the
+text before the match; 1 because its own first position is deleted or kept.
+This is 13.2's finding: only deletions carry an item forward. Of the 347, 142
+also satisfy (B): the 93 rules that stay (mostly `ʔ`-initial) may begin within
+the other 205 (the vowel-and-`ʔ` rules), which their cover tests read.
+
+So moving rules out of the loop (step 2b) would take 142 of the 440. With
+step 1's Ifs, a rule in the loop already costs only in the blocks where it has
+candidates; moving it saves its body in the iterations after the first. To
+take the 205, (B) would have to be relaxed: the loop rules' cover tests need a
+consumer's decision only where one of their candidates lies within one of its
+candidates, so a consumer could be decided in the loop only there.
+
+### 13.10 Status of step 2b (2026-11-25): the consumers decided after the loop
+
+The rules that satisfy 13.9's (A) and (B), the consumers, are decided after
+the correction kernel's While loop (`--fused-loop-consumers`, default on; in
+the kernel's signature when off). The analysis of 13.9 now runs for every
+correction kernel, and is more conservative than in 2a: it checks the
+mappings of every subgroup, not only those up to the first without contexts
+(no assumption about the order of the subgroups), takes the character
+unchanged as an alternative unless a subgroup with no contexts, no match
+stream and no yields maps it, and fails all rules of a kernel with case
+mappings. und_FONIPA-ar #3 still has 142 consumers.
+
+- **In the loop**, the consumers are not decided, and their covers are left
+  out of the state update (`withStrings`): where a consumer applies, the
+  outcome it replaces has the same value (A), so the state is the same; no
+  decision in the loop reads their covers (B).
+- **After the loop**, a consumer is decided as in the loop (in an If on its
+  candidates, from its before context, now final, and its cover tests), once.
+  Its cover tests read the final decisions of the loop's rules and those of
+  the consumers whose matches may cover its first position. These are decided
+  first (a topological order), with their covers updated; the others' covers
+  are not. Consumers in a cycle (a rule overlapping itself), or after one,
+  would be decided in a While loop of their own; und_FONIPA-ar has none: one
+  consumer (`[gkɠɡ][ǀǁǂǃ…]`) depends on 8 others (nasal + `k`/`g`).
+- The loop's iterations are unchanged (255,385 on `pool-und_FONIPA.txt`), and
+  the output is identical to step 1's.
+
+und_FONIPA-ar #3, statements before optimization:
+
+| | step 1 | step 2b |
+|---|--:|--:|
+| the loop | 62,701 | 55,388 |
+| of which the string rules | 58,829 (440 Ifs) | 52,144 (298 Ifs) |
+| outside the rules' Ifs (each iteration) | 3,872 | 3,244 |
+| after the loop | 4,073 | 7,760 |
+| of which the consumers (once) | — | 3,687 (142 Ifs) |
+| the kernel | 76,532 | 72,906 |
+
+Per iteration, the loop now runs 628 fewer statements outside the Ifs and 142
+fewer If tests, and the consumers' bodies run once per block instead of in
+each iteration (2.35 on average). Not yet measured: timing at 4 threads.
+

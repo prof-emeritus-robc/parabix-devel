@@ -147,6 +147,7 @@ void PabloCompiler::compile(KernelBuilder & b) {
     mMarker.emplace(entryBlock->createZeroes(), b.allZeroes());
     mMarker.emplace(entryBlock->createOnes(), b.allOnes());
     mBranchCount = 0;
+    mWhileCount = 0;
     addBranchCounter(b);
     mEntryBlock = b.GetInsertBlock();
     if (LLVM_UNLIKELY(mKernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject && !mContainsIllustratedValue.empty())) {
@@ -515,6 +516,14 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
     b.CreateCondBr(outerCond, whileBodyBlock, whileEndBlock);
 
     b.SetInsertPoint(whileBodyBlock);
+    //  (-pablo-count-while-iterations: the iterations so far, in this block.)
+    const bool countIterations = mKernel->countsWhileIterations();
+    const unsigned whileIndex = std::min(mWhileCount++, PabloKernel::MaxCountedWhiles - 1);
+    PHINode * iterPhi = nullptr;
+    if (LLVM_UNLIKELY(countIterations)) {
+        iterPhi = b.CreatePHI(b.getInt64Ty(), 2, "while.iterations");
+        iterPhi->addIncoming(b.getInt64(0), whileEntryBlock);
+    }
     PHINode * lowPhi = nullptr;
     if (LLVM_UNLIKELY(CheckWhileProgress)) {
         // -1 (as a signed number, below every position): no earlier iteration.
@@ -648,6 +657,12 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
         b.CreateAssert(progress, message, lowPhi, next.first);
         lowPhi->addIncoming(next.first, b.GetInsertBlock());
     }
+    Value * iterations = nullptr;
+    if (LLVM_UNLIKELY(countIterations)) {
+        iterations = b.CreateAdd(iterPhi, b.getInt64(1));
+        iterPhi->addIncoming(iterations, b.GetInsertBlock());
+    }
+    BasicBlock * const whileLatchBlock = b.GetInsertBlock();
     b.CreateCondBr(exitCond, whileBodyBlock, whileEndBlock);
 
     whileEndBlock->moveAfter(whileExitBlock);
@@ -664,7 +679,34 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
         assert (f != mMarker.end());
         f->second = escapedValue;
     }
+    PHINode * iterationsOut = nullptr;
+    if (LLVM_UNLIKELY(countIterations)) {
+        iterationsOut = b.CreatePHI(b.getInt64Ty(), 2, "while.iterations.out");
+        iterationsOut->addIncoming(b.getInt64(0), whileEntryBlock);
+        iterationsOut->addIncoming(iterations, whileLatchBlock);
+    }
     mCarryManager->leaveLoopScope(b, whileEntryBlock, whileExitBlock);
+    if (LLVM_UNLIKELY(countIterations)) {
+        //  The block's count, into the kernel state.
+        IntegerType * const i64 = b.getInt64Ty();
+        auto fieldPtr = [&](const char * scalar, std::vector<Value *> index) {
+            Value * ptr; Type * ty;
+            std::tie(ptr, ty) = b.getScalarFieldPtr(scalar);
+            index.insert(index.begin(), b.getInt32(0));
+            return b.CreateGEP(ty, ptr, index);
+        };
+        auto add = [&](Value * const ptr, Value * const amount) {
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64, ptr), amount), ptr);
+        };
+        add(fieldPtr(PabloKernel::WhileBlocksScalar, {b.getInt32(whileIndex)}), b.getInt64(1));
+        add(fieldPtr(PabloKernel::WhileIterationsScalar, {b.getInt32(whileIndex)}), iterationsOut);
+        Value * const maxPtr = fieldPtr(PabloKernel::WhileMaxScalar, {b.getInt32(whileIndex)});
+        Value * const max = b.CreateLoad(i64, maxPtr);
+        b.CreateStore(b.CreateSelect(b.CreateICmpUGT(iterationsOut, max), iterationsOut, max), maxPtr);
+        Value * const last = b.getInt64(PabloKernel::WhileCountBuckets - 1);
+        Value * const bucket = b.CreateSelect(b.CreateICmpUGT(iterationsOut, last), last, iterationsOut);
+        add(fieldPtr(PabloKernel::WhileHistogramScalar, {b.getInt32(whileIndex), bucket}), b.getInt64(1));
+    }
     if (LLVM_UNLIKELY(illustratorObj)) {
         Module * m = b.getModule();
         Function * fIllustratorExitLoop = m->getFunction(KERNEL_ILLUSTRATOR_EXIT_LOOP);

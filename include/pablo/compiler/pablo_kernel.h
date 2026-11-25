@@ -149,6 +149,20 @@ public:
     // on the attribute, so it is known for a kernel loaded from the cache.
     bool hasLocalCarries() const;
 
+    // -pablo-count-while-iterations: whether this kernel counts the iterations of its
+    // Whiles (decided in the constructor, from its name; the name then ends in
+    // "+WhileCounts").  The counts are kept in the kernel state, for at most
+    // MaxCountedWhiles Whiles (in the order compiled; later ones are added to the
+    // last), each with the number of blocks by the iterations in a block (the last
+    // bucket for WhileCountBuckets - 1 or more), and reported by the finalize method.
+    bool countsWhileIterations() const { return mCountWhileIterations; }
+    static constexpr unsigned MaxCountedWhiles = 8;
+    static constexpr unsigned WhileCountBuckets = 17;
+    static constexpr auto WhileBlocksScalar = "whileCountBlocks";
+    static constexpr auto WhileIterationsScalar = "whileCountIterations";
+    static constexpr auto WhileMaxScalar = "whileCountMax";
+    static constexpr auto WhileHistogramScalar = "whileCountHistogram";
+
     unsigned getCarryRebuildStrides() const override;
 
     // Not final: a Pablo kernel may extend it (call this, then add its own selections).
@@ -229,6 +243,7 @@ private:
     llvm::VectorType *               mStreamTy = nullptr;
     llvm::StructType *               mCarryDataTy = nullptr;
     llvm::LLVMContext *              mContext = nullptr;
+    bool                             mCountWhileIterations = false;
 
     Vec<Var *, 16>                   mInputs;
     Vec<Var *, 16>                   mOutputs;

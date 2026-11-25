@@ -43,6 +43,13 @@ extern llvm::sys::fs::OpenFlags PabloOptimizedOutputFileFlag;
 
 extern std::string PabloIllustrateKernelRegEx;
 
+// Count the iterations of the Whiles of the Pablo kernels whose names match this regex
+// (-pablo-count-while-iterations): per block, the popcount of the OR of the lowest bits
+// of the conditions that start the iterations.
+extern std::string PabloCountWhileRegEx;
+// (Matched against a Pablo kernel's name before its annotations.)
+bool countsWhileIterations(const std::string & kernelName);
+
 // Give every eligible Pablo kernel with lookahead inputs the ProvisionalLookAheadStride attribute.
 extern bool EnableProvisionalLookAheadStride;
 

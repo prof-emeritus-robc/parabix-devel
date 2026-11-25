@@ -20,6 +20,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <pablo/ast/branch.h>
+#include <boost/regex.hpp>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <llvm/Support/raw_ostream.h>
@@ -250,7 +251,13 @@ void PabloKernel::addInternalProperties(KernelBuilder & b) {
 }
 
 bool PabloKernel::hasLocalCarries() const {
-    return EnableLocalCarries && hasAttribute(kernel::Attribute::KindId::LocalCarries);
+    //  (Not while counting While iterations: the counts are kernel state, which a
+    //  kernel rebuilding its carries could update from concurrent segments.)
+    return EnableLocalCarries && !mCountWhileIterations && hasAttribute(kernel::Attribute::KindId::LocalCarries);
+}
+
+bool countsWhileIterations(const std::string & kernelName) {
+    return !PabloCountWhileRegEx.empty() && boost::regex_search(kernelName, boost::regex(PabloCountWhileRegEx));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -417,6 +424,44 @@ void PabloKernel::generateFinalizeMethod(KernelBuilder & b) {
     mContext = &C;
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
     mPabloCompiler->releaseKernelData(b);
+    if (LLVM_UNLIKELY(mCountWhileIterations)) {
+        //  The counts of each While that ran, to stderr.
+        Function * const dprintf = b.GetDprintf();
+        Value * const fd = b.getInt32(2);
+        IntegerType * const i64 = b.getInt64Ty();
+        auto at = [&](const char * scalar, std::vector<unsigned> index) -> Value * {
+            Value * ptr; Type * ty;
+            std::tie(ptr, ty) = b.getScalarFieldPtr(scalar);
+            std::vector<Value *> gep{b.getInt32(0)};
+            for (unsigned i : index) gep.push_back(b.getInt32(i));
+            return b.CreateLoad(i64, b.CreateGEP(ty, ptr, gep));
+        };
+        for (unsigned w = 0; w < MaxCountedWhiles; w++) {
+            Value * const blocks = at(WhileBlocksScalar, {w});
+            BasicBlock * const report = b.CreateBasicBlock("whileCountReport");
+            BasicBlock * const next = b.CreateBasicBlock("whileCountNext");
+            b.CreateCondBr(b.CreateICmpNE(blocks, b.getInt64(0)), report, next);
+            b.SetInsertPoint(report);
+            b.CreateCall(dprintf, {fd, b.GetString("While iterations: %s, While %u: %" PRIu64 " blocks, %" PRIu64
+                                                   " iterations, max %" PRIu64 "; blocks by iterations:"),
+                                   b.GetString(getName()), b.getInt32(w), blocks,
+                                   at(WhileIterationsScalar, {w}), at(WhileMaxScalar, {w})});
+            for (unsigned k = 0; k < WhileCountBuckets; k++) {
+                Value * const n = at(WhileHistogramScalar, {w, k});
+                BasicBlock * const show = b.CreateBasicBlock("whileCountBucket");
+                BasicBlock * const after = b.CreateBasicBlock("whileCountBucketNext");
+                b.CreateCondBr(b.CreateICmpNE(n, b.getInt64(0)), show, after);
+                b.SetInsertPoint(show);
+                const std::string format = (k + 1 == WhileCountBuckets) ? " %u+:%" PRIu64 : " %u:%" PRIu64;
+                b.CreateCall(dprintf, {fd, b.GetString(format), b.getInt32(k), n});
+                b.CreateBr(after);
+                b.SetInsertPoint(after);
+            }
+            b.CreateCall(dprintf, {fd, b.GetString("\n")});
+            b.CreateBr(next);
+            b.SetInsertPoint(next);
+        }
+    }
     if (CompileOptionIsSet(PabloCompilationFlags::EnableProfiling)) {
 
         SmallVector<char, 256> tmp;
@@ -472,6 +517,7 @@ llvm::IntegerType * PabloKernel::getInt1Ty() const {
 
 std::string && annotateKernelNameWithPabloDebugFlags(std::string && name) {
     assert (name.length() > 0);
+    const bool countWhiles = countsWhileIterations(name);
     //if (DebugOptionIsSet(DumpTrace)) {
     //    name += "+Dump";
     //}
@@ -515,6 +561,9 @@ std::string && annotateKernelNameWithPabloDebugFlags(std::string && name) {
     if (!EnableLocalCarries) {
         name += "-LocalCarries";
     }
+    if (countWhiles) {
+        name += "+WhileCounts";
+    }
     return std::move(name);
 }
 
@@ -554,6 +603,19 @@ PabloKernel::PabloKernel(LLVMTypeSystemInterface & ts,
     if (LLVM_UNLIKELY(mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
         addNonPersistentScalar(ts.getSizeTy(), "EOFUnnecessaryData");
         addInternalScalar(ts.getSizeTy(), KERNEL_ILLUSTRATOR_STRIDE_NUM);
+    }
+    //  (-pablo-count-while-iterations: as annotated in the name.)
+    const std::string & name = getName();
+    const std::string countSuffix = "+WhileCounts";
+    mCountWhileIterations = name.size() >= countSuffix.size()
+                            && name.compare(name.size() - countSuffix.size(), countSuffix.size(), countSuffix) == 0;
+    if (LLVM_UNLIKELY(mCountWhileIterations)) {
+        IntegerType * const i64 = IntegerType::getInt64Ty(ts.getSizeTy()->getContext());
+        ArrayType * const perWhile = ArrayType::get(i64, MaxCountedWhiles);
+        addInternalScalar(perWhile, WhileBlocksScalar);
+        addInternalScalar(perWhile, WhileIterationsScalar);
+        addInternalScalar(perWhile, WhileMaxScalar);
+        addInternalScalar(ArrayType::get(ArrayType::get(i64, WhileCountBuckets), MaxCountedWhiles), WhileHistogramScalar);
     }
 }
 

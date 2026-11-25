@@ -84,6 +84,7 @@ private:
     std::unique_ptr<CarryManager> const mCarryManager;
     TranslationMap                      mMarker;
     unsigned                            mBranchCount;
+    unsigned                            mWhileCount = 0;    // (the Whiles compiled, for -pablo-count-while-iterations)
     llvm::BasicBlock *                  mEntryBlock;
     std::vector<llvm::BasicBlock *>     mBasicBlock;
     llvm::SmallVector<const While *, 0> mContainsIllustratedValue;

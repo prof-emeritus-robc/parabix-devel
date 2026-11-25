@@ -74,6 +74,13 @@ static cl::opt<bool, true> ShowCarryExtentOption("ShowCarryExtent", cl::location
     cl::desc("Report the CarryExtent of each compiled Pablo kernel, or the statement that prevents rebuilding its carries"),
     cl::cat(codegen::JIT_InfoOptions), cl::init(false));
 
+std::string PabloCountWhileRegEx = "";
+static cl::opt<std::string, true> PabloCountWhileOption("pablo-count-while-iterations", cl::location(PabloCountWhileRegEx),
+    cl::desc("Count the iterations of the Whiles of the Pablo kernels whose names match this regex, block by block, "
+             "in the kernel state, and report them when the kernel is finalized (the kernels are named with "
+             "+WhileCounts, and do not rebuild their carries locally)"),
+    cl::value_desc("regex"), cl::cat(codegen::InstrumentationOptions));
+
 std::string PabloIllustrateKernelRegEx = "";
 static cl::opt<std::string, true> PabloIllustrateKernelOption("pablo-illustrate-kernel", cl::location(PabloIllustrateKernelRegEx), cl::ValueOptional,
     cl::desc("RegEx describing Pablo kernel names to illustrate"), cl::value_desc("regex"), cl::cat(codegen::InstrumentationOptions));

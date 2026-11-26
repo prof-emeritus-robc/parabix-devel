@@ -16957,9 +16957,7 @@ static std::string entityStep2Problem(const ldml::EntityGroupPlan & p) {
     for (const ldml::EntityRule & r : p.rules) {
         if (!r.before.empty()) return "a before context (step 4)";
     }
-    for (const auto & v : p.mayBeginWithin) {
-        if (!v.empty()) return "rules that may begin within others (step 3)";
-    }
+    if (!p.stageCycleRules.empty()) return "rules that may begin within matches of themselves (cycles: step 4)";
     return std::string();
 }
 
@@ -17115,6 +17113,8 @@ public:
             for (char32_t ch : r.result) sig += std::to_string(static_cast<unsigned>(ch)) + " ";
             sig += ";";
         }
+        sig += "stages:";
+        for (unsigned d : p.stage) sig += std::to_string(d) + ",";
         return sig;
     }
 protected:
@@ -17275,9 +17275,10 @@ void EntityMatch::generatePabloMethod() {
         return paths;
     };
     const unsigned maxLength = [&] {unsigned m = 1; for (const ldml::EntityRule & r : p.rules) m = std::max(m, r.maxLength); return m;}();
-    std::vector<PabloAST *> startLen(maxLength + 1, zeroes);
     PabloAST * prior = zeroes;
     std::vector<PabloAST *> wins;
+    //  The rule's matches by length, where it wins.
+    std::vector<std::map<unsigned, PabloAST *>> winsByLength;
     for (const ldml::EntityRule & r : p.rules) {
         std::map<unsigned, PabloAST *> byLength;
         for (const auto & [cond, l] : extend({{inText, 0}}, r.items, false)) {
@@ -17291,7 +17292,39 @@ void EntityMatch::generatePabloMethod() {
         PabloAST * const win = pb.createAnd(match, pb.createNot(prior));
         prior = pb.createOr(prior, match);
         wins.push_back(win);
-        for (const auto & [l, m] : byLength) startLen[l] = pb.createOr(startLen[l], pb.createAnd(win, m));
+        winsByLength.emplace_back();
+        for (const auto & [l, m] : byLength) winsByLength.back()[l] = pb.createAnd(win, m);
+    }
+    //  The selection (§5.4): a match applies unless it begins within a match
+    //  that applies.  A rule of stage 0 (within whose matches no rule may
+    //  begin... rather, that may begin within no rule's match) applies where it
+    //  wins; a rule of stage d, where it wins outside the matches applied of
+    //  the rules of the stages before (the only ones within whose matches it
+    //  may begin).
+    const std::vector<unsigned> & stage = p.stage;
+    const unsigned stages = stage.empty() ? 1 : *std::max_element(stage.begin(), stage.end()) + 1;
+    //  The positions after the first of the matches applied, of lengths by
+    //  their starts (startLen).
+    std::vector<PabloAST *> startLen(maxLength + 1, zeroes);
+    auto interior = [&]() {
+        PabloAST * r = zeroes;
+        for (unsigned j = 1; j < maxLength; j++) {
+            PabloAST * longer = zeroes;
+            for (unsigned l = j + 1; l <= maxLength; l++) longer = pb.createOr(longer, startLen[l]);
+            r = pb.createOr(r, pb.createAdvance(longer, j));
+        }
+        return r;
+    };
+    for (unsigned d = 0; d < stages; d++) {
+        PabloAST * const covered = d == 0 ? zeroes : interior();
+        for (size_t i = 0; i < wins.size(); i++) {
+            if ((stage.empty() ? 0 : stage[i]) != d) continue;
+            if (d > 0) {
+                wins[i] = pb.createAnd(wins[i], pb.createNot(covered));
+                for (auto & [l, m] : winsByLength[i]) m = pb.createAnd(m, pb.createNot(covered));
+            }
+            for (const auto & [l, m] : winsByLength[i]) startLen[l] = pb.createOr(startLen[l], m);
+        }
     }
     //  W: the rule's index + 1.
     const unsigned wBits = getOutputStreamSet(0)->getNumElements();
@@ -17304,12 +17337,8 @@ void EntityMatch::generatePabloMethod() {
         if (m == 0) deleted = pb.createOr(deleted, wins[i]);
         for (unsigned b = 0; b < ins.size(); b++) if (m > 1 && (((m - 1) >> b) & 1)) ins[b] = pb.createOr(ins[b], wins[i]);
     }
-    //  The rest of each match's text (§5.4: no match begins within another).
-    for (unsigned j = 1; j < maxLength; j++) {
-        PabloAST * longer = zeroes;
-        for (unsigned l = j + 1; l <= maxLength; l++) longer = pb.createOr(longer, startLen[l]);
-        deleted = pb.createOr(deleted, pb.createAdvance(longer, j));
-    }
+    //  The rest of each match's text.
+    deleted = pb.createOr(deleted, interior());
     writeOutputStreamSet("W", w);
     writeOutputStreamSet("Deleted", std::vector<PabloAST *>{pb.createInFile(deleted)});
     if (mHasIns) writeOutputStreamSet("Ins", ins);
@@ -17586,7 +17615,9 @@ static int printEntityReportOf(const std::string & name, const std::vector<ldml:
                           return r + "}";
                       }()
                       << ", \"overlaps\": {\"edges\": " << edges << ", \"pruned_edges\": " << pruned
-                      << ", \"cycle_rules\": " << list(cycle, false) << ", \"depth\": " << p.depth << "}"
+                      << ", \"cycle_rules\": " << list(cycle, false) << ", \"depth\": " << p.depth
+                      << ", \"stages\": " << (p.stage.empty() ? 1 : *std::max_element(p.stage.begin(), p.stage.end()) + 1)
+                      << ", \"stage_cycle_rules\": " << p.stageCycleRules.size() << "}"
                       << ", \"context_loop\": " << (p.contextLoop ? "true" : "false")
                       << ", \"before_states\": " << list(states, false)
                       << ", \"entities\": " << list(entities, false)

@@ -3,8 +3,9 @@
 #  SPDX-License-Identifier: OSL-3.0
 #
 #  xlit --entity-groups: conversion groups applied by their entity plans
-#  (doc/ldml-entity-groups-plan.md, step 2: Unicode mode, groups without
-#  before contexts or rules beginning within others).  For rules files of sets
+#  (doc/ldml-entity-groups-plan.md, steps 2 and 3: Unicode mode, groups
+#  without before contexts, whose rules beginning within others' matches form
+#  no cycle: selected in stages).  For rules files of sets
 #  with strings (strings extending single characters of the set, a union of
 #  such sets), optional items, after contexts (properties, a negated set that
 #  holds at the end of the text), expansions and deletions, on random text of
@@ -71,8 +72,20 @@ $H → H;
 ח → X;
 """
 
+#  Rules that may begin within others' matches, without cycles (step 3): y z
+#  within x y, z within y z (three stages), $V ː? within k $V (at a set with
+#  strings), and a rule a later one may begin within.
+OVERLAPS = """
+$V = [a e {e̞} o];
+x y → P;
+$V ː? → A;
+k $V → K;
+y z → QQ;
+z → ;
+"""
+
 #  (rules, the code expected with --class-layer=1)
-CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32")]
+CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32"), ("overlaps", OVERLAPS, "streams")]
 
 
 def pool_of(rules):
@@ -82,7 +95,8 @@ def pool_of(rules):
             chars.update(c for c in line.split("→")[0] if c not in " $[]{}?;=:^→" and not c.isascii())
     chars.update("abcdefgkqtxyz")
     chars.update(["̰", "̃", "̆", "̇", "̞", "ː", "ʼ", " ", "1", "\n", "ж", "中", "𝒜"])
-    strings = ["e̞", "ɪ̈", "k͡h", "k͡hʷ", "a̰", "ά̃", "н̆", "ɓ̃", "ד̇"]
+    strings = ["e̞", "ɪ̈", "k͡h", "k͡hʷ", "a̰", "ά̃", "н̆", "ɓ̃", "ד̇",
+               "xyz", "xyzz", "yzz", "ke̞ː", "kaː"]
     return sorted(chars) + strings
 
 

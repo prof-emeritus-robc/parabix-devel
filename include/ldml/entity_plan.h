@@ -125,6 +125,12 @@ struct EntityGroupPlan {
     //  (the stages of §5.4), or 0 with cycles.
     std::vector<size_t> cycleRules;
     unsigned depth = 0;
+    //  The stages of the rules' selection (§5.4) by the graph itself
+    //  (mayBeginWithin, not pruned): the depth of each rule, the longest
+    //  chain of rules within whose matches it may begin (0: none), and the
+    //  rules on cycles (none: the stages select exactly).
+    std::vector<unsigned> stage;
+    std::vector<size_t> stageCycleRules;
 
     //  The before contexts matched against the converted text (§5.3): for each
     //  distinct one-item before context, the conditions of the closed form.

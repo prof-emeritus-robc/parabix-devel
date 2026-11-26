@@ -146,6 +146,8 @@ std::string encodeUTF8(const std::u32string & s) {
     return out;
 }
 
+void stagesOf(const std::vector<std::vector<size_t>> & edges, std::vector<size_t> & cycles, std::vector<unsigned> & depths);
+
 class GroupPlanner {
 public:
     GroupPlanner(EntityGroupPlan & plan, const EntityOptions & options) : P(plan), mOptions(options) {}
@@ -656,11 +658,23 @@ void GroupPlanner::overlaps() {
             if (!pruned) P.mayBeginWithinPruned[i].push_back(j);
         }
     }
-    //  Cycles and depth of the pruned graph (an edge i → j: j may begin
-    //  within i).
+    //  Cycles and depths of the pruned graph, and the stages of the rules by
+    //  the graph itself.
+    std::vector<unsigned> depths;
+    stagesOf(P.mayBeginWithinPruned, P.cycleRules, depths);
+    P.depth = 0;
+    for (unsigned d : depths) P.depth = std::max(P.depth, d);
+    stagesOf(P.mayBeginWithin, P.stageCycleRules, P.stage);
+}
+
+//  Of a graph (an edge i → j: j may begin within i): the rules on cycles, and
+//  the depth of each rule, the longest path to it (0: none may cover it), with
+//  each set of mutually reachable rules as one node.
+void stagesOf(const std::vector<std::vector<size_t>> & edges, std::vector<size_t> & cycles, std::vector<unsigned> & depths) {
+    const size_t n = edges.size();
     std::vector<std::vector<bool>> reach(n, std::vector<bool>(n, false));
     for (size_t i = 0; i < n; i++) {
-        for (size_t j : P.mayBeginWithinPruned[i]) reach[i][j] = true;
+        for (size_t j : edges[i]) reach[i][j] = true;
     }
     for (size_t k = 0; k < n; k++) {
         for (size_t i = 0; i < n; i++) {
@@ -670,29 +684,28 @@ void GroupPlanner::overlaps() {
             }
         }
     }
+    cycles.clear();
     for (size_t i = 0; i < n; i++) {
-        if (reach[i][i]) P.cycleRules.push_back(i);
+        if (reach[i][i]) cycles.push_back(i);
     }
-    //  The longest path, with each set of mutually reachable rules as one node.
     std::vector<int> depth(n, -1);
     std::function<unsigned (size_t)> depthOf = [&](size_t j) -> unsigned {
         if (depth[j] >= 0) return static_cast<unsigned>(depth[j]);
         depth[j] = 0;
         unsigned d = 0;
+        bool covered = false;
         for (size_t i = 0; i < n; i++) {
-            if (!reach[i][j] || (reach[j][i])) continue;
+            if (!reach[i][j]) continue;
+            covered = true;
+            if (reach[j][i]) continue;      // (within a cycle)
             d = std::max(d, depthOf(i) + 1);
         }
-        //  (Within a cycle: the rules covering any of them.)
+        if (covered) d = std::max(d, 1u);
         depth[j] = static_cast<int>(d);
         return d;
     };
-    P.depth = 0;
-    for (size_t j = 0; j < n; j++) {
-        bool covered = false;
-        for (size_t i = 0; i < n; i++) covered |= reach[i][j];
-        if (covered) P.depth = std::max(P.depth, std::max(1u, depthOf(j)));
-    }
+    depths.assign(n, 0);
+    for (size_t j = 0; j < n; j++) depths[j] = depthOf(j);
 }
 
 void GroupPlanner::beforeStates() {

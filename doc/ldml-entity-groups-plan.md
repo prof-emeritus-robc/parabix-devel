@@ -781,3 +781,61 @@ entity path is for later.
 - step 3 (overlaps), step 4 (before contexts);
 - UTF-8 mode;
 - timing (only with your go-ahead).
+
+## 14. Status of step 3 (2026-11-26)
+
+**The stages.** The ldml plan gives each rule its stage (`stage`): its depth
+in the graph of `mayBeginWithin`, not pruned, since step 3 has no before
+contexts to prune by. The depth is the longest chain of rules within whose
+matches it may begin, and the rules on cycles are `stageCycleRules`
+(`stagesOf`, also used for the report's pruned graph).
+
+`EntityMatch` selects by the stages (§5.4):
+
+- a rule of stage 0 applies where it wins;
+- a rule of stage d applies where it wins outside the matches applied by
+  the rules of stages below d, which are the only rules within whose matches
+  it may begin. The rest of their texts, by their lengths, are the bounded
+  Advances of `interior`.
+
+A rule that wins at a covered position is dropped, and no later rule applies
+there: the position is not a cursor. The stages are in the kernel's
+signature. `entityStep2Problem` now admits overlaps without cycles, and
+cycles are left to step 4. The report gives `stages` and `stage_cycle_rules`.
+
+**Checks:**
+
+- **und_FONIPA-ar** (Unicode mode, `--entity-groups`):
+  - group 1 is applied by its entity plan, and group 2 too (stage 1: its first
+    rule may begin within `yʉ`);
+  - groups 3 and 4 by the regular plan (a before context; a repetition);
+  - the output is identical to the regular plan's on 1 MB of
+    `pool-und_FONIPA.txt`;
+  - on 998 targeted lines (every `$UVowel` × `[j $IVowel]` × `[e {e̞}
+    $SchwaVowel]`, with `y` and `yʉ` before them, `e̞`, `ɵ̞` and `ɪ̈` at each
+    position), the output is identical to both the regular plan's and ICU's.
+- **45 more groups are in scope** (acyclic overlaps, no before contexts).
+  Their outputs are identical to the regular plan's on 1 MB of their corpora:
+  - ru-ja group 2 (depth 5);
+  - Latn-Cans (depth 3);
+  - InterIndic-Devanagari;
+  - am_FONIPA-am groups 1, 3, 7, 8 (296 rules, depth 3) and 9.
+
+  Bopo-Latn and uk-uk_Latn/BGN are within filters, so the regular plan
+  applies them.
+- **`QA/xlit_entity_test.py`** has a third rules file of overlaps over three
+  stages (`y z` within `x y`, `z` within `y z`, `$V ː?` within `k $V` at a set
+  with strings): 9 checks, 1.5 s. With the stages' coverage removed (a
+  mutation check, then restored), both overlap checks fail.
+- **Cold compile time.** The regular plan's Unicode-mode und_FONIPA-ar
+  pipeline took 16 minutes to compile cold, even with
+  `-backend-optimization-level=none` (its correction kernel). With the
+  entity path, groups 1 and 2 add a few seconds.
+
+**Not yet:**
+
+- the If on contested positions around the stages (§5.4; the stages are
+  bounded Advances computed in every block);
+- step 4 (before contexts, cycles);
+- filters;
+- UTF-8 mode.

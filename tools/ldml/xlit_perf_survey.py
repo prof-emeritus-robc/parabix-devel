@@ -20,6 +20,11 @@
 #        run    the 20 MB input with the cache warm (best of two runs when the
 #               first takes less than 10 s); the run time is its wall time less
 #               the warm time.
+#      With --digests, the output of the 20 MB input (an untimed run) is
+#      recorded by its SHA-256 and size; with --reference-args ARGS also that of
+#      a run with ARGS added (its own empty object cache: a cold compilation),
+#      to check that the configuration timed gives the same output as the one
+#      ARGS selects (e.g. the features of a change turned off).
 #      Results are appended to <dir>/results.jsonl as they are computed; a run
 #      interrupted resumes from there (transforms already in it are skipped,
 #      also when they were surveyed without --with-lines: use another <dir>).
@@ -353,6 +358,23 @@ def timed(cmd, timeout, stdout=subprocess.DEVNULL):
     return time.perf_counter() - t, r.returncode, r.stderr.decode('utf-8', 'replace')[-400:]
 
 
+def output_digest(cmd, timeout, scratch):
+    #  The SHA-256 and size of the output of cmd (written to a file in scratch),
+    #  or an error.
+    path = os.path.join(scratch, 'output')
+    with open(path, 'wb') as out:
+        t, rc, err = timed(cmd, timeout, stdout=out)
+    if rc != 0:
+        return {'error': '%s: %s' % (rc, err.strip().splitlines()[-1] if err.strip() else '')}
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    size = os.path.getsize(path)
+    os.remove(path)
+    return {'sha256': h.hexdigest(), 'bytes': size}
+
+
 def plan_info(text):
     mode = next((l.strip()[len('mode: '):] for l in text.splitlines() if l.strip().startswith('mode: ')), None)
     scope = next((l.strip()[len('region scope (--lines): '):] for l in text.splitlines()
@@ -429,6 +451,15 @@ def survey_one(args, name, entries, inputs, with_lines, plan=None, plan_lines=No
             m['full'] = full
             if full is not None and m['warm'] is not None:
                 m['run'] = max(full - m['warm'], 0.0)
+            if args.digests and 'error' not in m:
+                m['output'] = output_digest(cmd + [corpus], args.run_timeout, args.out)
+                if args.reference_args:
+                    refCache = os.path.join(args.out, 'refcache')
+                    shutil.rmtree(refCache, ignore_errors=True)
+                    os.makedirs(refCache)
+                    ref = base + ['-object-cache-dir=' + refCache] + extra + args.reference_args.split() + [name]
+                    m['reference'] = output_digest(ref + [corpus], args.timeout + args.run_timeout, args.out)
+                    shutil.rmtree(refCache, ignore_errors=True)
             r[mode] = m
         shutil.rmtree(cache, ignore_errors=True)
     return r
@@ -743,6 +774,10 @@ def main():
                     help='run: survey again only the transforms whose plan changed (and new ones)')
     ap.add_argument('--seed-plans', action='store_true',
                     help='run: record the plan digests of the results without them, from the xlit that made them')
+    ap.add_argument('--digests', action='store_true',
+                    help='run: record the SHA-256 and size of the output of the 20 MB input (an untimed run)')
+    ap.add_argument('--reference-args',
+                    help='run, with --digests: also the output with these xlit arguments added, for comparison')
     ap.add_argument('--table-doc')
     ap.add_argument('--csv', help='report: write the per-transform table as CSV')
     ap.add_argument('command', choices=['corpora', 'run', 'report'])

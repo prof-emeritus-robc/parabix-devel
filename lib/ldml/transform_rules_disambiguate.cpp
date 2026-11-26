@@ -2176,7 +2176,6 @@ std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r, std::ve
         std::map<const Capture *, Capture *> captures;
         size_t next = 0;
         RE * text = rebuild(src->getText(), true, followingChoice, next, captures);
-        assert (next == keyLeaves);
         RE * afterContext = rebuild(src->getAfterContext(), false, followingChoice, next, captures);
         next = 0;
         RE * beforeContext = rebuild(src->getBeforeContext(), false, beforeChoice, next, captures);

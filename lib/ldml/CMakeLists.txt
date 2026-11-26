@@ -26,6 +26,7 @@ SRC
     transform_plan.cpp
     shape_groups.cpp
     divcode_plan.cpp
+    entity_plan.cpp
 DEPS
     re.adt
     re.analysis

@@ -116,6 +116,7 @@
 #include <ldml/transform_plan.h>
 #include <ldml/shape_groups.h>
 #include <ldml/divcode_plan.h>
+#include <ldml/entity_plan.h>
 #include <kernel/unicode/divcode.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
@@ -332,6 +333,15 @@ static cl::opt<bool, true> DivCodeFamilies("divcode-families",
 static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32, the default) "
                                       "or 6 (div64)"),
                                       cl::init(5), cl::cat(XlitOptions));
+static cl::opt<bool> EntityReport("entity-report",
+    cl::desc("Report the entity plan of each conversion group of the transform's own rules (see "
+             "doc/ldml-entity-groups-plan.md): its entities, rules, classes, overlaps and before-context states "
+             "(one JSON object per group) and exit"),
+    cl::init(false), cl::cat(XlitOptions));
+static cl::opt<unsigned> EntityMuxThreshold("entity-mux-threshold",
+    cl::desc("The most classes of an entity group's CC kernel computed as streams of their own; above it, a "
+             "multiplexed code (doc/ldml-entity-groups-plan.md §3.1)"),
+    cl::init(16), cl::cat(XlitOptions));
 static cl::opt<bool> DivCodeReport("divcode-report",
     cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
              "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
@@ -16836,6 +16846,124 @@ static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
     return r;
 }
 
+//  --entity-report: the entity plan of each conversion group (see
+//  ldml/entity_plan.h, doc/ldml-entity-groups-plan.md), one JSON object per
+//  line.
+static std::string entityChars(const UCD::UnicodeSet & s, size_t limit = 40) {
+    std::u32string text;
+    size_t n = 0;
+    for (const auto & range : s) {
+        for (UCD::codepoint_t c = range.first; c <= range.second; c++) {
+            if (n++ == limit) return jsonEscape(ldml::entityUTF8(text)) + "…";
+            text.push_back(static_cast<char32_t>(c));
+        }
+    }
+    return jsonEscape(ldml::entityUTF8(text));
+}
+
+static int printEntityReportOf(const std::string & name, const std::vector<ldml::Rule *> & forward) {
+    ldml::EntityOptions options;
+    options.muxThreshold = EntityMuxThreshold;
+    const std::vector<ldml::EntityGroupPlan> plans = ldml::planEntityGroups(forward, options);
+    auto list = [](const std::vector<std::string> & v, bool quoted = true) {
+        std::string r;
+        for (const std::string & x : v) r += (r.empty() ? "" : ", ") + (quoted ? "\"" + jsonEscape(x) + "\"" : x);
+        return "[" + r + "]";
+    };
+    for (const ldml::EntityGroupPlan & p : plans) {
+        auto itemText = [&](const ldml::EntityItem & item) {
+            std::string t;
+            switch (item.kind) {
+                case ldml::EntityItem::Kind::Literal: t = ldml::entityUTF8(std::u32string(1, item.literal)); break;
+                case ldml::EntityItem::Kind::Entity: t = "<" + p.entities[item.entity].name + ">"; break;
+                case ldml::EntityItem::Kind::Boundary: t = "[$]"; break;
+            }
+            return item.optional ? t + "?" : t;
+        };
+        auto itemsText = [&](const std::vector<ldml::EntityItem> & items) {
+            std::string t;
+            for (const ldml::EntityItem & item : items) t += (t.empty() ? "" : " ") + itemText(item);
+            return t;
+        };
+        std::vector<std::string> entities;
+        unsigned counts[5] = {0, 0, 0, 0, 0};
+        for (const ldml::Entity & e : p.entities) {
+            counts[static_cast<unsigned>(e.kind)]++;
+            std::string j = "{\"name\": \"" + jsonEscape(e.name) + "\", \"kind\": \"" + ldml::kindName(e.kind) + "\"";
+            std::vector<std::string> uses;
+            if (e.inText) uses.push_back("text");
+            if (e.inBefore) uses.push_back("before");
+            if (e.inAfter) uses.push_back("after");
+            j += ", \"uses\": " + list(uses);
+            j += ", \"chars\": " + std::to_string(e.chars.count());
+            if (e.kind != ldml::Entity::Kind::Property && e.kind != ldml::Entity::Kind::PropertySet) {
+                j += ", \"members\": \"" + entityChars(e.chars) + "\"";
+            }
+            if (!e.strings.empty()) {
+                std::vector<std::string> strings;
+                for (const std::u32string & s : e.strings) strings.push_back(ldml::entityUTF8(s));
+                j += ", \"strings\": " + list(strings);
+            }
+            if (e.boundary) j += ", \"boundary\": true";
+            std::vector<std::string> lengths;
+            for (unsigned l : e.lengths) lengths.push_back(std::to_string(l));
+            j += ", \"lengths\": " + list(lengths, false);
+            if (!e.operands.empty()) {
+                std::vector<std::string> ops;
+                for (size_t o : e.operands) ops.push_back(p.entities[o].name);
+                j += ", \"operands\": " + list(ops);
+            }
+            entities.push_back(j + "}");
+        }
+        std::vector<std::string> rules;
+        for (size_t i = 0; i < p.rules.size(); i++) {
+            const ldml::EntityRule & r = p.rules[i];
+            std::string j = "{\"rule\": " + std::to_string(i + 1) + ", \"source\": \"" + jsonEscape(r.text) + "\"";
+            if (!r.before.empty()) j += ", \"before\": \"" + jsonEscape(itemsText(r.before)) + "\"";
+            j += ", \"text\": \"" + jsonEscape(itemsText(r.items)) + "\"";
+            if (!r.after.empty()) j += ", \"after\": \"" + jsonEscape(itemsText(r.after)) + "\"";
+            j += ", \"length\": [" + std::to_string(r.minLength) + ", " + std::to_string(r.maxLength) + "]";
+            std::vector<std::string> within;
+            for (size_t w : p.mayBeginWithinPruned[i]) within.push_back(std::to_string(w + 1));
+            if (!within.empty()) j += ", \"rules_beginning_within\": " + list(within, false);
+            if (!r.problems.empty()) j += ", \"problems\": " + list(r.problems);
+            rules.push_back(j + "}");
+        }
+        size_t edges = 0, pruned = 0;
+        for (const auto & v : p.mayBeginWithin) edges += v.size();
+        for (const auto & v : p.mayBeginWithinPruned) pruned += v.size();
+        std::vector<std::string> cycle;
+        for (size_t c : p.cycleRules) cycle.push_back(std::to_string(c + 1));
+        std::vector<std::string> states;
+        for (const ldml::EntityGroupPlan::BeforeState & s : p.beforeStates) {
+            std::vector<std::string> sr;
+            for (size_t r : s.rules) sr.push_back(std::to_string(r + 1));
+            states.push_back("{\"context\": \"" + jsonEscape(s.entity < p.entities.size() ? p.entities[s.entity].name : "[$]") +
+                             "\", \"rules\": " + list(sr, false) +
+                             ", \"a_text_disjoint\": " + (s.textDisjoint ? "true" : "false") +
+                             ", \"b_results_outside\": " + (s.resultsOutside ? "true" : "false") +
+                             ", \"c_single_deletions\": " + (s.singleDeletions ? "true" : "false") +
+                             ", \"notes\": " + list(s.notes) + "}");
+        }
+        toolio::out() << "{\"transform\": \"" << jsonEscape(name) << "\", \"group\": " << p.number
+                      << ", \"rules\": " << p.rules.size()
+                      << ", \"eligible\": " << (p.eligible() ? "true" : "false")
+                      << ", \"problems\": " << list(p.problems)
+                      << ", \"entity_counts\": {\"property\": " << counts[0] << ", \"property_set\": " << counts[1]
+                      << ", \"pure_set\": " << counts[2] << ", \"string_set\": " << counts[3] << ", \"union\": " << counts[4] << "}"
+                      << ", \"classes\": {\"stream\": " << p.streamClasses << ", \"mux\": " << p.muxClasses
+                      << ", \"exclusive\": " << p.exclusiveClasses << ", \"code_bits\": " << p.codeBits
+                      << ", \"multiplexed\": " << (p.multiplexed ? "true" : "false") << "}"
+                      << ", \"overlaps\": {\"edges\": " << edges << ", \"pruned_edges\": " << pruned
+                      << ", \"cycle_rules\": " << list(cycle, false) << ", \"depth\": " << p.depth << "}"
+                      << ", \"context_loop\": " << (p.contextLoop ? "true" : "false")
+                      << ", \"before_states\": " << list(states, false)
+                      << ", \"entities\": " << list(entities, false)
+                      << ", \"rule_items\": " << list(rules, false) << "}\n";
+    }
+    return 0;
+}
+
 static int printDivCodeReportOf(const std::string & name, const TransformAnalysis & a);
 
 static int printDivCodeReport(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
@@ -19367,6 +19495,7 @@ static int run(int argc, char *argv[]) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis a = analyzer.analyzeRulesFile(parsed);
         if (DivCodeReport) return printDivCodeReportOf(RulesFile, a);
+        if (EntityReport) return printEntityReportOf(RulesFile, ldml::ExtractForwardRules(parsed));
         if (ShowPlan) {
             printPlan("rules file " + RulesFile, a);
             if (Lines) printRegionScope(regionScope(registry, analyzer, a));
@@ -19475,6 +19604,12 @@ static int run(int argc, char *argv[]) {
     if (DivCodeReport) {
         if (entry->isBuiltIn()) return 0;
         return printDivCodeReport(registry, entry);
+    }
+    if (EntityReport) {
+        if (entry->isBuiltIn()) return 0;
+        const std::vector<ldml::Rule *> parsed = ldml::parseTransformRules(ldml::extractTRules(readFile(entry->file)));
+        return printEntityReportOf(entry->canonicalName, entry->direction == ldml::TransformDirection::Forward
+                                   ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed));
     }
     if (RevisitReport) {
         TransformAnalyzer analyzer(registry);

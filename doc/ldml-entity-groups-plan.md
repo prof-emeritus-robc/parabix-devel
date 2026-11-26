@@ -922,3 +922,72 @@ brings it to 12 checks, 2 s.
 - filters and bounded regions;
 - UTF-8 mode;
 - timing (only with your go-ahead).
+
+## 16. Status of UTF-8 mode (2026-11-26)
+
+**The design: the hybrid, not §9's outline.** §9 planned matching on the
+bytes, with lengths in bytes. What is built instead uses the hybrid of
+doc/masked-transforms-plan.md step 16, which xlit already has
+(`selectorGroup`):
+
+- **Matching** is at one position per character. The inputs are computed on
+  the bytes and compressed by the UTF-8 index (`classKernel`, and the
+  property kernels, then `FilterByMask`).
+- **Application** is by selectors spread back to the last bytes of the
+  characters and applied by `UTF8_SelectorPipeline`.
+
+`EntityMatch` and its paths, states, stages and loop are therefore the same
+kernel in both modes. Lengths stay in characters, and the text is never
+decoded to 21 bits.
+
+- **Classes:** a code on the bytes, compressed:
+  - the class layer's Div32 code where its criterion holds and it codes every
+    string set's characters;
+  - otherwise the multiplexed code of the coded sets
+    (`cc::MultiplexedAlphabet`, its partition kept in `EntityCoding` to give
+    the codes of any union of its classes), as `absolutely` gives the
+    hybrid's.
+
+  The StringSet kernels compile over the compressed code bits. The hybrid
+  reads no 21-bit basis.
+- **Selectors** (`EntityMatch` in selector mode, output `Sel`): at the first
+  position of each match applied, the selector of the rule's result (the
+  empty string deletes); at the rest of the match, the deletion's selector.
+  The strings are `selectorFor`'s.
+- **Dispatch:** `UTF8PipelineBuilder::applyAnalysis` applies a step by
+  `entityHybridGroup` before the other paths when `entityStepProblem` allows
+  it and no filter is active. `utf8StepProblem`, `allUTF8Step` and
+  `mixedSegments` take the analysis and whether entities apply (no masks), so
+  such a group stays in UTF-8 mode rather than starting a Unicode segment.
+  `--plan` reports the modes likewise.
+- **Unicode segments:** `unicodeSegment` slices the step-to-group map with the
+  steps.
+
+**Checks (UTF-8 mode, `--entity-groups`):**
+
+- **und_FONIPA-ar:**
+  - groups 1 to 3 are applied in the hybrid (group 3: a multiplexed code of 7
+    bits);
+  - the output is identical to ICU's on 1 MB of `pool-und_FONIPA.txt`, on
+    the 464 targeted lines of §15 (default threads, and
+    `-thread-num=4 -segment-size=1`), and on the 998 group 2 lines of §14;
+  - the run takes 3.5 s, compilation included.
+- **Other transforms:** the outputs are identical to the regular plan's
+  (UTF-8 mode) on 1 MB for de-ASCII, am_FONIPA-am (groups 1, 3, 5, 7, 8 and 9;
+  5 has cycles), Latn-Cans, ru-ja, InterIndic-Devanagari and
+  und_FONIPA-und_FONXSAMP.
+- **`QA/xlit_entity_test.py`:** each rules file in both modes, with
+  `--class-layer` on and off: 24 checks, 2.7 s. The trace confirms the path
+  and the code (UTF-8 mode: Div32 for the layered file, multiplexed
+  otherwise). With the selectors' deletions removed (a mutation check, then
+  restored), the 8 UTF-8 checks fail and the 16 others pass.
+- `xlit_utf8_mode_test`, `xlit_utf8_masks_test`, `xlit_hybrid_test`,
+  `xlit_class_layer_test`.
+
+**Not yet:**
+
+- filters (masks), in both modes;
+- bounded regions;
+- the correction loop for before contexts outside the closed form;
+- an If on contested positions;
+- timing (only with your go-ahead).

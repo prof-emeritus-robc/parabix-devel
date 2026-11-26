@@ -3,7 +3,9 @@
 #  SPDX-License-Identifier: OSL-3.0
 #
 #  xlit --entity-groups: conversion groups applied by their entity plans
-#  (doc/ldml-entity-groups-plan.md, steps 2 to 4: Unicode mode; rules that
+#  (doc/ldml-entity-groups-plan.md, steps 2 to 4, in Unicode mode and in UTF-8
+#  mode, where a group is matched one position per character on classes of
+#  the bytes and its results applied as selectors (the hybrid); rules that
 #  begin within others' matches selected in stages, and those on cycles in a
 #  While loop; before contexts matched against the converted text given by
 #  the closed form of §5.3).  For rules files of sets
@@ -14,8 +16,9 @@
 #  UTF-8 bytes, line feeds), the output must be the regular plan's and ICU's,
 #  and the groups must be applied by their entity plans (--entity-groups-trace):
 #  with the class layer's Div32 code where its criterion holds (20 or more
-#  rules in 4 or more Div32 blocks, none with more than half), and with a stream
-#  for each class with --class-layer=0 or below the criterion.
+#  rules in 4 or more Div32 blocks, none with more than half), and otherwise
+#  (also with --class-layer=0) with a stream for each class in Unicode mode, or
+#  the multiplexed code of the classes in UTF-8 mode.
 #
 #  xlit_entity_test.py <xlit binary> [--extended-testing]
 
@@ -137,31 +140,38 @@ def main():
             input_path = os.path.join(d, name + "-in.txt")
             with open(input_path, "w", encoding="utf-8") as f:
                 f.write(text)
-            common = ["--rules-file=" + rules_path, "--utf8-mode=0", "--use-ICU=0", input_path]
-            regular = run(xlit, common)
             icu = run(xlit, ["--rules-file=" + rules_path, "--use-ICU=.*", input_path])
-            checks += 1
-            if regular.returncode != 0 or icu.returncode != 0 or regular.stdout != icu.stdout:
-                failures += 1
-                print("FAIL %s: the regular plan and ICU differ (or fail): %s %s" % (
-                      name, regular.stderr.decode(errors="replace")[:300], icu.stderr.decode(errors="replace")[:300]))
-                continue
-            for layer, expected in (("1", code), ("0", "streams")):
+            for mode in ("0", "1"):
+                common = ["--rules-file=" + rules_path, "--utf8-mode=" + mode, "--use-ICU=0", input_path]
+                regular = run(xlit, common)
                 checks += 1
-                ent = run(xlit, ["--entity-groups", "--entity-groups-trace", "--class-layer=" + layer] + common)
-                trace = ent.stderr.decode(errors="replace")
-                problems = []
-                if ent.returncode != 0:
-                    problems.append("exit status %d" % ent.returncode)
-                if ent.stdout != regular.stdout:
-                    problems.append("output differs from the regular plan's")
-                if ": applied" not in trace:
-                    problems.append("not applied by its entity plan")
-                if "code " + expected not in trace:
-                    problems.append("code not " + expected)
-                if problems:
+                if regular.returncode != 0 or icu.returncode != 0 or regular.stdout != icu.stdout:
                     failures += 1
-                    print("FAIL %s --class-layer=%s: %s; %s" % (name, layer, ", ".join(problems), trace[:400]))
+                    print("FAIL %s --utf8-mode=%s: the regular plan and ICU differ (or fail): %s %s" % (
+                          name, mode, regular.stderr.decode(errors="replace")[:300], icu.stderr.decode(errors="replace")[:300]))
+                    continue
+                #  (In UTF-8 mode, the hybrid: a code on the bytes, the class
+                #  layer's or the multiplexed one.)
+                for layer in ("1", "0"):
+                    if mode == "0":
+                        expected = code if layer == "1" else "streams"
+                    else:
+                        expected = (code if code != "streams" else "multiplexed") if layer == "1" else "multiplexed"
+                    checks += 1
+                    ent = run(xlit, ["--entity-groups", "--entity-groups-trace", "--class-layer=" + layer] + common)
+                    trace = ent.stderr.decode(errors="replace")
+                    problems = []
+                    if ent.returncode != 0:
+                        problems.append("exit status %d" % ent.returncode)
+                    if ent.stdout != regular.stdout:
+                        problems.append("output differs from the regular plan's")
+                    if (": applied (UTF-8 mode)" if mode == "1" else ": applied") not in trace:
+                        problems.append("not applied by its entity plan")
+                    if "code " + expected not in trace:
+                        problems.append("code not " + expected)
+                    if problems:
+                        failures += 1
+                        print("FAIL %s --utf8-mode=%s --class-layer=%s: %s; %s" % (name, mode, layer, ", ".join(problems), trace[:400]))
     print("%d checks, %d failures" % (checks, failures))
     return 1 if failures else 0
 

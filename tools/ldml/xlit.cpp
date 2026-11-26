@@ -11023,6 +11023,8 @@ struct NormalizationFrames {
 
 //  (See the entity group kernels.)
 static std::string entityStep2Problem(const ldml::EntityGroupPlan & p);
+struct EntityCoding;
+struct EntityInputs;
 
 class RulePipelineBuilder {
 public:
@@ -11090,6 +11092,9 @@ public:
         StreamSet * index = nullptr;    // the last byte of each character
         std::pair<StreamSet *, StreamSet *> regions{nullptr, nullptr};    // the starts and follows of the regions (bytes)
     };
+    //  A group by its entity plan in the hybrid (see entitySelectorGroup).
+    StreamSet * entitySelectorGroup(const std::string & label, const ldml::EntityGroupPlan & plan, StreamSet * Ones,
+                                    const ByteSource & bytes, std::vector<std::u32string> & strings);
     StreamSet * selectorGroup(const std::string & label, const ldml::TransformStep & step, StreamSet * Ones,
                               std::vector<TransformMask> & masks, const ByteSource & bytes, std::vector<std::u32string> & strings) {
         mMasks.restore(std::move(masks));
@@ -11186,6 +11191,7 @@ private:
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     //  A conversion group by its entity plan (doc/ldml-entity-groups-plan.md).
     Staged entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21);
+    EntityInputs entityInputs(const ldml::EntityGroupPlan & plan, const EntityCoding & coding, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     Staged prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -15288,6 +15294,7 @@ private:
     std::string mGroupLabel;
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count);
     StreamSet * hybridGroup(const ldml::TransformStep & step, StreamSet * Basis);
+    StreamSet * entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis);
     PipelineBuilder & mP;
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
@@ -15344,8 +15351,16 @@ static std::string hybridProblem(const ldml::TransformStep & step) {
 //  applied in UTF-8 mode (a transform it invokes is, in mixed modes itself,
 //  unless it is a built-in of Unicode mode, applied by its shape groups, or not
 //  by the regular plan).  With bounded, the groups that are not line-bound too.
+static std::string entityStepProblem(const TransformAnalysis & a, size_t i, bool bounded);
 static std::string utf8StepProblem(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                   const ldml::TransformStep & step, bool bounded) {
+                                   const ldml::TransformStep & step, bool bounded,
+                                   const TransformAnalysis * a = nullptr, bool entities = false) {
+    //  (A group the entity plan applies, in the hybrid: with entities, the step
+    //  is one of a's applied without a filter, see entityStepProblem.)
+    if (entities && a && step.kind == ldml::TransformStep::Kind::Conversion) {
+        const size_t i = static_cast<size_t>(&step - a->plan.steps.data());
+        if (i < a->plan.steps.size() && entityStepProblem(*a, i, bounded && !groupLineBound(step)).empty()) return "";
+    }
     if (step.kind == ldml::TransformStep::Kind::Transform) {
         const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
         if (used == nullptr) return "an unknown transform " + step.transform.getText();
@@ -15392,8 +15407,9 @@ StreamSet * UTF8PipelineBuilder::transform(const ldml::TransformEntry * entry, S
 static bool allUTF8Transform(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
                              const ldml::TransformEntry * entry, bool bounded);
 static bool allUTF8Step(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                        const ldml::TransformStep & step, bool bounded) {
-    if (!utf8StepProblem(registry, analyzer, step, bounded).empty()) return false;
+                        const ldml::TransformStep & step, bool bounded,
+                        const TransformAnalysis * a = nullptr, bool entities = false) {
+    if (!utf8StepProblem(registry, analyzer, step, bounded, a, entities).empty()) return false;
     if (step.kind != ldml::TransformStep::Kind::Transform) return true;
     const ldml::TransformEntry * const used = registry.lookup(step.transform.getText());
     return used->isBuiltIn() || allUTF8Transform(registry, analyzer, used, bounded);
@@ -15434,12 +15450,12 @@ struct MixedSegment {
     std::string why;    // of a Unicode segment: why its first step needs it
 };
 static std::vector<MixedSegment> mixedSegments(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
-                                               const TransformAnalysis & a, bool bounded) {
+                                               const TransformAnalysis & a, bool bounded, bool entities = false) {
     const std::vector<ldml::TransformStep> & steps = a.plan.steps;
     const size_t n = steps.size();
     //  restUTF8[k]: steps [k, n) wholly in UTF-8 mode.
     std::vector<bool> restUTF8(n + 1, true);
-    for (size_t k = n; k-- > 0; ) restUTF8[k] = restUTF8[k + 1] && allUTF8Step(registry, analyzer, steps[k], bounded);
+    for (size_t k = n; k-- > 0; ) restUTF8[k] = restUTF8[k + 1] && allUTF8Step(registry, analyzer, steps[k], bounded, &a, entities);
     auto isNull = [&](const ldml::TransformStep & s) {
         if (s.kind != ldml::TransformStep::Kind::Transform || s.filter) return false;
         const ldml::TransformEntry * const e = registry.lookup(s.transform.getText());
@@ -15447,7 +15463,7 @@ static std::vector<MixedSegment> mixedSegments(const ldml::TransformRegistry & r
     };
     std::vector<MixedSegment> segments;
     for (size_t i = 0; i < n; ) {
-        const std::string problem = utf8StepProblem(registry, analyzer, steps[i], bounded);
+        const std::string problem = utf8StepProblem(registry, analyzer, steps[i], bounded, &a, entities);
         if (problem.empty() && restUTF8[i + 1]) {
             //  (Wholly in UTF-8 mode, or a transform in mixed modes itself.)
             if (!segments.empty() && !segments.back().unicode) segments.back().end = i + 1;
@@ -15455,7 +15471,7 @@ static std::vector<MixedSegment> mixedSegments(const ldml::TransformRegistry & r
             i++;
             continue;
         }
-        if (problem.empty() && allUTF8Step(registry, analyzer, steps[i], bounded)) {
+        if (problem.empty() && allUTF8Step(registry, analyzer, steps[i], bounded, &a, entities)) {
             if (!segments.empty() && !segments.back().unicode) segments.back().end = i + 1;
             else segments.push_back({i, i + 1, false, ""});
             i++;
@@ -15537,6 +15553,10 @@ StreamSet * UTF8PipelineBuilder::unicodeSegment(const std::string & label, const
     StreamSet * U21 = U21_Of(mP, Basis);
     TransformAnalysis part = a;
     part.plan.steps.assign(a.plan.steps.begin() + static_cast<std::ptrdiff_t>(i), a.plan.steps.begin() + static_cast<std::ptrdiff_t>(j));
+    if (a.entityGroupOfStep.size() == a.plan.steps.size()) {
+        part.entityGroupOfStep.assign(a.entityGroupOfStep.begin() + static_cast<std::ptrdiff_t>(i),
+                                      a.entityGroupOfStep.begin() + static_cast<std::ptrdiff_t>(j));
+    }
     part.plan.filter = nullptr;
     part.problems.clear();
     part.plan.problems.clear();
@@ -15576,7 +15596,7 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
     //  (Mixed modes: the Unicode segments, see mixedSegments.)
     std::vector<size_t> unicodeEnd(a.plan.steps.size(), 0);
     if (MixedModes) {
-        for (const MixedSegment & m : mixedSegments(mRegistry, mAnalyzer, a, mBounded)) {
+        for (const MixedSegment & m : mixedSegments(mRegistry, mAnalyzer, a, mBounded, EntityGroups && mMasks.empty())) {
             if (m.unicode) unicodeEnd[m.begin] = m.end;
         }
     }
@@ -15600,7 +15620,22 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
             if (step.filter) popFilter();
         } else {
             mGroupLabel = name + "G" + std::to_string(++group);
-            Basis = conversionGroup(step, Basis, outermost);
+            //  (With --entity-groups: a group its entity plan applies, in the
+            //  hybrid, before the other paths; doc/ldml-entity-groups-plan.md.)
+            const std::string notByEntities = !EntityGroups ? std::string("off")
+                : !mMasks.empty() ? std::string("within a filter")
+                : entityStepProblem(a, i, mBounded && !groupLineBound(step));
+            if (EntityGroups && EntityGroupsTrace) {
+                llvm::errs() << "entity groups: " << mGroupLabel << ": "
+                             << (notByEntities.empty() ? "applied" : "not applied: " + notByEntities) << " (UTF-8 mode)\n";
+            }
+            if (EntityGroups && notByEntities.empty()) {
+                const size_t kernels = mP.getNumOfKernelCalls();
+                Basis = entityHybridGroup(a.entityGroups[a.entityGroupOfStep[i]], Basis);
+                if (outermost && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
+            } else {
+                Basis = conversionGroup(step, Basis, outermost);
+            }
         }
         mFrames->end();
         checkMasks(name + ": after step " + std::to_string(i + 1), Basis);
@@ -15610,6 +15645,41 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
     if (a.plan.filter) popFilter();
     mDepth--;
     return Basis;
+}
+
+//  Why a step of an analysis is not applied by its entity plan (outside a
+//  filter), or "": its group's plan, no regions bounding a group whose contexts
+//  are not line-bound, and no parts of other kinds.
+static std::string entityStepProblem(const TransformAnalysis & a, size_t i, bool bounded) {
+    if (!EntityGroups) return "off";
+    const int e = i < a.entityGroupOfStep.size() ? a.entityGroupOfStep[i] : -1;
+    if (e < 0) return "no source group corresponds to the step";
+    const ldml::TransformStep & step = a.plan.steps[i];
+    if (bounded) return "bounded regions";
+    if (step.hasFrontLetters || step.frontLettersEnd || !step.chainRevisitRules.empty() || !step.markRunEditRules.empty()
+        || !step.prefixRuns.empty() || !step.deferred.empty() || !step.copyCaptures.empty()
+        || !step.captureReplacements.empty() || !step.insertions.empty()) return "parts the plan does not cover";
+    return entityStep2Problem(a.entityGroups[e]);
+}
+
+//  A group by its entity plan in the hybrid (see
+//  RulePipelineBuilder::entitySelectorGroup): its selectors spread back to the
+//  last bytes of the characters and applied to the bytes.  (Outside filters.)
+StreamSet * UTF8PipelineBuilder::entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis) {
+    RulePipelineBuilder::ByteSource bytes;
+    bytes.basis = Basis;
+    StreamSet * const index = mP.CreateStreamSet(1, 1);
+    mP.CreateKernelCall<UTF8_index>(Basis, index);
+    bytes.index = index;
+    StreamSet * const ones = mP.CreateStreamSet(1);
+    FilterByMask(mP, index, index, ones);
+    std::vector<std::u32string> strings;
+    StreamSet * const selectors = unicode().entitySelectorGroup(mGroupLabel, plan, ones, bytes, strings);
+    StreamSet * const atBytes = mP.CreateStreamSet(selectors->getNumElements());
+    SpreadByMask(mP, index, selectors, atBytes);
+    PositionMap positions;
+    Basis = UTF8_SelectorPipeline(mP, strings, Basis, atBytes, &positions);
+    return inStep(Staged(Basis, std::move(positions)));
 }
 
 //  A group by the hybrid (see RulePipelineBuilder::selectorGroup): matched one
@@ -16961,21 +17031,62 @@ static std::string entityStep2Problem(const ldml::EntityGroupPlan & p) {
 }
 
 //  The classes of an entity group: the class layer's Div32 code (with its
-//  external sets), or a stream for each of its stream sets.
+//  external sets), a stream for each of its stream sets (Unicode mode), or the
+//  multiplexed code of its coded sets (UTF-8 mode, the hybrid's, where the
+//  class layer does not apply; see absolutely).
 struct EntityCoding {
     bool layered = false;
+    bool muxed = false;
     ClassLayerCoding layer;
+    //  (muxed: the classes of the code's bits, and the partition of the
+    //  codepoints, by its ranges, each with its code.)
+    std::vector<UCD::UnicodeSet> muxBits;
+    std::vector<std::pair<UCD::codepoint_t, unsigned>> partition;
     std::vector<UCD::UnicodeSet> codedSets;     // (layered: the sets of layer.codes and layer.external)
     std::vector<UCD::UnicodeSet> streamSets;    // (otherwise)
+    bool coding() const {return layered || muxed;}
     //  The index of a set among the coded or stream sets, or -1.
     int indexOf(const UCD::UnicodeSet & s) const {
-        const std::vector<UCD::UnicodeSet> & sets = layered ? codedSets : streamSets;
+        const std::vector<UCD::UnicodeSet> & sets = coding() ? codedSets : streamSets;
         for (size_t i = 0; i < sets.size(); i++) if (sets[i] == s) return static_cast<int>(i);
         return -1;
+    }
+    //  The codes of a set (exact, or false: a set the code does not express).
+    bool codesOf(const UCD::UnicodeSet & s, UCD::UnicodeSet & codes) const {
+        if (layered) {
+            if (!coded(s)) return false;
+            codes = pseudoCodes(s, layer.blocks);
+            return true;
+        }
+        if (!muxed) return false;
+        codes = UCD::UnicodeSet();
+        UCD::UnicodeSet covered;
+        for (size_t i = 0; i < partition.size(); i++) {
+            const UCD::codepoint_t lo = partition[i].first;
+            const UCD::codepoint_t hi = i + 1 < partition.size() ? partition[i + 1].first - 1 : UCD::UNICODE_MAX;
+            const UCD::UnicodeSet range(lo, hi);
+            if ((range & s).empty()) continue;
+            codes.insert(partition[i].second);
+            covered = covered + range;
+        }
+        //  (Exact if every part met lies within the set: the codes are then those
+        //  of exactly its characters, as each code's parts are met together.)
+        UCD::UnicodeSet all;
+        for (size_t i = 0; i < partition.size(); i++) {
+            if (!codes.contains(partition[i].second)) continue;
+            const UCD::codepoint_t lo = partition[i].first;
+            const UCD::codepoint_t hi = i + 1 < partition.size() ? partition[i + 1].first - 1 : UCD::UNICODE_MAX;
+            all = all + UCD::UnicodeSet(lo, hi);
+        }
+        return all == s;
     }
     //  Whether a set (any set within the blocks, such as part of a string
     //  set) has codes of the layer: not external, and within its blocks.
     bool coded(const UCD::UnicodeSet & s) const {
+        if (muxed) {
+            UCD::UnicodeSet codes;
+            return codesOf(s, codes);
+        }
         if (!layered) return false;
         const int i = indexOf(s);
         if (i >= 0) return layer.external[i] < 0;
@@ -16984,12 +17095,16 @@ struct EntityCoding {
         }
         return true;
     }
+    //  The classes of the code's bits (layered or muxed).
+    const std::vector<UCD::UnicodeSet> & bits() const {return layered ? layer.bits : muxBits;}
     std::string signature() const {
-        std::string sig = layered ? "L" : "S";
+        std::string sig = layered ? "L" : muxed ? "M" : "S";
         if (layered) {
             for (UCD::codepoint_t b : layer.blocks) sig += std::to_string(b) + ",";
             sig += "|";
             for (const UCD::UnicodeSet & e : layer.externalSets) sig += setKey(e) + ";";
+        } else if (muxed) {
+            for (const auto & [cp, code] : partition) sig += std::to_string(cp) + ":" + std::to_string(code) + ",";
         } else {
             for (const UCD::UnicodeSet & s : streamSets) sig += setKey(s) + ";";
         }
@@ -16997,11 +17112,34 @@ struct EntityCoding {
     }
 };
 
-static EntityCoding entityCoding(const ldml::EntityGroupPlan & p) {
+//  The coding of an entity group's classes: in UTF-8 mode (the hybrid) a code,
+//  the class layer's or the multiplexed one.
+static EntityCoding entityCoding(const ldml::EntityGroupPlan & p, bool utf8 = false) {
     EntityCoding c;
     c.layered = entityClassLayer(p, c.layer);
+    if (c.layered) c.codedSets = p.codedSets;
+    //  (The hybrid reads no 21-bit basis: every string set must have codes.)
+    if (c.layered && utf8) {
+        for (const ldml::Entity & x : p.entities) {
+            if (x.kind != ldml::Entity::Kind::StringSet) continue;
+            bool coded = c.coded(x.chars);
+            for (const std::u32string & str : x.strings) {
+                for (char32_t ch : str) coded = coded && c.coded(UCD::UnicodeSet(static_cast<UCD::codepoint_t>(ch)));
+            }
+            if (!coded) c.layered = false;
+        }
+        if (!c.layered) c.codedSets.clear();
+    }
     if (c.layered) {
+    } else if (utf8) {
+        c.muxed = true;
         c.codedSets = p.codedSets;
+        cc::CC_Set ccs;
+        for (const UCD::UnicodeSet & s : p.codedSets) ccs.push_back(re::makeCC(UCD::UnicodeSet(s), &cc::Unicode));
+        if (ccs.empty()) ccs.push_back(re::makeCC(UCD::UnicodeSet(0), &cc::Unicode));
+        std::unique_ptr<cc::MultiplexedAlphabet> mpx(cc::makeMultiplexedAlphabet("entity_classes", ccs));
+        for (const re::CC * bit : mpx->getMultiplexedCCs()) c.muxBits.push_back(*bit);
+        c.partition = mpx->getPartition();
     } else {
         c.streamSets = p.streamSets;
     }
@@ -17089,10 +17227,12 @@ public:
     EntityMatch(LLVMTypeSystemInterface & ts, const ldml::EntityGroupPlan & plan, const EntityCoding & coding,
                 const std::string & label, StreamSet * Classes, StreamSet * Externals, StreamSet * InText,
                 const std::vector<StreamSet *> & Props, const std::vector<StreamSet *> & StringSets,
-                StreamSet * W, StreamSet * Deleted, StreamSet * Ins)
-    : PabloKernel(ts, "EntityMatch_" + label + "_" + getStringHash(signatureOf(plan, coding)),
-                  {}, outputs(W, Deleted, Ins))
-    , mPlan(plan), mCoding(coding), mSignature(signatureOf(plan, coding)) {
+                StreamSet * W, StreamSet * Deleted, StreamSet * Ins,
+                const std::vector<unsigned> & selectors = {}, unsigned deletionSelector = 0, StreamSet * Sel = nullptr)
+    : PabloKernel(ts, "EntityMatch_" + label + "_" + getStringHash(signatureOf(plan, coding, selectors, deletionSelector)),
+                  {}, outputs(W, Deleted, Ins, Sel))
+    , mPlan(plan), mCoding(coding), mSignature(signatureOf(plan, coding, selectors, deletionSelector))
+    , mSelectors(selectors), mDeletionSelector(deletionSelector) {
         const unsigned la = lookahead(plan);
         auto in = [&](const std::string & name, StreamSet * s) {
             if (la > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(), LookAhead(la)});
@@ -17120,8 +17260,14 @@ public:
         for (const ldml::EntityRule & r : p.rules) if (r.result.empty() || r.maxLength > 1) return true;
         return false;
     }
-    static std::string signatureOf(const ldml::EntityGroupPlan & p, const EntityCoding & c) {
+    static std::string signatureOf(const ldml::EntityGroupPlan & p, const EntityCoding & c,
+                                   const std::vector<unsigned> & selectors, unsigned deletionSelector) {
         std::string sig = c.signature() + "#";
+        if (!selectors.empty()) {
+            sig += "sel:";
+            for (unsigned x : selectors) sig += std::to_string(x) + ",";
+            sig += "del:" + std::to_string(deletionSelector) + "#";
+        }
         for (const ldml::EntityRule & r : p.rules) {
             sig += entityItemsKey(p, r.items) + "/" + entityItemsKey(p, r.after) + "→";
             for (char32_t ch : r.result) sig += std::to_string(static_cast<unsigned>(ch)) + " ";
@@ -17140,13 +17286,17 @@ protected:
     llvm::StringRef getSignature() const override {return mSignature;}
     void generatePabloMethod() override;
 private:
-    static Bindings outputs(StreamSet * W, StreamSet * Deleted, StreamSet * Ins) {
+    static Bindings outputs(StreamSet * W, StreamSet * Deleted, StreamSet * Ins, StreamSet * Sel) {
+        if (Sel) return Bindings{Binding{"Sel", Sel}};
         Bindings b{Binding{"W", W}, Binding{"Deleted", Deleted}};
         if (Ins) b.emplace_back("Ins", Ins);
         return b;
     }
     const ldml::EntityGroupPlan mPlan;
     const EntityCoding mCoding;
+    //  (The hybrid: the selector of each rule's result, and of the deletion.)
+    const std::vector<unsigned> mSelectors;
+    const unsigned mDeletionSelector;
     const std::string mSignature;
     bool mHasExternals = false;
     bool mHasIns = false;
@@ -17183,10 +17333,10 @@ void EntityMatch::generatePabloMethod() {
         if (f != classMemo.end()) return f->second;
         PabloAST * r;
         const int i = mCoding.indexOf(set);
-        if (!mCoding.layered) {
+        if (!mCoding.coding()) {
             if (LLVM_UNLIKELY(i < 0)) llvm::report_fatal_error("EntityMatch: a set without a class stream");
             r = at(classes[i], o);
-        } else if (i >= 0 && mCoding.layer.external[i] >= 0) {
+        } else if (mCoding.layered && i >= 0 && mCoding.layer.external[i] >= 0) {
             r = at(externals[mCoding.layer.external[i]], o);
         } else {
             auto & c = compilers[o];
@@ -17196,7 +17346,8 @@ void EntityMatch::generatePabloMethod() {
                 bits.resize(std::max<size_t>(bits.size(), 21), zeroes);
                 c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
             }
-            const UCD::UnicodeSet codes = pseudoCodes(set, mCoding.layer.blocks);
+            UCD::UnicodeSet codes;
+            if (LLVM_UNLIKELY(!mCoding.codesOf(set, codes))) llvm::report_fatal_error("EntityMatch: a set the code does not express");
             r = pb.createAnd(c->compileCC(re::makeCC(UCD::UnicodeSet(codes), &cc::Unicode), pb), at(inText, o));
         }
         classMemo.emplace(std::make_pair(key, o), r);
@@ -17446,6 +17597,20 @@ void EntityMatch::generatePabloMethod() {
             }
         }
     }
+    //  The hybrid: the selector of the result of the rule applied at the first
+    //  position of each match, and of the deletion at the others.
+    if (!mSelectors.empty()) {
+        const unsigned selBits = getOutputStreamSet(0)->getNumElements();
+        std::vector<PabloAST *> sel(selBits, zeroes);
+        PabloAST * const rest = interiorOf(pb, startLen);
+        for (unsigned b = 0; b < selBits; b++) {
+            for (size_t i = 0; i < wins.size(); i++) if ((mSelectors[i] >> b) & 1) sel[b] = pb.createOr(sel[b], wins[i]);
+            if ((mDeletionSelector >> b) & 1) sel[b] = pb.createOr(sel[b], rest);
+            sel[b] = pb.createInFile(sel[b]);
+        }
+        writeOutputStreamSet("Sel", sel);
+        return;
+    }
     //  W: the rule's index + 1.
     const unsigned wBits = getOutputStreamSet(0)->getNumElements();
     std::vector<PabloAST *> w(wBits, zeroes);
@@ -17522,38 +17687,51 @@ private:
     std::vector<std::u32string> mResults;
 };
 
-Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21) {
+//  The inputs of an entity group's EntityMatch (see entityGroup): its classes
+//  (a stream each, or the bits of a code and the external sets), the positions
+//  of the text, its properties and its string sets.  In the hybrid (mBytes),
+//  computed on the bytes and compressed to one position per character by the
+//  index (classKernel), U21 being the positions of the characters.
+struct EntityInputs {
+    StreamSet * classes = nullptr;
+    StreamSet * externals = nullptr;
+    StreamSet * inText = nullptr;
+    std::vector<StreamSet *> props;
+    std::vector<StreamSet *> stringSets;
+};
+
+EntityInputs RulePipelineBuilder::entityInputs(const ldml::EntityGroupPlan & plan, const EntityCoding & coding, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    const EntityCoding coding = entityCoding(plan);
+    EntityInputs in;
     if (EntityGroupsTrace) {
         llvm::errs() << "entity groups: " << mGroupLabel << ": code "
                      << (coding.layered ? "div32 (" + std::to_string(coding.layer.bits.size()) + " bits, "
                                           + std::to_string(coding.layer.externalSets.size()) + " external sets)"
-                                        : "streams (" + std::to_string(coding.streamSets.size()) + ")") << "\n";
+                         : coding.muxed ? "multiplexed (" + std::to_string(coding.muxBits.size()) + " bits)"
+                                        : "streams (" + std::to_string(coding.streamSets.size()) + ")")
+                     << (mBytes ? ", on the bytes" : "") << "\n";
     }
-    //  The classes: the bits of the class layer's code (and its external sets),
+    //  The classes: the bits of the code (and the class layer's external sets),
     //  or a stream for each stream set.
     std::vector<re::CC *> ccs;
-    if (coding.layered) {
-        for (const UCD::UnicodeSet & b : coding.layer.bits) ccs.push_back(re::makeCC(UCD::UnicodeSet(b), &cc::Unicode));
+    if (coding.coding()) {
+        for (const UCD::UnicodeSet & b : coding.bits()) ccs.push_back(re::makeCC(UCD::UnicodeSet(b), &cc::Unicode));
     } else {
         for (const UCD::UnicodeSet & s : coding.streamSets) ccs.push_back(re::makeCC(UCD::UnicodeSet(s), &cc::Unicode));
     }
     if (ccs.empty()) ccs.push_back(re::makeCC(&cc::Unicode));
-    StreamSet * const Classes = P.CreateStreamSet(ccs.size());
-    P.CreateKernelCall<CharClassesKernel>(ccs, U21, Classes);
-    SHOW_STREAM(Classes);
-    StreamSet * Externals = nullptr;
+    in.classes = P.CreateStreamSet(ccs.size());
+    classKernel(ccs, U21, in.classes);
+    SHOW_STREAM(in.classes);
     if (coding.layered && !coding.layer.externalSets.empty()) {
         std::vector<re::CC *> ext;
         for (const UCD::UnicodeSet & e : coding.layer.externalSets) ext.push_back(re::makeCC(UCD::UnicodeSet(e), &cc::Unicode));
-        Externals = P.CreateStreamSet(ext.size());
-        P.CreateKernelCall<CharClassesKernel>(ext, U21, Externals);
+        in.externals = P.CreateStreamSet(ext.size());
+        classKernel(ext, U21, in.externals);
     }
-    StreamSet * const InText = P.CreateStreamSet(1);
-    P.CreateKernelCall<TextPositions>(U21, InText);
+    in.inText = P.CreateStreamSet(1);
+    P.CreateKernelCall<TextPositions>(U21, in.inText);
     //  The properties, each by a kernel of its own (shared across groups).
-    std::vector<StreamSet *> props;
     for (size_t e : entitiesOfKind(plan, ldml::Entity::Kind::Property)) {
         const re::PropertyExpression * pe = cast<re::PropertyExpression>(plan.entities[e].re);
         re::PropertyExpression * const copy = re::makePropertyExpression(pe->getKind(), pe->getPropertyIdentifier(),
@@ -17561,26 +17739,48 @@ Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, Stre
         UCD::linkProperties(copy);
         UCD::resolveProperties(UCD::standardizeProperties(copy));
         StreamSet * const stream = P.CreateStreamSet(1);
-        P.CreateKernelCall<UnicodePropertyKernelBuilder>(copy, U21, stream);
-        props.push_back(stream);
+        if (mBytes) {
+            StreamSet * const atBytes = P.CreateStreamSet(1);
+            P.CreateKernelCall<UnicodePropertyKernelBuilder>(copy, mBytes->basis, atBytes);
+            FilterByMask(P, mBytes->index, atBytes, stream);
+        } else {
+            P.CreateKernelCall<UnicodePropertyKernelBuilder>(copy, U21, stream);
+        }
+        in.props.push_back(stream);
     }
     //  The string sets, over the code's bits where their sets have codes, or the
     //  21-bit basis.
-    std::vector<StreamSet *> stringSets;
     for (size_t e : entitiesOfKind(plan, ldml::Entity::Kind::StringSet)) {
         const ldml::Entity & x = plan.entities[e];
-        bool coded = coding.layered && coding.coded(x.chars);
-        for (const std::u32string & s : x.strings) {
-            for (char32_t c : s) coded = coded && coding.coded(UCD::UnicodeSet(static_cast<UCD::codepoint_t>(c)));
+        bool coded = coding.coding() && coding.coded(x.chars);
+        for (const std::u32string & str : x.strings) {
+            for (char32_t c : str) coded = coded && coding.coded(UCD::UnicodeSet(static_cast<UCD::codepoint_t>(c)));
         }
+        if (LLVM_UNLIKELY(mBytes && !coded)) llvm::report_fatal_error("xlit: a string set the hybrid's code does not express");
         std::function<UCD::UnicodeSet (const UCD::UnicodeSet &)> code;
-        if (coded) code = [&](const UCD::UnicodeSet & s) {return pseudoCodes(s, coding.layer.blocks);};
+        if (coded) code = [&](const UCD::UnicodeSet & s) {
+            UCD::UnicodeSet codes;
+            if (LLVM_UNLIKELY(!coding.codesOf(s, codes))) llvm::report_fatal_error("xlit: a set of a string set without codes");
+            return codes;
+        };
         const kernel::StringSetSpec spec = kernel::makeStringSetSpec(x.chars, x.strings, false, code);
         StreamSet * const lengths = P.CreateStreamSet(spec.lengths.size());
-        P.CreateKernelCall<kernel::StringSetKernel>(spec, coded ? Classes : U21, lengths);
+        P.CreateKernelCall<kernel::StringSetKernel>(spec, coded ? in.classes : U21, lengths);
         SHOW_STREAM(lengths);
-        stringSets.push_back(lengths);
+        in.stringSets.push_back(lengths);
     }
+    return in;
+}
+
+Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    const EntityCoding coding = entityCoding(plan);
+    const EntityInputs in = entityInputs(plan, coding, U21);
+    StreamSet * const Classes = in.classes;
+    StreamSet * const Externals = in.externals;
+    StreamSet * const InText = in.inText;
+    const std::vector<StreamSet *> & props = in.props;
+    const std::vector<StreamSet *> & stringSets = in.stringSets;
     const unsigned wBits = bitsFor(plan.rules.size());
     StreamSet * W = P.CreateStreamSet(wBits);
     StreamSet * Deleted = P.CreateStreamSet(1);
@@ -17615,6 +17815,36 @@ Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, Stre
     FilterByMask(P, keep, Out, filtered);
     positions.remove(keep);
     return Staged(filtered, std::move(positions));
+}
+
+//  A group by its entity plan in the hybrid (UTF-8 mode, see selectorGroup):
+//  matched one position per character (Ones) on classes of the bytes
+//  compressed by the index, its results as selectors (the result's string at
+//  the first position of each match, deletions at the others).  Returns the
+//  selectors, with their strings.
+StreamSet * RulePipelineBuilder::entitySelectorGroup(const std::string & label, const ldml::EntityGroupPlan & plan,
+                                                    StreamSet * Ones, const ByteSource & bytes, std::vector<std::u32string> & strings) {
+    const std::string saved = mTransformLabel;
+    const std::string savedGroup = mGroupLabel;
+    mGroupLabel = label;
+    mBytes = &bytes;
+    mSelectorStrings.clear();
+    mSelectorIds.clear();
+    std::vector<unsigned> selectors;
+    for (const ldml::EntityRule & r : plan.rules) selectors.push_back(static_cast<unsigned>(selectorFor(r.result)));
+    const unsigned deletion = static_cast<unsigned>(selectorFor(U""));
+    PipelineBuilder & P = mP;
+    const EntityCoding coding = entityCoding(plan, true);
+    const EntityInputs in = entityInputs(plan, coding, Ones);
+    StreamSet * const Sel = mP.CreateStreamSet(bitsFor(mSelectorStrings.size()));
+    mP.CreateKernelCall<EntityMatch>(plan, coding, label, in.classes, in.externals, in.inText, in.props, in.stringSets,
+                                     nullptr, nullptr, nullptr, selectors, deletion, Sel);
+    SHOW_BIXNUM(Sel);
+    strings = mSelectorStrings;
+    mBytes = nullptr;
+    mGroupLabel = savedGroup;
+    mTransformLabel = saved;
+    return Sel;
 }
 
 //  --entity-report: the entity plan of each conversion group (see
@@ -18467,21 +18697,23 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
         };
         toolio::out() << "  mode: mixed:";
         const char * sep = "";
-        for (const MixedSegment & m : mixedSegments(analyzer.registry(), analyzer, analyzer.analyze(entry), bounded)) {
+        const TransformAnalysis & analysis = analyzer.analyze(entry);
+        const bool entities = EntityGroups && !analysis.plan.filter;
+        for (const MixedSegment & m : mixedSegments(analyzer.registry(), analyzer, analysis, bounded, entities)) {
             if (m.unicode) {
                 toolio::out() << sep << range(m.begin, m.end) << " Unicode (" << m.why << ")";
                 sep = ";";
                 continue;
             }
             for (size_t i = m.begin; i < m.end; ) {
-                if (!allUTF8Step(analyzer.registry(), analyzer, steps[i], bounded)) {
+                if (!allUTF8Step(analyzer.registry(), analyzer, steps[i], bounded, &analysis, entities)) {
                     toolio::out() << sep << range(i, i + 1) << " mixed (" << steps[i].transform.getText() << ")";
                     sep = ";";
                     i++;
                     continue;
                 }
                 size_t j = i + 1;
-                while (j < m.end && allUTF8Step(analyzer.registry(), analyzer, steps[j], bounded)) j++;
+                while (j < m.end && allUTF8Step(analyzer.registry(), analyzer, steps[j], bounded, &analysis, entities)) j++;
                 toolio::out() << sep << range(i, j) << " UTF-8";
                 sep = ";";
                 i = j;

@@ -82,6 +82,7 @@
 #include <kernel/bitwise/bixnum_kernel.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
+#include <kernel/scan/scan.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/position_map.h>
@@ -369,6 +370,14 @@ static cl::opt<bool> ClassLayer("class-layer",
     cl::desc("In UTF-8 mode, give a fused kernel with many rules over many Div32 blocks its classes as Div32 codes and "
              "decide its rules in Ifs by the blocks of their first characters (default on)"),
     cl::init(true), cl::cat(XlitOptions));
+//  (Debugging: for each kernel given the class layer's Div32 code, the classes
+//  also computed as the multiplexed code, and every class compared at every
+//  position of the text: the differences reported on stderr; see
+//  ClassLayerCheck.)
+static cl::opt<bool> ClassLayerCheckOption("class-layer-check",
+    cl::desc("Compute the classes of each kernel with the class layer both as its Div32 code and as the multiplexed "
+             "code, and report the positions where a class differs (debugging), to stderr"),
+    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> ClassLayerReport("class-layer-report",
     cl::desc("Report, for each FusedRules kernel constructed, its classes as a DivCode class layer would have them "
              "(explicit and external sets, Div32 blocks, code bits, level-1 leaves), to stderr"),
@@ -6758,6 +6767,87 @@ static std::string shortText(const std::vector<UCD::UnicodeSet> & text) {
     return out;
 }
 
+//  --class-layer-check: the classes of a kernel's sets compiled from the
+//  multiplexed code (Mux, with the codes muxCodes) and from the class layer's
+//  Div32 code (Div: the code's bits, then the external sets' streams; codes
+//  divCodes, external), compared within the text.  Diff: the positions where any
+//  class differs; Info, at these: (check << 9) | (the first class differing + 1),
+//  16 bits.
+class ClassLayerCheck final : public pablo::PabloKernel {
+public:
+    ClassLayerCheck(LLVMTypeSystemInterface & ts, unsigned check, std::vector<UCD::UnicodeSet> muxCodes,
+                    std::vector<UCD::UnicodeSet> divCodes, std::vector<int> external, unsigned divCodeBits,
+                    StreamSet * Mux, StreamSet * Div, StreamSet * InText, StreamSet * Diff, StreamSet * Info)
+    : PabloKernel(ts, "ClassLayerCheck_" + std::to_string(check) + "_" + getStringHash(signature(muxCodes, divCodes, external, divCodeBits)),
+                  {Binding{"Mux", Mux}, Binding{"Div", Div}, Binding{"InText", InText}},
+                  {Binding{"Diff", Diff}, Binding{"Info", Info}}),
+      mCheck(check), mMuxCodes(std::move(muxCodes)), mDivCodes(std::move(divCodes)), mExternal(std::move(external)),
+      mDivCodeBits(divCodeBits) {}
+protected:
+    void generatePabloMethod() override {
+        pablo::PabloBuilder pb(getEntryScope());
+        std::vector<pablo::PabloAST *> mux = getInputStreamSet("Mux");
+        std::vector<pablo::PabloAST *> divAll = getInputStreamSet("Div");
+        pablo::PabloAST * const inText = getInputStreamSet("InText")[0];
+        std::vector<pablo::PabloAST *> div(divAll.begin(), divAll.begin() + mDivCodeBits);
+        pablo::PabloAST * const zeroes = pb.createZeroes();
+        mux.resize(std::max<size_t>(mux.size(), 21), zeroes);
+        div.resize(std::max<size_t>(div.size(), 21), zeroes);
+        cc::Parabix_CC_Compiler_Builder muxCompiler(mux), divCompiler(div);
+        auto compile = [&](cc::Parabix_CC_Compiler_Builder & c, const UCD::UnicodeSet & codes) -> pablo::PabloAST * {
+            if (codes.empty()) return zeroes;
+            return c.compileCC(re::makeCC(codes, &cc::Unicode), pb);
+        };
+        pablo::PabloAST * seen = zeroes;
+        std::vector<pablo::PabloAST *> info(16, zeroes);
+        for (size_t i = 0; i < mMuxCodes.size(); i++) {
+            pablo::PabloAST * const m = compile(muxCompiler, mMuxCodes[i]);
+            pablo::PabloAST * const d = mExternal[i] >= 0 ? divAll[mDivCodeBits + static_cast<unsigned>(mExternal[i])]
+                                                          : compile(divCompiler, mDivCodes[i]);
+            pablo::PabloAST * const diff = pb.createAnd(inText, pb.createXor(m, d));
+            pablo::PabloAST * const first = pb.createAnd(diff, pb.createNot(seen));
+            seen = pb.createOr(seen, diff);
+            const unsigned value = (mCheck << 9) | static_cast<unsigned>(i + 1);
+            for (unsigned b = 0; b < 16; b++) {
+                if ((value >> b) & 1) info[b] = pb.createOr(info[b], first);
+            }
+        }
+        for (unsigned b = 0; b < 16; b++) {
+            if ((mCheck << 9) >> b & 1) info[b] = pb.createOr(info[b], seen);
+        }
+        writeOutputStreamSet("Diff", std::vector<pablo::PabloAST *>{seen});
+        writeOutputStreamSet("Info", info);
+    }
+private:
+    static std::string signature(const std::vector<UCD::UnicodeSet> & m, const std::vector<UCD::UnicodeSet> & d,
+                                 const std::vector<int> & e, unsigned bits) {
+        std::string s = std::to_string(bits);
+        for (size_t i = 0; i < m.size(); i++) s += "|" + setKey(m[i]) + "/" + setKey(d[i]) + "/" + std::to_string(e[i]);
+        return s;
+    }
+    const unsigned mCheck;
+    const std::vector<UCD::UnicodeSet> mMuxCodes, mDivCodes;
+    const std::vector<int> mExternal;
+    const unsigned mDivCodeBits;
+};
+
+//  The kernels checked by --class-layer-check: the sets of each, by its number.
+static std::vector<std::vector<UCD::UnicodeSet>> ClassLayerChecks;
+static size_t ClassLayerCheckDiffs = 0;
+
+extern "C" void xlit_class_layer_diff(const uint16_t * info, uint64_t position) {
+    const unsigned check = *info >> 9, cls = *info & 0x1FF;
+    ClassLayerCheckDiffs++;
+    if (ClassLayerCheckDiffs > 50) return;
+    std::string set = "?";
+    if (check < ClassLayerChecks.size() && cls >= 1 && cls <= ClassLayerChecks[check].size()) {
+        const UCD::UnicodeSet & u = ClassLayerChecks[check][cls - 1];
+        set = std::to_string(u.size()) + " characters, from U+" + llvm::utohexstr(u.front().first);
+    }
+    llvm::errs() << "class layer check " << check << ": position " << position << ": class " << (cls ? cls - 1 : 0)
+                 << " differs (" << set << ")\n";
+}
+
 void FusedRules::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     StatementAttribution attr;
@@ -12770,6 +12860,39 @@ Staged RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, St
             if (layered) for (const UCD::UnicodeSet & e : layer.externalSets) bits.push_back(re::makeCC(e, &cc::Unicode));
             StreamSet * const codes = P.CreateStreamSet(bits.size());
             classKernel(bits, U21, codes);
+            if (layered && ClassLayerCheckOption) {
+                //  (--class-layer-check: the multiplexed code too, both compared.)
+                const auto mpx = multiplexedClasses(sets);
+                std::vector<re::CC *> muxBits;
+                for (const UCD::UnicodeSet & b : mpx.first) muxBits.push_back(re::makeCC(b, &cc::Unicode));
+                StreamSet * const mux = P.CreateStreamSet(muxBits.size());
+                classKernel(muxBits, U21, mux);
+                const unsigned check = static_cast<unsigned>(ClassLayerChecks.size());
+                ClassLayerChecks.push_back(sets);
+                StreamSet * const diff = P.CreateStreamSet(1);
+                StreamSet * const info = P.CreateStreamSet(16);
+                P.CreateKernelCall<ClassLayerCheck>(check, mpx.second, layer.codes, layer.external,
+                                                    classLayerCodeBits(layer.blocks.size()), mux, codes, inText, diff, info);
+                StreamSet * const infoValues = P.CreateStreamSet(1, 16);
+                P.CreateKernelCall<P2S16Kernel>(info, infoValues);
+                StreamSet * const indices = P.CreateStreamSet(1, 64);
+                P.CreateKernelCall<ScanIndexGenerator>(diff, indices);
+                Kernel * const reader = P.CreateKernelCall<ScanReader>(infoValues, indices, std::string("xlit_class_layer_diff"),
+                                                                       std::initializer_list<StreamSet *>{indices});
+                P.LinkFunction(reader, "xlit_class_layer_diff", xlit_class_layer_diff);
+                errs() << "class layer check " << check << ": " << sets.size() << " classes, " << layer.blocks.size()
+                       << " blocks, " << layer.externalSets.size() << " external; blocks:";
+                for (UCD::codepoint_t b : layer.blocks) errs() << " " << llvm::utohexstr(b << ClassLayerShift);
+                errs() << "\n";
+                for (const UCD::UnicodeSet & e : layer.externalSets) {
+                    errs() << "class layer check " << check << ": external:";
+                    for (const auto & r : e) {
+                        errs() << " " << llvm::utohexstr(r.first);
+                        if (r.second != r.first) errs() << "-" << llvm::utohexstr(r.second);
+                    }
+                    errs() << "\n";
+                }
+            }
             return codes;
         }
         //  The classes of the multiplexed mapping numbers in kernels of their own

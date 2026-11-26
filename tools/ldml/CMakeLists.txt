@@ -29,6 +29,7 @@ DEPS
     kernel.bitwise
     kernel.io
     kernel.pipeline
+    kernel.scan
     kernel.streamutils
     kernel.unicode
     kernel.unicode.normalization

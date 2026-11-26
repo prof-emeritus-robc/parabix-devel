@@ -2277,3 +2277,24 @@ external sets, in both modes); all 53 xlit and ldml tests, `greptest` and
 
 Not yet: timing (#289 with and without the layer, at 4 threads, with the
 outputs compared), and step 4f (Ifs on the first character within a block).
+
+### 13.18 Step 4f (2026-11-26): Ifs on the first character within a leaf
+
+`--class-layer-char-ifs` (default on; `nK` in the kernel signature when off):
+a leaf of the class layer with 8 or more string rules
+(`ClassLayerCharIfRules`) beginning with two or more characters has a second
+level of Ifs. The string rules whose first sets in the leaf's block have at
+most 4 characters (`ClassLayerCharIfChars`) are split by these characters,
+each character's in an If on it (its class from the code, in the leaf's
+scope) within the leaf's If; the other string rules and the subgroups stay in
+the leaf's body (not duplicated). A block holding both common and rare first
+characters (und_FONIPA-ar's vowels and `ʔ`, the rare vowels with diacritics)
+then skips the rare characters' rules where they are absent.
+
+Checks: Hant-Hans and Hans-Hant on `nat-zh.txt`, am_Ethi-am_Ethi/Geminate on
+`pool-am.txt` the same with the second level and without it;
+`xlit_class_layer_test.py` (its kernels with 40 more Ifs with the second level:
+584 against 544); und_FONIPA-ar identical to step 1's; the xlit and ldml tests.
+
+Not yet: timing, and whether the thresholds (8 rules, 4 characters) suit
+the kernels of 13.13 (structural choices, as the criterion's).

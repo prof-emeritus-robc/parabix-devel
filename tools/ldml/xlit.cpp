@@ -378,6 +378,12 @@ static cl::opt<bool> ClassLayerCheckOption("class-layer-check",
     cl::desc("Compute the classes of each kernel with the class layer both as its Div32 code and as the multiplexed "
              "code, and report the positions where a class differs (debugging), to stderr"),
     cl::init(false), cl::cat(XlitOptions));
+//  With the class layer, a second level of Ifs within a leaf: on each first
+//  character of its string rules (doc/ldml-divcode-plan.md §13.5, step 4f).
+static cl::opt<bool> ClassLayerCharIfs("class-layer-char-ifs",
+    cl::desc("With the class layer, decide the string rules of a leaf with many in Ifs on their first characters "
+             "(default on)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> ClassLayerReport("class-layer-report",
     cl::desc("Report, for each FusedRules kernel constructed, its classes as a DivCode class layer would have them "
              "(explicit and external sets, Div32 blocks, code bits, level-1 leaves), to stderr"),
@@ -6575,6 +6581,7 @@ private:
             for (UCD::codepoint_t b : c.classBlocks) s += std::to_string(b) + ",";
             if (!c.absolute) for (const UCD::UnicodeSet & codes : c.classCodes) s += setKey(codes) + ";";
             for (int e : c.classExternal) s += "e" + std::to_string(e);
+            if (!ClassLayerCharIfs) s += "nK";
         }
         if (c.absolute) {
             s += "Ab" + std::to_string(c.deletionSelector);
@@ -7102,9 +7109,18 @@ void FusedRules::generatePabloMethod() {
     //  ClassLayerMaxSetBlocks blocks, or given by streams, at the top (in the
     //  entry scope).  forLeaves builds the body for each, a leaf's in an If on
     //  the characters of its block.
+    //  With --class-layer-char-ifs (step 4f), a leaf of ClassLayerCharIfRules or
+    //  more string rules beginning with two or more characters has a second
+    //  level: the string rules whose first sets in the block have at most
+    //  ClassLayerCharIfChars characters, split by these characters (chars), each
+    //  character's in an If on it within the leaf's; the others, and the
+    //  subgroups, in the leaf's body.
+    static constexpr size_t ClassLayerCharIfRules = 8, ClassLayerCharIfChars = 4;
+    using LeafRules = std::vector<std::pair<size_t, UCD::UnicodeSet>>;
     struct ClassLeaf {
         UCD::codepoint_t block = 0;
-        std::vector<std::pair<size_t, UCD::UnicodeSet>> strings, subgroups;
+        LeafRules strings, subgroups;
+        std::map<UCD::codepoint_t, LeafRules> chars;
     };
     std::map<UCD::codepoint_t, ClassLeaf> classLeaves;
     ClassLeaf topLeaf;
@@ -7131,6 +7147,24 @@ void FusedRules::generatePabloMethod() {
             const FusedSubgroup & sg = mConfig.subgroups[g];
             place(false, g, FusedSubgroupPlan(sg, mConfig.absolute).all, sg.match >= 0 || sg.afterMatch >= 0);
         }
+        for (auto & e : classLeaves) {
+            ClassLeaf & l = e.second;
+            if (!ClassLayerCharIfs || l.strings.size() < ClassLayerCharIfRules) continue;
+            std::map<UCD::codepoint_t, LeafRules> chars;
+            LeafRules stay;
+            for (const auto & r : l.strings) {
+                if (r.second.size() > ClassLayerCharIfChars) {
+                    stay.push_back(r);
+                    continue;
+                }
+                for (const auto & range : r.second) {
+                    for (UCD::codepoint_t c = range.first; c <= range.second; c++) chars[c].emplace_back(r.first, UCD::UnicodeSet(c));
+                }
+            }
+            if (chars.size() < 2) continue;
+            l.strings = std::move(stay);
+            l.chars = std::move(chars);
+        }
     }
     unsigned scopes = 0;
     auto forLeaves = [&](const std::function<void (const ClassLeaf &)> & body) {
@@ -7144,6 +7178,21 @@ void FusedRules::generatePabloMethod() {
             cb = &ib;
             leafScope = ++scopes;
             body(l);
+            //  (The second level: an If on each first character, in the leaf's.)
+            const unsigned scope = leafScope;
+            for (const auto & c : l.chars) {
+                PabloAST * const charCondition = classIn(ib, scope, 0, UCD::UnicodeSet(c.first));
+                PabloBuilder iib = ib.createScope();
+                cb = &iib;
+                leafScope = ++scopes;
+                ClassLeaf charLeaf;
+                charLeaf.block = l.block;
+                charLeaf.strings = c.second;
+                body(charLeaf);
+                cb = &ib;
+                leafScope = scope;
+                ib.createIf(charCondition, iib);
+            }
             cb = &pb;
             leafScope = 0;
             pb.createIf(condition, ib);

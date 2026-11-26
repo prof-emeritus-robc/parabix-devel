@@ -43,8 +43,10 @@ x → yz;
 q → ;
 """
 
-#  30 rules whose first characters are in 6 Div32 blocks (Latin, Greek, two of
-#  Cyrillic, IPA, Hebrew), none with more than half of them.
+#  31 rules whose first characters are in 6 Div32 blocks (Latin, Greek, two of
+#  Cyrillic, IPA, Hebrew), none with more than half of them; and one whose first
+#  set has 18 blocks (\u0100 to \u0320), outside the rule Ifs, before the rules
+#  of the IPA block with which it competes (ɐʼ, ɗʼ).
 LAYERED = """
 $A = [a b c {a̰}];
 $G = [α β γ {ά̃}];
@@ -52,6 +54,7 @@ $K = [к л м {н̆}];
 $I = [ɐ ɑ ɒ {ɓ̃}];
 $H = [א ב ג {ד̇}];
 [$A $G] ʼ → U;
+[\u0100-\u0320] ʼ → T;
 $A ː? → A;
 d } [:L:] → D;
 e → EE;
@@ -161,7 +164,7 @@ def pool_of(rules):
     chars.update(["̰", "̃", "̆", "̇", "̞", "ː", "ʼ", " ", "1", "\n", "ж", "中", "𝒜"])
     strings = ["e̞", "ɪ̈", "k͡h", "k͡hʷ", "a̰", "ά̃", "н̆", "ɓ̃", "ד̇",
                "xyz", "xyzz", "yzz", "ke̞ː", "kaː", " ʔʔe", "eʔeʔeʔe", "ʔʔʔ", " ʔe̞ʔa",
-               "axb", "axxb", "acxe", "wn", "qn", "txn", "tn", "o", "xxd"]
+               "axb", "axxb", "acxe", "wn", "qn", "txn", "tn", "o", "xxd", "ɐʼ", "ɗʼ", "ɗːʼ", "Āʼ"]
     return sorted(chars) + strings
 
 
@@ -214,6 +217,12 @@ def main():
                         problems.append("not applied by its entity plan")
                     if "code " + expected not in trace:
                         problems.append("code not " + expected)
+                    #  (The class layer's code: the rules in an If on the block
+                    #  of their first characters, as LAYERED has no before
+                    #  contexts.)
+                    ifs = expected == "div32"
+                    if ifs != ("rule Ifs (" in trace):
+                        problems.append("rule Ifs " + ("missing" if ifs else "unexpected"))
                     if problems:
                         failures += 1
                         print("FAIL %s --utf8-mode=%s --class-layer=%s: %s; %s" % (name, mode, layer, ", ".join(problems), trace[:400]))

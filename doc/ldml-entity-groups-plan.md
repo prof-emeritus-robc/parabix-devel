@@ -1161,3 +1161,57 @@ plan no longer excludes `[$]` in a text.
   two path tests needed `--entity-groups=0`.
 - **und_FONIPA-ar and -fa with the defaults**, against ICU: 1 MB each, and the
   464 targeted lines.
+
+## 20. Rule Ifs (2026-11-26)
+
+**The problem.** The survey of 2026-11-26 showed `EntityMatch` slower than
+the regular plan on groups of thousands of rules (Hant-Hans 0.38 → 1.92 s,
+Jpan-Latn 2.8 → 7.7 s, the Ethiopic Geminate transforms 0.2–0.6 → 4.5–7 s),
+and slightly slower on most other transforms (median +13 %). `EntityMatch`
+evaluated every rule at every block, where the fused kernels test each rule
+only within an If on the Div32 block of its first characters (the class
+layer's leaves).
+
+**The leaves.** With the class layer's Div32 code, `entityRuleLeaves` places
+each rule by the blocks of its first set (`firstSets`):
+- in the leaf of each of its blocks, if it has at most
+  `ClassLayerMaxSetBlocks`;
+- at the top otherwise: a first set with more blocks or none, a text that may
+  be empty, or a leading item that is or contains the text boundary (a match
+  of zero width at the end of a run, whatever the character there).
+
+At a position, only the rules of its character's leaf and those at the top
+may match.
+
+**The kernel.** `EntityMatch` builds an If on each leaf's block (the class
+`classAt(block)` from the code's high bits). Within it:
+- the rules of the leaf and those at the top (matched outside the Ifs) are
+  taken in order;
+- each wins where it matches and no earlier one does.
+
+At the positions of no leaf, the rules at the top are taken alone.
+
+**The accumulated values.** Vars, created at first use, collect the results
+over the leaves, ANDed with the leaf's condition:
+- A rule that applies wherever it wins (stage 0, on no cycle) adds its
+  results directly: its matches by length (`startLen`), and its W, Ins and
+  deletion bits (or its selector bits in the hybrid).
+- The other rules accumulate their wins, rule by rule, for the selection by
+  stages and cycles, which runs after the Ifs as before.
+
+The memos of the class, length and lookahead expressions are keyed by scope,
+so no expression of one If's body is used in another's. The kernel's
+signature carries `#ifs`.
+
+**Not covered.** Groups with before contexts (the closed form and the
+correction loop compute their states on all the rules' matches) and groups
+without the Div32 code stay flat. `--entity-rule-ifs=0` turns the Ifs off.
+
+**Tests.**
+- `QA/xlit_entity_test.py` checks for the Ifs in the trace (`rule Ifs (n
+  leaves, m rules at the top)`) where the code is Div32. Its layered case has
+  a rule at the top, `[Ā-̠] ʼ`, of 18 blocks, before the IPA rules
+  it competes with.
+- Latin-ASCII (63 leaves) and InterIndic-Bengali (6 leaves): the output on
+  1 MB of their survey corpora is the same with and without the Ifs, and the
+  regular plan's.

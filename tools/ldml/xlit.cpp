@@ -343,6 +343,11 @@ static cl::opt<bool> EntityGroupsTrace("entity-groups-trace",
     cl::desc("With --entity-groups: report, for each conversion group applied, whether its entity plan applies it, or "
              "why not, to stderr"),
     cl::init(false), cl::cat(XlitOptions));
+static cl::opt<bool> EntityRuleIfs("entity-rule-ifs",
+    cl::desc("With --entity-groups: match the rules of a group with the class layer's Div32 code in an If for each "
+             "Div32 block of their first characters, as the fused kernels' leaves (doc/ldml-entity-groups-plan.md §20; "
+             "default on, --entity-rule-ifs=0 for every rule in every block)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> EntityReport("entity-report",
     cl::desc("Report the entity plan of each conversion group of the transform's own rules (see "
              "doc/ldml-entity-groups-plan.md): its entities, rules, classes, overlaps and before-context states "
@@ -17378,6 +17383,41 @@ static const std::vector<size_t> & entityCycleRules(const ldml::EntityGroupPlan 
     return entityHasBefore(p) ? p.cycleRules : p.stageCycleRules;
 }
 
+//  The leaves of an entity group's rule Ifs (doc/ldml-entity-groups-plan.md
+//  §20): with the class layer's Div32 code, the rules by the Div32 blocks of
+//  their first sets (a rule whose first set has more than
+//  ClassLayerMaxSetBlocks blocks, none, or that may match the empty text or
+//  begin with the text boundary, at the top: outside the Ifs).  At a position,
+//  only the rules of the leaf of its character's block, and those at the top,
+//  may match.  Not with before contexts (their states are computed on all
+//  the rules' matches).
+struct EntityRuleLeaves {
+    std::map<UCD::codepoint_t, std::vector<size_t>> leaves;    // by block, the rules in order
+    std::vector<size_t> top;
+    bool apply = false;
+};
+static EntityRuleLeaves entityRuleLeaves(const ldml::EntityGroupPlan & p, const EntityCoding & c) {
+    EntityRuleLeaves l;
+    if (!EntityRuleIfs || !c.layered || entityHasBefore(p)) return l;
+    for (size_t i = 0; i < p.rules.size(); i++) {
+        const ldml::EntityRule & r = p.rules[i];
+        bool top = r.minLength == 0 || i >= p.firstSets.size() || p.firstSets[i].empty();
+        for (const ldml::EntityItem & item : r.items) {
+            if (item.kind == ldml::EntityItem::Kind::Boundary) top = true;
+            if (item.kind == ldml::EntityItem::Kind::Entity && p.entities[item.entity].boundary) top = true;
+            if (!item.optional) break;
+        }
+        const std::set<UCD::codepoint_t> b = top ? std::set<UCD::codepoint_t>() : setBlocks(p.firstSets[i], ClassLayerMaxSetBlocks);
+        if (top || b.empty() || b.size() > ClassLayerMaxSetBlocks) {
+            l.top.push_back(i);
+            continue;
+        }
+        for (UCD::codepoint_t k : b) l.leaves[k].push_back(i);
+    }
+    l.apply = !l.leaves.empty();
+    return l;
+}
+
 //  The matches of the rules of an entity group at each position (§5.1, §5.2):
 //  of the rule that applies there (the first in order that matches), W (its
 //  index + 1, 0: none); the positions deleted (the rest of the matches' texts,
@@ -17447,6 +17487,7 @@ public:
         for (size_t c : entityCycleRules(p)) sig += std::to_string(c) + ",";
         if (entityLoop(p)) sig += "loop";
         else if (entityHasBefore(p)) sig += "state:" + entityKey(p, p.stateEntity);
+        if (entityRuleLeaves(p, c).apply) sig += "#ifs";
         for (const ldml::EntityRule & r : p.rules) sig += "<" + entityItemsKey(p, r.before) + ">";
         return sig;
     }
@@ -17487,6 +17528,11 @@ void EntityMatch::generatePabloMethod() {
     PabloAST * const mask = mHasMask ? getInputStreamSet("mask")[0] : nullptr;
     PabloAST * const region = mHasRegion ? getInputStreamSet("region")[0] : nullptr;
     PabloAST * const zeroes = pb.createZeroes();
+    //  The builder of the scope being built (the entry scope, or a rule If's,
+    //  see entityRuleLeaves), whose number is in the memos' keys: an
+    //  expression of one If's body is not used in another's.
+    PabloBuilder * cb = &pb;
+    unsigned scope = 0;
     const std::vector<size_t> propEntities = entitiesOfKind(p, ldml::Entity::Kind::Property);
     const std::vector<size_t> ssEntities = entitiesOfKind(p, ldml::Entity::Kind::StringSet);
     std::map<size_t, PabloAST *> props;
@@ -17494,20 +17540,20 @@ void EntityMatch::generatePabloMethod() {
     std::map<size_t, std::vector<PabloAST *>> ss;
     for (size_t i = 0; i < ssEntities.size(); i++) ss[ssEntities[i]] = getInputStreamSet("ss" + std::to_string(i));
     //  An input stream looked ahead.
-    std::map<std::pair<PabloAST *, unsigned>, PabloAST *> ahead;
+    std::map<std::tuple<unsigned, PabloAST *, unsigned>, PabloAST *> ahead;
     auto at = [&](PabloAST * s, unsigned o) -> PabloAST * {
         if (o == 0) return s;
-        auto & a = ahead[{s, o}];
-        if (a == nullptr) a = pb.createLookahead(s, o);
+        auto & a = ahead[{scope, s, o}];
+        if (a == nullptr) a = cb->createLookahead(s, o);
         return a;
     };
     //  The code bits looked ahead (layered).
-    std::map<unsigned, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> compilers;
-    std::map<std::pair<std::string, unsigned>, PabloAST *> classMemo;
+    std::map<std::pair<unsigned, unsigned>, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> compilers;
+    std::map<std::tuple<std::string, unsigned, unsigned>, PabloAST *> classMemo;
     auto classAt = [&](const UCD::UnicodeSet & set, unsigned o) -> PabloAST * {
         if (set.empty()) return zeroes;
         const std::string key = setKey(set);
-        auto f = classMemo.find({key, o});
+        auto f = classMemo.find({key, o, scope});
         if (f != classMemo.end()) return f->second;
         PabloAST * r;
         const int i = mCoding.indexOf(set);
@@ -17517,7 +17563,7 @@ void EntityMatch::generatePabloMethod() {
         } else if (mCoding.layered && i >= 0 && mCoding.layer.external[i] >= 0) {
             r = at(externals[mCoding.layer.external[i]], o);
         } else {
-            auto & c = compilers[o];
+            auto & c = compilers[{scope, o}];
             if (!c) {
                 std::vector<PabloAST *> bits;
                 for (PabloAST * b : classes) bits.push_back(at(b, o));
@@ -17526,9 +17572,9 @@ void EntityMatch::generatePabloMethod() {
             }
             UCD::UnicodeSet codes;
             if (LLVM_UNLIKELY(!mCoding.codesOf(set, codes))) llvm::report_fatal_error("EntityMatch: a set the code does not express");
-            r = pb.createAnd(c->compileCC(re::makeCC(UCD::UnicodeSet(codes), &cc::Unicode), pb), at(inText, o));
+            r = cb->createAnd(c->compileCC(re::makeCC(UCD::UnicodeSet(codes), &cc::Unicode), *cb), at(inText, o));
         }
-        classMemo.emplace(std::make_pair(key, o), r);
+        classMemo.emplace(std::make_tuple(key, o, scope), r);
         return r;
     };
     //  A property set's expression.
@@ -17545,13 +17591,13 @@ void EntityMatch::generatePabloMethod() {
             PabloAST * r = zeroes;
             for (const re::RE * a : *alt) {
                 if (ldml::isBoundary(a)) continue;
-                r = pb.createOr(r, evalSet(a, o));
+                r = cb->createOr(r, evalSet(a, o));
             }
             return r;
         } else if (const re::Diff * d = dyn_cast<re::Diff>(re)) {
-            return pb.createAnd(evalSet(d->getLH(), o), pb.createNot(evalSet(d->getRH(), o)));
+            return cb->createAnd(evalSet(d->getLH(), o), cb->createNot(evalSet(d->getRH(), o)));
         } else if (const re::Intersect * x = dyn_cast<re::Intersect>(re)) {
-            return pb.createAnd(evalSet(x->getLH(), o), evalSet(x->getRH(), o));
+            return cb->createAnd(evalSet(x->getLH(), o), evalSet(x->getRH(), o));
         } else if (isa<re::Any>(re)) {
             return at(inText, o);
         } else if (const re::CC * cc = dyn_cast<re::CC>(re)) {
@@ -17563,9 +17609,9 @@ void EntityMatch::generatePabloMethod() {
     //  a match of length k (any: the string sets' streams are then of all their
     //  matches, see entityInputs), of which the longest within the run is
     //  chosen by longestAt.
-    std::map<std::tuple<size_t, unsigned, unsigned>, PabloAST *> lenMemo;
+    std::map<std::tuple<size_t, unsigned, unsigned, unsigned>, PabloAST *> lenMemo;
     std::function<PabloAST * (size_t, unsigned, unsigned)> len = [&](size_t e, unsigned k, unsigned o) -> PabloAST * {
-        auto f = lenMemo.find({e, k, o});
+        auto f = lenMemo.find({e, k, o, scope});
         if (f != lenMemo.end()) return f->second;
         const ldml::Entity & x = p.entities[e];
         PabloAST * r = zeroes;
@@ -17574,10 +17620,10 @@ void EntityMatch::generatePabloMethod() {
                 if (k == 1) r = classAt(x.chars, o);
                 break;
             case ldml::Entity::Kind::Property:
-                if (k == 1) r = pb.createAnd(at(props[e], o), at(inText, o));
+                if (k == 1) r = cb->createAnd(at(props[e], o), at(inText, o));
                 break;
             case ldml::Entity::Kind::PropertySet:
-                if (k == 1) r = pb.createAnd(evalSet(x.re, o), at(inText, o));
+                if (k == 1) r = cb->createAnd(evalSet(x.re, o), at(inText, o));
                 break;
             case ldml::Entity::Kind::StringSet: {
                 const auto it = std::lower_bound(x.lengths.begin(), x.lengths.end(), k);
@@ -17585,15 +17631,15 @@ void EntityMatch::generatePabloMethod() {
                 break;
             }
             case ldml::Entity::Kind::Union: {
-                for (size_t op : x.operands) r = pb.createOr(r, len(op, k, o));
+                for (size_t op : x.operands) r = cb->createOr(r, len(op, k, o));
                 if (mask) break;
                 for (unsigned longer : x.lengths) {
-                    if (longer > k) r = pb.createAnd(r, pb.createNot(len(e, longer, o)));
+                    if (longer > k) r = cb->createAnd(r, cb->createNot(len(e, longer, o)));
                 }
                 break;
             }
         }
-        lenMemo.emplace(std::make_tuple(e, k, o), r);
+        lenMemo.emplace(std::make_tuple(e, k, o, scope), r);
         return r;
     };
     //  Within a filter, the positions o to o + k - 1 all in the mask: within the
@@ -17603,12 +17649,12 @@ void EntityMatch::generatePabloMethod() {
     //  (Likewise, with bounded regions, the positions of an after context all in
     //  the region: inRunOf(region, ...).  The positions before o are in the run,
     //  as those of the items before.)
-    std::map<std::tuple<PabloAST *, unsigned, unsigned>, PabloAST *> maskMemo;
+    std::map<std::tuple<PabloAST *, unsigned, unsigned, unsigned>, PabloAST *> maskMemo;
     auto inRunOf = [&](PabloAST * run, unsigned o, unsigned k) -> PabloAST * {
-        auto & m = maskMemo[{run, o, k}];
+        auto & m = maskMemo[{run, o, k, scope}];
         if (m == nullptr) {
             m = at(run, o);
-            for (unsigned j = 1; j < k; j++) m = pb.createAnd(m, at(run, o + j));
+            for (unsigned j = 1; j < k; j++) m = cb->createAnd(m, at(run, o + j));
         }
         return m;
     };
@@ -17617,35 +17663,35 @@ void EntityMatch::generatePabloMethod() {
     //  a filter (run), the longest that fits within the run.
     //  (The run: the mask for a text; for a context, the region with bounded
     //  regions, none otherwise.)
-    std::map<std::tuple<size_t, unsigned, unsigned, bool>, PabloAST *> longestMemo;
+    std::map<std::tuple<size_t, unsigned, unsigned, bool, unsigned>, PabloAST *> longestMemo;
     auto longestAt = [&](size_t e, unsigned k, unsigned o, bool text) -> PabloAST * {
         if (!mask) return len(e, k, o);
-        auto & r = longestMemo[{e, k, o, text}];
+        auto & r = longestMemo[{e, k, o, text, scope}];
         if (r) return r;
         PabloAST * const run = text ? mask : region;
-        auto fits = [&](unsigned l) {return run ? pb.createAnd(len(e, l, o), inRunOf(run, o, l)) : len(e, l, o);};
+        auto fits = [&](unsigned l) {return run ? cb->createAnd(len(e, l, o), inRunOf(run, o, l)) : len(e, l, o);};
         r = fits(k);
         for (unsigned longer : p.entities[e].lengths) {
-            if (longer > k) r = pb.createAnd(r, pb.createNot(fits(longer)));
+            if (longer > k) r = cb->createAnd(r, cb->createNot(fits(longer)));
         }
         return r;
     };
     auto start = [&](size_t e, unsigned o, bool run) {
         PabloAST * r = zeroes;
-        for (unsigned k : p.entities[e].lengths) r = pb.createOr(r, longestAt(e, k, o, run));
+        for (unsigned k : p.entities[e].lengths) r = cb->createOr(r, longestAt(e, k, o, run));
         return r;
     };
     //  The end of the text (or, with bounded regions, of the region) at offset o
     //  of an after context (the positions before o are within it).
     auto pastEnd = [&](unsigned o) -> PabloAST * {
-        return pb.createNot(at(region ? region : inText, o));
+        return cb->createNot(at(region ? region : inText, o));
     };
     //  The end of the run of a text at offset o: a set of the text with the
     //  text boundary ([$], [^c]) matches nothing there, as at the end of the
     //  text (each run of a filter is transformed as a text of its own; the
     //  after contexts see beyond it).
     auto runEnd = [&](unsigned o) -> PabloAST * {
-        return pb.createNot(at(mask ? mask : (region ? region : inText), o));
+        return cb->createNot(at(mask ? mask : (region ? region : inText), o));
     };
     //  The paths of a sequence of items: (condition, offset after them).
     using Paths = std::vector<std::pair<PabloAST *, unsigned>>;
@@ -17655,18 +17701,18 @@ void EntityMatch::generatePabloMethod() {
             Paths next;
             for (const auto & [cond, o] : paths) {
                 if (item.kind == ldml::EntityItem::Kind::Boundary) {
-                    next.emplace_back(pb.createAnd(cond, context ? pastEnd(o) : runEnd(o)), o);
+                    next.emplace_back(cb->createAnd(cond, context ? pastEnd(o) : runEnd(o)), o);
                 } else if (item.kind == ldml::EntityItem::Kind::Literal) {
                     PabloAST * c = classAt(UCD::UnicodeSet(item.literal), o);
-                    if (mask && !context) c = pb.createAnd(c, inRun(o, 1));
-                    if (region && context) c = pb.createAnd(c, at(region, o));
-                    next.emplace_back(pb.createAnd(cond, c), o + 1);
-                    if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(c)), o);
+                    if (mask && !context) c = cb->createAnd(c, inRun(o, 1));
+                    if (region && context) c = cb->createAnd(c, at(region, o));
+                    next.emplace_back(cb->createAnd(cond, c), o + 1);
+                    if (item.optional) next.emplace_back(cb->createAnd(cond, cb->createNot(c)), o);
                 } else {
                     const ldml::Entity & x = p.entities[item.entity];
-                    for (unsigned k : x.lengths) next.emplace_back(pb.createAnd(cond, longestAt(item.entity, k, o, !context)), o + k);
-                    if (x.boundary) next.emplace_back(pb.createAnd(cond, context ? pastEnd(o) : runEnd(o)), o);
-                    if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(start(item.entity, o, !context))), o);
+                    for (unsigned k : x.lengths) next.emplace_back(cb->createAnd(cond, longestAt(item.entity, k, o, !context)), o + k);
+                    if (x.boundary) next.emplace_back(cb->createAnd(cond, context ? pastEnd(o) : runEnd(o)), o);
+                    if (item.optional) next.emplace_back(cb->createAnd(cond, cb->createNot(start(item.entity, o, !context))), o);
                 }
             }
             paths = std::move(next);
@@ -17674,17 +17720,26 @@ void EntityMatch::generatePabloMethod() {
         return paths;
     };
     const unsigned maxLength = [&] {unsigned m = 1; for (const ldml::EntityRule & r : p.rules) m = std::max(m, r.maxLength); return m;}();
-    //  Each rule's matches by length (its text and after context).
-    std::vector<std::map<unsigned, PabloAST *>> matchesByLength;
-    for (const ldml::EntityRule & r : p.rules) {
+    //  Each rule's matches by length (its text and after context), in the
+    //  scope being built.  (With rule Ifs, those of the rules at the top only,
+    //  the others' in their leaves.)
+    auto ruleMatches = [&](size_t i) {
+        const ldml::EntityRule & r = p.rules[i];
         std::map<unsigned, PabloAST *> byLength;
         for (const auto & [cond, l] : extend({{inText, 0}}, r.items, false)) {
             PabloAST * m = zeroes;
-            for (const auto & a : extend({{cond, l}}, r.after, true)) m = pb.createOr(m, a.first);
+            for (const auto & a : extend({{cond, l}}, r.after, true)) m = cb->createOr(m, a.first);
             auto & b = byLength[l];
-            b = b ? pb.createOr(b, m) : m;
+            b = b ? cb->createOr(b, m) : m;
         }
-        matchesByLength.push_back(std::move(byLength));
+        return byLength;
+    };
+    const EntityRuleLeaves leaves = entityRuleLeaves(p, mCoding);
+    std::vector<std::map<unsigned, PabloAST *>> matchesByLength(p.rules.size());
+    if (leaves.apply) {
+        for (size_t i : leaves.top) matchesByLength[i] = ruleMatches(i);
+    } else {
+        for (size_t i = 0; i < p.rules.size(); i++) matchesByLength[i] = ruleMatches(i);
     }
     //  The rule that wins at each position (the first that matches there), with
     //  its matches by length, given the state of the before contexts: whether
@@ -17712,6 +17767,30 @@ void EntityMatch::generatePabloMethod() {
     std::vector<PabloAST *> wins;
     std::vector<std::map<unsigned, PabloAST *>> winsByLength;
     const bool loop = entityLoop(p);
+    const std::vector<unsigned> & stage = entityStages(p);
+    const std::vector<size_t> & cycle = entityCycleRules(p);
+    //  The values accumulated over the rule Ifs, by name (Vars, created at
+    //  their first use: the entry scope then precedes the If being built), and
+    //  those of the scope being built (assigned to them by flush, within the
+    //  scope's condition).
+    std::map<std::string, Var *> accVars;
+    std::map<std::string, PabloAST *> accLocal;
+    auto acc = [&](const std::string & name, PabloAST * x) {
+        const auto f = accLocal.find(name);
+        accLocal[name] = f == accLocal.end() ? x : cb->createOr(f->second, x);
+    };
+    auto flush = [&](PabloAST * cond) {
+        for (const auto & [name, x] : accLocal) {
+            Var *& v = accVars[name];
+            if (v == nullptr) v = pb.createVar("acc_" + name, zeroes);
+            cb->createAssign(v, cb->createOr(v, cb->createAnd(x, cond)));
+        }
+        accLocal.clear();
+    };
+    auto accVar = [&](const std::string & name) -> PabloAST * {
+        const auto f = accVars.find(name);
+        return f == accVars.end() ? zeroes : f->second;
+    };
     if (loop) {
         //  The correction loop (§19): the cursors and their states, from the
         //  positions where they are known (the starts, and after k characters
@@ -17837,6 +17916,83 @@ void EntityMatch::generatePabloMethod() {
                 }
             }
         }
+    } else if (!hasBefore && leaves.apply) {
+        //  The rule Ifs (§20): in each leaf (an If on the block of its
+        //  character), the winners among its rules and those at the top (the
+        //  only ones that may match there), in order; at the positions of no
+        //  leaf, among those at the top.  A rule that applies where it wins
+        //  (stage 0, on no cycle) adds its results to the accumulated values;
+        //  the others' wins are accumulated for the selection by stages.
+        auto isFinal = [&](size_t i) {
+            return (stage.empty() ? 0 : stage[i]) == 0 && std::find(cycle.begin(), cycle.end(), i) == cycle.end();
+        };
+        const unsigned outBits = getOutputStreamSet(0)->getNumElements();
+        const unsigned insBits = mSelectors.empty() && mHasIns ? getOutputStreamSet(2)->getNumElements() : 0;
+        std::vector<std::set<unsigned>> ruleLengths(p.rules.size());
+        auto applyWin = [&](size_t i, PabloAST * win, const std::map<unsigned, PabloAST *> & byLength) {
+            if (!isFinal(i)) {
+                acc("win_" + std::to_string(i), win);
+                for (const auto & [l, m] : byLength) {
+                    acc("winlen_" + std::to_string(i) + "_" + std::to_string(l), m);
+                    ruleLengths[i].insert(l);
+                }
+                return;
+            }
+            for (const auto & [l, m] : byLength) acc("len_" + std::to_string(l), m);
+            if (!mSelectors.empty()) {
+                for (unsigned b = 0; b < outBits; b++) if ((mSelectors[i] >> b) & 1) acc("sel_" + std::to_string(b), win);
+                return;
+            }
+            for (unsigned b = 0; b < outBits; b++) if (((i + 1) >> b) & 1) acc("w_" + std::to_string(b), win);
+            const size_t m = p.rules[i].result.size();
+            if (m == 0) acc("del", win);
+            for (unsigned b = 0; b < insBits; b++) if (m > 1 && (((m - 1) >> b) & 1)) acc("ins_" + std::to_string(b), win);
+        };
+        const std::set<size_t> atTop(leaves.top.begin(), leaves.top.end());
+        auto winnersOf = [&](const std::vector<size_t> & rules) {
+            PabloAST * prior = zeroes;
+            for (size_t i : rules) {
+                const std::map<unsigned, PabloAST *> byLength = atTop.count(i) ? matchesByLength[i] : ruleMatches(i);
+                PabloAST * match = zeroes;
+                for (const auto & [l, m] : byLength) match = cb->createOr(match, m);
+                PabloAST * const win = cb->createAnd(match, cb->createNot(prior));
+                prior = cb->createOr(prior, match);
+                std::map<unsigned, PabloAST *> winByLength;
+                for (const auto & [l, m] : byLength) winByLength[l] = byLength.size() == 1 ? win : cb->createAnd(win, m);
+                applyWin(i, win, winByLength);
+            }
+        };
+        PabloAST * anyLeaf = zeroes;
+        unsigned scopes = 0;
+        for (const auto & [block, rules] : leaves.leaves) {
+            UCD::UnicodeSet chars;
+            chars.insert_range(block << ClassLayerShift, ((block + 1) << ClassLayerShift) - 1);
+            PabloAST * const cond = classAt(chars, 0);
+            if (!leaves.top.empty()) anyLeaf = pb.createOr(anyLeaf, cond);
+            std::vector<size_t> merged;
+            std::merge(rules.begin(), rules.end(), leaves.top.begin(), leaves.top.end(), std::back_inserter(merged));
+            PabloBuilder ib = pb.createScope();
+            cb = &ib;
+            scope = ++scopes;
+            winnersOf(merged);
+            flush(cond);
+            cb = &pb;
+            scope = 0;
+            pb.createIf(cond, ib);
+        }
+        if (!leaves.top.empty()) {
+            winnersOf(leaves.top);
+            flush(pb.createAnd(inText, pb.createNot(anyLeaf)));
+        }
+        for (size_t i = 0; i < p.rules.size(); i++) {
+            wins.push_back(nullptr);
+            winsByLength.emplace_back();
+            if (isFinal(i)) continue;
+            wins.back() = accVar("win_" + std::to_string(i));
+            for (unsigned l : ruleLengths[i]) {
+                winsByLength.back()[l] = accVar("winlen_" + std::to_string(i) + "_" + std::to_string(l));
+            }
+        }
     } else if (!hasBefore) {
         winners(true, wins, winsByLength);
     } else {
@@ -17881,12 +18037,12 @@ void EntityMatch::generatePabloMethod() {
     //  The rules of a cycle (that may begin within matches of each other or
     //  themselves, as $AVowel ː? ʔ $AVowel ː?) are then selected from the left
     //  among themselves, in a While loop.
-    const std::vector<unsigned> & stage = entityStages(p);
-    const std::vector<size_t> & cycle = entityCycleRules(p);
     const unsigned stages = stage.empty() ? 1 : *std::max_element(stage.begin(), stage.end()) + 1;
     //  The positions after the first of the matches applied, of lengths by
     //  their starts (startLen).
+    //  (With rule Ifs, from the rules that apply where they win.)
     std::vector<PabloAST *> startLen(maxLength + 1, zeroes);
+    for (unsigned l = 1; l <= maxLength; l++) startLen[l] = accVar("len_" + std::to_string(l));
     //  The positions after the first of matches given by their starts by length.
     auto interiorOf = [&](PabloBuilder & b, const std::vector<PabloAST *> & byLength) {
         PabloAST * r = zeroes;
@@ -17907,7 +18063,7 @@ void EntityMatch::generatePabloMethod() {
         PabloAST * const covered = d == 0 ? zeroes : interiorOf(pb, startLen);
         std::vector<size_t> inCycle;
         for (size_t i = 0; i < wins.size(); i++) {
-            if ((stage.empty() ? 0 : stage[i]) != d) continue;
+            if (wins[i] == nullptr || (stage.empty() ? 0 : stage[i]) != d) continue;
             if (d > 0) {
                 wins[i] = pb.createAnd(wins[i], pb.createNot(covered));
                 for (auto & [l, m] : winsByLength[i]) m = pb.createAnd(m, pb.createNot(covered));
@@ -17974,7 +18130,8 @@ void EntityMatch::generatePabloMethod() {
         std::vector<PabloAST *> sel(selBits, zeroes);
         PabloAST * const rest = interiorOf(pb, startLen);
         for (unsigned b = 0; b < selBits; b++) {
-            for (size_t i = 0; i < wins.size(); i++) if ((mSelectors[i] >> b) & 1) sel[b] = pb.createOr(sel[b], wins[i]);
+            sel[b] = accVar("sel_" + std::to_string(b));
+            for (size_t i = 0; i < wins.size(); i++) if (wins[i] && ((mSelectors[i] >> b) & 1)) sel[b] = pb.createOr(sel[b], wins[i]);
             if ((mDeletionSelector >> b) & 1) sel[b] = pb.createOr(sel[b], rest);
             sel[b] = pb.createInFile(sel[b]);
         }
@@ -17985,8 +18142,11 @@ void EntityMatch::generatePabloMethod() {
     const unsigned wBits = getOutputStreamSet(0)->getNumElements();
     std::vector<PabloAST *> w(wBits, zeroes);
     std::vector<PabloAST *> ins(mHasIns ? getOutputStreamSet(2)->getNumElements() : 0, zeroes);
-    PabloAST * deleted = zeroes;
+    for (unsigned b = 0; b < wBits; b++) w[b] = accVar("w_" + std::to_string(b));
+    for (unsigned b = 0; b < ins.size(); b++) ins[b] = accVar("ins_" + std::to_string(b));
+    PabloAST * deleted = accVar("del");
     for (size_t i = 0; i < wins.size(); i++) {
+        if (wins[i] == nullptr) continue;
         for (unsigned b = 0; b < wBits; b++) if (((i + 1) >> b) & 1) w[b] = pb.createOr(w[b], wins[i]);
         const size_t m = p.rules[i].result.size();
         if (m == 0) deleted = pb.createOr(deleted, wins[i]);
@@ -18079,7 +18239,12 @@ EntityInputs RulePipelineBuilder::entityInputs(const ldml::EntityGroupPlan & pla
                                           + std::to_string(coding.layer.externalSets.size()) + " external sets)"
                          : coding.muxed ? "multiplexed (" + std::to_string(coding.muxBits.size()) + " bits)"
                                         : "streams (" + std::to_string(coding.streamSets.size()) + ")")
-                     << (mBytes ? ", on the bytes" : "") << "\n";
+                     << (mBytes ? ", on the bytes" : "");
+        const EntityRuleLeaves leaves = entityRuleLeaves(plan, coding);
+        if (leaves.apply) {
+            llvm::errs() << ", rule Ifs (" << leaves.leaves.size() << " leaves, " << leaves.top.size() << " rules at the top)";
+        }
+        llvm::errs() << "\n";
     }
     //  The classes: the bits of the code (and the class layer's external sets),
     //  or a stream for each stream set.

@@ -1056,3 +1056,41 @@ now as DivCode's (`entityKernelLabel`: other than letters and digits, '_').
 
 **`--lines`:** und_FONIPA-ar group 3's contexts are not line-bound, so with
 `--lines` the regular plan applies it (the output is ICU's, in Unicode mode).
+
+## 18. Status of bounded regions (2026-11-26)
+
+With `--lines`, each line is a text of its own. A group whose contexts are not
+line-bound (`groupLineBound`) must see the region's edges as the text's: the
+regular plan bounds its fused kernels' contexts by the regions
+(`FusedRulesConfig::region`: `withinAhead`, `pastEnd`, `beforeStart`).
+`EntityMatch` now takes the regions too (`region`, from `boundedRegions()`,
+the region-scope mask, compressed to the characters in the hybrid), in both
+modes:
+
+- **The text** lies within the active mask (the regions' mask, or a filter
+  within it), as before.
+- **After contexts:** each item lies within the region (`inRunOf(region, …)`:
+  the positions of the items before it are in the region already), and a
+  string set takes its longest match within the region. `[$]`, and a set with
+  the boundary, holds at the first position past the region (`pastEnd`: not
+  in the region).
+- **The closed form (§5.3):** the state starts at each region's start if the
+  set has the boundary, and after a character of the set only within the
+  region (`Advance(C) ∧ Advance(region)`). The deletions of the chain lie in
+  the regions.
+
+`entityStepProblem` no longer excludes bounded regions, so with `--lines` such
+groups stay in UTF-8 mode in the mixed segments.
+
+**Checks** (both modes, against ICU line by line):
+
+- **und_FONIPA-ar `--lines`** on the 464 targeted lines of §15: groups 1 to 3
+  are applied by their entity plans (before, the regular plan applied group 3:
+  its contexts are not line-bound).
+- **Cyrl-Latn `--lines`** on 1 MB of `nat-ru.txt` (a global filter within the
+  regions).
+- **A rules file whose results depend on the edges:** `$S = [ $]` (a line
+  feed is not in it) as a closed-form state, `a } [$]` and `a } [ $]`.
+  With the region ignored (a mutation check, then restored), 10 of its 13 lines
+  differ from ICU's. It is in `QA/xlit_entity_test.py` (34 checks, 5.8 s
+  cold: a little over the 5 s of the test-time limit).

@@ -11096,9 +11096,10 @@ public:
     //  A group by its entity plan in the hybrid (see entitySelectorGroup).
     //  (The masks given, one position per character, are returned unchanged:
     //  the selectors are applied to the bytes, which keeps their masks in step.)
+    //  (bounded: the group's contexts are bounded by the regions.)
     StreamSet * entitySelectorGroup(const std::string & label, const ldml::EntityGroupPlan & plan, StreamSet * Ones,
                                     std::vector<TransformMask> & masks, const ByteSource & bytes,
-                                    std::vector<std::u32string> & strings);
+                                    std::vector<std::u32string> & strings, bool bounded = false);
     StreamSet * selectorGroup(const std::string & label, const ldml::TransformStep & step, StreamSet * Ones,
                               std::vector<TransformMask> & masks, const ByteSource & bytes, std::vector<std::u32string> & strings) {
         mMasks.restore(std::move(masks));
@@ -11194,7 +11195,9 @@ private:
     Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
     //  A conversion group by its entity plan (doc/ldml-entity-groups-plan.md).
-    Staged entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21);
+    //  (regions: with bounded regions, those bounding a group whose contexts are
+    //  not line-bound, or nullptr.)
+    Staged entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21, StreamSet * regions = nullptr);
     EntityInputs entityInputs(const ldml::EntityGroupPlan & plan, const EntityCoding & coding, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged deferredRules(const ldml::TransformStep & step, StreamSet * U21);
@@ -15298,7 +15301,7 @@ private:
     std::string mGroupLabel;
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * Basis, bool count);
     StreamSet * hybridGroup(const ldml::TransformStep & step, StreamSet * Basis);
-    StreamSet * entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis);
+    StreamSet * entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis, bool bounded = false);
     PipelineBuilder & mP;
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
@@ -15634,7 +15637,7 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
             }
             if (EntityGroups && notByEntities.empty()) {
                 const size_t kernels = mP.getNumOfKernelCalls();
-                Basis = entityHybridGroup(a.entityGroups[a.entityGroupOfStep[i]], Basis);
+                Basis = entityHybridGroup(a.entityGroups[a.entityGroupOfStep[i]], Basis, mBounded && !groupLineBound(step));
                 if (outermost && mGroupCounts && groupRules(step) > 0) mGroupCounts->push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
             } else {
                 Basis = conversionGroup(step, Basis, outermost);
@@ -15658,7 +15661,7 @@ static std::string entityStepProblem(const TransformAnalysis & a, size_t i, bool
     const int e = i < a.entityGroupOfStep.size() ? a.entityGroupOfStep[i] : -1;
     if (e < 0) return "no source group corresponds to the step";
     const ldml::TransformStep & step = a.plan.steps[i];
-    if (bounded) return "bounded regions";
+    (void) bounded;     // (bounded regions: given to EntityMatch, see entityGroup)
     if (step.hasFrontLetters || step.frontLettersEnd || !step.chainRevisitRules.empty() || !step.markRunEditRules.empty()
         || !step.prefixRuns.empty() || !step.deferred.empty() || !step.copyCaptures.empty()
         || !step.captureReplacements.empty() || !step.insertions.empty()) return "parts the plan does not cover";
@@ -15670,7 +15673,7 @@ static std::string entityStepProblem(const TransformAnalysis & a, size_t i, bool
 //  last bytes of the characters and applied to the bytes, which keeps the masks
 //  in step (within filters, the masks compressed to the characters for the
 //  group, as hybridGroup's).
-StreamSet * UTF8PipelineBuilder::entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis) {
+StreamSet * UTF8PipelineBuilder::entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis, bool bounded) {
     RulePipelineBuilder::ByteSource bytes;
     bytes.basis = Basis;
     StreamSet * const index = mP.CreateStreamSet(1, 1);
@@ -15683,7 +15686,7 @@ StreamSet * UTF8PipelineBuilder::entityHybridGroup(const ldml::EntityGroupPlan &
     mMasks.restore(std::vector<TransformMask>(byteMasks));
     std::vector<TransformMask> masks = unicodeMasks(Basis);
     std::vector<std::u32string> strings;
-    StreamSet * const selectors = unicode().entitySelectorGroup(mGroupLabel, plan, ones, masks, bytes, strings);
+    StreamSet * const selectors = unicode().entitySelectorGroup(mGroupLabel, plan, ones, masks, bytes, strings, bounded);
     mMasks.restore(std::move(byteMasks));
     StreamSet * const atBytes = mP.CreateStreamSet(selectors->getNumElements());
     SpreadByMask(mP, index, selectors, atBytes);
@@ -16881,7 +16884,6 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (EntityGroups) {
                 if (entity < 0) notByEntities = "no source group corresponds to the step";
                 else if (mBytes) notByEntities = "UTF-8 mode (the hybrid)";
-                else if (boundedRegions()) notByEntities = "bounded regions";
                 else if (mDeletedRunEnds || mDeletedRunAfter) notByEntities = "after deleted runs";
                 else if (step.hasFrontLetters || !step.chainRevisitRules.empty() || !step.markRunEditRules.empty()
                          || !step.prefixRuns.empty() || !step.deferred.empty() || !step.captureReplacements.empty()
@@ -16894,7 +16896,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
                              << (byEntities ? "applied" : "not applied: " + notByEntities) << "\n";
             }
             if (byEntities) {
-                U21 = inStep(entityGroup(a.entityGroups[entity], U21));
+                U21 = inStep(entityGroup(a.entityGroups[entity], U21, groupLineBound(step) ? nullptr : boundedRegions()));
             } else if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
                 U21 = inStep(conversionGroup(step, U21));
             }
@@ -17247,11 +17249,12 @@ public:
                 const std::vector<StreamSet *> & Props, const std::vector<StreamSet *> & StringSets,
                 StreamSet * W, StreamSet * Deleted, StreamSet * Ins,
                 const std::vector<unsigned> & selectors = {}, unsigned deletionSelector = 0, StreamSet * Sel = nullptr,
-                StreamSet * Mask = nullptr)
-    : PabloKernel(ts, "EntityMatch_" + entityKernelLabel(label) + "_" + getStringHash(signatureOf(plan, coding, selectors, deletionSelector, Mask != nullptr)),
+                StreamSet * Mask = nullptr, StreamSet * Region = nullptr)
+    : PabloKernel(ts, "EntityMatch_" + entityKernelLabel(label) + "_"
+                      + getStringHash(signatureOf(plan, coding, selectors, deletionSelector, Mask != nullptr, Region != nullptr)),
                   {}, outputs(W, Deleted, Ins, Sel))
     , mPlan(plan), mCoding(coding), mSelectors(selectors), mDeletionSelector(deletionSelector)
-    , mSignature(signatureOf(plan, coding, selectors, deletionSelector, Mask != nullptr)) {
+    , mSignature(signatureOf(plan, coding, selectors, deletionSelector, Mask != nullptr, Region != nullptr)) {
         const unsigned la = lookahead(plan);
         auto in = [&](const std::string & name, StreamSet * s) {
             if (la > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(), LookAhead(la)});
@@ -17263,7 +17266,9 @@ public:
         for (size_t i = 0; i < Props.size(); i++) in("prop" + std::to_string(i), Props[i]);
         for (size_t i = 0; i < StringSets.size(); i++) in("ss" + std::to_string(i), StringSets[i]);
         if (Mask) in("mask", Mask);
+        if (Region) in("region", Region);
         mHasMask = Mask != nullptr;
+        mHasRegion = Region != nullptr;
         mHasExternals = Externals != nullptr;
         mHasIns = Ins != nullptr;
     }
@@ -17282,8 +17287,9 @@ public:
         return false;
     }
     static std::string signatureOf(const ldml::EntityGroupPlan & p, const EntityCoding & c,
-                                   const std::vector<unsigned> & selectors, unsigned deletionSelector, bool masked) {
-        std::string sig = c.signature() + (masked ? "#masked#" : "#");
+                                   const std::vector<unsigned> & selectors, unsigned deletionSelector, bool masked,
+                                   bool region) {
+        std::string sig = c.signature() + (masked ? "#masked" : "#") + (region ? "#region#" : "#");
         if (!selectors.empty()) {
             sig += "sel:";
             for (unsigned x : selectors) sig += std::to_string(x) + ",";
@@ -17324,6 +17330,10 @@ private:
     //  Within a filter: the characters of the rules' texts must all be in the
     //  mask (a match lies within a run of it); contexts see the whole text.
     bool mHasMask = false;
+    //  With bounded regions (a group whose contexts are not line-bound, see
+    //  boundRegions): the contexts see the region of the match only, as a text
+    //  of its own (its start and end as the text's).
+    bool mHasRegion = false;
 };
 
 void EntityMatch::generatePabloMethod() {
@@ -17333,6 +17343,7 @@ void EntityMatch::generatePabloMethod() {
     const std::vector<PabloAST *> externals = mHasExternals ? getInputStreamSet("externals") : std::vector<PabloAST *>{};
     PabloAST * const inText = getInputStreamSet("inText")[0];
     PabloAST * const mask = mHasMask ? getInputStreamSet("mask")[0] : nullptr;
+    PabloAST * const region = mHasRegion ? getInputStreamSet("region")[0] : nullptr;
     PabloAST * const zeroes = pb.createZeroes();
     const std::vector<size_t> propEntities = entitiesOfKind(p, ldml::Entity::Kind::Property);
     const std::vector<size_t> ssEntities = entitiesOfKind(p, ldml::Entity::Kind::StringSet);
@@ -17447,23 +17458,30 @@ void EntityMatch::generatePabloMethod() {
     //  run of the text's first position (ICU applies the rules to each run of
     //  the filter's characters as if the text ended there; contexts see the
     //  whole text).
-    std::map<std::pair<unsigned, unsigned>, PabloAST *> maskMemo;
-    auto inRun = [&](unsigned o, unsigned k) -> PabloAST * {
-        auto & m = maskMemo[{o, k}];
+    //  (Likewise, with bounded regions, the positions of an after context all in
+    //  the region: inRunOf(region, ...).  The positions before o are in the run,
+    //  as those of the items before.)
+    std::map<std::tuple<PabloAST *, unsigned, unsigned>, PabloAST *> maskMemo;
+    auto inRunOf = [&](PabloAST * run, unsigned o, unsigned k) -> PabloAST * {
+        auto & m = maskMemo[{run, o, k}];
         if (m == nullptr) {
-            m = at(mask, o);
-            for (unsigned j = 1; j < k; j++) m = pb.createAnd(m, at(mask, o + j));
+            m = at(run, o);
+            for (unsigned j = 1; j < k; j++) m = pb.createAnd(m, at(run, o + j));
         }
         return m;
     };
+    auto inRun = [&](unsigned o, unsigned k) {return inRunOf(mask, o, k);};
     //  The longest match of an entity at offset o has length k: in a text within
     //  a filter (run), the longest that fits within the run.
+    //  (The run: the mask for a text; for a context, the region with bounded
+    //  regions, none otherwise.)
     std::map<std::tuple<size_t, unsigned, unsigned, bool>, PabloAST *> longestMemo;
-    auto longestAt = [&](size_t e, unsigned k, unsigned o, bool run) -> PabloAST * {
+    auto longestAt = [&](size_t e, unsigned k, unsigned o, bool text) -> PabloAST * {
         if (!mask) return len(e, k, o);
-        auto & r = longestMemo[{e, k, o, run}];
+        auto & r = longestMemo[{e, k, o, text}];
         if (r) return r;
-        auto fits = [&](unsigned l) {return run ? pb.createAnd(len(e, l, o), inRun(o, l)) : len(e, l, o);};
+        PabloAST * const run = text ? mask : region;
+        auto fits = [&](unsigned l) {return run ? pb.createAnd(len(e, l, o), inRunOf(run, o, l)) : len(e, l, o);};
         r = fits(k);
         for (unsigned longer : p.entities[e].lengths) {
             if (longer > k) r = pb.createAnd(r, pb.createNot(fits(longer)));
@@ -17475,6 +17493,11 @@ void EntityMatch::generatePabloMethod() {
         for (unsigned k : p.entities[e].lengths) r = pb.createOr(r, longestAt(e, k, o, run));
         return r;
     };
+    //  The end of the text (or, with bounded regions, of the region) at offset o
+    //  of an after context (the positions before o are within it).
+    auto pastEnd = [&](unsigned o) -> PabloAST * {
+        return pb.createNot(at(region ? region : inText, o));
+    };
     //  The paths of a sequence of items: (condition, offset after them).
     using Paths = std::vector<std::pair<PabloAST *, unsigned>>;
     auto extend = [&](const Paths & in, const std::vector<ldml::EntityItem> & items, bool context) {
@@ -17483,16 +17506,17 @@ void EntityMatch::generatePabloMethod() {
             Paths next;
             for (const auto & [cond, o] : paths) {
                 if (item.kind == ldml::EntityItem::Kind::Boundary) {
-                    next.emplace_back(pb.createAnd(cond, pb.createNot(at(inText, o))), o);
+                    next.emplace_back(pb.createAnd(cond, pastEnd(o)), o);
                 } else if (item.kind == ldml::EntityItem::Kind::Literal) {
                     PabloAST * c = classAt(UCD::UnicodeSet(item.literal), o);
                     if (mask && !context) c = pb.createAnd(c, inRun(o, 1));
+                    if (region && context) c = pb.createAnd(c, at(region, o));
                     next.emplace_back(pb.createAnd(cond, c), o + 1);
                     if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(c)), o);
                 } else {
                     const ldml::Entity & x = p.entities[item.entity];
                     for (unsigned k : x.lengths) next.emplace_back(pb.createAnd(cond, longestAt(item.entity, k, o, !context)), o + k);
-                    if (context && x.boundary) next.emplace_back(pb.createAnd(cond, pb.createNot(at(inText, o))), o);
+                    if (context && x.boundary) next.emplace_back(pb.createAnd(cond, pastEnd(o)), o);
                     if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(start(item.entity, o, !context))), o);
                 }
             }
@@ -17546,9 +17570,13 @@ void EntityMatch::generatePabloMethod() {
         //  the boundary, and through the deletions of one position decided in
         //  state 1 (no other rule changes it: its results end with characters
         //  not in the set, and the deletions in state 1 are of one position).
+        //  (With bounded regions, the start of each region as the start of the
+        //  text, and a character of the set only within the region.)
         const size_t C = p.stateEntity;
+        PabloAST * const within = region ? region : inText;
         PabloAST * start = pb.createAdvance(len(C, 1, 0), 1);
-        if (p.entities[C].boundary) start = pb.createOr(start, pb.createAnd(inText, pb.createNot(pb.createAdvance(inText, 1))));
+        if (region) start = pb.createAnd(start, pb.createAdvance(region, 1));
+        if (p.entities[C].boundary) start = pb.createOr(start, pb.createAnd(within, pb.createNot(pb.createAdvance(within, 1))));
         PabloAST * deleted1 = zeroes;
         for (size_t i = 0; i < p.rules.size(); i++) {
             const auto f = byLength1[i].find(1);
@@ -17834,7 +17862,7 @@ EntityInputs RulePipelineBuilder::entityInputs(const ldml::EntityGroupPlan & pla
     return in;
 }
 
-Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21) {
+Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21, StreamSet * regions) {
     PipelineBuilder & P = mP;
     const EntityCoding coding = entityCoding(plan);
     const EntityInputs in = entityInputs(plan, coding, U21);
@@ -17849,7 +17877,7 @@ Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, Stre
     const unsigned maxIns = EntityMatch::maxInsertion(plan);
     StreamSet * const Ins = maxIns > 0 ? P.CreateStreamSet(bitsFor(maxIns)) : nullptr;
     P.CreateKernelCall<EntityMatch>(plan, coding, mGroupLabel, Classes, Externals, InText, props, stringSets, W, Deleted, Ins,
-                                    std::vector<unsigned>{}, 0, nullptr, activeMask());
+                                    std::vector<unsigned>{}, 0, nullptr, activeMask(), regions);
     SHOW_BIXNUM(W);
     SHOW_STREAM(Deleted);
     PositionMap positions;
@@ -17887,7 +17915,8 @@ Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, Stre
 //  selectors, with their strings.
 StreamSet * RulePipelineBuilder::entitySelectorGroup(const std::string & label, const ldml::EntityGroupPlan & plan,
                                                     StreamSet * Ones, std::vector<TransformMask> & masks,
-                                                    const ByteSource & bytes, std::vector<std::u32string> & strings) {
+                                                    const ByteSource & bytes, std::vector<std::u32string> & strings,
+                                                    bool bounded) {
     mMasks.restore(std::move(masks));
     const std::string saved = mTransformLabel;
     const std::string savedGroup = mGroupLabel;
@@ -17903,7 +17932,8 @@ StreamSet * RulePipelineBuilder::entitySelectorGroup(const std::string & label, 
     const EntityInputs in = entityInputs(plan, coding, Ones);
     StreamSet * const Sel = mP.CreateStreamSet(bitsFor(mSelectorStrings.size()));
     mP.CreateKernelCall<EntityMatch>(plan, coding, label, in.classes, in.externals, in.inText, in.props, in.stringSets,
-                                     nullptr, nullptr, nullptr, selectors, deletion, Sel, activeMask());
+                                     nullptr, nullptr, nullptr, selectors, deletion, Sel, activeMask(),
+                                     bounded ? boundedRegions() : nullptr);
     SHOW_BIXNUM(Sel);
     strings = mSelectorStrings;
     mBytes = nullptr;

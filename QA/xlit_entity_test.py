@@ -19,7 +19,9 @@
 #  rules in 4 or more Div32 blocks, none with more than half), and otherwise
 #  (also with --class-layer=0) with a stream for each class in Unicode mode, or
 #  the multiplexed code of the classes in UTF-8 mode.  Each rules file is also
-#  applied within a global filter (see FILTERS), against ICU.
+#  applied within a global filter (see FILTERS), against ICU; and a rules file
+#  whose contexts see the edges of the lines, with --lines (bounded regions,
+#  see REGIONS), against ICU line by line.
 #
 #  xlit_entity_test.py <xlit binary> [--extended-testing]
 
@@ -114,6 +116,21 @@ $V → v;
 FILTERS = {"small": ":: [^\u031E \u02D0] ;", "layered": ":: [^\u02BC \u0303 γ] ;",
            "overlaps": ":: [^y \u031E] ;", "states": ":: [^\u031E] ;"}
 
+#  Bounded regions (--lines; the group's contexts are not line-bound): each
+#  line a text of its own, its start and end the text's for the contexts.  $S
+#  (a space, or the text boundary) holds at a line's start only as the start of
+#  a region (the line feed before it is not in $S), and [$] and [\u0020$] after
+#  an a only at the end of its line (a line feed follows it).
+REGIONS = """
+$S = [\u0020$] ;
+$S {a} → X ;
+a } [$] → E ;
+a } [\u0020$] → F ;
+a → z ;
+q → ;
+"""
+REGIONS_TEXT = "a\nqa\naa\n a\na a\nqqa\nb a q\naq\nqqaa\n\na\nba\nqa a\n"
+
 #  (rules, the code expected with --class-layer=1)
 CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32"), ("overlaps", OVERLAPS, "streams"),
          ("states", STATES, "streams")]
@@ -203,6 +220,29 @@ def main():
                 if problems:
                     failures += 1
                     print("FAIL %s filtered --utf8-mode=%s: %s; %s" % (name, mode, ", ".join(problems), trace[:400]))
+        #  Bounded regions, against ICU line by line.
+        rules_path = os.path.join(d, "regions.txt")
+        with open(rules_path, "w", encoding="utf-8") as f:
+            f.write(REGIONS)
+        input_path = os.path.join(d, "regions-in.txt")
+        with open(input_path, "w", encoding="utf-8") as f:
+            f.write(REGIONS_TEXT * (20 if EXTENDED else 4))
+        icu = run(xlit, ["--rules-file=" + rules_path, "--lines", "--use-ICU=.*", input_path])
+        for mode in ("0", "1"):
+            checks += 1
+            ent = run(xlit, ["--rules-file=" + rules_path, "--lines", "--utf8-mode=" + mode, "--use-ICU=0",
+                             "--entity-groups", "--entity-groups-trace", input_path])
+            trace = ent.stderr.decode(errors="replace")
+            problems = []
+            if ent.returncode != 0 or icu.returncode != 0:
+                problems.append("exit status %d (ICU %d)" % (ent.returncode, icu.returncode))
+            if ent.stdout != icu.stdout:
+                problems.append("output differs from ICU's")
+            if ": applied" not in trace:
+                problems.append("not applied by its entity plan")
+            if problems:
+                failures += 1
+                print("FAIL regions --lines --utf8-mode=%s: %s; %s" % (mode, ", ".join(problems), trace[:400]))
     print("%d checks, %d failures" % (checks, failures))
     return 1 if failures else 0
 

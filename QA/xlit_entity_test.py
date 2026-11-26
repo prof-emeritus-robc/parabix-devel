@@ -18,7 +18,8 @@
 #  with the class layer's Div32 code where its criterion holds (20 or more
 #  rules in 4 or more Div32 blocks, none with more than half), and otherwise
 #  (also with --class-layer=0) with a stream for each class in Unicode mode, or
-#  the multiplexed code of the classes in UTF-8 mode.
+#  the multiplexed code of the classes in UTF-8 mode.  Each rules file is also
+#  applied within a global filter (see FILTERS), against ICU.
 #
 #  xlit_entity_test.py <xlit binary> [--extended-testing]
 
@@ -103,6 +104,16 @@ $V → v;
 ʔ → ;
 """
 
+#  Global filters (ICU applies the rules to each run of the filter's characters
+#  as if the text ended at the run's end; contexts see the whole text), on
+#  each rules file: a string of a set or an optional item at the end of a run
+#  (e̞, ː), the second item of a rule, the deleted ʔ.  The rules are followed by
+#  :: Null ; (ICU 74 ignores the global filter of a transform of a single group),
+#  and compared with ICU's only: the regular plan does not end the runs there
+#  (it keeps e in "ee̞" with ̞ outside the filter, where ICU matches $V ː? → A).
+FILTERS = {"small": ":: [^\u031E \u02D0] ;", "layered": ":: [^\u02BC \u0303 γ] ;",
+           "overlaps": ":: [^y \u031E] ;", "states": ":: [^\u031E] ;"}
+
 #  (rules, the code expected with --class-layer=1)
 CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32"), ("overlaps", OVERLAPS, "streams"),
          ("states", STATES, "streams")]
@@ -172,6 +183,26 @@ def main():
                     if problems:
                         failures += 1
                         print("FAIL %s --utf8-mode=%s --class-layer=%s: %s; %s" % (name, mode, layer, ", ".join(problems), trace[:400]))
+            #  Within the global filter, against ICU.
+            filtered_path = os.path.join(d, name + "-filtered.txt")
+            with open(filtered_path, "w", encoding="utf-8") as f:
+                f.write(FILTERS[name] + "\n" + rules + ":: Null ;\n")
+            icu = run(xlit, ["--rules-file=" + filtered_path, "--use-ICU=.*", input_path])
+            for mode in ("0", "1"):
+                checks += 1
+                ent = run(xlit, ["--rules-file=" + filtered_path, "--utf8-mode=" + mode, "--use-ICU=0",
+                                 "--entity-groups", "--entity-groups-trace", input_path])
+                trace = ent.stderr.decode(errors="replace")
+                problems = []
+                if ent.returncode != 0 or icu.returncode != 0:
+                    problems.append("exit status %d (ICU %d)" % (ent.returncode, icu.returncode))
+                if ent.stdout != icu.stdout:
+                    problems.append("output differs from ICU's")
+                if ": applied" not in trace:
+                    problems.append("not applied by its entity plan")
+                if problems:
+                    failures += 1
+                    print("FAIL %s filtered --utf8-mode=%s: %s; %s" % (name, mode, ", ".join(problems), trace[:400]))
     print("%d checks, %d failures" % (checks, failures))
     return 1 if failures else 0
 

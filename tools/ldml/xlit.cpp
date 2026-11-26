@@ -11094,8 +11094,11 @@ public:
         std::pair<StreamSet *, StreamSet *> regions{nullptr, nullptr};    // the starts and follows of the regions (bytes)
     };
     //  A group by its entity plan in the hybrid (see entitySelectorGroup).
+    //  (The masks given, one position per character, are returned unchanged:
+    //  the selectors are applied to the bytes, which keeps their masks in step.)
     StreamSet * entitySelectorGroup(const std::string & label, const ldml::EntityGroupPlan & plan, StreamSet * Ones,
-                                    const ByteSource & bytes, std::vector<std::u32string> & strings);
+                                    std::vector<TransformMask> & masks, const ByteSource & bytes,
+                                    std::vector<std::u32string> & strings);
     StreamSet * selectorGroup(const std::string & label, const ldml::TransformStep & step, StreamSet * Ones,
                               std::vector<TransformMask> & masks, const ByteSource & bytes, std::vector<std::u32string> & strings) {
         mMasks.restore(std::move(masks));
@@ -15357,7 +15360,7 @@ static std::string utf8StepProblem(const ldml::TransformRegistry & registry, Tra
                                    const ldml::TransformStep & step, bool bounded,
                                    const TransformAnalysis * a = nullptr, bool entities = false) {
     //  (A group the entity plan applies, in the hybrid: with entities, the step
-    //  is one of a's applied without a filter, see entityStepProblem.)
+    //  is one of a's, see entityStepProblem.)
     if (entities && a && step.kind == ldml::TransformStep::Kind::Conversion) {
         const size_t i = static_cast<size_t>(&step - a->plan.steps.data());
         if (i < a->plan.steps.size() && entityStepProblem(*a, i, bounded && !groupLineBound(step)).empty()) return "";
@@ -15597,7 +15600,7 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
     //  (Mixed modes: the Unicode segments, see mixedSegments.)
     std::vector<size_t> unicodeEnd(a.plan.steps.size(), 0);
     if (MixedModes) {
-        for (const MixedSegment & m : mixedSegments(mRegistry, mAnalyzer, a, mBounded, EntityGroups && mMasks.empty())) {
+        for (const MixedSegment & m : mixedSegments(mRegistry, mAnalyzer, a, mBounded, EntityGroups)) {
             if (m.unicode) unicodeEnd[m.begin] = m.end;
         }
     }
@@ -15624,7 +15627,6 @@ StreamSet * UTF8PipelineBuilder::applyAnalysis(const std::string & name, const T
             //  (With --entity-groups: a group its entity plan applies, in the
             //  hybrid, before the other paths; doc/ldml-entity-groups-plan.md.)
             const std::string notByEntities = !EntityGroups ? std::string("off")
-                : !mMasks.empty() ? std::string("within a filter")
                 : entityStepProblem(a, i, mBounded && !groupLineBound(step));
             if (EntityGroups && EntityGroupsTrace) {
                 llvm::errs() << "entity groups: " << mGroupLabel << ": "
@@ -15665,7 +15667,9 @@ static std::string entityStepProblem(const TransformAnalysis & a, size_t i, bool
 
 //  A group by its entity plan in the hybrid (see
 //  RulePipelineBuilder::entitySelectorGroup): its selectors spread back to the
-//  last bytes of the characters and applied to the bytes.  (Outside filters.)
+//  last bytes of the characters and applied to the bytes, which keeps the masks
+//  in step (within filters, the masks compressed to the characters for the
+//  group, as hybridGroup's).
 StreamSet * UTF8PipelineBuilder::entityHybridGroup(const ldml::EntityGroupPlan & plan, StreamSet * Basis) {
     RulePipelineBuilder::ByteSource bytes;
     bytes.basis = Basis;
@@ -15674,8 +15678,13 @@ StreamSet * UTF8PipelineBuilder::entityHybridGroup(const ldml::EntityGroupPlan &
     bytes.index = index;
     StreamSet * const ones = mP.CreateStreamSet(1);
     FilterByMask(mP, index, index, ones);
+    //  (The masks of the bytes kept; a copy compressed for the group.)
+    std::vector<TransformMask> byteMasks = mMasks.release();
+    mMasks.restore(std::vector<TransformMask>(byteMasks));
+    std::vector<TransformMask> masks = unicodeMasks(Basis);
     std::vector<std::u32string> strings;
-    StreamSet * const selectors = unicode().entitySelectorGroup(mGroupLabel, plan, ones, bytes, strings);
+    StreamSet * const selectors = unicode().entitySelectorGroup(mGroupLabel, plan, ones, masks, bytes, strings);
+    mMasks.restore(std::move(byteMasks));
     StreamSet * const atBytes = mP.CreateStreamSet(selectors->getNumElements());
     SpreadByMask(mP, index, selectors, atBytes);
     PositionMap positions;
@@ -16872,7 +16881,6 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (EntityGroups) {
                 if (entity < 0) notByEntities = "no source group corresponds to the step";
                 else if (mBytes) notByEntities = "UTF-8 mode (the hybrid)";
-                else if (activeMask()) notByEntities = "within a filter";
                 else if (boundedRegions()) notByEntities = "bounded regions";
                 else if (mDeletedRunEnds || mDeletedRunAfter) notByEntities = "after deleted runs";
                 else if (step.hasFrontLetters || !step.chainRevisitRules.empty() || !step.markRunEditRules.empty()
@@ -17203,6 +17211,15 @@ static unsigned itemsMaxLength(const ldml::EntityGroupPlan & p, const std::vecto
     return n;
 }
 
+//  A group label in a kernel name (which names a file of the object cache):
+//  its characters other than letters and digits as '_' (as the transforms'
+//  names have '/', e.g. uk-uk_Latn/BGN).
+static std::string entityKernelLabel(const std::string & label) {
+    std::string l;
+    for (char c : label) l += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+    return l;
+}
+
 //  Whether some rule of an entity group has a before context (given by the
 //  closed form, see entityStep2Problem), and the stages and cycles of its
 //  selection: by the graph pruned of such rules where they cannot win within a
@@ -17229,11 +17246,12 @@ public:
                 const std::string & label, StreamSet * Classes, StreamSet * Externals, StreamSet * InText,
                 const std::vector<StreamSet *> & Props, const std::vector<StreamSet *> & StringSets,
                 StreamSet * W, StreamSet * Deleted, StreamSet * Ins,
-                const std::vector<unsigned> & selectors = {}, unsigned deletionSelector = 0, StreamSet * Sel = nullptr)
-    : PabloKernel(ts, "EntityMatch_" + label + "_" + getStringHash(signatureOf(plan, coding, selectors, deletionSelector)),
+                const std::vector<unsigned> & selectors = {}, unsigned deletionSelector = 0, StreamSet * Sel = nullptr,
+                StreamSet * Mask = nullptr)
+    : PabloKernel(ts, "EntityMatch_" + entityKernelLabel(label) + "_" + getStringHash(signatureOf(plan, coding, selectors, deletionSelector, Mask != nullptr)),
                   {}, outputs(W, Deleted, Ins, Sel))
     , mPlan(plan), mCoding(coding), mSelectors(selectors), mDeletionSelector(deletionSelector)
-    , mSignature(signatureOf(plan, coding, selectors, deletionSelector)) {
+    , mSignature(signatureOf(plan, coding, selectors, deletionSelector, Mask != nullptr)) {
         const unsigned la = lookahead(plan);
         auto in = [&](const std::string & name, StreamSet * s) {
             if (la > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(), LookAhead(la)});
@@ -17244,6 +17262,8 @@ public:
         in("inText", InText);
         for (size_t i = 0; i < Props.size(); i++) in("prop" + std::to_string(i), Props[i]);
         for (size_t i = 0; i < StringSets.size(); i++) in("ss" + std::to_string(i), StringSets[i]);
+        if (Mask) in("mask", Mask);
+        mHasMask = Mask != nullptr;
         mHasExternals = Externals != nullptr;
         mHasIns = Ins != nullptr;
     }
@@ -17262,8 +17282,8 @@ public:
         return false;
     }
     static std::string signatureOf(const ldml::EntityGroupPlan & p, const EntityCoding & c,
-                                   const std::vector<unsigned> & selectors, unsigned deletionSelector) {
-        std::string sig = c.signature() + "#";
+                                   const std::vector<unsigned> & selectors, unsigned deletionSelector, bool masked) {
+        std::string sig = c.signature() + (masked ? "#masked#" : "#");
         if (!selectors.empty()) {
             sig += "sel:";
             for (unsigned x : selectors) sig += std::to_string(x) + ",";
@@ -17301,6 +17321,9 @@ private:
     const std::string mSignature;
     bool mHasExternals = false;
     bool mHasIns = false;
+    //  Within a filter: the characters of the rules' texts must all be in the
+    //  mask (a match lies within a run of it); contexts see the whole text.
+    bool mHasMask = false;
 };
 
 void EntityMatch::generatePabloMethod() {
@@ -17309,6 +17332,7 @@ void EntityMatch::generatePabloMethod() {
     const std::vector<PabloAST *> classes = getInputStreamSet("classes");
     const std::vector<PabloAST *> externals = mHasExternals ? getInputStreamSet("externals") : std::vector<PabloAST *>{};
     PabloAST * const inText = getInputStreamSet("inText")[0];
+    PabloAST * const mask = mHasMask ? getInputStreamSet("mask")[0] : nullptr;
     PabloAST * const zeroes = pb.createZeroes();
     const std::vector<size_t> propEntities = entitiesOfKind(p, ldml::Entity::Kind::Property);
     const std::vector<size_t> ssEntities = entitiesOfKind(p, ldml::Entity::Kind::StringSet);
@@ -17382,7 +17406,10 @@ void EntityMatch::generatePabloMethod() {
         }
         llvm::report_fatal_error("EntityMatch: an unsupported property set");
     };
-    //  The longest match of an entity at offset o has length k.
+    //  The longest match of an entity at offset o has length k; within a filter,
+    //  a match of length k (any: the string sets' streams are then of all their
+    //  matches, see entityInputs), of which the longest within the run is
+    //  chosen by longestAt.
     std::map<std::tuple<size_t, unsigned, unsigned>, PabloAST *> lenMemo;
     std::function<PabloAST * (size_t, unsigned, unsigned)> len = [&](size_t e, unsigned k, unsigned o) -> PabloAST * {
         auto f = lenMemo.find({e, k, o});
@@ -17406,6 +17433,7 @@ void EntityMatch::generatePabloMethod() {
             }
             case ldml::Entity::Kind::Union: {
                 for (size_t op : x.operands) r = pb.createOr(r, len(op, k, o));
+                if (mask) break;
                 for (unsigned longer : x.lengths) {
                     if (longer > k) r = pb.createAnd(r, pb.createNot(len(e, longer, o)));
                 }
@@ -17415,9 +17443,36 @@ void EntityMatch::generatePabloMethod() {
         lenMemo.emplace(std::make_tuple(e, k, o), r);
         return r;
     };
-    auto start = [&](size_t e, unsigned o) {
+    //  Within a filter, the positions o to o + k - 1 all in the mask: within the
+    //  run of the text's first position (ICU applies the rules to each run of
+    //  the filter's characters as if the text ended there; contexts see the
+    //  whole text).
+    std::map<std::pair<unsigned, unsigned>, PabloAST *> maskMemo;
+    auto inRun = [&](unsigned o, unsigned k) -> PabloAST * {
+        auto & m = maskMemo[{o, k}];
+        if (m == nullptr) {
+            m = at(mask, o);
+            for (unsigned j = 1; j < k; j++) m = pb.createAnd(m, at(mask, o + j));
+        }
+        return m;
+    };
+    //  The longest match of an entity at offset o has length k: in a text within
+    //  a filter (run), the longest that fits within the run.
+    std::map<std::tuple<size_t, unsigned, unsigned, bool>, PabloAST *> longestMemo;
+    auto longestAt = [&](size_t e, unsigned k, unsigned o, bool run) -> PabloAST * {
+        if (!mask) return len(e, k, o);
+        auto & r = longestMemo[{e, k, o, run}];
+        if (r) return r;
+        auto fits = [&](unsigned l) {return run ? pb.createAnd(len(e, l, o), inRun(o, l)) : len(e, l, o);};
+        r = fits(k);
+        for (unsigned longer : p.entities[e].lengths) {
+            if (longer > k) r = pb.createAnd(r, pb.createNot(fits(longer)));
+        }
+        return r;
+    };
+    auto start = [&](size_t e, unsigned o, bool run) {
         PabloAST * r = zeroes;
-        for (unsigned k : p.entities[e].lengths) r = pb.createOr(r, len(e, k, o));
+        for (unsigned k : p.entities[e].lengths) r = pb.createOr(r, longestAt(e, k, o, run));
         return r;
     };
     //  The paths of a sequence of items: (condition, offset after them).
@@ -17430,14 +17485,15 @@ void EntityMatch::generatePabloMethod() {
                 if (item.kind == ldml::EntityItem::Kind::Boundary) {
                     next.emplace_back(pb.createAnd(cond, pb.createNot(at(inText, o))), o);
                 } else if (item.kind == ldml::EntityItem::Kind::Literal) {
-                    PabloAST * const c = classAt(UCD::UnicodeSet(item.literal), o);
+                    PabloAST * c = classAt(UCD::UnicodeSet(item.literal), o);
+                    if (mask && !context) c = pb.createAnd(c, inRun(o, 1));
                     next.emplace_back(pb.createAnd(cond, c), o + 1);
                     if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(c)), o);
                 } else {
                     const ldml::Entity & x = p.entities[item.entity];
-                    for (unsigned k : x.lengths) next.emplace_back(pb.createAnd(cond, len(item.entity, k, o)), o + k);
+                    for (unsigned k : x.lengths) next.emplace_back(pb.createAnd(cond, longestAt(item.entity, k, o, !context)), o + k);
                     if (context && x.boundary) next.emplace_back(pb.createAnd(cond, pb.createNot(at(inText, o))), o);
-                    if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(start(item.entity, o))), o);
+                    if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(start(item.entity, o, !context))), o);
                 }
             }
             paths = std::move(next);
@@ -17639,7 +17695,7 @@ class EntityApply final : public PabloKernel {
 public:
     EntityApply(LLVMTypeSystemInterface & ts, const ldml::EntityGroupPlan & plan, const std::string & label,
                 StreamSet * U21, StreamSet * W, StreamSet * Out)
-    : PabloKernel(ts, "EntityApply_" + label + "_" + getStringHash(resultsOf(plan) + ":" + std::to_string(W->getNumElements())),
+    : PabloKernel(ts, "EntityApply_" + entityKernelLabel(label) + "_" + getStringHash(resultsOf(plan) + ":" + std::to_string(W->getNumElements())),
                   {Binding{"U21", U21}, Binding{"W", W}}, {Binding{"Out", Out}}) {
         for (const ldml::EntityRule & r : plan.rules) mResults.push_back(r.result);
     }
@@ -17764,7 +17820,12 @@ EntityInputs RulePipelineBuilder::entityInputs(const ldml::EntityGroupPlan & pla
             if (LLVM_UNLIKELY(!coding.codesOf(s, codes))) llvm::report_fatal_error("xlit: a set of a string set without codes");
             return codes;
         };
-        const kernel::StringSetSpec spec = kernel::makeStringSetSpec(x.chars, x.strings, false, code);
+        kernel::StringSetSpec spec = kernel::makeStringSetSpec(x.chars, x.strings, false, code);
+        //  (Within a filter, all the matches, by length, without the guards that
+        //  keep the longest: EntityMatch chooses the longest within the run.)
+        if (activeMask()) {
+            for (kernel::StringSetSpec::Term & t : spec.terms) t.guards.clear();
+        }
         StreamSet * const lengths = P.CreateStreamSet(spec.lengths.size());
         P.CreateKernelCall<kernel::StringSetKernel>(spec, coded ? in.classes : U21, lengths);
         SHOW_STREAM(lengths);
@@ -17787,7 +17848,8 @@ Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, Stre
     StreamSet * Deleted = P.CreateStreamSet(1);
     const unsigned maxIns = EntityMatch::maxInsertion(plan);
     StreamSet * const Ins = maxIns > 0 ? P.CreateStreamSet(bitsFor(maxIns)) : nullptr;
-    P.CreateKernelCall<EntityMatch>(plan, coding, mGroupLabel, Classes, Externals, InText, props, stringSets, W, Deleted, Ins);
+    P.CreateKernelCall<EntityMatch>(plan, coding, mGroupLabel, Classes, Externals, InText, props, stringSets, W, Deleted, Ins,
+                                    std::vector<unsigned>{}, 0, nullptr, activeMask());
     SHOW_BIXNUM(W);
     SHOW_STREAM(Deleted);
     PositionMap positions;
@@ -17824,7 +17886,9 @@ Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, Stre
 //  the first position of each match, deletions at the others).  Returns the
 //  selectors, with their strings.
 StreamSet * RulePipelineBuilder::entitySelectorGroup(const std::string & label, const ldml::EntityGroupPlan & plan,
-                                                    StreamSet * Ones, const ByteSource & bytes, std::vector<std::u32string> & strings) {
+                                                    StreamSet * Ones, std::vector<TransformMask> & masks,
+                                                    const ByteSource & bytes, std::vector<std::u32string> & strings) {
+    mMasks.restore(std::move(masks));
     const std::string saved = mTransformLabel;
     const std::string savedGroup = mGroupLabel;
     mGroupLabel = label;
@@ -17839,12 +17903,13 @@ StreamSet * RulePipelineBuilder::entitySelectorGroup(const std::string & label, 
     const EntityInputs in = entityInputs(plan, coding, Ones);
     StreamSet * const Sel = mP.CreateStreamSet(bitsFor(mSelectorStrings.size()));
     mP.CreateKernelCall<EntityMatch>(plan, coding, label, in.classes, in.externals, in.inText, in.props, in.stringSets,
-                                     nullptr, nullptr, nullptr, selectors, deletion, Sel);
+                                     nullptr, nullptr, nullptr, selectors, deletion, Sel, activeMask());
     SHOW_BIXNUM(Sel);
     strings = mSelectorStrings;
     mBytes = nullptr;
     mGroupLabel = savedGroup;
     mTransformLabel = saved;
+    masks = mMasks.release();
     return Sel;
 }
 
@@ -18699,7 +18764,7 @@ static void printMode(TransformAnalyzer & analyzer, const ldml::TransformEntry *
         toolio::out() << "  mode: mixed:";
         const char * sep = "";
         const TransformAnalysis & analysis = analyzer.analyze(entry);
-        const bool entities = EntityGroups && !analysis.plan.filter;
+        const bool entities = EntityGroups;
         for (const MixedSegment & m : mixedSegments(analyzer.registry(), analyzer, analysis, bounded, entities)) {
             if (m.unicode) {
                 toolio::out() << sep << range(m.begin, m.end) << " Unicode (" << m.why << ")";

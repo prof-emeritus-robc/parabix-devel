@@ -991,3 +991,68 @@ decoded to 21 bits.
 - the correction loop for before contexts outside the closed form;
 - an If on contested positions;
 - timing (only with your go-ahead).
+
+## 17. Status of filters (2026-11-26)
+
+**Semantics.** Within a filter, ICU applies the rules to each run of the
+filter's characters as if the text ended at the run's end, and contexts see
+the whole text. `EntityMatch` takes the active mask (the innermost: each mask
+lies within those before it), in both modes. A rule's text matches only
+within the run of its first position, and the after contexts are not
+restricted:
+
+- **Longest match within the run.** A string set or union matches the
+  longest member that fits within the run (`longestAt`), not the longest
+  overall. With `e̞` whose mark is outside the filter, `$V` matches `e`.
+  Within a filter, the StringSet kernels therefore give all the matches by
+  length (the spec without its guards), and `EntityMatch` chooses. Unions take
+  their operands' matches without exclusion.
+- **Optional items.** An optional item is absent where nothing of it fits
+  within the run, as `ː?` before an `ː` outside the filter.
+- **Unchanged:** the closed form for the before contexts (characters outside
+  the filter are never converted), the stages and the loop.
+- **UTF-8 mode:** the masks are compressed to the characters for the hybrid
+  and restored for the bytes (as `hybridGroup`), and `UTF8_SelectorPipeline`
+  keeps them in step.
+- **Bounded regions** (`--lines` with groups whose contexts are not
+  line-bound) remain excluded.
+
+**A fix to the committed code.** The kernel names had the group label, and a
+transform's name may have '/' (uk-uk_Latn/BGN). The object cache could not
+create the kernel's file, and the run failed with LLVM ERROR. The labels are
+now as DivCode's (`entityKernelLabel`: other than letters and digits, '_').
+
+**Checks (both modes):**
+
+- **Real transforms**, 1 MB each:
+  - Cyrl-Latn, Latin-ASCII and uk-uk_Latn/BGN (global filters): identical to
+    the regular plan's and ICU's;
+  - de-ASCII: Latin-ASCII's group 2, within its filter, invoked by de-ASCII,
+    is now applied by its entity plan; identical to the regular plan's and
+    ICU's;
+  - Bopo-Latn: identical to the regular plan's; both differ from ICU's (as
+    before).
+- **`QA/xlit_entity_test.py`:** each rules file is also applied within a
+  global filter (strings and optional items at a run's end, the second item
+  of a rule, the deleted ʔ), as a compound (with `:: Null ;`), against ICU:
+  32 checks, 5.4 s. With the run left out of the longest match (a mutation
+  check, then restored), the 8 filtered checks fail.
+- `xlit_utf8_mode_test`, `xlit_utf8_masks_test`, `xlit_hybrid_test`,
+  `xlit_class_layer_test`, `string_set_test`.
+
+**Found in the regular plan (not changed):**
+
+1. **Runs within a filter.** The regular plan does not end the runs as ICU
+   does. For the rules `$V = [a e {e̞} i {ɪ̈}]; $V ː? → A; …` under
+   `:: [^̞ ː] ;` (with `:: Null ;`), the text `ee̞ː` gives `AA̞ː`
+   with ICU and the entity plan, `Ae̞ː` with the regular plan (the `e`
+   before the excluded mark is not converted). Three of the four filtered
+   rules files differ from ICU this way.
+2. **The single-group filter.** In a transform of a single group with a
+   global filter (which ICU 74 ignores), the regular plan lets a rule
+   `[$A $G] ʼ → U` whose `ʼ` is outside the filter keep `$A ː? → A` from
+   applying to the `a` before it. As a compound it applies (as ICU). The
+   entity plan applies the same run semantics in both.
+
+**`--lines`:** und_FONIPA-ar group 3's contexts are not line-bound, so with
+`--lines` the regular plan applies it (the output is ICU's, in Unicode mode).

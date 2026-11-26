@@ -425,6 +425,9 @@ UCD::UnicodeSet GroupPlanner::itemAll(const EntityItem & item) const {
 unsigned GroupPlanner::itemMin(const EntityItem & item) const {
     if (item.optional || item.kind == EntityItem::Kind::Boundary) return 0;
     if (item.kind == EntityItem::Kind::Literal) return 1;
+    //  (A set with the text boundary also matches nothing at the end of the
+    //  text, or of a run of a filter.)
+    if (P.entities[item.entity].boundary) return 0;
     return P.entities[item.entity].lengths.front();
 }
 
@@ -444,7 +447,6 @@ void GroupPlanner::addRule(const ConversionRule * c) {
     flatten(source->getText(), false, r.items, r, Use::Text);
     flatten(source->getAfterContext(), false, r.after, r, Use::After);
     for (const EntityItem & item : r.items) {
-        if (item.kind == EntityItem::Kind::Boundary) r.problems.push_back("the text boundary within a text");
         r.minLength += itemMin(item);
         r.maxLength += itemMax(item);
     }
@@ -464,7 +466,9 @@ void GroupPlanner::addRule(const ConversionRule * c) {
             }
         }
     }
-    if (r.before.size() > 1) r.problems.push_back("a before context of several items");
+    for (const EntityItem & item : r.before) {
+        if (item.optional) r.problems.push_back("an optional item in a before context");
+    }
     if (result->hasCursor()) {
         std::u32string revisit;
         const RE * toRevisit = result->getResultToRevisit();

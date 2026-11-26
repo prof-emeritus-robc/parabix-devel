@@ -120,7 +120,8 @@ def make_text(rules, seed, lines):
 
 
 def run(xlit, args):
-    return subprocess.run([xlit] + args, capture_output=True)
+    #  (The paths this test checks, not the entity plans'; see xlit_entity_test.py.)
+    return subprocess.run([xlit] + args + ["--entity-groups=0"], capture_output=True)
 
 
 def main():

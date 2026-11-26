@@ -280,7 +280,8 @@ CODES_TEXT, DEFAULT_CODES_TEXT = 20000, 5000
 
 
 def run(xlit, args):
-    return subprocess.run([xlit] + args, capture_output=True)
+    #  (The paths this test checks, not the entity plans'; see xlit_entity_test.py.)
+    return subprocess.run([xlit] + args + ["--entity-groups=0"], capture_output=True)
 
 
 #  Each case returns (failures, the lines it reports), and writes its files in

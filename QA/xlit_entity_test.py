@@ -114,7 +114,8 @@ $V → v;
 #  and compared with ICU's only: the regular plan does not end the runs there
 #  (it keeps e in "ee̞" with ̞ outside the filter, where ICU matches $V ː? → A).
 FILTERS = {"small": ":: [^\u031E \u02D0] ;", "layered": ":: [^\u02BC \u0303 γ] ;",
-           "overlaps": ":: [^y \u031E] ;", "states": ":: [^\u031E] ;"}
+           "overlaps": ":: [^y \u031E] ;", "states": ":: [^\u031E] ;",
+           "loop": ":: [^o\u0020] ;"}
 
 #  Bounded regions (--lines; the group's contexts are not line-bound): each
 #  line a text of its own, its start and end the text's for the contexts.  $S
@@ -131,9 +132,24 @@ q → ;
 """
 REGIONS_TEXT = "a\nqa\naa\n a\na a\nqqa\nb a q\naq\nqqaa\n\na\nba\nqa a\n"
 
+#  Before contexts outside the closed form (the correction loop): a literal
+#  character, [$] alone, two items, two state sets, reached through deletions
+#  (x → ;) and results ending with a context's character (q → a, w → ka).
+LOOP = """
+a {b} → X ;
+[$] {d} → S ;
+a c {e} → Z ;
+[aeiou] {n} → N ;
+[kt] {n} → M ;
+x → ;
+q → a ;
+w → ka ;
+c → c ;
+"""
+
 #  (rules, the code expected with --class-layer=1)
 CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32"), ("overlaps", OVERLAPS, "streams"),
-         ("states", STATES, "streams")]
+         ("states", STATES, "streams"), ("loop", LOOP, "streams")]
 
 
 def pool_of(rules):
@@ -144,7 +160,8 @@ def pool_of(rules):
     chars.update("abcdefgkqtxyz")
     chars.update(["̰", "̃", "̆", "̇", "̞", "ː", "ʼ", " ", "1", "\n", "ж", "中", "𝒜"])
     strings = ["e̞", "ɪ̈", "k͡h", "k͡hʷ", "a̰", "ά̃", "н̆", "ɓ̃", "ד̇",
-               "xyz", "xyzz", "yzz", "ke̞ː", "kaː", " ʔʔe", "eʔeʔeʔe", "ʔʔʔ", " ʔe̞ʔa"]
+               "xyz", "xyzz", "yzz", "ke̞ː", "kaː", " ʔʔe", "eʔeʔeʔe", "ʔʔʔ", " ʔe̞ʔa",
+               "axb", "axxb", "acxe", "wn", "qn", "txn", "tn", "o", "xxd"]
     return sorted(chars) + strings
 
 
@@ -171,7 +188,7 @@ def main():
             icu = run(xlit, ["--rules-file=" + rules_path, "--use-ICU=.*", input_path])
             for mode in ("0", "1"):
                 common = ["--rules-file=" + rules_path, "--utf8-mode=" + mode, "--use-ICU=0", input_path]
-                regular = run(xlit, common)
+                regular = run(xlit, common + ["--entity-groups=0"])
                 checks += 1
                 if regular.returncode != 0 or icu.returncode != 0 or regular.stdout != icu.stdout:
                     failures += 1

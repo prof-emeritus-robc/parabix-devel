@@ -336,9 +336,9 @@ static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size 
                                       "or 6 (div64)"),
                                       cl::init(5), cl::cat(XlitOptions));
 static cl::opt<bool> EntityGroups("entity-groups",
-    cl::desc("Apply the conversion groups that the entity plan accepts by its kernels (doc/ldml-entity-groups-plan.md; "
-             "before DivCode and the regular plan; Unicode mode, step 2: groups without before contexts or overlaps)"),
-    cl::init(false), cl::cat(XlitOptions));
+    cl::desc("Apply the conversion groups that the entity plan accepts by its kernels (doc/ldml-entity-groups-plan.md), "
+             "before DivCode, the hybrid and the regular plan (default on; --entity-groups=0 for the others only)"),
+    cl::init(true), cl::cat(XlitOptions));
 static cl::opt<bool> EntityGroupsTrace("entity-groups-trace",
     cl::desc("With --entity-groups: report, for each conversion group applied, whether its entity plan applies it, or "
              "why not, to stderr"),
@@ -11024,6 +11024,7 @@ struct NormalizationFrames {
 
 //  (See the entity group kernels.)
 static std::string entityStep2Problem(const ldml::EntityGroupPlan & p);
+static std::string entityLoopProblem(const ldml::EntityGroupPlan & p);
 struct EntityCoding;
 struct EntityInputs;
 
@@ -17035,10 +17036,7 @@ static bool entityClassLayer(const ldml::EntityGroupPlan & p, ClassLayerCoding &
 //  Why a group is not applied by its entity plan in step 2 (empty: it is).
 static std::string entityStep2Problem(const ldml::EntityGroupPlan & p) {
     if (!p.eligible()) return p.problems.front();
-    for (const ldml::EntityRule & r : p.rules) {
-        if (!r.before.empty() && !p.closedForm) return "before contexts that the closed form does not give (the correction loop: not yet)";
-    }
-    return std::string();
+    return entityLoopProblem(p);
 }
 
 //  The classes of an entity group: the class layer's Div32 code (with its
@@ -17222,6 +17220,140 @@ static std::string entityKernelLabel(const std::string & label) {
     return l;
 }
 
+//  The states of the before contexts matched against the converted text, where
+//  the closed form (§5.3) does not give them: the correction loop of an entity
+//  group (doc/ldml-entity-groups-plan.md §19).  The items of the before contexts
+//  are sets (a set, a literal character, or [$]: no characters, the text
+//  boundary); a character's class is the vector of the sets that contain it,
+//  and the text's start has the vector of the sets with the boundary.  The state
+//  at a position is the classes of the last k characters of the converted text
+//  before it (k: the most items of a before context), the start's class beyond
+//  the start.
+static constexpr size_t EntityMaxStates = 64;
+struct EntityStates {
+    std::vector<UCD::UnicodeSet> sets;
+    std::vector<bool> setBoundary;
+    //  (Each set's origin, for its stream: an entity, a literal character, or
+    //  neither, the text boundary alone.)
+    std::vector<int> setEntity;
+    std::vector<int> setLiteral;
+    unsigned k = 0;
+    std::vector<uint64_t> vectors;                  // by class
+    std::vector<UCD::UnicodeSet> classChars;        // by class (the start's may have none)
+    unsigned startClass = 0;
+    std::vector<std::vector<unsigned>> ruleItems;   // by rule, its before items' sets
+    std::vector<std::vector<unsigned>> resultClasses;   // by rule, its result's characters' classes
+    size_t states() const {
+        size_t n = 1;
+        for (unsigned i = 0; i < k; i++) n *= vectors.size();
+        return n;
+    }
+    //  A state's class at depth d (1: the last character), and the state after
+    //  appending a class.
+    unsigned classAt(size_t state, unsigned d) const {
+        for (unsigned i = 1; i < d; i++) state /= vectors.size();
+        return static_cast<unsigned>(state % vectors.size());
+    }
+    size_t shift(size_t state, unsigned c) const {
+        size_t n = 1;
+        for (unsigned i = 1; i < k; i++) n *= vectors.size();
+        return (state % n) * vectors.size() + c;
+    }
+    unsigned classOf(UCD::codepoint_t c) const {
+        uint64_t v = 0;
+        for (size_t j = 0; j < sets.size(); j++) if (sets[j].contains(c)) v |= uint64_t{1} << j;
+        return static_cast<unsigned>(std::find(vectors.begin(), vectors.end(), v) - vectors.begin());
+    }
+    //  Whether a rule's before context holds in a state.
+    bool holds(size_t rule, size_t state) const {
+        const std::vector<unsigned> & items = ruleItems[rule];
+        const unsigned n = static_cast<unsigned>(items.size());
+        for (unsigned i = 0; i < n; i++) {
+            const unsigned d = n - i;
+            if (!((vectors[classAt(state, d)] >> items[i]) & 1)) return false;
+        }
+        return true;
+    }
+};
+
+//  The states of an entity group's before contexts, or the reason they cannot
+//  be given.
+static std::string entityStates(const ldml::EntityGroupPlan & p, EntityStates & st) {
+    std::map<std::string, unsigned> setIndex;
+    auto setOf = [&](const UCD::UnicodeSet & chars, bool boundary, int entity, int literal) {
+        const std::string key = setKey(chars) + (boundary ? "$" : "");
+        auto f = setIndex.find(key);
+        if (f != setIndex.end()) return f->second;
+        st.sets.push_back(chars);
+        st.setBoundary.push_back(boundary);
+        st.setEntity.push_back(entity);
+        st.setLiteral.push_back(literal);
+        return setIndex[key] = static_cast<unsigned>(st.sets.size() - 1);
+    };
+    for (const ldml::EntityRule & r : p.rules) {
+        st.ruleItems.emplace_back();
+        for (const ldml::EntityItem & item : r.before) {
+            if (item.optional) return "an optional item in a before context";
+            switch (item.kind) {
+                case ldml::EntityItem::Kind::Literal:
+                    st.ruleItems.back().push_back(setOf(UCD::UnicodeSet(item.literal), false, -1, static_cast<int>(item.literal))); break;
+                case ldml::EntityItem::Kind::Boundary:
+                    st.ruleItems.back().push_back(setOf(UCD::UnicodeSet(), true, -1, -1)); break;
+                case ldml::EntityItem::Kind::Entity: {
+                    const ldml::Entity & x = p.entities[item.entity];
+                    if (!x.strings.empty()) return "a set with strings in a before context";
+                    st.ruleItems.back().push_back(setOf(x.chars, x.boundary, static_cast<int>(item.entity), -1));
+                    break;
+                }
+            }
+        }
+        st.k = std::max<unsigned>(st.k, static_cast<unsigned>(r.before.size()));
+    }
+    if (st.sets.size() > 60) return "more than 60 sets in before contexts";
+    //  The classes: the vectors of the parts of the codepoints, and the start's.
+    std::vector<UCD::UnicodeSet> parts{UCD::UnicodeSet(0, UCD::UNICODE_MAX)};
+    for (const UCD::UnicodeSet & set : st.sets) {
+        std::vector<UCD::UnicodeSet> next;
+        for (const UCD::UnicodeSet & part : parts) {
+            const UCD::UnicodeSet in = part & set, out = part - set;
+            if (!in.empty()) next.push_back(in);
+            if (!out.empty()) next.push_back(out);
+        }
+        parts = std::move(next);
+    }
+    for (const UCD::UnicodeSet & part : parts) {
+        uint64_t v = 0;
+        const UCD::codepoint_t c = part.begin()->first;
+        for (size_t j = 0; j < st.sets.size(); j++) if (st.sets[j].contains(c)) v |= uint64_t{1} << j;
+        const size_t i = std::find(st.vectors.begin(), st.vectors.end(), v) - st.vectors.begin();
+        if (i == st.vectors.size()) {
+            st.vectors.push_back(v);
+            st.classChars.push_back(part);
+        } else {
+            st.classChars[i] = st.classChars[i] + part;
+        }
+    }
+    uint64_t start = 0;
+    for (size_t j = 0; j < st.sets.size(); j++) if (st.setBoundary[j]) start |= uint64_t{1} << j;
+    const size_t i = std::find(st.vectors.begin(), st.vectors.end(), start) - st.vectors.begin();
+    if (i == st.vectors.size()) {
+        st.vectors.push_back(start);
+        st.classChars.emplace_back();
+    }
+    st.startClass = static_cast<unsigned>(i);
+    if (st.k == 0) st.k = 1;
+    if (st.states() > EntityMaxStates) return "more than " + std::to_string(EntityMaxStates) + " states of the before contexts";
+    for (const ldml::EntityRule & r : p.rules) {
+        st.resultClasses.emplace_back();
+        for (char32_t c : r.result) st.resultClasses.back().push_back(st.classOf(static_cast<UCD::codepoint_t>(c)));
+    }
+    return std::string();
+}
+
+//  Whether an entity group's before contexts are given by the correction loop
+//  (some rule has one, and the closed form does not apply).
+static bool entityLoop(const ldml::EntityGroupPlan & p);
+
 //  Whether some rule of an entity group has a before context (given by the
 //  closed form, see entityStep2Problem), and the stages and cycles of its
 //  selection: by the graph pruned of such rules where they cannot win within a
@@ -17229,6 +17361,15 @@ static std::string entityKernelLabel(const std::string & label) {
 static bool entityHasBefore(const ldml::EntityGroupPlan & p) {
     for (const ldml::EntityRule & r : p.rules) if (!r.before.empty()) return true;
     return false;
+}
+static bool entityLoop(const ldml::EntityGroupPlan & p) {
+    return entityHasBefore(p) && !p.closedForm;
+}
+//  Why the correction loop cannot give an entity group's before contexts, or "".
+static std::string entityLoopProblem(const ldml::EntityGroupPlan & p) {
+    if (!entityLoop(p)) return std::string();
+    EntityStates st;
+    return entityStates(p, st);
 }
 static const std::vector<unsigned> & entityStages(const ldml::EntityGroupPlan & p) {
     return entityHasBefore(p) ? p.stagePruned : p.stage;
@@ -17304,8 +17445,9 @@ public:
         for (unsigned d : entityStages(p)) sig += std::to_string(d) + ",";
         sig += "cycles:";
         for (size_t c : entityCycleRules(p)) sig += std::to_string(c) + ",";
-        if (entityHasBefore(p)) sig += "state:" + entityKey(p, p.stateEntity);
-        for (const ldml::EntityRule & r : p.rules) sig += r.before.empty() ? "-" : "b";
+        if (entityLoop(p)) sig += "loop";
+        else if (entityHasBefore(p)) sig += "state:" + entityKey(p, p.stateEntity);
+        for (const ldml::EntityRule & r : p.rules) sig += "<" + entityItemsKey(p, r.before) + ">";
         return sig;
     }
 protected:
@@ -17498,6 +17640,13 @@ void EntityMatch::generatePabloMethod() {
     auto pastEnd = [&](unsigned o) -> PabloAST * {
         return pb.createNot(at(region ? region : inText, o));
     };
+    //  The end of the run of a text at offset o: a set of the text with the
+    //  text boundary ([$], [^c]) matches nothing there, as at the end of the
+    //  text (each run of a filter is transformed as a text of its own; the
+    //  after contexts see beyond it).
+    auto runEnd = [&](unsigned o) -> PabloAST * {
+        return pb.createNot(at(mask ? mask : (region ? region : inText), o));
+    };
     //  The paths of a sequence of items: (condition, offset after them).
     using Paths = std::vector<std::pair<PabloAST *, unsigned>>;
     auto extend = [&](const Paths & in, const std::vector<ldml::EntityItem> & items, bool context) {
@@ -17506,7 +17655,7 @@ void EntityMatch::generatePabloMethod() {
             Paths next;
             for (const auto & [cond, o] : paths) {
                 if (item.kind == ldml::EntityItem::Kind::Boundary) {
-                    next.emplace_back(pb.createAnd(cond, pastEnd(o)), o);
+                    next.emplace_back(pb.createAnd(cond, context ? pastEnd(o) : runEnd(o)), o);
                 } else if (item.kind == ldml::EntityItem::Kind::Literal) {
                     PabloAST * c = classAt(UCD::UnicodeSet(item.literal), o);
                     if (mask && !context) c = pb.createAnd(c, inRun(o, 1));
@@ -17516,7 +17665,7 @@ void EntityMatch::generatePabloMethod() {
                 } else {
                     const ldml::Entity & x = p.entities[item.entity];
                     for (unsigned k : x.lengths) next.emplace_back(pb.createAnd(cond, longestAt(item.entity, k, o, !context)), o + k);
-                    if (context && x.boundary) next.emplace_back(pb.createAnd(cond, pastEnd(o)), o);
+                    if (x.boundary) next.emplace_back(pb.createAnd(cond, context ? pastEnd(o) : runEnd(o)), o);
                     if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(start(item.entity, o, !context))), o);
                 }
             }
@@ -17543,12 +17692,13 @@ void EntityMatch::generatePabloMethod() {
     //  state's set (or is empty, if the set has the text boundary); a rule with
     //  a before context matches only in state 1 (§5.3).
     const bool hasBefore = entityHasBefore(p);
-    auto winners = [&](bool state, std::vector<PabloAST *> & wins, std::vector<std::map<unsigned, PabloAST *>> & byLength) {
+    auto winnersIf = [&](const std::function<bool (size_t)> & holds, std::vector<PabloAST *> & wins,
+                         std::vector<std::map<unsigned, PabloAST *>> & byLength) {
         PabloAST * prior = zeroes;
         for (size_t i = 0; i < p.rules.size(); i++) {
             wins.push_back(zeroes);
             byLength.emplace_back();
-            if (!p.rules[i].before.empty() && !state) continue;
+            if (!holds(i)) continue;
             PabloAST * match = zeroes;
             for (const auto & [l, m] : matchesByLength[i]) match = pb.createOr(match, m);
             wins.back() = pb.createAnd(match, pb.createNot(prior));
@@ -17556,9 +17706,138 @@ void EntityMatch::generatePabloMethod() {
             for (const auto & [l, m] : matchesByLength[i]) byLength.back()[l] = pb.createAnd(wins.back(), m);
         }
     };
+    auto winners = [&](bool state, std::vector<PabloAST *> & wins, std::vector<std::map<unsigned, PabloAST *>> & byLength) {
+        winnersIf([&](size_t i) {return p.rules[i].before.empty() || state;}, wins, byLength);
+    };
     std::vector<PabloAST *> wins;
     std::vector<std::map<unsigned, PabloAST *>> winsByLength;
-    if (!hasBefore) {
+    const bool loop = entityLoop(p);
+    if (loop) {
+        //  The correction loop (§19): the cursors and their states, from the
+        //  positions where they are known (the starts, and after k characters
+        //  that no rule converts), along the transitions of the winners in each
+        //  state, in a While loop whose Vars accumulate.
+        EntityStates st;
+        if (LLVM_UNLIKELY(!entityStates(p, st).empty())) llvm::report_fatal_error("EntityMatch: before contexts without states");
+        const size_t S = st.states();
+        const unsigned N = static_cast<unsigned>(st.vectors.size());
+        PabloAST * const within = region ? region : inText;
+        //  The sets' streams, and the classes' (the characters of each class).
+        std::vector<PabloAST *> setStream;
+        for (size_t j = 0; j < st.sets.size(); j++) {
+            if (st.setEntity[j] >= 0) setStream.push_back(len(static_cast<size_t>(st.setEntity[j]), 1, 0));
+            else if (st.setLiteral[j] >= 0) setStream.push_back(classAt(UCD::UnicodeSet(static_cast<UCD::codepoint_t>(st.setLiteral[j])), 0));
+            else setStream.push_back(zeroes);
+        }
+        std::vector<PabloAST *> classStream(N, zeroes);
+        for (unsigned c = 0; c < N; c++) {
+            if (st.classChars[c].empty()) continue;
+            PabloAST * x = inText;
+            for (size_t j = 0; j < st.sets.size(); j++) {
+                x = pb.createAnd(x, ((st.vectors[c] >> j) & 1) ? setStream[j] : pb.createNot(setStream[j]));
+            }
+            classStream[c] = x;
+        }
+        //  The positions that no rule's text may cover (whatever the before
+        //  contexts): never converted, and never within a match.
+        PabloAST * spans = zeroes;
+        for (const auto & byLength : matchesByLength) {
+            for (const auto & [l, m] : byLength) {
+                for (unsigned j = 0; j < l; j++) spans = pb.createOr(spans, j ? pb.createAdvance(m, j) : m);
+            }
+        }
+        PabloAST * const barrier = pb.createAnd(within, pb.createNot(spans));
+        //  The positions known: a state's classes, each that of a barrier at its
+        //  depth, or the start's beyond the start (of the text or region).
+        std::vector<PabloAST *> inside(st.k + 1, nullptr);
+        for (unsigned i = 1; i <= st.k; i++) {
+            PabloAST * const back = pb.createAdvance(within, i);
+            inside[i] = i == 1 ? back : pb.createAnd(inside[i - 1], back);
+        }
+        std::vector<PabloAST *> known(S, zeroes);
+        for (size_t sigma = 0; sigma < S; sigma++) {
+            PabloAST * x = within;
+            for (unsigned d = 1; d <= st.k; d++) {
+                const unsigned c = st.classAt(sigma, d);
+                PabloAST * comp = pb.createAnd(inside[d], pb.createAdvance(pb.createAnd(barrier, classStream[c]), d));
+                if (c == st.startClass) comp = pb.createOr(comp, pb.createNot(inside[d]));
+                x = pb.createAnd(x, comp);
+            }
+            known[sigma] = x;
+        }
+        //  The winners in each state, and the transitions: by (state after,
+        //  length), the positions in each state from which they go there.
+        std::vector<std::vector<PabloAST *>> winsIn(S);
+        std::vector<std::vector<std::map<unsigned, PabloAST *>>> byLengthIn(S);
+        std::map<std::pair<size_t, unsigned>, std::vector<PabloAST *>> go;     // (to, length) -> by state from
+        auto addGo = [&](size_t from, size_t to, unsigned l, PabloAST * cond) {
+            auto & g = go[{to, l}];
+            if (g.empty()) g.assign(S, zeroes);
+            g[from] = pb.createOr(g[from], cond);
+        };
+        for (size_t sigma = 0; sigma < S; sigma++) {
+            winnersIf([&](size_t i) {return st.holds(i, sigma);}, winsIn[sigma], byLengthIn[sigma]);
+            PabloAST * any = zeroes;
+            for (size_t i = 0; i < p.rules.size(); i++) {
+                size_t to = sigma;
+                for (unsigned c : st.resultClasses[i]) to = st.shift(to, c);
+                for (const auto & [l, m] : byLengthIn[sigma][i]) addGo(sigma, to, l, m);
+                any = pb.createOr(any, winsIn[sigma][i]);
+            }
+            PabloAST * const none = pb.createAnd(inText, pb.createNot(any));
+            for (unsigned c = 0; c < N; c++) {
+                if (st.classChars[c].empty()) continue;
+                addGo(sigma, st.shift(sigma, c), 1, pb.createAnd(none, classStream[c]));
+            }
+        }
+        //  (A transition lands within the text or region of its start.)
+        PabloAST * const landing = pb.createAnd(inText, pb.createAdvance(within, 1));
+        std::vector<Var *> reach;
+        PabloAST * initial = zeroes;
+        for (size_t sigma = 0; sigma < S; sigma++) {
+            reach.push_back(pb.createVar("reach" + std::to_string(sigma), known[sigma]));
+            initial = pb.createOr(initial, known[sigma]);
+        }
+        Var * const done = pb.createVar("cursorsDone", zeroes);
+        Var * const pending = pb.createVar("cursorsPending", initial);
+        PabloBuilder wb = pb.createScope();
+        {
+            std::vector<PabloAST *> frontier(S);
+            PabloAST * all = zeroes;
+            for (size_t sigma = 0; sigma < S; sigma++) {
+                frontier[sigma] = wb.createAnd(reach[sigma], wb.createNot(done));
+                all = wb.createOr(all, frontier[sigma]);
+            }
+            PabloAST * const nowDone = wb.createOr(done, all);
+            std::vector<PabloAST *> next(S, zeroes);
+            for (const auto & [key, from] : go) {
+                PabloAST * x = zeroes;
+                for (size_t sigma = 0; sigma < S; sigma++) x = wb.createOr(x, wb.createAnd(frontier[sigma], from[sigma]));
+                next[key.first] = wb.createOr(next[key.first], wb.createAdvance(x, key.second));
+            }
+            PabloAST * reached = zeroes;
+            for (size_t sigma = 0; sigma < S; sigma++) {
+                PabloAST * const r = wb.createOr(reach[sigma], wb.createAnd(next[sigma], landing));
+                wb.createAssign(reach[sigma], r);
+                reached = wb.createOr(reached, r);
+            }
+            wb.createAssign(done, nowDone);
+            wb.createAssign(pending, wb.createAnd(reached, wb.createNot(nowDone)));
+        }
+        pb.createWhile(pending, wb);
+        //  The matches applied: where they win, at a cursor, in its state.
+        for (size_t i = 0; i < p.rules.size(); i++) {
+            wins.push_back(zeroes);
+            winsByLength.emplace_back();
+            for (const auto & [l, m] : matchesByLength[i]) winsByLength.back()[l] = zeroes;
+            for (size_t sigma = 0; sigma < S; sigma++) {
+                wins.back() = pb.createOr(wins.back(), pb.createAnd(reach[sigma], winsIn[sigma][i]));
+                for (const auto & [l, m] : byLengthIn[sigma][i]) {
+                    winsByLength.back()[l] = pb.createOr(winsByLength.back()[l], pb.createAnd(reach[sigma], m));
+                }
+            }
+        }
+    } else if (!hasBefore) {
         winners(true, wins, winsByLength);
     } else {
         std::vector<PabloAST *> wins0, wins1;
@@ -17618,7 +17897,13 @@ void EntityMatch::generatePabloMethod() {
         }
         return r;
     };
-    for (unsigned d = 0; d < stages; d++) {
+    if (loop) {
+        //  (The loop decides the cursors: a match applies where it begins at one.)
+        for (size_t i = 0; i < wins.size(); i++) {
+            for (const auto & [l, m] : winsByLength[i]) startLen[l] = pb.createOr(startLen[l], m);
+        }
+    }
+    for (unsigned d = 0; d < (loop ? 0 : stages); d++) {
         PabloAST * const covered = d == 0 ? zeroes : interiorOf(pb, startLen);
         std::vector<size_t> inCycle;
         for (size_t i = 0; i < wins.size(); i++) {

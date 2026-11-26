@@ -1094,3 +1094,66 @@ groups stay in UTF-8 mode in the mixed segments.
   With the region ignored (a mutation check, then restored), 10 of its 13 lines
   differ from ICU's. It is in `QA/xlit_entity_test.py` (34 checks, 5.8 s
   cold: a little over the 5 s of the test-time limit).
+
+## 19. Status of the correction loop, and the default (2026-11-26)
+
+**The correction loop.** Before contexts that the closed form does not give
+(literal characters, `[$]` alone, several items, several sets, or a set
+failing (a) to (c)) are matched against the converted text by a loop over the
+cursors of the group (`EntityStates`, in `EntityMatch`).
+
+- **Classes and states.**
+  - The items of the before contexts are sets: a set, a literal character, or
+    `[$]` (no characters, the boundary).
+  - A character's class is the vector of the sets containing it. The start of
+    the text (or region) has the vector of the sets with the boundary.
+  - The state at a cursor is the classes of the last k characters of the
+    converted text (k: the most items of a before context), at most 64 states
+    (`EntityMaxStates`).
+- **Transitions.** In each state, the winner at each position is the first
+  rule whose text and after context match (statically) and whose before
+  context holds in that state. A winner goes to the position after its match,
+  in the state shifted by the classes of its result (unchanged by a
+  deletion). No winner goes to the next position, shifted by the character's
+  class.
+- **Known positions.** These are the starts of the text or regions, and the
+  positions after k positions that no rule's text can cover. Those are never
+  converted, so the position after them is a cursor in the state of their
+  classes.
+- **The loop.** A While loop with accumulating Vars (`reach[σ]`, `done`)
+  expands the new cursors along the transitions. Each iteration does one
+  Advance per (state after, length), over precomputed transition streams. The
+  carries are those of the pending/accumulating pattern, so block boundaries
+  are handled.
+- **Selection** is the loop's: a match applies where it wins at a cursor in
+  its state. So overlaps, stages and cycles need nothing more in these groups.
+
+The closed form remains the path where it applies; it needs no loop.
+
+**The boundary in a text.** As ICU, a set of a text with the text boundary
+(`[^c]`, or `[$]`) also matches nothing at the end of the text, or of a run
+of a filter or region (`runEnd`), as `xlit_filter_run_end_test` requires. The
+plan no longer excludes `[$]` in a text.
+
+**`--entity-groups` is on by default.** `xlit_divcode_test` and
+`xlit_class_layer_test`, which check the kernels of the other paths, run with
+`--entity-groups=0`, and so do the regular-plan runs of `xlit_entity_test`.
+
+**Checks:**
+
+- **A rules file for the loop**, against ICU in both modes: `a {b}`,
+  `[$] {d}`, `a c {e}`, `[aeiou] {n}`, `[kt] {n}`, with `x → ;`, `q → a`,
+  `w → ka`, on 300 random lines and chains of deletions of 64 to 500
+  characters (across blocks). It matches with 4 threads and segments of one
+  stride, with `--lines`, and within a filter. With the results' classes left
+  out of the transitions (a mutation check, then restored), 280 lines differ.
+- **und_FONIPA-fa:** group 3, whose before contexts the closed form does not
+  give, is applied by the loop. On 1 MB of `pool-und_FONIPA.txt` the output
+  is ICU's, in both modes (3.4 to 5.2 s with compilation).
+- **`QA/xlit_entity_test.py`:** the loop's rules file in both modes, with the
+  class layer on and off, and within a filter: 42 checks.
+- **The xlit and ldml tests:** all 55 pass with the entity groups on by
+  default. Before the boundary fix, `xlit_filter_run_end_test` failed, and the
+  two path tests needed `--entity-groups=0`.
+- **und_FONIPA-ar and -fa with the defaults**, against ICU: 1 MB each, and the
+  464 targeted lines.

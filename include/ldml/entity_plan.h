@@ -39,10 +39,6 @@ class Rule;
 class ConversionRule;
 
 struct EntityOptions {
-    //  The most classes (pure sets and literal characters) that the group's CC
-    //  kernel computes as streams of their own; above it, the classes (with
-    //  the characters of the strings) are multiplexed (§3.1).
-    unsigned muxThreshold = 16;
     //  The longest text of a rule (in characters).
     unsigned maxTextLength = 16;
 };
@@ -105,15 +101,18 @@ struct EntityGroupPlan {
     std::vector<Entity> entities;
     std::vector<EntityRule> rules;
 
-    //  The classes of the group's CC kernel (§3.1): the pure sets and
-    //  literal characters (streamClasses); with the characters of the strings
-    //  and the single-character parts of the string sets, the classes of a
-    //  multiplexed code (muxClasses), with its exclusive classes and code bits.
-    unsigned streamClasses = 0;
-    unsigned muxClasses = 0;
-    unsigned exclusiveClasses = 0;
-    unsigned codeBits = 0;
-    bool multiplexed = false;
+    //  The sets of the group's CC kernel (§3.1), distinct, in order of first
+    //  use: streamSets, the pure sets, the literal characters and the sets of
+    //  characters within property sets (a stream each, without a code);
+    //  codedSets, these and, for the string sets, their single-character parts
+    //  and each character of their strings (with a code, such as the class
+    //  layer's).  The choice of code is the client's.
+    std::vector<UCD::UnicodeSet> streamSets;
+    std::vector<UCD::UnicodeSet> codedSets;
+    //  The sets with which the rules' matches may begin (by rule), for the
+    //  leaves of a class layer's criterion: the union of the first characters
+    //  of the leading optional items and of the first required item.
+    std::vector<UCD::UnicodeSet> firstSets;
 
     //  The rules that may begin within a match of each rule (a conservative
     //  test on the characters: at an offset of 1 or more of the rule's matches,

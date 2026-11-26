@@ -118,6 +118,7 @@
 #include <ldml/divcode_plan.h>
 #include <ldml/entity_plan.h>
 #include <kernel/unicode/divcode.h>
+#include <kernel/unicode/string_set.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
@@ -333,15 +334,19 @@ static cl::opt<bool, true> DivCodeFamilies("divcode-families",
 static cl::opt<unsigned> DivCodeShift("divcode-shift", cl::desc("The block size of DivCode alphabets: 5 (div32, the default) "
                                       "or 6 (div64)"),
                                       cl::init(5), cl::cat(XlitOptions));
+static cl::opt<bool> EntityGroups("entity-groups",
+    cl::desc("Apply the conversion groups that the entity plan accepts by its kernels (doc/ldml-entity-groups-plan.md; "
+             "before DivCode and the regular plan; Unicode mode, step 2: groups without before contexts or overlaps)"),
+    cl::init(false), cl::cat(XlitOptions));
+static cl::opt<bool> EntityGroupsTrace("entity-groups-trace",
+    cl::desc("With --entity-groups: report, for each conversion group applied, whether its entity plan applies it, or "
+             "why not, to stderr"),
+    cl::init(false), cl::cat(XlitOptions));
 static cl::opt<bool> EntityReport("entity-report",
     cl::desc("Report the entity plan of each conversion group of the transform's own rules (see "
              "doc/ldml-entity-groups-plan.md): its entities, rules, classes, overlaps and before-context states "
              "(one JSON object per group) and exit"),
     cl::init(false), cl::cat(XlitOptions));
-static cl::opt<unsigned> EntityMuxThreshold("entity-mux-threshold",
-    cl::desc("The most classes of an entity group's CC kernel computed as streams of their own; above it, a "
-             "multiplexed code (doc/ldml-entity-groups-plan.md §3.1)"),
-    cl::init(16), cl::cat(XlitOptions));
 static cl::opt<bool> DivCodeReport("divcode-report",
     cl::desc("Report the DivCode plan of each conversion group of the transform's own rules with string rules (see "
              "doc/ldml-divcode-plan.md): eligibility, alphabet, rules, leaves (one JSON object per group) and exit"),
@@ -652,6 +657,13 @@ struct TransformAnalysis {
     ldml::TransformPlan plan;
     std::vector<std::string> problems;
     std::vector<std::string> revisitReport;     // with --revisit-report
+    //  With --entity-groups: the entity plans of the conversion groups of the
+    //  rules as given (doc/ldml-entity-groups-plan.md), and for each step of
+    //  plan, the entity plan of its group (an index in entityGroups), or -1:
+    //  only where the steps correspond to the groups one to one, between the
+    //  same transform rules (see alignEntityGroups).
+    std::vector<ldml::EntityGroupPlan> entityGroups;
+    std::vector<int> entityGroupOfStep;
 };
 
 class TransformAnalyzer {
@@ -1272,6 +1284,49 @@ static void setNFD_Before(ldml::TransformPlan & plan, const std::vector<ldml::Ru
     }
 }
 
+//  The entity plans of the groups of the rules as given (extracted: the forward
+//  rules), and the step of the plan corresponding to each: the transform rules
+//  delimit the same segments in both, and a segment's group corresponds to the
+//  segment's step if it has exactly one conversion step (a group the planning
+//  split, or rules it moved, correspond to none).
+static void alignEntityGroups(const std::vector<ldml::Rule *> & extracted, TransformAnalysis & a) {
+    a.entityGroups = ldml::planEntityGroups(extracted);
+    a.entityGroupOfStep.assign(a.plan.steps.size(), -1);
+    //  The group of each source segment (-1: none).
+    std::vector<int> sourceSegments{-1};
+    int group = -1;
+    bool inGroup = false;
+    for (const ldml::Rule * r : extracted) {
+        if (llvm::isa<ldml::ConversionRule>(r)) {
+            if (!inGroup) {
+                inGroup = true;
+                group++;
+                if (sourceSegments.back() >= 0) return;      // (two groups in a segment: a filter rule between)
+                sourceSegments.back() = group;
+            }
+        } else if (llvm::isa<ldml::TransformRule>(r)) {
+            inGroup = false;
+            sourceSegments.push_back(-1);
+        } else if (llvm::isa<ldml::FilterRule>(r)) {
+            inGroup = false;
+        }
+    }
+    std::vector<std::vector<size_t>> planSegments(1);
+    for (size_t i = 0; i < a.plan.steps.size(); i++) {
+        if (a.plan.steps[i].kind == ldml::TransformStep::Kind::Transform) {
+            planSegments.emplace_back();
+        } else {
+            planSegments.back().push_back(i);
+        }
+    }
+    if (planSegments.size() != sourceSegments.size()) return;
+    for (size_t k = 0; k < planSegments.size(); k++) {
+        if (sourceSegments[k] >= 0 && planSegments[k].size() == 1) {
+            a.entityGroupOfStep[planSegments[k].front()] = sourceSegments[k];
+        }
+    }
+}
+
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
     try {
@@ -1419,6 +1474,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         }
         blockingMarkProblems(a.plan, mRegistry, a.plan.problems);
         a.problems = a.plan.problems;
+        if (EntityGroups) alignEntityGroups(extracted, a);
         //  The bit changes of the subgroups of a group are combined, assuming that
         //  no two rules of a group may apply at the same position.
         if (dstats.overlapsAfter > 0) {
@@ -10965,6 +11021,9 @@ struct NormalizationFrames {
     }
 };
 
+//  (See the entity group kernels.)
+static std::string entityStep2Problem(const ldml::EntityGroupPlan & p);
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
@@ -11125,6 +11184,8 @@ private:
     NormalizationInput mNFC_Input = NormalizationInput::Any;
     Staged conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged divCodeGroup(const ldml::DivCodePlan & plan, StreamSet * U21);
+    //  A conversion group by its entity plan (doc/ldml-entity-groups-plan.md).
+    Staged entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21);
     Staged insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     Staged deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     Staged prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -16732,7 +16793,30 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
             if (!step.markRunEditRules.empty()) U21 = inStep(markRunEditsGroup(step, U21));
             if (!step.prefixRuns.empty()) U21 = inStep(prefixRunsGroup(step, U21));
-            if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
+            //  (With --entity-groups: a group whose entity plan applies, before
+            //  DivCode and the regular plan; doc/ldml-entity-groups-plan.md §3.1.)
+            const int entity = i < a.entityGroupOfStep.size() ? a.entityGroupOfStep[i] : -1;
+            //  (Why not, if not: see --entity-groups-trace.)
+            std::string notByEntities;
+            if (EntityGroups) {
+                if (entity < 0) notByEntities = "no source group corresponds to the step";
+                else if (mBytes) notByEntities = "UTF-8 mode (the hybrid)";
+                else if (activeMask()) notByEntities = "within a filter";
+                else if (boundedRegions()) notByEntities = "bounded regions";
+                else if (mDeletedRunEnds || mDeletedRunAfter) notByEntities = "after deleted runs";
+                else if (step.hasFrontLetters || !step.chainRevisitRules.empty() || !step.markRunEditRules.empty()
+                         || !step.prefixRuns.empty() || !step.deferred.empty() || !step.captureReplacements.empty()
+                         || !step.insertions.empty()) notByEntities = "parts the plan does not cover";
+                else notByEntities = entityStep2Problem(a.entityGroups[entity]);
+            }
+            const bool byEntities = EntityGroups && notByEntities.empty();
+            if (EntityGroupsTrace && EntityGroups) {
+                llvm::errs() << "entity groups: " << mGroupLabel << ": "
+                             << (byEntities ? "applied" : "not applied: " + notByEntities) << "\n";
+            }
+            if (byEntities) {
+                U21 = inStep(entityGroup(a.entityGroups[entity], U21));
+            } else if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
                 U21 = inStep(conversionGroup(step, U21));
             }
             if (!step.deferred.empty()) U21 = inStep(deferredRules(step, U21));
@@ -16846,6 +16930,544 @@ static std::string divCodeShiftReport(const ldml::DivCodePlan & plan) {
     return r;
 }
 
+//  The class layer's rule for an entity group (doc/ldml-entity-groups-plan.md
+//  §3.1): classLayerCriterion's thresholds on the leaves of the rules' first
+//  sets, and the Div32 code of the group's coded sets.
+static bool entityClassLayer(const ldml::EntityGroupPlan & p, ClassLayerCoding & coding, ClassLayerLeaves * leaves = nullptr) {
+    if (!ClassLayer) return false;
+    ClassLayerLeaves local;
+    ClassLayerLeaves & l = leaves ? *leaves : local;
+    for (const UCD::UnicodeSet & first : p.firstSets) {
+        l.rules++;
+        const std::set<UCD::codepoint_t> b = setBlocks(first, ClassLayerMaxSetBlocks);
+        if (first.empty() || b.size() > ClassLayerMaxSetBlocks) { l.top++; continue; }
+        for (UCD::codepoint_t k : b) l.rulesIn[k]++;
+    }
+    if (!(l.rules >= 20 && l.rulesIn.size() >= 4 && 2 * l.maxLeaf() <= l.rules)) return false;
+    return div32Classes(p.codedSets, coding);
+}
+
+//  The kernels of a conversion group applied by its entity plan
+//  (doc/ldml-entity-groups-plan.md §5, §6; step 2: groups without before
+//  contexts or overlaps, Unicode mode).
+
+//  Why a group is not applied by its entity plan in step 2 (empty: it is).
+static std::string entityStep2Problem(const ldml::EntityGroupPlan & p) {
+    if (!p.eligible()) return p.problems.front();
+    for (const ldml::EntityRule & r : p.rules) {
+        if (!r.before.empty()) return "a before context (step 4)";
+    }
+    for (const auto & v : p.mayBeginWithin) {
+        if (!v.empty()) return "rules that may begin within others (step 3)";
+    }
+    return std::string();
+}
+
+//  The classes of an entity group: the class layer's Div32 code (with its
+//  external sets), or a stream for each of its stream sets.
+struct EntityCoding {
+    bool layered = false;
+    ClassLayerCoding layer;
+    std::vector<UCD::UnicodeSet> codedSets;     // (layered: the sets of layer.codes and layer.external)
+    std::vector<UCD::UnicodeSet> streamSets;    // (otherwise)
+    //  The index of a set among the coded or stream sets, or -1.
+    int indexOf(const UCD::UnicodeSet & s) const {
+        const std::vector<UCD::UnicodeSet> & sets = layered ? codedSets : streamSets;
+        for (size_t i = 0; i < sets.size(); i++) if (sets[i] == s) return static_cast<int>(i);
+        return -1;
+    }
+    //  Whether a set (any set within the blocks, such as part of a string
+    //  set) has codes of the layer: not external, and within its blocks.
+    bool coded(const UCD::UnicodeSet & s) const {
+        if (!layered) return false;
+        const int i = indexOf(s);
+        if (i >= 0) return layer.external[i] < 0;
+        for (UCD::codepoint_t b : setBlocks(s, ClassLayerMaxSetBlocks + 1)) {
+            if (!std::binary_search(layer.blocks.begin(), layer.blocks.end(), b)) return false;
+        }
+        return true;
+    }
+    std::string signature() const {
+        std::string sig = layered ? "L" : "S";
+        if (layered) {
+            for (UCD::codepoint_t b : layer.blocks) sig += std::to_string(b) + ",";
+            sig += "|";
+            for (const UCD::UnicodeSet & e : layer.externalSets) sig += setKey(e) + ";";
+        } else {
+            for (const UCD::UnicodeSet & s : streamSets) sig += setKey(s) + ";";
+        }
+        return sig;
+    }
+};
+
+static EntityCoding entityCoding(const ldml::EntityGroupPlan & p) {
+    EntityCoding c;
+    c.layered = entityClassLayer(p, c.layer);
+    if (c.layered) {
+        c.codedSets = p.codedSets;
+    } else {
+        c.streamSets = p.streamSets;
+    }
+    return c;
+}
+
+static bool entityUsed(const ldml::Entity & e) {
+    return e.inText || e.inAfter;
+}
+
+//  The StringSet entities used (inputs of EntityMatch, in order), and the
+//  Property entities.
+static std::vector<size_t> entitiesOfKind(const ldml::EntityGroupPlan & p, ldml::Entity::Kind k) {
+    std::vector<size_t> r;
+    for (size_t i = 0; i < p.entities.size(); i++) {
+        if (p.entities[i].kind == k && entityUsed(p.entities[i])) r.push_back(i);
+    }
+    return r;
+}
+
+static std::string entityKey(const ldml::EntityGroupPlan & p, size_t e) {
+    const ldml::Entity & x = p.entities[e];
+    std::string k = std::string(ldml::kindName(x.kind)) + ":" + setKey(x.chars);
+    for (const std::u32string & s : x.strings) {
+        k += "{";
+        for (char32_t c : s) k += std::to_string(static_cast<unsigned>(c)) + " ";
+        k += "}";
+    }
+    if (x.boundary) k += "$";
+    if (x.kind == ldml::Entity::Kind::Property || x.kind == ldml::Entity::Kind::PropertySet) k += x.text;
+    for (size_t o : x.operands) k += "(" + entityKey(p, o) + ")";
+    return k;
+}
+
+static std::string entityItemsKey(const ldml::EntityGroupPlan & p, const std::vector<ldml::EntityItem> & items) {
+    std::string k;
+    for (const ldml::EntityItem & item : items) {
+        switch (item.kind) {
+            case ldml::EntityItem::Kind::Literal: k += "c" + std::to_string(static_cast<unsigned>(item.literal)); break;
+            case ldml::EntityItem::Kind::Entity: k += "e[" + entityKey(p, item.entity) + "]"; break;
+            case ldml::EntityItem::Kind::Boundary: k += "$"; break;
+        }
+        k += item.optional ? "?," : ",";
+    }
+    return k;
+}
+
+static unsigned bitsFor(size_t n) {
+    unsigned b = 0;
+    while ((size_t{1} << b) <= n) b++;
+    return std::max(b, 1u);
+}
+
+static unsigned itemsMaxLength(const ldml::EntityGroupPlan & p, const std::vector<ldml::EntityItem> & items) {
+    unsigned n = 0;
+    for (const ldml::EntityItem & item : items) {
+        if (item.kind == ldml::EntityItem::Kind::Literal) n += 1;
+        else if (item.kind == ldml::EntityItem::Kind::Entity) n += p.entities[item.entity].lengths.back();
+    }
+    return n;
+}
+
+//  The matches of the rules of an entity group at each position (§5.1, §5.2):
+//  of the rule that applies there (the first in order that matches), W (its
+//  index + 1, 0: none); the positions deleted (the rest of the matches' texts,
+//  and the texts of the rules with empty results), Deleted; and the positions
+//  to insert after each match (its result's length - 1), Ins.
+class EntityMatch final : public PabloKernel {
+public:
+    EntityMatch(LLVMTypeSystemInterface & ts, const ldml::EntityGroupPlan & plan, const EntityCoding & coding,
+                const std::string & label, StreamSet * Classes, StreamSet * Externals, StreamSet * InText,
+                const std::vector<StreamSet *> & Props, const std::vector<StreamSet *> & StringSets,
+                StreamSet * W, StreamSet * Deleted, StreamSet * Ins)
+    : PabloKernel(ts, "EntityMatch_" + label + "_" + getStringHash(signatureOf(plan, coding)),
+                  {}, outputs(W, Deleted, Ins))
+    , mPlan(plan), mCoding(coding), mSignature(signatureOf(plan, coding)) {
+        const unsigned la = lookahead(plan);
+        auto in = [&](const std::string & name, StreamSet * s) {
+            if (la > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(), LookAhead(la)});
+            else mInputStreamSets.push_back(Binding{name, s});
+        };
+        in("classes", Classes);
+        if (Externals) in("externals", Externals);
+        in("inText", InText);
+        for (size_t i = 0; i < Props.size(); i++) in("prop" + std::to_string(i), Props[i]);
+        for (size_t i = 0; i < StringSets.size(); i++) in("ss" + std::to_string(i), StringSets[i]);
+        mHasExternals = Externals != nullptr;
+        mHasIns = Ins != nullptr;
+    }
+    static unsigned lookahead(const ldml::EntityGroupPlan & p) {
+        unsigned la = 0;
+        for (const ldml::EntityRule & r : p.rules) la = std::max(la, r.maxLength + itemsMaxLength(p, r.after));
+        return la;
+    }
+    static unsigned maxInsertion(const ldml::EntityGroupPlan & p) {
+        size_t m = 0;
+        for (const ldml::EntityRule & r : p.rules) if (r.result.size() > 1) m = std::max(m, r.result.size() - 1);
+        return static_cast<unsigned>(m);
+    }
+    static bool deletes(const ldml::EntityGroupPlan & p) {
+        for (const ldml::EntityRule & r : p.rules) if (r.result.empty() || r.maxLength > 1) return true;
+        return false;
+    }
+    static std::string signatureOf(const ldml::EntityGroupPlan & p, const EntityCoding & c) {
+        std::string sig = c.signature() + "#";
+        for (const ldml::EntityRule & r : p.rules) {
+            sig += entityItemsKey(p, r.items) + "/" + entityItemsKey(p, r.after) + "→";
+            for (char32_t ch : r.result) sig += std::to_string(static_cast<unsigned>(ch)) + " ";
+            sig += ";";
+        }
+        return sig;
+    }
+protected:
+    bool hasSignature() const override {return true;}
+    llvm::StringRef getSignature() const override {return mSignature;}
+    void generatePabloMethod() override;
+private:
+    static Bindings outputs(StreamSet * W, StreamSet * Deleted, StreamSet * Ins) {
+        Bindings b{Binding{"W", W}, Binding{"Deleted", Deleted}};
+        if (Ins) b.emplace_back("Ins", Ins);
+        return b;
+    }
+    const ldml::EntityGroupPlan mPlan;
+    const EntityCoding mCoding;
+    const std::string mSignature;
+    bool mHasExternals = false;
+    bool mHasIns = false;
+};
+
+void EntityMatch::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const ldml::EntityGroupPlan & p = mPlan;
+    const std::vector<PabloAST *> classes = getInputStreamSet("classes");
+    const std::vector<PabloAST *> externals = mHasExternals ? getInputStreamSet("externals") : std::vector<PabloAST *>{};
+    PabloAST * const inText = getInputStreamSet("inText")[0];
+    PabloAST * const zeroes = pb.createZeroes();
+    const std::vector<size_t> propEntities = entitiesOfKind(p, ldml::Entity::Kind::Property);
+    const std::vector<size_t> ssEntities = entitiesOfKind(p, ldml::Entity::Kind::StringSet);
+    std::map<size_t, PabloAST *> props;
+    for (size_t i = 0; i < propEntities.size(); i++) props[propEntities[i]] = getInputStreamSet("prop" + std::to_string(i))[0];
+    std::map<size_t, std::vector<PabloAST *>> ss;
+    for (size_t i = 0; i < ssEntities.size(); i++) ss[ssEntities[i]] = getInputStreamSet("ss" + std::to_string(i));
+    //  An input stream looked ahead.
+    std::map<std::pair<PabloAST *, unsigned>, PabloAST *> ahead;
+    auto at = [&](PabloAST * s, unsigned o) -> PabloAST * {
+        if (o == 0) return s;
+        auto & a = ahead[{s, o}];
+        if (a == nullptr) a = pb.createLookahead(s, o);
+        return a;
+    };
+    //  The code bits looked ahead (layered).
+    std::map<unsigned, std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> compilers;
+    std::map<std::pair<std::string, unsigned>, PabloAST *> classMemo;
+    auto classAt = [&](const UCD::UnicodeSet & set, unsigned o) -> PabloAST * {
+        if (set.empty()) return zeroes;
+        const std::string key = setKey(set);
+        auto f = classMemo.find({key, o});
+        if (f != classMemo.end()) return f->second;
+        PabloAST * r;
+        const int i = mCoding.indexOf(set);
+        if (!mCoding.layered) {
+            if (LLVM_UNLIKELY(i < 0)) llvm::report_fatal_error("EntityMatch: a set without a class stream");
+            r = at(classes[i], o);
+        } else if (i >= 0 && mCoding.layer.external[i] >= 0) {
+            r = at(externals[mCoding.layer.external[i]], o);
+        } else {
+            auto & c = compilers[o];
+            if (!c) {
+                std::vector<PabloAST *> bits;
+                for (PabloAST * b : classes) bits.push_back(at(b, o));
+                bits.resize(std::max<size_t>(bits.size(), 21), zeroes);
+                c = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
+            }
+            const UCD::UnicodeSet codes = pseudoCodes(set, mCoding.layer.blocks);
+            r = pb.createAnd(c->compileCC(re::makeCC(UCD::UnicodeSet(codes), &cc::Unicode), pb), at(inText, o));
+        }
+        classMemo.emplace(std::make_pair(key, o), r);
+        return r;
+    };
+    //  A property set's expression.
+    std::function<PabloAST * (const re::RE *, unsigned)> evalSet = [&](const re::RE * re, unsigned o) -> PabloAST * {
+        if (const re::PropertyExpression * pe = dyn_cast<re::PropertyExpression>(re)) {
+            const std::string text = ldml::printUnicodeSet(pe);
+            for (size_t e : propEntities) {
+                if (p.entities[e].text == text) return at(props[e], o);
+            }
+            llvm::report_fatal_error("EntityMatch: a property without a stream");
+        } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+            return evalSet(n->getDefinition(), o);
+        } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+            PabloAST * r = zeroes;
+            for (const re::RE * a : *alt) {
+                if (ldml::isBoundary(a)) continue;
+                r = pb.createOr(r, evalSet(a, o));
+            }
+            return r;
+        } else if (const re::Diff * d = dyn_cast<re::Diff>(re)) {
+            return pb.createAnd(evalSet(d->getLH(), o), pb.createNot(evalSet(d->getRH(), o)));
+        } else if (const re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+            return pb.createAnd(evalSet(x->getLH(), o), evalSet(x->getRH(), o));
+        } else if (isa<re::Any>(re)) {
+            return at(inText, o);
+        } else if (const re::CC * cc = dyn_cast<re::CC>(re)) {
+            return classAt(*cc, o);
+        }
+        llvm::report_fatal_error("EntityMatch: an unsupported property set");
+    };
+    //  The longest match of an entity at offset o has length k.
+    std::map<std::tuple<size_t, unsigned, unsigned>, PabloAST *> lenMemo;
+    std::function<PabloAST * (size_t, unsigned, unsigned)> len = [&](size_t e, unsigned k, unsigned o) -> PabloAST * {
+        auto f = lenMemo.find({e, k, o});
+        if (f != lenMemo.end()) return f->second;
+        const ldml::Entity & x = p.entities[e];
+        PabloAST * r = zeroes;
+        switch (x.kind) {
+            case ldml::Entity::Kind::PureSet:
+                if (k == 1) r = classAt(x.chars, o);
+                break;
+            case ldml::Entity::Kind::Property:
+                if (k == 1) r = pb.createAnd(at(props[e], o), at(inText, o));
+                break;
+            case ldml::Entity::Kind::PropertySet:
+                if (k == 1) r = pb.createAnd(evalSet(x.re, o), at(inText, o));
+                break;
+            case ldml::Entity::Kind::StringSet: {
+                const auto it = std::lower_bound(x.lengths.begin(), x.lengths.end(), k);
+                if (it != x.lengths.end() && *it == k) r = at(ss[e][it - x.lengths.begin()], o);
+                break;
+            }
+            case ldml::Entity::Kind::Union: {
+                for (size_t op : x.operands) r = pb.createOr(r, len(op, k, o));
+                for (unsigned longer : x.lengths) {
+                    if (longer > k) r = pb.createAnd(r, pb.createNot(len(e, longer, o)));
+                }
+                break;
+            }
+        }
+        lenMemo.emplace(std::make_tuple(e, k, o), r);
+        return r;
+    };
+    auto start = [&](size_t e, unsigned o) {
+        PabloAST * r = zeroes;
+        for (unsigned k : p.entities[e].lengths) r = pb.createOr(r, len(e, k, o));
+        return r;
+    };
+    //  The paths of a sequence of items: (condition, offset after them).
+    using Paths = std::vector<std::pair<PabloAST *, unsigned>>;
+    auto extend = [&](const Paths & in, const std::vector<ldml::EntityItem> & items, bool context) {
+        Paths paths = in;
+        for (const ldml::EntityItem & item : items) {
+            Paths next;
+            for (const auto & [cond, o] : paths) {
+                if (item.kind == ldml::EntityItem::Kind::Boundary) {
+                    next.emplace_back(pb.createAnd(cond, pb.createNot(at(inText, o))), o);
+                } else if (item.kind == ldml::EntityItem::Kind::Literal) {
+                    PabloAST * const c = classAt(UCD::UnicodeSet(item.literal), o);
+                    next.emplace_back(pb.createAnd(cond, c), o + 1);
+                    if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(c)), o);
+                } else {
+                    const ldml::Entity & x = p.entities[item.entity];
+                    for (unsigned k : x.lengths) next.emplace_back(pb.createAnd(cond, len(item.entity, k, o)), o + k);
+                    if (context && x.boundary) next.emplace_back(pb.createAnd(cond, pb.createNot(at(inText, o))), o);
+                    if (item.optional) next.emplace_back(pb.createAnd(cond, pb.createNot(start(item.entity, o))), o);
+                }
+            }
+            paths = std::move(next);
+        }
+        return paths;
+    };
+    const unsigned maxLength = [&] {unsigned m = 1; for (const ldml::EntityRule & r : p.rules) m = std::max(m, r.maxLength); return m;}();
+    std::vector<PabloAST *> startLen(maxLength + 1, zeroes);
+    PabloAST * prior = zeroes;
+    std::vector<PabloAST *> wins;
+    for (const ldml::EntityRule & r : p.rules) {
+        std::map<unsigned, PabloAST *> byLength;
+        for (const auto & [cond, l] : extend({{inText, 0}}, r.items, false)) {
+            PabloAST * m = zeroes;
+            for (const auto & a : extend({{cond, l}}, r.after, true)) m = pb.createOr(m, a.first);
+            auto & b = byLength[l];
+            b = b ? pb.createOr(b, m) : m;
+        }
+        PabloAST * match = zeroes;
+        for (const auto & [l, m] : byLength) match = pb.createOr(match, m);
+        PabloAST * const win = pb.createAnd(match, pb.createNot(prior));
+        prior = pb.createOr(prior, match);
+        wins.push_back(win);
+        for (const auto & [l, m] : byLength) startLen[l] = pb.createOr(startLen[l], pb.createAnd(win, m));
+    }
+    //  W: the rule's index + 1.
+    const unsigned wBits = getOutputStreamSet(0)->getNumElements();
+    std::vector<PabloAST *> w(wBits, zeroes);
+    std::vector<PabloAST *> ins(mHasIns ? getOutputStreamSet(2)->getNumElements() : 0, zeroes);
+    PabloAST * deleted = zeroes;
+    for (size_t i = 0; i < wins.size(); i++) {
+        for (unsigned b = 0; b < wBits; b++) if (((i + 1) >> b) & 1) w[b] = pb.createOr(w[b], wins[i]);
+        const size_t m = p.rules[i].result.size();
+        if (m == 0) deleted = pb.createOr(deleted, wins[i]);
+        for (unsigned b = 0; b < ins.size(); b++) if (m > 1 && (((m - 1) >> b) & 1)) ins[b] = pb.createOr(ins[b], wins[i]);
+    }
+    //  The rest of each match's text (§5.4: no match begins within another).
+    for (unsigned j = 1; j < maxLength; j++) {
+        PabloAST * longer = zeroes;
+        for (unsigned l = j + 1; l <= maxLength; l++) longer = pb.createOr(longer, startLen[l]);
+        deleted = pb.createOr(deleted, pb.createAdvance(longer, j));
+    }
+    writeOutputStreamSet("W", w);
+    writeOutputStreamSet("Deleted", std::vector<PabloAST *>{pb.createInFile(deleted)});
+    if (mHasIns) writeOutputStreamSet("Ins", ins);
+}
+
+//  The results of an entity group's rules written at the positions of their
+//  matches (§5.5): at the first position of a match (W, the rule's index + 1),
+//  the first character of its result; at the positions inserted after it, the
+//  rest.  (The rest of its text, and the texts of empty results, are deleted
+//  after it.)
+class EntityApply final : public PabloKernel {
+public:
+    EntityApply(LLVMTypeSystemInterface & ts, const ldml::EntityGroupPlan & plan, const std::string & label,
+                StreamSet * U21, StreamSet * W, StreamSet * Out)
+    : PabloKernel(ts, "EntityApply_" + label + "_" + getStringHash(resultsOf(plan) + ":" + std::to_string(W->getNumElements())),
+                  {Binding{"U21", U21}, Binding{"W", W}}, {Binding{"Out", Out}}) {
+        for (const ldml::EntityRule & r : plan.rules) mResults.push_back(r.result);
+    }
+    static std::string resultsOf(const ldml::EntityGroupPlan & p) {
+        std::string s;
+        for (const ldml::EntityRule & r : p.rules) {
+            for (char32_t c : r.result) s += std::to_string(static_cast<unsigned>(c)) + " ";
+            s += ";";
+        }
+        return s;
+    }
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> U21 = getInputStreamSet("U21");
+        const std::vector<PabloAST *> W = getInputStreamSet("W");
+        PabloAST * const zeroes = pb.createZeroes();
+        size_t maxM = 0;
+        for (const std::u32string & r : mResults) maxM = std::max(maxM, r.size());
+        PabloAST * changed = zeroes;
+        std::vector<PabloAST *> newBits(21, zeroes);
+        for (unsigned j = 0; j < maxM; j++) {
+            std::vector<PabloAST *> wj;
+            for (PabloAST * b : W) wj.push_back(j == 0 ? b : pb.createAdvance(b, j));
+            wj.resize(std::max<size_t>(wj.size(), 21), zeroes);
+            cc::Parabix_CC_Compiler_Builder ccc(wj);
+            UCD::UnicodeSet sel;
+            std::vector<UCD::UnicodeSet> bits(21);
+            for (size_t i = 0; i < mResults.size(); i++) {
+                if (mResults[i].size() <= j) continue;
+                const UCD::codepoint_t code = static_cast<UCD::codepoint_t>(i + 1);
+                sel.insert(code);
+                for (unsigned b = 0; b < 21; b++) if ((mResults[i][j] >> b) & 1) bits[b].insert(code);
+            }
+            if (sel.empty()) continue;
+            changed = pb.createOr(changed, ccc.compileCC(re::makeCC(UCD::UnicodeSet(sel), &cc::Unicode), pb));
+            for (unsigned b = 0; b < 21; b++) {
+                if (!bits[b].empty()) newBits[b] = pb.createOr(newBits[b], ccc.compileCC(re::makeCC(UCD::UnicodeSet(bits[b]), &cc::Unicode), pb));
+            }
+        }
+        std::vector<PabloAST *> out;
+        for (unsigned b = 0; b < 21; b++) out.push_back(pb.createOr(pb.createAnd(U21[b], pb.createNot(changed)), newBits[b]));
+        writeOutputStreamSet("Out", out);
+    }
+private:
+    std::vector<std::u32string> mResults;
+};
+
+Staged RulePipelineBuilder::entityGroup(const ldml::EntityGroupPlan & plan, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    const EntityCoding coding = entityCoding(plan);
+    if (EntityGroupsTrace) {
+        llvm::errs() << "entity groups: " << mGroupLabel << ": code "
+                     << (coding.layered ? "div32 (" + std::to_string(coding.layer.bits.size()) + " bits, "
+                                          + std::to_string(coding.layer.externalSets.size()) + " external sets)"
+                                        : "streams (" + std::to_string(coding.streamSets.size()) + ")") << "\n";
+    }
+    //  The classes: the bits of the class layer's code (and its external sets),
+    //  or a stream for each stream set.
+    std::vector<re::CC *> ccs;
+    if (coding.layered) {
+        for (const UCD::UnicodeSet & b : coding.layer.bits) ccs.push_back(re::makeCC(UCD::UnicodeSet(b), &cc::Unicode));
+    } else {
+        for (const UCD::UnicodeSet & s : coding.streamSets) ccs.push_back(re::makeCC(UCD::UnicodeSet(s), &cc::Unicode));
+    }
+    if (ccs.empty()) ccs.push_back(re::makeCC(&cc::Unicode));
+    StreamSet * const Classes = P.CreateStreamSet(ccs.size());
+    P.CreateKernelCall<CharClassesKernel>(ccs, U21, Classes);
+    SHOW_STREAM(Classes);
+    StreamSet * Externals = nullptr;
+    if (coding.layered && !coding.layer.externalSets.empty()) {
+        std::vector<re::CC *> ext;
+        for (const UCD::UnicodeSet & e : coding.layer.externalSets) ext.push_back(re::makeCC(UCD::UnicodeSet(e), &cc::Unicode));
+        Externals = P.CreateStreamSet(ext.size());
+        P.CreateKernelCall<CharClassesKernel>(ext, U21, Externals);
+    }
+    StreamSet * const InText = P.CreateStreamSet(1);
+    P.CreateKernelCall<TextPositions>(U21, InText);
+    //  The properties, each by a kernel of its own (shared across groups).
+    std::vector<StreamSet *> props;
+    for (size_t e : entitiesOfKind(plan, ldml::Entity::Kind::Property)) {
+        const re::PropertyExpression * pe = cast<re::PropertyExpression>(plan.entities[e].re);
+        re::PropertyExpression * const copy = re::makePropertyExpression(pe->getKind(), pe->getPropertyIdentifier(),
+                                                                         pe->getOperator(), pe->getValueString());
+        UCD::linkProperties(copy);
+        UCD::resolveProperties(UCD::standardizeProperties(copy));
+        StreamSet * const stream = P.CreateStreamSet(1);
+        P.CreateKernelCall<UnicodePropertyKernelBuilder>(copy, U21, stream);
+        props.push_back(stream);
+    }
+    //  The string sets, over the code's bits where their sets have codes, or the
+    //  21-bit basis.
+    std::vector<StreamSet *> stringSets;
+    for (size_t e : entitiesOfKind(plan, ldml::Entity::Kind::StringSet)) {
+        const ldml::Entity & x = plan.entities[e];
+        bool coded = coding.layered && coding.coded(x.chars);
+        for (const std::u32string & s : x.strings) {
+            for (char32_t c : s) coded = coded && coding.coded(UCD::UnicodeSet(static_cast<UCD::codepoint_t>(c)));
+        }
+        std::function<UCD::UnicodeSet (const UCD::UnicodeSet &)> code;
+        if (coded) code = [&](const UCD::UnicodeSet & s) {return pseudoCodes(s, coding.layer.blocks);};
+        const kernel::StringSetSpec spec = kernel::makeStringSetSpec(x.chars, x.strings, false, code);
+        StreamSet * const lengths = P.CreateStreamSet(spec.lengths.size());
+        P.CreateKernelCall<kernel::StringSetKernel>(spec, coded ? Classes : U21, lengths);
+        SHOW_STREAM(lengths);
+        stringSets.push_back(lengths);
+    }
+    const unsigned wBits = bitsFor(plan.rules.size());
+    StreamSet * W = P.CreateStreamSet(wBits);
+    StreamSet * Deleted = P.CreateStreamSet(1);
+    const unsigned maxIns = EntityMatch::maxInsertion(plan);
+    StreamSet * const Ins = maxIns > 0 ? P.CreateStreamSet(bitsFor(maxIns)) : nullptr;
+    P.CreateKernelCall<EntityMatch>(plan, coding, mGroupLabel, Classes, Externals, InText, props, stringSets, W, Deleted, Ins);
+    SHOW_BIXNUM(W);
+    SHOW_STREAM(Deleted);
+    PositionMap positions;
+    StreamSet * Text = U21;
+    if (Ins) {
+        SHOW_BIXNUM(Ins);
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, Ins, SpreadMask, kernel::InsertPosition::After);
+        auto spread = [&](StreamSet * s) {
+            StreamSet * const out = P.CreateStreamSet(s->getNumElements());
+            SpreadByMask(P, SpreadMask, s, out);
+            return out;
+        };
+        Text = spread(Text);
+        W = spread(W);
+        Deleted = spread(Deleted);
+        positions.insert(SpreadMask);
+    }
+    StreamSet * const Out = P.CreateStreamSet(21);
+    P.CreateKernelCall<EntityApply>(plan, mGroupLabel, Text, W, Out);
+    SHOW_BIXNUM(Out);
+    if (!EntityMatch::deletes(plan)) return Staged(Out, std::move(positions));
+    StreamSet * const keep = P.CreateStreamSet(1);
+    Invert(P, Deleted, keep);
+    StreamSet * const filtered = P.CreateStreamSet(21);
+    FilterByMask(P, keep, Out, filtered);
+    positions.remove(keep);
+    return Staged(filtered, std::move(positions));
+}
+
 //  --entity-report: the entity plan of each conversion group (see
 //  ldml/entity_plan.h, doc/ldml-entity-groups-plan.md), one JSON object per
 //  line.
@@ -16862,9 +17484,7 @@ static std::string entityChars(const UCD::UnicodeSet & s, size_t limit = 40) {
 }
 
 static int printEntityReportOf(const std::string & name, const std::vector<ldml::Rule *> & forward) {
-    ldml::EntityOptions options;
-    options.muxThreshold = EntityMuxThreshold;
-    const std::vector<ldml::EntityGroupPlan> plans = ldml::planEntityGroups(forward, options);
+    const std::vector<ldml::EntityGroupPlan> plans = ldml::planEntityGroups(forward);
     auto list = [](const std::vector<std::string> & v, bool quoted = true) {
         std::string r;
         for (const std::string & x : v) r += (r.empty() ? "" : ", ") + (quoted ? "\"" + jsonEscape(x) + "\"" : x);
@@ -16951,9 +17571,20 @@ static int printEntityReportOf(const std::string & name, const std::vector<ldml:
                       << ", \"problems\": " << list(p.problems)
                       << ", \"entity_counts\": {\"property\": " << counts[0] << ", \"property_set\": " << counts[1]
                       << ", \"pure_set\": " << counts[2] << ", \"string_set\": " << counts[3] << ", \"union\": " << counts[4] << "}"
-                      << ", \"classes\": {\"stream\": " << p.streamClasses << ", \"mux\": " << p.muxClasses
-                      << ", \"exclusive\": " << p.exclusiveClasses << ", \"code_bits\": " << p.codeBits
-                      << ", \"multiplexed\": " << (p.multiplexed ? "true" : "false") << "}"
+                      << ", \"classes\": " << [&]() {
+                          ClassLayerCoding coding;
+                          ClassLayerLeaves leaves;
+                          const bool layered = entityClassLayer(p, coding, &leaves);
+                          std::string r = "{\"stream\": " + std::to_string(p.streamSets.size()) + ", \"coded\": "
+                                          + std::to_string(p.codedSets.size()) + ", \"code\": \"" + (layered ? "div32" : "streams") + "\"";
+                          if (layered) {
+                              r += ", \"code_bits\": " + std::to_string(coding.bits.size()) + ", \"blocks\": "
+                                   + std::to_string(coding.blocks.size()) + ", \"external\": " + std::to_string(coding.externalSets.size());
+                          }
+                          r += ", \"leaves\": " + std::to_string(leaves.rulesIn.size()) + ", \"max_leaf\": "
+                               + std::to_string(leaves.maxLeaf()) + ", \"top\": " + std::to_string(leaves.top);
+                          return r + "}";
+                      }()
                       << ", \"overlaps\": {\"edges\": " << edges << ", \"pruned_edges\": " << pruned
                       << ", \"cycle_rules\": " << list(cycle, false) << ", \"depth\": " << p.depth << "}"
                       << ", \"context_loop\": " << (p.contextLoop ? "true" : "false")

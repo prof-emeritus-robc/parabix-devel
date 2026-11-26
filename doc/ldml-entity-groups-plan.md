@@ -22,14 +22,14 @@ a group a stream computation of its own:
   group (§3.1). They are:
   - the pure sets, both `$variables` and inline sets without strings;
   - the literal characters;
-  - where the group is multiplexed, also the characters of the strings and the
+  - where the group is coded, also the characters of the strings and the
     single-character members of the string sets.
 
-  The kernel outputs one stream per class, or above a threshold, the bits of a
-  multiplexed code;
+  The kernel outputs one stream per class, or where the class layer's
+  criterion holds, the bits of its Div32 code;
 - each **set with strings**, a `$variable` or an inline set such as
   `[{m̥} m ɱ]`: a new `StringSet` kernel, giving what longest-leftmost matching
-  of the set needs (§4). On a multiplexed group, its REs are over the code.
+  of the set needs (§4). On a coded group, its REs are over the code.
 
 The conversion group's logic then reads these streams. A rule is a sequence of
 items; each item is matched through its entity's streams, never through the
@@ -112,60 +112,53 @@ whether the text boundary is a member):
 Order disambiguation and expansion are not run: priority is the rule order
 itself (§5.2).
 
-### 3.1 The group's classes: per-class streams or a multiplexed code
+### 3.1 The group's classes: the class layer's code, or per-class streams
 
-The class set of a group is:
+The entity path codes its classes by the **class layer's rule**
+(doc/ldml-divcode-plan.md §13.14–13.18), not by a rule of its own. One code
+assignment then serves both paths, with one check (`--class-layer-check`) and
+one class compiler.
 
-- its pure sets (`$variables` and inline);
-- its literal characters;
-- the characters of the strings of its string sets, each a singleton class;
-- the single-character parts of the string sets.
+The group's sets are:
 
-Properties stay external, as kernels of their own, and are not part of the
-class set.
+- **Stream sets:** its pure sets (`$variables` and inline), its literal
+  characters, and the sets of characters within property sets;
+- **Coded sets:** the stream sets, plus the characters of the strings of its
+  string sets, each a singleton set, and the single-character parts of the
+  string sets.
 
-- **At or below the threshold** (`--entity-mux-threshold=N`, the number of
-  distinct classes): the `CharClassesKernel` outputs one stream per class,
-  except for the characters of strings and the single-character parts of
-  string sets, and the StringSet kernels read the U21 basis.
-- **Above the threshold:** the classes are multiplexed with
-  `cc::MultiplexedAlphabet` (`multiplexedClasses` in xlit, as for the hybrid
-  groups' `classCodes`).
-  - The kernel outputs the k bits of the code of each character's exclusive
-    class, with 0 for characters in no class. Each class is then the CC of its
-    codes over those k bits.
-  - Each string character is a singleton class in the input, so it has a code
-    of its own.
-  - The consumers (StringSet, EntityMatch) compile their classes over the k
-    code bits instead of the 21 basis bits.
-  - A union of pure sets is the union of their codes, not an OR of streams.
+Properties stay external, as kernels of their own, and are not part of either
+list.
 
-The threshold is structural, like the class-layer criterion: the number of
-classes, and so the number of streams that the consumers read, against the k
-code bits. It is not chosen by timing. Initial value: 16. Step 0 reports
-the counts per group. For group 3, an estimate: about 35 pure sets and
-literals, plus about 20 characters within strings. That gives about 60–80
-exclusive classes and a code of 7 bits, against 21 basis bits.
+- **The criterion** is `classLayerCriterion`'s, applied to the entity rules
+  (structural, not timed). It counts the source rules by the Div32 blocks of
+  their first characters, the union over the leading optional items and the
+  first required one. It requires 20 or more rules in 4 or more leaves, none
+  with more than half, and `--class-layer` on.
+- **When it holds and `div32Classes` codes the coded sets:** the group's
+  `CharClassesKernel` outputs the bits of the Div32 pseudo-codepoint and, after
+  them, the external sets, each as a stream of its own (sets that neither they
+  nor their complements fit in 16 blocks, as in step 4d).
+  - Each set is the CC of its pseudo-codepoints (`pseudoCodes`) over those bits.
+  - Pseudo-codepoints identify every character of the layer's blocks exactly,
+    so a string's characters, and any subset of a string set's characters,
+    are exact sets of codes.
+  - The StringSet kernels and the match kernel compile over the code bits. A
+    StringSet whose single-character part is external reads the 21-bit basis
+    instead.
+- **Otherwise, in Unicode mode:** one stream per stream set, as the regular
+  kernels without the layer have, and the StringSet kernels read the 21-bit
+  basis.
+- **In UTF-8 mode (§9):** where the layer does not apply, the multiplexed code
+  of the hybrid groups (`multiplexedClasses`), as `absolutely` chooses.
 
-The Div32 code of the class layer (doc/ldml-divcode-plan.md §13.14) is another
-such code. The multiplexed code is used here because its classes are exact
-codes (each class a union of whole codes), which a StringSet's literals need.
-The Div32 alternative can be evaluated later, as a different code behind the
-same interface.
+The ldml plan gives the two lists (`streamSets`, `codedSets`). xlit makes the
+choice, as it does for the fused kernels, and `--entity-report` prints it.
 
-**Eligibility (Unicode phase 1).** A group is eligible if:
-
-- every text and context item is a set (any kind), a literal, or `X?` of one;
-- `Tmax` ≤ 16;
-- there are no cursors, revisits, captures, references, function calls or `+`/`*`;
-- every converted before context is handled by §5.3, or the group falls back
-  to the selection loop (§5.4).
-
-**Report:** `xlit --entity-report` prints one JSON object per group: entities
-by kind, with members, lengths and uses; rules with their item kinds; overlap
-depth (§5.4); eligibility or problems; estimated kernel and stream counts.
-Running it on all transforms tells how far the plan reaches beyond
-und_FONIPA-ar.
+**Path precedence.** With `--entity-groups`, a group the entity plan accepts
+is applied by it before DivCode or the regular plan are tried. DivCode and the
+regular plan take the other groups. The option is off by default, so nothing
+changes until it is enabled.
 
 ## 4. The StringSet kernel
 
@@ -227,9 +220,10 @@ repetitions.
   - **U21** (a group below the threshold): the CCs come from
     `cc::Parabix_CC_Compiler` over the 21 basis bits (the UTF compiler in
     UTF-8 mode).
-  - **The group's multiplexed code** (above the threshold): the kernel is
-    given the structure with each character and set replaced by its codes in
-    the `MultiplexedAlphabet` (`transformCC`).
+  - **The class layer's code** (§3.1): the kernel is given the structure with
+    each character and set replaced by its pseudo-codepoints (`pseudoCodes`),
+    or in UTF-8 mode without the layer, by its codes in the
+    `MultiplexedAlphabet` (`transformCC`).
     - A string character is a single code.
     - The single-character part of the set is the union of its codes.
     - The CCs are compiled over the k code bits.
@@ -243,8 +237,8 @@ repetitions.
   basis shape. It depends on no transform or group, so it is shared by groups
   2 and 3, by und_FONIPA-fa, and by the 22 `*-ar` transforms that invoke
   und_FONIPA-ar.
-- **Over a multiplexed code:** the hash also covers the code assignment (the
-  transformed CCs). Groups with the same classes share the kernel, and others
+- **Over a code:** the hash also covers the code assignment (the
+  translated sets). Groups with the same classes share the kernel, and others
   do not. This is the cost of the smaller basis.
 
 **Unit test:** `tests/string_set_test`, registered with
@@ -409,7 +403,7 @@ The DivCode kernels are reused for counting, insertion and compression
 U21 ─┬─ CharClasses(group classes) ── Cls: one stream per class, or k code bits (§3.1)
      ├─ UnicodeProperty gc=L │ gc=M │ gc=N ────── Prop (shared, cached)
      │
-     │   StringSet $IVowel, $UVowel, …, inline_n (U21, or Cls when multiplexed) ── Lₖ per set
+     │   StringSet $IVowel, $UVowel, …, inline_n (U21, or Cls when coded) ── Lₖ per set
      │
      │   EntityMatch(Cls, Prop, Lₖ…) ─ W⁰ N⁰ W¹ N¹   (bounded: LocalCarries)
      │          │
@@ -459,8 +453,8 @@ mixed within a transform.
      passes Win through.
    - Check: rules files of string sets and `?` items (`QA/xlit_entity_test.py`,
      small, ≤ 5 s), against the regular plan and ICU. Run them with
-     `--entity-mux-threshold` at 0 (always multiplexed) and at a large value
-     (never), so that both class paths are covered.
+     `--class-layer` on and off (rules files with 20 or more rules over 4 or
+     more blocks), so that both class paths are covered.
 3. **Selection stages** (acyclic overlaps). Driver: group 2.
    - Check: und_FONIPA-ar with group 2 by the entity plan, on
      `pool-und_FONIPA.txt` and targeted cases (`yʉie`, `e̞` and `ɵ̞` at each
@@ -524,12 +518,18 @@ Timing the entity plan against the regular plan (4 threads) only with your go-ah
 1. **The StringSet interface is length-indexed starts (§4)**, not start and
    end streams. The (start, end) pair is derived where needed.
 2. **The group's CC kernel holds the pure `$variables`, the inline pure sets
-   and the literal characters.** Above a threshold of classes, it outputs a
-   multiplexed code, and the string characters are classes of that code, over
-   which the StringSet kernels are compiled (§3.1).
+   and the literal characters.** Its code follows the class layer's rule
+   (§3.1): the Div32 code where the layer's criterion holds, with the string
+   characters as codes over which the StringSet kernels are compiled;
+   otherwise one stream per class (Unicode mode), or the hybrid's multiplexed
+   code (UTF-8 mode). This revises the first version of this decision, which
+   had a threshold of its own (`--entity-mux-threshold`) and the multiplexed
+   code: that duplicated the class layer and could diverge from it.
 3. **Unions of string sets are derived** in the consumer (`$Vowel`,
    `[j $IVowel]`), not given StringSet kernels of their own.
 4. **Group 4 stays on the regular plan** in phase 1.
+5. **With `--entity-groups`, the entity path takes precedence** over DivCode
+   for the groups it accepts.
 
 ## 11. Status of step 0 (2026-11-26)
 
@@ -545,7 +545,9 @@ one JSON object per group, with:
 - the before-context states, with conditions (a)–(c);
 - the problems.
 
-`--entity-mux-threshold` (default 16) sets the threshold for multiplexing.
+(The class counts and multiplexed codes below were computed with the first
+version of §3.1, `--entity-mux-threshold`, since replaced by the class layer's
+rule: decision 2 of §10.)
 
 **The analysis:**
 
@@ -674,3 +676,108 @@ since it builds no RE.
   restored), 30 of the 40 fail.
 
 **Not yet:** UTF-8 mode (lengths in bytes, §9); the kernel in xlit (step 2).
+
+## 13. Status of step 2 (2026-11-26)
+
+**The code (revision of §3.1).** The entity path's classes follow the class
+layer's rule, not a threshold of their own. The ldml plan gives the sets
+(`streamSets`, `codedSets`) and each rule's first set (`firstSets`).
+`entityClassLayer` (xlit) applies `classLayerCriterion`'s thresholds to the
+leaves of the source rules' first sets, and `div32Classes` to the coded sets.
+`--entity-report` prints the choice with the leaves. `--entity-mux-threshold`
+is gone.
+
+For und_FONIPA-ar's group 3, the criterion does not hold: the block
+0x60–0x7F has 37 of its 68 source rules, more than half (13 leaves). The
+expanded rules of the regular plan pass it, because the expansion splits
+them by characters. So group 3 has a stream for each of its 33 classes, and
+its StringSet kernels read the 21-bit basis.
+
+**Which steps it applies to.** `TransformAnalysis` keeps, with
+`--entity-groups`, the entity plans of the forward rules as given
+(`entityGroups`), and the step of the plan corresponding to each
+(`alignEntityGroups`). The transform rules delimit the same segments in
+both, and a segment's group corresponds to its step if the segment has one
+conversion step. `applyAnalysis` applies a step by its entity plan, before
+DivCode and the regular plan, if all of the following hold:
+
+- not in UTF-8 mode's hybrid;
+- not within a filter (a mask);
+- not with bounded regions;
+- not after deleted runs;
+- the step has no parts of other kinds;
+- the plan has no before contexts and no rule may begin within another
+  (`entityStep2Problem`).
+
+`--entity-groups-trace` reports each group, and the code used, or why the
+path does not apply.
+
+**The kernels** (`tools/ldml/xlit.cpp`):
+
+- **Inputs:** the classes (a `CharClassesKernel` of the code bits, with
+  another for its external sets, or one of the stream sets), `TextPositions`,
+  a `UnicodePropertyKernelBuilder` for each property, and a `StringSetKernel`
+  for each string set used. A string set reads the code bits where its sets
+  have codes, and U21 otherwise.
+- **`EntityMatch_<label>_<hash>`:** each rule's matches by paths. Each path
+  takes one length for each item (each length of a string set or union, 0 for
+  an absent optional item, which must not begin there: possessive), and is a
+  conjunction of the inputs looked ahead (Pablo Lookahead reads inputs only,
+  so the backward recursion of §5.1 is enumerated as paths).
+  - After contexts are paths too, with the text boundary (`¬InText` ahead)
+    for `[$]` and for sets that include it.
+  - Property sets are evaluated from the property streams and classes. A
+    union's longest match is derived from its operands'.
+  - The first rule that matches wins (rule order).
+  - Outputs: W (the rule's index + 1), Deleted (the rest of each match's text
+    by its length, and the texts of empty results) and Ins (the result's
+    length − 1).
+- **Insertion and deletion:** `InsertionSpreadMask` and `SpreadByMask` of
+  U21, W and Deleted where a rule expands.
+- **`EntityApply_<label>_<hash>`:** for each offset j, the rules whose results
+  have a character there are a CC over W advanced by j. Their bits replace
+  U21's at the first position (j = 0) and at the inserted ones.
+- `FilterByMask(¬Deleted)` follows.
+
+**Checks:**
+
+- **Four real transforms:** the outputs of
+  - de-ASCII (`nat-de.txt`, string sets),
+  - am-am_FONIPA (`pool-am.txt`, 436 rules),
+  - und_FONIPA-und_FONXSAMP (`pool-und_FONIPA.txt`),
+  - InterIndic-Bengali (`gen-Deva-InterIndic-from-pool-Deva.txt`)
+
+  are identical to the regular plan's on 1 MB of each, in Unicode mode, with
+  the entity kernels in the pipeline.
+- **Filters:** Cyrl-Latn and Latin-ASCII are within global filters, so the
+  regular plan applies them. Supporting filters is a gap, since many
+  transforms have a global filter.
+- **`QA/xlit_entity_test.py`** (ctest `xlit_entity_test`, 2 s) has two rules
+  files:
+  - **small:** a stream for each class, with sets with strings of 2 and 3
+    characters, an optional item, a property after context, an expansion and a
+    deletion;
+  - **layered:** 30 rules in 6 Div32 blocks (the Div32 code, 9 bits), with
+    the union `[$A $G]`, a negated set after context holding at the text end,
+    and optional items.
+
+  Each is checked against the regular plan and ICU, with `--class-layer`
+  on and off, and the trace confirms the path and the code. With the rule
+  priority removed (a mutation check, then restored), the layered checks
+  fail.
+- `string_set_test`, `xlit_class_layer_test`.
+
+**A first check that proved nothing.** A rules file the regular plan cannot
+implement (`$C } [:L:] → C` with `{k͡h}` in `$C`: "a string may not follow the
+text, which has an after context") was applied by ICU in all three runs, so
+their outputs agreed trivially. The tests now run with `--use-ICU=0`, and
+check that the path was taken. The entity plan implements that rule. Letting
+such transforms count as implementable when their groups are applied by the
+entity path is for later.
+
+**Not yet:**
+
+- filters (masks), bounded regions;
+- step 3 (overlaps), step 4 (before contexts);
+- UTF-8 mode;
+- timing (only with your go-ahead).

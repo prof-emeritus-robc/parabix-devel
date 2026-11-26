@@ -487,17 +487,31 @@ bool GroupPlanner::sameItems(const std::vector<EntityItem> & a, const std::vecto
 }
 
 void GroupPlanner::classes() {
-    std::set<std::string> streamKeys;
-    std::vector<UCD::UnicodeSet> mux;
-    std::set<std::string> muxKeys;
-    auto addMux = [&](const UCD::UnicodeSet & s) {
+    std::set<std::string> streamKeys, codedKeys;
+    auto addCoded = [&](const UCD::UnicodeSet & s) {
         if (s.empty()) return;
-        if (muxKeys.insert(rangesKey(s)).second) mux.push_back(s);
+        if (codedKeys.insert(rangesKey(s)).second) P.codedSets.push_back(s);
     };
     auto addStream = [&](const UCD::UnicodeSet & s) {
         if (s.empty()) return;
-        streamKeys.insert(rangesKey(s));
-        addMux(s);
+        if (streamKeys.insert(rangesKey(s)).second) P.streamSets.push_back(s);
+        addCoded(s);
+    };
+    //  The sets of characters within a property set (its CCs).
+    std::function<void (const RE *)> innerCCs = [&](const RE * re) {
+        if (const CC * cc = dyn_cast<CC>(re)) {
+            addStream(*cc);
+        } else if (const Name * n = dyn_cast<Name>(re)) {
+            if (!isFunctionCall(n) && n->getDefinition()) innerCCs(n->getDefinition());
+        } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+            for (const RE * x : *alt) innerCCs(x);
+        } else if (const Diff * d = dyn_cast<Diff>(re)) {
+            innerCCs(d->getLH());
+            innerCCs(d->getRH());
+        } else if (const Intersect * x = dyn_cast<Intersect>(re)) {
+            innerCCs(x->getLH());
+            innerCCs(x->getRH());
+        }
     };
     auto items = [&](const std::vector<EntityItem> & v) {
         for (const EntityItem & item : v) {
@@ -513,35 +527,25 @@ void GroupPlanner::classes() {
         if (!(e.inText || e.inBefore || e.inAfter)) continue;
         if (e.kind == Entity::Kind::PureSet) {
             addStream(e.chars);
-        } else if (e.kind == Entity::Kind::StringSet) {
-            addMux(e.chars);
-            for (const std::u32string & s : e.strings) {
-                for (char32_t c : s) addMux(UCD::UnicodeSet(c));
-            }
+        } else if (e.kind == Entity::Kind::PropertySet && e.re) {
+            innerCCs(e.re);
         }
     }
-    P.streamClasses = static_cast<unsigned>(streamKeys.size());
-    P.muxClasses = static_cast<unsigned>(mux.size());
-    //  The exclusive classes: the partition of the union of the classes.
-    std::vector<UCD::UnicodeSet> parts;
-    for (const UCD::UnicodeSet & s : mux) {
-        std::vector<UCD::UnicodeSet> next;
-        UCD::UnicodeSet rest = s;
-        for (const UCD::UnicodeSet & p : parts) {
-            const UCD::UnicodeSet in = p & s;
-            const UCD::UnicodeSet out = p - s;
-            if (!in.empty()) next.push_back(in);
-            if (!out.empty()) next.push_back(out);
-            rest = rest - p;
+    for (const Entity & e : P.entities) {
+        if (!(e.inText || e.inBefore || e.inAfter) || e.kind != Entity::Kind::StringSet) continue;
+        addCoded(e.chars);
+        for (const std::u32string & s : e.strings) {
+            for (char32_t c : s) addCoded(UCD::UnicodeSet(c));
         }
-        if (!rest.empty()) next.push_back(rest);
-        parts = std::move(next);
     }
-    P.exclusiveClasses = static_cast<unsigned>(parts.size());
-    unsigned bits = 0;
-    while ((1u << bits) < P.exclusiveClasses + 1) bits++;
-    P.codeBits = bits;
-    P.multiplexed = P.streamClasses > mOptions.muxThreshold;
+    for (const EntityRule & r : P.rules) {
+        UCD::UnicodeSet first;
+        for (const EntityItem & item : r.items) {
+            first = first + itemFirst(item);
+            if (!item.optional) break;
+        }
+        P.firstSets.push_back(first);
+    }
 }
 
 //  The character-level automaton of a rule's text: transitions on sets of

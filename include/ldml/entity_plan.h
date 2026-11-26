@@ -131,6 +131,11 @@ struct EntityGroupPlan {
     //  rules on cycles (none: the stages select exactly).
     std::vector<unsigned> stage;
     std::vector<size_t> stageCycleRules;
+    //  The same by the pruned graph (mayBeginWithinPruned), which is exact
+    //  where the before contexts' state is given by the closed form (a rule
+    //  whose before context holds only in its state cannot win within a
+    //  match, see closedForm).
+    std::vector<unsigned> stagePruned;
 
     //  The before contexts matched against the converted text (§5.3): for each
     //  distinct one-item before context, the conditions of the closed form.
@@ -147,6 +152,11 @@ struct EntityGroupPlan {
     //  to (c): the state is then computed by the correction loop (K1/K0).
     bool contextLoop = false;
     std::vector<std::string> contextLoopReasons;
+    //  Whether the before contexts are given by the closed form of §5.3: every
+    //  before context is the one item of stateEntity (a set, beforeStates[0]),
+    //  whose conditions (a) to (c) hold; or there are none.
+    bool closedForm = false;
+    size_t stateEntity = 0;
 
     std::vector<std::string> problems;
     bool eligible() const {return problems.empty();}

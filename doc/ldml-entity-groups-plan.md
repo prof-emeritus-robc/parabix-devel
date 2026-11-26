@@ -839,3 +839,86 @@ cycles are left to step 4. The report gives `stages` and `stage_cycle_rules`.
 - step 4 (before contexts, cycles);
 - filters;
 - UTF-8 mode.
+
+## 15. Status of step 4 (2026-11-26)
+
+**The closed form (§5.3).** The plan's `closedForm` holds when:
+
+- every before context is the one item of a single state's set
+  (`stateEntity`, a set);
+- that state's conditions (a) to (c) hold.
+
+Other before contexts (literal characters, `[$]` alone, several sets or
+items) are left to the regular plan; the correction loop for them is not yet
+written.
+
+`EntityMatch` decides the winning rule at each position twice, once for each
+state; the rules with before contexts match only in state 1. Then:
+
+```
+state = InText ∧ MatchStar(Advance(C) ∨ [text start, if C has the boundary], D¹)
+D¹    = the winners in state 1 that delete one position
+wins  = state ? wins¹ : wins⁰          (with their lengths)
+```
+
+**Stages and cycles.** With before contexts, the stages come from the pruned
+graph (`stagePruned`, `cycleRules`). That graph is exact for the closed form:
+within a match, `state` is 0, since the character before an inner position
+is a character of the text, not in C, or a deletion within the match, which
+state 1 does not reach. So a rule with a before context cannot win there.
+
+The rules on cycles are selected after the stages below them have removed
+their covered candidates, in a While loop with two accumulating Vars,
+accepted and rejected:
+
+- an undecided candidate within no live (not rejected) candidate is
+  accepted;
+- the candidates within newly accepted ones are rejected. Only the new bits
+  are advanced, so the carry-outs, ORed over the iterations, are the
+  interiors of all the matches accepted.
+
+The live test advances a value that is not accumulated. Its carry-in, read
+in the first iteration only, may still include the previous block's
+rejected candidates. That only delays an acceptance to the second
+iteration; a candidate covered by a previous block's accepted match is
+rejected in the first by the carry of the accepted. The rules on cycles join
+`startLen` after the loop, for the later stages.
+
+The stages, the cycles, the state's set and the rules with before contexts
+are in the kernel's signature.
+
+**und_FONIPA-ar** (Unicode mode, `--entity-groups`):
+
+- groups 1 to 3 are applied by their entity plans. Group 3 has the closed
+  form for `$Boundary`, 33 class streams and the loop for rule 16
+  (`$AVowel ː? ʔ $AVowel ː?`). Group 4 is applied by the regular plan
+  (`ووو+`).
+- **Corpus:** on 1 MB of `pool-und_FONIPA.txt`, the output is identical to
+  the regular plan's and ICU's.
+- **Compile time:** the whole run took 5.8 s, compilation included
+  (`-backend-optimization-level=none`), against 16 minutes to compile the
+  regular plan's Unicode-mode pipeline cold (§14).
+- **Targeted text:** 464 lines (68 KB) are identical to ICU's, with the
+  default threads and with `-thread-num=4 -segment-size=1`. They include:
+  - boundary chains through deletions (` ʔʔa`, ` ʔəa`, ` əʔə`), schwa
+    deletion (`kəa`), `ʔɵ̞a`, `ɵ̞ːa`;
+  - self-overlap chains (`aʔaʔa`, `aːʔaːʔa`), `iːʔ` before a vowel, a
+    boundary and the end, `ʎ̥` before `[^ $IVowel j ʝ]`;
+  - chains of 50 to 300 repetitions of `aʔ`, ` aːʔ` and `ʔ` (across
+    blocks);
+  - 400 random lines of vowels, glottal stops, consonants and boundaries.
+- **Mutation checks** (then restored): without the chain of state 1 through
+  deletions (`MatchStar`), 78 lines differ; with the cycle's candidates all
+  accepted (no loop), 29.
+
+**`QA/xlit_entity_test.py`:** a fourth rules file (`$B {ʔ? $V} → W`,
+`$V ʔ $V → XY`, `ʔ → ;`: a closed-form state through deletions and a cycle)
+brings it to 12 checks, 2 s.
+
+**Not yet:**
+
+- the correction loop for before contexts outside the closed form;
+- an If on contested positions around the stages and the loop;
+- filters and bounded regions;
+- UTF-8 mode;
+- timing (only with your go-ahead).

@@ -16955,9 +16955,8 @@ static bool entityClassLayer(const ldml::EntityGroupPlan & p, ClassLayerCoding &
 static std::string entityStep2Problem(const ldml::EntityGroupPlan & p) {
     if (!p.eligible()) return p.problems.front();
     for (const ldml::EntityRule & r : p.rules) {
-        if (!r.before.empty()) return "a before context (step 4)";
+        if (!r.before.empty() && !p.closedForm) return "before contexts that the closed form does not give (the correction loop: not yet)";
     }
-    if (!p.stageCycleRules.empty()) return "rules that may begin within matches of themselves (cycles: step 4)";
     return std::string();
 }
 
@@ -17010,7 +17009,7 @@ static EntityCoding entityCoding(const ldml::EntityGroupPlan & p) {
 }
 
 static bool entityUsed(const ldml::Entity & e) {
-    return e.inText || e.inAfter;
+    return e.inText || e.inAfter || e.inBefore;
 }
 
 //  The StringSet entities used (inputs of EntityMatch, in order), and the
@@ -17065,6 +17064,21 @@ static unsigned itemsMaxLength(const ldml::EntityGroupPlan & p, const std::vecto
     return n;
 }
 
+//  Whether some rule of an entity group has a before context (given by the
+//  closed form, see entityStep2Problem), and the stages and cycles of its
+//  selection: by the graph pruned of such rules where they cannot win within a
+//  match (the closed form), by the graph itself otherwise.
+static bool entityHasBefore(const ldml::EntityGroupPlan & p) {
+    for (const ldml::EntityRule & r : p.rules) if (!r.before.empty()) return true;
+    return false;
+}
+static const std::vector<unsigned> & entityStages(const ldml::EntityGroupPlan & p) {
+    return entityHasBefore(p) ? p.stagePruned : p.stage;
+}
+static const std::vector<size_t> & entityCycleRules(const ldml::EntityGroupPlan & p) {
+    return entityHasBefore(p) ? p.cycleRules : p.stageCycleRules;
+}
+
 //  The matches of the rules of an entity group at each position (§5.1, §5.2):
 //  of the rule that applies there (the first in order that matches), W (its
 //  index + 1, 0: none); the positions deleted (the rest of the matches' texts,
@@ -17114,7 +17128,11 @@ public:
             sig += ";";
         }
         sig += "stages:";
-        for (unsigned d : p.stage) sig += std::to_string(d) + ",";
+        for (unsigned d : entityStages(p)) sig += std::to_string(d) + ",";
+        sig += "cycles:";
+        for (size_t c : entityCycleRules(p)) sig += std::to_string(c) + ",";
+        if (entityHasBefore(p)) sig += "state:" + entityKey(p, p.stateEntity);
+        for (const ldml::EntityRule & r : p.rules) sig += r.before.empty() ? "-" : "b";
         return sig;
     }
 protected:
@@ -17275,10 +17293,8 @@ void EntityMatch::generatePabloMethod() {
         return paths;
     };
     const unsigned maxLength = [&] {unsigned m = 1; for (const ldml::EntityRule & r : p.rules) m = std::max(m, r.maxLength); return m;}();
-    PabloAST * prior = zeroes;
-    std::vector<PabloAST *> wins;
-    //  The rule's matches by length, where it wins.
-    std::vector<std::map<unsigned, PabloAST *>> winsByLength;
+    //  Each rule's matches by length (its text and after context).
+    std::vector<std::map<unsigned, PabloAST *>> matchesByLength;
     for (const ldml::EntityRule & r : p.rules) {
         std::map<unsigned, PabloAST *> byLength;
         for (const auto & [cond, l] : extend({{inText, 0}}, r.items, false)) {
@@ -17287,43 +17303,147 @@ void EntityMatch::generatePabloMethod() {
             auto & b = byLength[l];
             b = b ? pb.createOr(b, m) : m;
         }
-        PabloAST * match = zeroes;
-        for (const auto & [l, m] : byLength) match = pb.createOr(match, m);
-        PabloAST * const win = pb.createAnd(match, pb.createNot(prior));
-        prior = pb.createOr(prior, match);
-        wins.push_back(win);
-        winsByLength.emplace_back();
-        for (const auto & [l, m] : byLength) winsByLength.back()[l] = pb.createAnd(win, m);
+        matchesByLength.push_back(std::move(byLength));
+    }
+    //  The rule that wins at each position (the first that matches there), with
+    //  its matches by length, given the state of the before contexts: whether
+    //  the converted text before the position ends with a character of the
+    //  state's set (or is empty, if the set has the text boundary); a rule with
+    //  a before context matches only in state 1 (§5.3).
+    const bool hasBefore = entityHasBefore(p);
+    auto winners = [&](bool state, std::vector<PabloAST *> & wins, std::vector<std::map<unsigned, PabloAST *>> & byLength) {
+        PabloAST * prior = zeroes;
+        for (size_t i = 0; i < p.rules.size(); i++) {
+            wins.push_back(zeroes);
+            byLength.emplace_back();
+            if (!p.rules[i].before.empty() && !state) continue;
+            PabloAST * match = zeroes;
+            for (const auto & [l, m] : matchesByLength[i]) match = pb.createOr(match, m);
+            wins.back() = pb.createAnd(match, pb.createNot(prior));
+            prior = pb.createOr(prior, match);
+            for (const auto & [l, m] : matchesByLength[i]) byLength.back()[l] = pb.createAnd(wins.back(), m);
+        }
+    };
+    std::vector<PabloAST *> wins;
+    std::vector<std::map<unsigned, PabloAST *>> winsByLength;
+    if (!hasBefore) {
+        winners(true, wins, winsByLength);
+    } else {
+        std::vector<PabloAST *> wins0, wins1;
+        std::vector<std::map<unsigned, PabloAST *>> byLength0, byLength1;
+        winners(false, wins0, byLength0);
+        winners(true, wins1, byLength1);
+        //  The closed form (§5.3): the state is 1 after a character of the set
+        //  (which no rule converts), and at the start of the text if the set has
+        //  the boundary, and through the deletions of one position decided in
+        //  state 1 (no other rule changes it: its results end with characters
+        //  not in the set, and the deletions in state 1 are of one position).
+        const size_t C = p.stateEntity;
+        PabloAST * start = pb.createAdvance(len(C, 1, 0), 1);
+        if (p.entities[C].boundary) start = pb.createOr(start, pb.createAnd(inText, pb.createNot(pb.createAdvance(inText, 1))));
+        PabloAST * deleted1 = zeroes;
+        for (size_t i = 0; i < p.rules.size(); i++) {
+            const auto f = byLength1[i].find(1);
+            if (p.rules[i].result.empty() && f != byLength1[i].end()) deleted1 = pb.createOr(deleted1, f->second);
+        }
+        PabloAST * const state = pb.createAnd(pb.createMatchStar(start, deleted1), inText, "state");
+        PabloAST * const notState = pb.createNot(state);
+        for (size_t i = 0; i < p.rules.size(); i++) {
+            wins.push_back(pb.createOr(pb.createAnd(state, wins1[i]), pb.createAnd(notState, wins0[i])));
+            winsByLength.emplace_back();
+            for (const auto & [l, m] : matchesByLength[i]) {
+                PabloAST * const w1 = byLength1[i].count(l) ? byLength1[i][l] : zeroes;
+                PabloAST * const w0 = byLength0[i].count(l) ? byLength0[i][l] : zeroes;
+                winsByLength.back()[l] = pb.createOr(pb.createAnd(state, w1), pb.createAnd(notState, w0));
+            }
+        }
     }
     //  The selection (§5.4): a match applies unless it begins within a match
-    //  that applies.  A rule of stage 0 (within whose matches no rule may
-    //  begin... rather, that may begin within no rule's match) applies where it
-    //  wins; a rule of stage d, where it wins outside the matches applied of
-    //  the rules of the stages before (the only ones within whose matches it
-    //  may begin).
-    const std::vector<unsigned> & stage = p.stage;
+    //  that applies.  A rule of stage 0 (that may begin within no rule's
+    //  match) applies where it wins; a rule of stage d, where it wins outside
+    //  the matches applied of the rules of the stages before (the only ones
+    //  within whose matches it may begin, other than those of its own cycle).
+    //  The rules of a cycle (that may begin within matches of each other or
+    //  themselves, as $AVowel ː? ʔ $AVowel ː?) are then selected from the left
+    //  among themselves, in a While loop.
+    const std::vector<unsigned> & stage = entityStages(p);
+    const std::vector<size_t> & cycle = entityCycleRules(p);
     const unsigned stages = stage.empty() ? 1 : *std::max_element(stage.begin(), stage.end()) + 1;
     //  The positions after the first of the matches applied, of lengths by
     //  their starts (startLen).
     std::vector<PabloAST *> startLen(maxLength + 1, zeroes);
-    auto interior = [&]() {
+    //  The positions after the first of matches given by their starts by length.
+    auto interiorOf = [&](PabloBuilder & b, const std::vector<PabloAST *> & byLength) {
         PabloAST * r = zeroes;
         for (unsigned j = 1; j < maxLength; j++) {
             PabloAST * longer = zeroes;
-            for (unsigned l = j + 1; l <= maxLength; l++) longer = pb.createOr(longer, startLen[l]);
-            r = pb.createOr(r, pb.createAdvance(longer, j));
+            for (unsigned l = j + 1; l <= maxLength; l++) longer = b.createOr(longer, byLength[l]);
+            r = b.createOr(r, b.createAdvance(longer, j));
         }
         return r;
     };
     for (unsigned d = 0; d < stages; d++) {
-        PabloAST * const covered = d == 0 ? zeroes : interior();
+        PabloAST * const covered = d == 0 ? zeroes : interiorOf(pb, startLen);
+        std::vector<size_t> inCycle;
         for (size_t i = 0; i < wins.size(); i++) {
             if ((stage.empty() ? 0 : stage[i]) != d) continue;
             if (d > 0) {
                 wins[i] = pb.createAnd(wins[i], pb.createNot(covered));
                 for (auto & [l, m] : winsByLength[i]) m = pb.createAnd(m, pb.createNot(covered));
             }
+            if (std::find(cycle.begin(), cycle.end(), i) != cycle.end()) {
+                inCycle.push_back(i);
+                continue;
+            }
             for (const auto & [l, m] : winsByLength[i]) startLen[l] = pb.createOr(startLen[l], m);
+        }
+        if (inCycle.empty()) continue;
+        //  The candidates of the cycle's rules, by length.
+        std::vector<PabloAST *> cand(maxLength + 1, zeroes);
+        PabloAST * all = zeroes;
+        for (size_t i : inCycle) {
+            for (const auto & [l, m] : winsByLength[i]) {
+                cand[l] = pb.createOr(cand[l], m);
+                all = pb.createOr(all, m);
+            }
+        }
+        //  From the left: a candidate within no live candidate (not rejected)
+        //  is accepted; the candidates within the accepted ones are rejected.
+        //  Accepted and rejected accumulate (a While's carries: the carry-in of
+        //  an Advance is read in its first iteration only, and the carry-outs of
+        //  the iterations are ORed).  The test of the live candidates covering
+        //  a candidate advances a value that is not accumulated: in the first
+        //  iteration after a block boundary it may still see the candidates of
+        //  the previous block that were rejected, which only delays an
+        //  acceptance to the next iteration (the ones accepted there have
+        //  rejected theirs in the first iteration, by the carry of the
+        //  accepted).
+        Var * const accepted = pb.createVar("cycleAccepted", zeroes);
+        Var * const rejected = pb.createVar("cycleRejected", zeroes);
+        Var * const pending = pb.createVar("cyclePending", all);
+        PabloBuilder wb = pb.createScope();
+        {
+            std::vector<PabloAST *> live(maxLength + 1, zeroes);
+            for (unsigned l = 1; l <= maxLength; l++) live[l] = wb.createAnd(cand[l], wb.createNot(rejected));
+            PabloAST * const coveredByLive = interiorOf(wb, live);
+            PabloAST * const undecided = wb.createAnd(all, wb.createNot(wb.createOr(accepted, rejected)));
+            PabloAST * const newAccepted = wb.createAnd(undecided, wb.createNot(coveredByLive));
+            PabloAST * const acc = wb.createOr(accepted, newAccepted);
+            std::vector<PabloAST *> fresh(maxLength + 1, zeroes);
+            for (unsigned l = 1; l <= maxLength; l++) fresh[l] = wb.createAnd(cand[l], newAccepted);
+            PabloAST * const newRejected = wb.createAnd(wb.createAnd(all, wb.createNot(acc)), interiorOf(wb, fresh));
+            PabloAST * const rej = wb.createOr(rejected, newRejected);
+            wb.createAssign(accepted, acc);
+            wb.createAssign(rejected, rej);
+            wb.createAssign(pending, wb.createAnd(all, wb.createNot(wb.createOr(acc, rej))));
+        }
+        pb.createWhile(pending, wb);
+        for (size_t i : inCycle) {
+            wins[i] = pb.createAnd(wins[i], accepted);
+            for (auto & [l, m] : winsByLength[i]) {
+                m = pb.createAnd(m, accepted);
+                startLen[l] = pb.createOr(startLen[l], m);
+            }
         }
     }
     //  W: the rule's index + 1.
@@ -17338,7 +17458,7 @@ void EntityMatch::generatePabloMethod() {
         for (unsigned b = 0; b < ins.size(); b++) if (m > 1 && (((m - 1) >> b) & 1)) ins[b] = pb.createOr(ins[b], wins[i]);
     }
     //  The rest of each match's text.
-    deleted = pb.createOr(deleted, interior());
+    deleted = pb.createOr(deleted, interiorOf(pb, startLen));
     writeOutputStreamSet("W", w);
     writeOutputStreamSet("Deleted", std::vector<PabloAST *>{pb.createInFile(deleted)});
     if (mHasIns) writeOutputStreamSet("Ins", ins);

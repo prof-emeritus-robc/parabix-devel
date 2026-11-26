@@ -3,9 +3,10 @@
 #  SPDX-License-Identifier: OSL-3.0
 #
 #  xlit --entity-groups: conversion groups applied by their entity plans
-#  (doc/ldml-entity-groups-plan.md, steps 2 and 3: Unicode mode, groups
-#  without before contexts, whose rules beginning within others' matches form
-#  no cycle: selected in stages).  For rules files of sets
+#  (doc/ldml-entity-groups-plan.md, steps 2 to 4: Unicode mode; rules that
+#  begin within others' matches selected in stages, and those on cycles in a
+#  While loop; before contexts matched against the converted text given by
+#  the closed form of §5.3).  For rules files of sets
 #  with strings (strings extending single characters of the set, a union of
 #  such sets), optional items, after contexts (properties, a negated set that
 #  holds at the end of the text), expansions and deletions, on random text of
@@ -84,8 +85,24 @@ y z → QQ;
 z → ;
 """
 
+#  Before contexts matched against the converted text, given by the closed
+#  form (step 4): the state is 1 after a character of $B (in no text, after no
+#  result) and through the deletions of one position in state 1 (ʔ → ;, so
+#  that the second ʔ of " ʔʔe" is at a boundary); and a rule that may begin
+#  within its own matches (a cycle: "eʔeʔe"), selected from the left in a
+#  While loop.
+STATES = """
+$B = [^[:L:][:M:][:N:]];
+$V = [a e {e̞}];
+$B {ʔ? $V} → W;
+$V ʔ $V → XY;
+$V → v;
+ʔ → ;
+"""
+
 #  (rules, the code expected with --class-layer=1)
-CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32"), ("overlaps", OVERLAPS, "streams")]
+CASES = [("small", SMALL, "streams"), ("layered", LAYERED, "div32"), ("overlaps", OVERLAPS, "streams"),
+         ("states", STATES, "streams")]
 
 
 def pool_of(rules):
@@ -96,7 +113,7 @@ def pool_of(rules):
     chars.update("abcdefgkqtxyz")
     chars.update(["̰", "̃", "̆", "̇", "̞", "ː", "ʼ", " ", "1", "\n", "ж", "中", "𝒜"])
     strings = ["e̞", "ɪ̈", "k͡h", "k͡hʷ", "a̰", "ά̃", "н̆", "ɓ̃", "ד̇",
-               "xyz", "xyzz", "yzz", "ke̞ː", "kaː"]
+               "xyz", "xyzz", "yzz", "ke̞ː", "kaː", " ʔʔe", "eʔeʔeʔe", "ʔʔʔ", " ʔe̞ʔa"]
     return sorted(chars) + strings
 
 

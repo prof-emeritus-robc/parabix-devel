@@ -664,6 +664,7 @@ void GroupPlanner::overlaps() {
     stagesOf(P.mayBeginWithinPruned, P.cycleRules, depths);
     P.depth = 0;
     for (unsigned d : depths) P.depth = std::max(P.depth, d);
+    P.stagePruned = depths;
     stagesOf(P.mayBeginWithin, P.stageCycleRules, P.stage);
 }
 
@@ -794,6 +795,23 @@ void GroupPlanner::finish() {
     classes();
     overlaps();
     beforeStates();
+    //  The closed form: no before contexts, or all of them the one item of a
+    //  single state whose conditions hold.
+    P.closedForm = true;
+    for (const EntityRule & r : P.rules) {
+        if (r.before.empty()) continue;
+        if (P.beforeStates.size() != 1 || r.before.size() != 1 || r.before.front().kind != EntityItem::Kind::Entity
+                || r.before.front().optional || r.before.front().entity != P.beforeStates.front().entity) {
+            P.closedForm = false;
+        }
+    }
+    if (P.beforeStates.size() == 1) {
+        const EntityGroupPlan::BeforeState & s = P.beforeStates.front();
+        P.stateEntity = s.entity;
+        if (!(s.textDisjoint && s.resultsOutside && s.singleDeletions)) P.closedForm = false;
+    } else if (P.beforeStates.size() > 1) {
+        P.closedForm = false;
+    }
     for (const EntityGroupPlan::BeforeState & s : P.beforeStates) {
         if (!(s.textDisjoint && s.resultsOutside && s.singleDeletions)) {
             const std::string name = s.entity == NoEntity ? "[$]" : P.entities[s.entity].name;

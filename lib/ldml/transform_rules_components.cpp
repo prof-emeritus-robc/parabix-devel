@@ -73,13 +73,6 @@ Footprint footprint(const ConversionRule * rule) {
     return f;
 }
 
-bool affects(const Footprint & a, const Footprint & b) {
-    if (!(a.context & (b.text + b.result)).empty()) return true;
-    if (!(a.text & b.result).empty()) return true;
-    if (b.lengthChanging && a.hasContext) return true;
-    return false;
-}
-
 }
 
 std::vector<std::vector<size_t>> IndependentComponents(const std::vector<Rule *> & group) {

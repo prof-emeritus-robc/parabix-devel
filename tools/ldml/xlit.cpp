@@ -69,6 +69,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
 #include <pablo/pablo.h>
@@ -17231,8 +17232,8 @@ public:
                 const std::vector<unsigned> & selectors = {}, unsigned deletionSelector = 0, StreamSet * Sel = nullptr)
     : PabloKernel(ts, "EntityMatch_" + label + "_" + getStringHash(signatureOf(plan, coding, selectors, deletionSelector)),
                   {}, outputs(W, Deleted, Ins, Sel))
-    , mPlan(plan), mCoding(coding), mSignature(signatureOf(plan, coding, selectors, deletionSelector))
-    , mSelectors(selectors), mDeletionSelector(deletionSelector) {
+    , mPlan(plan), mCoding(coding), mSelectors(selectors), mDeletionSelector(deletionSelector)
+    , mSignature(signatureOf(plan, coding, selectors, deletionSelector)) {
         const unsigned la = lookahead(plan);
         auto in = [&](const std::string & name, StreamSet * s) {
             if (la > 0) mInputStreamSets.push_back(Binding{name, s, FixedRate(), LookAhead(la)});

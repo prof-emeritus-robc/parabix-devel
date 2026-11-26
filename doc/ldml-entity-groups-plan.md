@@ -788,7 +788,11 @@ entity path is for later.
 in the graph of `mayBeginWithin`, not pruned, since step 3 has no before
 contexts to prune by. The depth is the longest chain of rules within whose
 matches it may begin, and the rules on cycles are `stageCycleRules`
-(`stagesOf`, also used for the report's pruned graph).
+(`stagesOf`, also used for the report's pruned graph). `stagesOf` takes the
+strongly connected components of the graph and the longest paths of their
+condensation, in time linear in the graph; a transitive closure, cubic in the
+number of rules, took minutes on the groups of thousands of rules of the
+Ethiopic Geminate transforms (6,888 in am_Ethi-am_Ethi/Geminate).
 
 `EntityMatch` selects by the stages (§5.4):
 

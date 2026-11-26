@@ -676,41 +676,84 @@ void GroupPlanner::overlaps() {
 //  the depth of each rule, the longest path to it (0: none may cover it), with
 //  each set of mutually reachable rules as one node.
 void stagesOf(const std::vector<std::vector<size_t>> & edges, std::vector<size_t> & cycles, std::vector<unsigned> & depths) {
+    //  The strongly connected components (Tarjan's algorithm, iterative), in
+    //  reverse topological order of the condensation; then the longest path to
+    //  each component, in topological order.  Linear in the size of the graph.
     const size_t n = edges.size();
-    std::vector<std::vector<bool>> reach(n, std::vector<bool>(n, false));
-    for (size_t i = 0; i < n; i++) {
-        for (size_t j : edges[i]) reach[i][j] = true;
-    }
-    for (size_t k = 0; k < n; k++) {
-        for (size_t i = 0; i < n; i++) {
-            if (!reach[i][k]) continue;
-            for (size_t j = 0; j < n; j++) {
-                if (reach[k][j]) reach[i][j] = true;
+    constexpr size_t None = std::numeric_limits<size_t>::max();
+    std::vector<size_t> index(n, None), low(n, 0), component(n, None);
+    std::vector<bool> onStack(n, false);
+    std::vector<size_t> stack;
+    std::vector<std::vector<size_t>> components;
+    std::vector<std::pair<size_t, size_t>> work;   // (node, next edge)
+    size_t counter = 0;
+    for (size_t root = 0; root < n; root++) {
+        if (index[root] != None) continue;
+        work.emplace_back(root, 0);
+        while (!work.empty()) {
+            const size_t v = work.back().first;
+            size_t & e = work.back().second;
+            if (e == 0 && index[v] == None) {
+                index[v] = low[v] = counter++;
+                stack.push_back(v);
+                onStack[v] = true;
+            }
+            if (e < edges[v].size()) {
+                const size_t w = edges[v][e++];
+                if (index[w] == None) {
+                    work.emplace_back(w, 0);
+                } else if (onStack[w]) {
+                    low[v] = std::min(low[v], index[w]);
+                }
+                continue;
+            }
+            if (low[v] == index[v]) {
+                std::vector<size_t> c;
+                size_t w;
+                do {
+                    w = stack.back();
+                    stack.pop_back();
+                    onStack[w] = false;
+                    component[w] = components.size();
+                    c.push_back(w);
+                } while (w != v);
+                components.push_back(std::move(c));
+            }
+            work.pop_back();
+            if (!work.empty()) {
+                const size_t u = work.back().first;
+                low[u] = std::min(low[u], low[v]);
             }
         }
     }
-    cycles.clear();
-    for (size_t i = 0; i < n; i++) {
-        if (reach[i][i]) cycles.push_back(i);
-    }
-    std::vector<int> depth(n, -1);
-    std::function<unsigned (size_t)> depthOf = [&](size_t j) -> unsigned {
-        if (depth[j] >= 0) return static_cast<unsigned>(depth[j]);
-        depth[j] = 0;
-        unsigned d = 0;
-        bool covered = false;
-        for (size_t i = 0; i < n; i++) {
-            if (!reach[i][j]) continue;
-            covered = true;
-            if (reach[j][i]) continue;      // (within a cycle)
-            d = std::max(d, depthOf(i) + 1);
+    const size_t m = components.size();
+    std::vector<bool> cyclic(m, false);
+    for (size_t v = 0; v < n; v++) {
+        for (size_t w : edges[v]) {
+            if (component[w] == component[v]) cyclic[component[v]] = true;
         }
-        if (covered) d = std::max(d, 1u);
-        depth[j] = static_cast<int>(d);
-        return d;
-    };
+    }
+    cycles.clear();
+    for (size_t v = 0; v < n; v++) {
+        if (cyclic[component[v]]) cycles.push_back(v);
+    }
+    //  The depth of a component: the longest path to it from the components
+    //  before it, at least 1 if it is covered (a predecessor, or a cycle).
+    std::vector<unsigned> depth(m, 0);
+    std::vector<bool> covered(m, false);
+    for (size_t k = m; k-- > 0; ) {
+        if (cyclic[k] || covered[k]) depth[k] = std::max(depth[k], 1u);
+        for (size_t v : components[k]) {
+            for (size_t w : edges[v]) {
+                const size_t c = component[w];
+                if (c == k) continue;
+                covered[c] = true;
+                depth[c] = std::max(depth[c], depth[k] + 1);
+            }
+        }
+    }
     depths.assign(n, 0);
-    for (size_t j = 0; j < n; j++) depths[j] = depthOf(j);
+    for (size_t v = 0; v < n; v++) depths[v] = depth[component[v]];
 }
 
 void GroupPlanner::beforeStates() {

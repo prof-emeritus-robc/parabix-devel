@@ -2241,3 +2241,39 @@ Checks: `xlit_class_layer_test.py` has rules with external sets (a before
 context `[^[:L:]]`, an after context `[:N:]`) in a layered kernel, in both
 modes, against the regular plan and ICU; Hant-Hans on `nat-zh.txt` is the same
 with the layer and without it, in both modes.
+
+### 13.17 Step 4e (2026-11-26): correction kernels in the class layer
+
+- **The criterion** (`classLayerCriterion`) no longer excludes correction
+  kernels. A correction kernel with the layer computes the first positions of
+  its string matches and the positions of its subgroups (without the before
+  contexts matched against the converted text) in the leaves' Ifs, accumulated
+  in Vars, which the kernel then reads as before. und_FONIPA-ar's #289 (the loop
+  kernel) and its post kernel are now layered (16 blocks, 13 leaves, 4 external
+  sets).
+- **The cover setup in Ifs** (with `--fused-rule-ifs`): the candidates of each
+  cover at an offset above 0 (an Advance of the rule's candidates) and their
+  complement are Vars assigned in an If on the rule's candidates (none, and
+  all, where it is skipped); offset 0 and the runs' covers are as before.
+  (5,708 statements of #289's setup ran in every block.)
+- **A bug found on the way, in the UTF-8 class compiler** (fixed in its own
+  commit): with the Div32 code, und_FONIPA-ar's output changed at one
+  character of 20 MB. `--class-layer-check` (debugging: each layered kernel's
+  classes also computed from the multiplexed code, compared at every position,
+  differences reported) showed one class wrong at one position: three bits of
+  the code lost for U+032A (read as U+0280). The class kernel (Advance mode)
+  nested an If on lead bytes CC–CD, tested at the lead byte, whose body worked
+  at the second byte with an Advance built outside it: a character whose second
+  byte began a block lost its classes (the case of 5bece0cc2 in another
+  branch). Each If whose body works at later code units now tests its test
+  moved to every one of them (`coverSequence`). `tests/utf8_classes_test.py`
+  has #289's 14 classes in one kernel (it fails without the fix).
+
+Checks: und_FONIPA-ar on `pool-und_FONIPA.txt` identical to step 1's, with no
+class difference reported by `--class-layer-check`; `xlit_class_layer_test.py`
+with correction kernels layered (contexts matched against the converted text,
+external sets, in both modes); all 53 xlit and ldml tests, `greptest` and
+`utf8_classes_test`.
+
+Not yet: timing (#289 with and without the layer, at 4 threads, with the
+outputs compared), and step 4f (Ifs on the first character within a block).

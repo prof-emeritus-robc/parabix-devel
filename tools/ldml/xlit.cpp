@@ -6220,10 +6220,11 @@ static ClassLayerLeaves classLayerLeaves(const FusedRulesConfig & c) {
 
 //  Whether a fused kernel has its rules decided in Ifs by blocks (structural,
 //  doc/ldml-divcode-plan.md §13.13): 20 or more rules in 4 or more leaves, none
-//  with more than half of them; not a correction kernel, and with no insertion
-//  rules or marked case mappings.
+//  with more than half of them; with no insertion rules or marked case
+//  mappings.  (A correction kernel: its static matching in the leaves, see
+//  FusedRules::generatePabloMethod; doc/ldml-divcode-plan.md §13.16, step 4e.)
 static bool classLayerCriterion(const FusedRulesConfig & c) {
-    if (c.correction || !c.insertions.empty() || !c.marks.empty()) return false;
+    if (!c.insertions.empty() || !c.marks.empty()) return false;
     for (const FusedSubgroup & g : c.subgroups) if (g.caseMaps) return false;
     const ClassLayerLeaves l = classLayerLeaves(c);
     return l.rules >= 20 && l.rulesIn.size() >= 4 && 2 * l.maxLeaf() <= l.rules;
@@ -7181,6 +7182,30 @@ void FusedRules::generatePabloMethod() {
         attr.mark("subgroup matches", static_cast<long>(ats.size()));
         ats.push_back(subgroupAt(g, FusedSubgroupPlan(g, mConfig.absolute).all));
     }
+    if (layered && correction) {
+        //  A correction kernel with the class layer: the first positions of the
+        //  string matches and the positions of the subgroups (without the before
+        //  contexts matched against the converted text), accumulated in Vars over
+        //  the leaves, each leaf's in its If; the kernel then reads them as
+        //  before.
+        attr.mark("string matches");
+        std::vector<Var *> startVars(mConfig.strings.size()), atVars(mConfig.subgroups.size());
+        for (size_t r = 0; r < startVars.size(); r++) startVars[r] = pb.createVar("Start" + std::to_string(r), zeroes);
+        for (size_t g = 0; g < atVars.size(); g++) atVars[g] = pb.createVar("At" + std::to_string(g), zeroes);
+        forLeaves([&](const ClassLeaf & l) {
+            for (const auto & e : l.strings) {
+                PabloAST * m = stringStart(mConfig.strings[e.first], e.second);
+                if (mConfig.selected >= 0) m = cb->createAnd(m, source(mConfig.selected));
+                cb->createAssign(startVars[e.first], cb->createOr(startVars[e.first], m));
+            }
+            for (const auto & e : l.subgroups) {
+                PabloAST * const at = subgroupAt(mConfig.subgroups[e.first], e.second);
+                cb->createAssign(atVars[e.first], cb->createOr(atVars[e.first], at));
+            }
+        });
+        starts.assign(startVars.begin(), startVars.end());
+        ats.assign(atVars.begin(), atVars.end());
+    }
 
     //  The insertion rules: where their after contexts match (from the next
     //  position) and they are eligible, and where they apply (given by the
@@ -7409,7 +7434,7 @@ void FusedRules::generatePabloMethod() {
     //  added there is at or moved from the first positions of its rules, within
     //  its condition).
     std::unique_ptr<Results> layeredResults;
-    if (layered) {
+    if (layered && !correction) {
         Results acc = stateIn();
         unsigned v = 0;
         auto toVar = [&](PabloAST *& x) {
@@ -7709,6 +7734,34 @@ void FusedRules::generatePabloMethod() {
                 bool last = false;
             };
             std::vector<StringCover> covers;
+            //  The candidates at the offsets of an entry's covers (ks, offset > 0,
+            //  not runs) and their complements: with --fused-rule-ifs, in an If on
+            //  the entry's candidates (doc/ldml-divcode-plan.md §13.16, step 4e),
+            //  as Vars (none, and all, where the If is skipped: no candidate in the
+            //  block and no pending carry, where the Advances give none); then
+            //  where a converted rule may apply (dep).
+            auto coverCandidates = [&](size_t e, const std::vector<size_t> & ks) {
+                if (!FusedRuleIfs || candS[e] == zeroes || ks.empty()) {
+                    for (size_t k : ks) {
+                        covers[k].cand = pb.createAdvance(candS[e], covers[k].offset);
+                        covers[k].notCand = pb.createNot(covers[k].cand);
+                    }
+                } else {
+                    PabloBuilder ib = pb.createScope();
+                    for (size_t k : ks) {
+                        const std::string suffix = std::to_string(e) + "_" + std::to_string(covers[k].offset);
+                        Var * const c = pb.createVar("SC" + suffix, zeroes);
+                        Var * const nc = pb.createVar("SN" + suffix, ones);
+                        PabloAST * const a = ib.createAdvance(candS[e], covers[k].offset);
+                        ib.createAssign(c, a);
+                        ib.createAssign(nc, ib.createNot(a));
+                        covers[k].cand = c;
+                        covers[k].notCand = nc;
+                    }
+                    pb.createIf(candS[e], ib);
+                }
+                for (size_t k : ks) dep = pb.createOr(dep, covers[k].cand);
+            };
             for (size_t r = 0; r < mConfig.strings.size(); r++) {
                 const FusedStringRule & rule = mConfig.strings[r];
                 if (!loopRule[r]) continue;
@@ -7719,6 +7772,7 @@ void FusedRules::generatePabloMethod() {
                 DT[r] = pb.createVar("DT" + std::to_string(r), zeroes);
                 DF[r] = pb.createVar("DF" + std::to_string(r), zeroes);
                 const unsigned n = static_cast<unsigned>(rule.text.size()), m = static_cast<unsigned>(rule.replacement.size());
+                std::vector<size_t> shifted;
                 for (unsigned o = 0; o < n; o++) {
                     StringCover sc;
                     sc.rule = r;
@@ -7728,17 +7782,20 @@ void FusedRules::generatePabloMethod() {
                     //  the rest of the replacement after it at the last position.)
                     if (!sc.result.empty() && sc.result[0] == static_cast<char32_t>(ldml::StringRuleDeleted)) sc.result.erase(0, 1);
                     sc.result = selectedText(mConfig, sc.result);
-                    sc.cand = o ? pb.createAdvance(candS[r], o) : candS[r];
-                    sc.notCand = pb.createNot(sc.cand);
-                    if (o) {
+                    if (o == 0) {
+                        sc.cand = candS[r];
+                        sc.notCand = pb.createNot(sc.cand);
+                        dep = pb.createOr(dep, sc.cand);
+                    } else {
                         const std::string suffix = std::to_string(r) + "_" + std::to_string(o);
                         sc.T = pb.createVar("ST" + suffix, zeroes);
                         sc.F = pb.createVar("SF" + suffix, zeroes);
+                        shifted.push_back(covers.size());
                     }
-                    dep = pb.createOr(dep, sc.cand);
                     coversOf[r].push_back(covers.size());
                     covers.push_back(std::move(sc));
                 }
+                coverCandidates(r, shifted);
                 if (!rule.run.empty()) {
                     StringCover sc;
                     sc.rule = r;
@@ -7765,23 +7822,27 @@ void FusedRules::generatePabloMethod() {
                 candS[e] = part == 2 ? zeroes : source(k.starts);
                 DT[e] = pb.createVar("DT" + std::to_string(e), zeroes);
                 DF[e] = pb.createVar("DF" + std::to_string(e), zeroes);
+                std::vector<size_t> shifted;
                 for (unsigned o = 0; o < k.length; o++) {
                     StringCover sc;
                     sc.rule = e;
                     sc.offset = o;
                     sc.stat = true;
                     sc.last = o + 1 == k.length;
-                    sc.cand = o ? pb.createAdvance(candS[e], o) : candS[e];
-                    sc.notCand = pb.createNot(sc.cand);
-                    if (o) {
+                    if (o == 0) {
+                        sc.cand = candS[e];
+                        sc.notCand = pb.createNot(sc.cand);
+                        dep = pb.createOr(dep, sc.cand);
+                    } else {
                         const std::string suffix = std::to_string(e) + "_" + std::to_string(o);
                         sc.T = pb.createVar("ST" + suffix, zeroes);
                         sc.F = pb.createVar("SF" + suffix, zeroes);
+                        shifted.push_back(covers.size());
                     }
-                    dep = pb.createOr(dep, sc.cand);
                     coversOf[e].push_back(covers.size());
                     covers.push_back(std::move(sc));
                 }
+                coverCandidates(e, shifted);
             }
             //  (The covers as loopConsumers has them.)
             if (LLVM_UNLIKELY(covers.size() != lc.covers.size())) llvm::report_fatal_error("FusedRules: the covers of loopConsumers differ");

@@ -16,7 +16,8 @@
 #  contexts in them), the output must be that of the regular plan
 #  (--class-layer=0) and ICU's (but with the filter, see filtered_rules), with
 #  the default threads and with four threads
-#  and segments of one stride, in UTF-8 mode (the classes coded in place of the
+#  and segments of one stride (the correction kernels of the rules with before
+#  contexts matched against the converted text layered as well), in UTF-8 mode (the classes coded in place of the
 #  multiplexed code) and in Unicode mode (in place of a stream for each class).  The layer must be used (--class-layer-report).
 #
 #  xlit_class_layer_test.py <xlit binary> [--extended-testing]
@@ -66,6 +67,7 @@ def string_rules(seed, pairs, extras):
             # (Sets the class layer gives as streams of their own: external.)
             lines.append("[^[:L:]] { %s%s \u2192 W ;" % (chr(firsts[-5]), chr(seconds[4])))
             lines.append("%s%s } [:N:] \u2192 N ;" % (chr(firsts[-6]), chr(seconds[5])))
+            lines.append("[^\u0e02] { %s%s \u2192 V ;" % (chr(firsts[-7]), chr(seconds[6])))
     return "\n".join(sorted(set(lines), key=lines.index)) + "\n"
 
 
@@ -157,6 +159,13 @@ def main():
                         if not any(k.get("layered") for k in kernels):
                             failures += 1
                             print("FAIL %s: no kernel with the class layer (%d kernels)" % (label, len(kernels)))
+                        # (With contexts matched against the converted text: a
+                        # correction kernel with the layer, doc/ldml-divcode-plan.md
+                        # §13.16, step 4e.)
+                        if name != "pairs" and not any(k.get("layered") and k.get("kind") in ("correction", "loop", "post")
+                                                       for k in kernels):
+                            failures += 1
+                            print("FAIL %s: no correction kernel with the class layer" % label)
                     if layered.returncode != 0:
                         failures += 1
                         print("FAIL %s %s: exit status %d\n%s" % (label, " ".join(config), layered.returncode,

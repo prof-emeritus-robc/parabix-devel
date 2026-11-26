@@ -624,3 +624,53 @@ transforms):
   matches them as written; the plan takes them as written too);
 - the exactness of the pruning under the closed form (§5.3), which the step 4
   check compares against the loop.
+
+## 12. Status of step 1 (2026-11-26)
+
+**The refactoring.** `re::unambiguousStringClass`
+(`include/re/transforms/resolve_possessive.h`) returns the structure that
+`unambiguousStrings` computed:
+
+- the single characters that begin no string (`others`);
+- the literals kept, each with its guards (the rests of the preferred strings
+  it begins, or backward, their beginnings);
+- `firsts` and `singles`.
+
+`unambiguousStrings` builds its RE from that structure, with the same
+alternatives in the same order, so `unambiguousAlternatives` and the
+possessive resolution are unchanged. `greptest` (255 cases) and
+`ldml_trules_test` pass. `maxInvolved` (64 by default, the old limit) bounds
+the single characters that begin strings. `makeStringSetSpec` lifts the limit,
+since it builds no RE.
+
+**The kernel.** `kernel::StringSetKernel` is in
+`include/kernel/unicode/string_set.h` and `lib/kernel/unicode/string_set.cpp`.
+
+- **Input:** a `StringSetSpec`, which holds the lengths (ascending, one output
+  stream each), the terms (a sequence of sets and its guards) and the
+  direction. `makeStringSetSpec(chars, strings, backward, code)` builds it
+  from a set's members by `unambiguousStringClass(…, Longest, …)`. The
+  optional `code` maps the sets to a multiplexed alphabet's codes.
+- **Compilation:** the sets are compiled as sets of codepoints over the basis,
+  padded to 21 bits: the 21-bit Unicode basis, or the bits of a code.
+  - **Forward:** each offset uses the basis bits looked ahead by it, with a
+    `LookAhead` on the input (the longest term plus its longest guard, less
+    1).
+  - **Backward:** Advances of the classes, with no lookahead.
+- **Name:** `StringSet_{fwd|bwd}_<hash of the basis shape and the spec>_<basis shape>`.
+
+**The test.** `tests/string_set.cpp` and `string_set_test.py` (ctest
+`string_set_test`, about 2 s once compiled, 9 s cold).
+
+- **Sets:** 4 of und_FONIPA-ar's (`$UVowel`, the `n` set with `{n̼̊}` of 3
+  characters, `[{t͡ʃ} ʧ]`, `$IVowel`) and 6 random ones (fixed seed). The
+  random sets have strings that extend others and strings that end with
+  others, and combining marks and characters of 2, 3 and 4 UTF-8 bytes, on
+  texts of 3,000 codepoints.
+- **Runs:** each set forward and backward, over the 21-bit basis and over a
+  multiplexed code of the set's classes, that is 40 runs, compared with a
+  Python reference of the longest match at each position.
+- **Result:** all 40 pass. With the guards removed (a mutation check, then
+  restored), 30 of the 40 fail.
+
+**Not yet:** UTF-8 mode (lengths in bytes, §9); the kernel in xlit (step 2).

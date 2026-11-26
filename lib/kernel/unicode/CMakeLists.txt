@@ -9,6 +9,7 @@ NAME
 SRC
     charclasses.cpp
     divcode.cpp
+    string_set.cpp
     char_replacement.cpp
     boundary_kernels.cpp
     UCD_property_kernel.cpp

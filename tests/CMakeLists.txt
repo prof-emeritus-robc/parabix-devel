@@ -127,6 +127,13 @@ add_test(NAME region_reversal_test
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/region_reversal_test.py ${TEST_BIN_DIR}/region_reversal)
 
 # Character classes on UTF-8 bytes (kernel::CharClassesKernel), checked with Python
+# StringSet kernels: the longest matches of sets with strings, compared with a reference
+parabix_add_executable(NAME string_set SRC string_set.cpp
+                       DEPS kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.unicode toolchain)
+add_test(NAME string_set_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/string_set_test.py ${TEST_BIN_DIR}/string_set)
+
 parabix_add_executable(NAME utf8_classes SRC utf8_classes.cpp
                        DEPS kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.unicode toolchain)
 add_test(NAME utf8_classes_test

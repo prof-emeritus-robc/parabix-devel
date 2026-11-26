@@ -116,27 +116,27 @@ static bool orderedStrings(RE * r, std::vector<std::vector<CC *>> & strings) {
 //  w that is a proper suffix of preferred strings t' w is taken only where none
 //  of them matches, (?<!t'...) w, and with firsts the characters with which
 //  the matches end; at each end position, at most one alternative matches.
-static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bool backward = false,
-                               CC ** singles = nullptr) {
+bool unambiguousStringClass(RE * e, PossessiveChoice choice, bool backward, UnambiguousStrings & out,
+                            size_t maxInvolved) {
     std::vector<std::vector<CC *>> alternatives;
-    if (!orderedStrings(e, alternatives)) return nullptr;
+    if (!orderedStrings(e, alternatives)) return false;
     const cc::Alphabet * alphabet = nullptr;
     bool multi = false;
     UCD::UnicodeSet starts;                     // the first (backward: last) characters of the strings of several characters
     for (const auto & a : alternatives) {
         for (CC * cc : a) {
-            if (alphabet && cc->getAlphabet() != alphabet) return nullptr;
+            if (alphabet && cc->getAlphabet() != alphabet) return false;
             alphabet = cc->getAlphabet();
         }
         if (a.size() > 1) {
             multi = true;
             for (CC * cc : a) {
-                if (cc->count() != 1) return nullptr;
+                if (cc->count() != 1) return false;
             }
             starts.insert(lo_codepoint((backward ? a.back() : a.front())->front()));
         }
     }
-    if (!multi) return nullptr;
+    if (!multi) return false;
     struct Literal {
         std::u32string text;
         size_t order;
@@ -149,7 +149,7 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bo
             const UCD::UnicodeSet chars = *a.front();
             others = others + (chars - starts);
             const UCD::UnicodeSet involved = chars & starts;
-            if (involved.count() > 64) return nullptr;
+            if (involved.count() > maxInvolved) return false;
             for (const auto & range : involved) {
                 for (UCD::codepoint_t c = lo_codepoint(range); c <= hi_codepoint(range); c++) {
                     literals.push_back(Literal{std::u32string(1, static_cast<char32_t>(c)), i});
@@ -171,21 +171,18 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bo
     auto preferred = [&](const Literal & t, const Literal & w) {
         return choice == PossessiveChoice::Longest ? t.text.size() > w.text.size() : t.order < w.order;
     };
-    std::vector<RE *> alts;
-    UCD::UnicodeSet first = others;
-    if (!others.empty()) alts.push_back(makeCC(std::move(others), alphabet));
     //  Whether t begins (backward: ends) with w.
     auto extends = [&](const std::u32string & t, const std::u32string & w) {
         return backward ? t.compare(t.size() - w.size(), w.size(), w) == 0 : t.compare(0, w.size(), w) == 0;
     };
-    auto literal = [&](const std::u32string & text) {
-        std::vector<RE *> items;
-        for (char32_t c : text) items.push_back(makeCC(static_cast<UCD::codepoint_t>(c), alphabet));
-        return makeSeq(items.begin(), items.end());
-    };
+    out = UnambiguousStrings();
+    out.alphabet = alphabet;
+    out.others = others;
+    out.firsts = others;
+    out.singles = others;
     for (const Literal & w : distinct) {
         bool dropped = false;
-        std::vector<RE *> guards;
+        std::vector<std::u32string> guards;
         for (const Literal & t : distinct) {
             if (&t == &w || !preferred(t, w)) continue;
             if (t.text.size() < w.text.size() && extends(w.text, t.text)) {
@@ -193,11 +190,36 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bo
             } else if (t.text.size() > w.text.size() && extends(t.text, w.text)) {
                 //  The rest of t, beyond w.
                 const size_t n = t.text.size() - w.text.size();
-                guards.push_back(literal(backward ? t.text.substr(0, n) : t.text.substr(w.text.size())));
+                guards.push_back(backward ? t.text.substr(0, n) : t.text.substr(w.text.size()));
             }
         }
         if (dropped) continue;
+        out.firsts.insert(static_cast<UCD::codepoint_t>(backward ? w.text.back() : w.text.front()));
+        //  (The first characters that are alternatives of their own, guarded
+        //  only by the rest of the longer alternatives they begin, which are
+        //  alternatives too: at such a character, an alternative always matches.)
+        if (w.text.size() == 1) out.singles.insert(static_cast<UCD::codepoint_t>(w.text.front()));
+        out.literals.push_back(UnambiguousStrings::Literal{w.text, std::move(guards)});
+    }
+    return true;
+}
+
+static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bool backward = false,
+                               CC ** singles = nullptr) {
+    UnambiguousStrings u;
+    if (!unambiguousStringClass(e, choice, backward, u)) return nullptr;
+    const cc::Alphabet * const alphabet = u.alphabet;
+    auto literal = [&](const std::u32string & text) {
+        std::vector<RE *> items;
+        for (char32_t c : text) items.push_back(makeCC(static_cast<UCD::codepoint_t>(c), alphabet));
+        return makeSeq(items.begin(), items.end());
+    };
+    std::vector<RE *> alts;
+    if (!u.others.empty()) alts.push_back(makeCC(UCD::UnicodeSet(u.others), alphabet));
+    for (const UnambiguousStrings::Literal & w : u.literals) {
         RE * const text = literal(w.text);
+        std::vector<RE *> guards;
+        for (const std::u32string & g : w.guards) guards.push_back(literal(g));
         if (guards.empty()) {
             alts.push_back(text);
         } else if (backward) {
@@ -205,19 +227,9 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bo
         } else {
             alts.push_back(makeSeq({text, makeNegativeLookAheadAssertion(makeAlt(guards.begin(), guards.end()))}));
         }
-        first.insert(static_cast<UCD::codepoint_t>(backward ? w.text.back() : w.text.front()));
     }
-    //  The first characters that are alternatives of their own (guarded only by
-    //  the rest of the longer alternatives they begin, which are alternatives
-    //  too): at such a character, an alternative always matches.
-    if (singles) {
-        UCD::UnicodeSet alone = others;
-        for (const Literal & w : distinct) {
-            if (w.text.size() == 1) alone.insert(static_cast<UCD::codepoint_t>(w.text.front()));
-        }
-        *singles = makeCC(std::move(alone), alphabet);
-    }
-    firsts = makeCC(std::move(first), alphabet);
+    if (singles) *singles = makeCC(std::move(u.singles), alphabet);
+    firsts = makeCC(std::move(u.firsts), alphabet);
     return makeAlt(alts.begin(), alts.end());
 }
 

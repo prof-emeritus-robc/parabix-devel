@@ -6,8 +6,8 @@
 #  utf8_classes_test.py <utf8_classes binary>: character classes computed on the
 #  UTF-8 bytes (kernel::CharClassesKernel, both bit movement modes), compared
 #  with a reference, for large classes of CJK characters (whose compilation
-#  nests If blocks) and text placing the characters at every offset from the
-#  block boundaries.
+#  nests If blocks) and for the bits of a Div32 code (xlit's class layer), and
+#  text placing the characters at every offset from the block boundaries.
 
 import os, random, subprocess, sys, tempfile
 
@@ -39,8 +39,38 @@ def main():
     others = [0x61, 0x62, 0x20, 0xE9, 0x3B1, 0x1F600, 0x20000]
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
-        for trial in range(3):
-            if trial == 0:
+        for trial in range(5):
+            if trial >= 3:
+                #  The bits of a Div32 code (xlit's class layer): the low 5 bits
+                #  of the characters of its blocks, then the bits of the blocks'
+                #  codes (i + 1 for the i-th block), and the external sets after
+                #  them (utf8_classes_externals.txt), 14 classes in one kernel, as
+                #  und_FONIPA-ar's group 3 kernel has them.  The kernel nested an
+                #  If on lead bytes CC-CD, tested at the lead byte, whose body
+                #  worked at the second byte with an Advance built outside it: a
+                #  character whose second byte began a block lost its classes
+                #  (U+032A read as U+0280).  Trial 3: classes 0-7; trial 4: 8-13.
+                blocks = [0x60, 0xE0, 0x120, 0x140, 0x1C0, 0x240, 0x260, 0x280, 0x2A0, 0x2C0, 0x300, 0x320, 0x360, 0x3A0,
+                          0x3C0, 0x1D80]
+                bits = [set() for _ in range(10)]
+                for i, base in enumerate(blocks):
+                    for c in range(base, base + 32):
+                        for j in range(5):
+                            if (c >> j) & 1: bits[j].add(c)
+                        for j in range(5):
+                            if ((i + 1) >> j) & 1: bits[5 + j].add(c)
+                externals = []
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'utf8_classes_externals.txt')) as f:
+                    for line in f:
+                        c = set()
+                        for r in line.split():
+                            lo, _, hi = r.partition('-')
+                            c.update(range(int(lo, 16), int(hi or lo, 16) + 1))
+                        externals.append(c)
+                allClasses = bits + externals
+                classes = allClasses[0:8] if trial == 3 else allClasses[8:16]
+                layer = [c for base in blocks for c in range(base, base + 32)]
+            elif trial == 0:
                 #  Two classes with 给 (U+7ED9, E7 BB 99): a range covering
                 #  the whole block of second byte BB in one, as a nested If of the
                 #  other.  At byte 126 of the text, its last byte begins a block
@@ -66,20 +96,31 @@ def main():
                     classes.append(c)
             cfile = os.path.join(tmp, 'classes.txt')
             with open(cfile, 'w') as f:
-                for c in classes: f.write(ranges(c) + '\n')
+                for c in (allClasses if trial >= 3 else classes): f.write(ranges(c) + '\n')
+            group = ['-group=%d' % (trial - 3)] if trial >= 3 else []
             #  Text: the characters at every offset (padding of 0..255 ASCII
             #  bytes before a line of CJK text), and random mixtures.
             parts = []
-            line = ''.join(chr(c) for c in rng.sample(pool, 60)) if trial else '\u7ed9' * 60
-            for pad in range(256):
-                parts.append('a' * pad + '\n' + line + '\n')
-            for _ in range(200):
-                parts.append(''.join(chr(rng.choice(pool + others)) for _ in range(rng.randint(1, 80))) + '\n')
+            if trial >= 3:
+                #  The characters of the blocks at every offset, each line led by
+                #  U+032A, after ASCII only (no lead byte before it in the block).
+                line = '\u032a' + ''.join(chr(rng.choice(layer)) for _ in range(59))
+                for pad in range(256):
+                    parts.append('a' * pad + '\n' + line + '\n')
+                    parts.append('a' * pad + '\u032a' + 'a' * (255 - pad) + '\n')
+                for _ in range(400):
+                    parts.append(''.join(chr(rng.choice(layer + others)) for _ in range(rng.randint(1, 120))) + '\n')
+            else:
+                line = ''.join(chr(c) for c in rng.sample(pool, 60)) if trial else '\u7ed9' * 60
+                for pad in range(256):
+                    parts.append('a' * pad + '\n' + line + '\n')
+                for _ in range(200):
+                    parts.append(''.join(chr(rng.choice(pool + others)) for _ in range(rng.randint(1, 80))) + '\n')
             text = ''.join(parts)
             tfile = os.path.join(tmp, 'text.txt')
             with open(tfile, 'w', encoding='utf-8') as f: f.write(text)
             for mode in ('advance', 'lookahead'):
-                run = subprocess.run([binary, '-classes=' + cfile, '-mode=' + mode, tfile], capture_output=True)
+                run = subprocess.run([binary, '-classes=' + cfile, '-mode=' + mode] + group + [tfile], capture_output=True)
                 got = run.stdout
                 if run.returncode != 0:
                     print('FAIL trial %d mode %s: exit code %d %s' % (trial, mode, run.returncode, run.stderr.decode(errors='replace')[:300]))

@@ -506,6 +506,22 @@ protected:
     virtual void prepareSuffix(unsigned scope, PabloBuilder & pb) = 0;
     virtual void prepareScope(unsigned scope, PabloBuilder & pb) = 0;
     virtual PabloAST * adjustPosition(PabloAST * t, unsigned from, unsigned to, PabloBuilder & pb) = 0;
+    //  The condition of an If whose body works at code units first to last of
+    //  the sequences that a test at code unit at marks: the test moved to each of
+    //  these (outside the If).  Tested only at the code unit of the test, the body
+    //  would be skipped in a block whose first positions hold the later code
+    //  units of a sequence begun in the block before, unless a carry of the body
+    //  made it enter: the movement into the body may be an Advance built outside
+    //  the If (the builder reuses an identical one), so that the body has none.
+    //  (In Lookahead mode, everything is at the first code unit: the test.)
+    PabloAST * coverSequence(PabloAST * t, unsigned at, unsigned first, unsigned last, PabloBuilder & pb) {
+        PabloAST * cover = nullptr;
+        for (unsigned u = first; u <= last; u++) {
+            PabloAST * const moved = adjustPosition(t, at, u, pb);
+            cover = cover ? pb.createOr(cover, moved) : moved;
+        }
+        return cover ? cover : t;
+    }
     //  The basis of the first code unit adjusted (mScopeBasis[0] and
     //  mCodeUnitCompiler[0]), once it is extracted from the basis Var.
     virtual void adjustBasis() {}
@@ -720,7 +736,8 @@ void U8_Compiler::createInitialHierarchy(CC_List & ccs) {
                 rangeTest = mSeqData[TwoByte].combinedTest;
             }
             auto nested = mPB.createScope();
-            mPB.createIf(rangeTest, nested);
+            //  (The body works at every code unit of the sequences: see coverSequence.)
+            mPB.createIf(coverSequence(rangeTest, 1, 1, mEncoder.encoded_length(actual_subrange.hi), mPB), nested);
             if (InitialTest == InitialTestMode::RangeCC) {
                 preparePrefixTests(nested);
             }
@@ -740,7 +757,9 @@ void U8_Compiler::extendLengthHierarchy(EnclosingInfo & initialInfo, PabloBuilde
         prepareFixedLengthHierarchy(FourByte, initialInfo, pb);
     } else {
         auto nested = pb.createScope();
-        pb.createIf(prefix34_test, nested);
+        //  (The body works at every code unit of the sequences: see coverSequence.)
+        const unsigned last34 = mSeqData[FourByte].actualRange.is_empty() ? 3 : 4;
+        pb.createIf(coverSequence(prefix34_test, 1, 1, last34, pb), nested);
         if (mSeqData[FourByte].actualRange.is_empty()) {
             EnclosingInfo threeByteInfo(mSeqData[ThreeByte].testRange, mSeqData[ThreeByte].test);
             prepareFixedLengthHierarchy(ThreeByte, threeByteInfo, nested);
@@ -894,19 +913,17 @@ void U8_Compiler::compileFromCodeUnit(U8_Seq_Kind k, EnclosingInfo & if_parent, 
                     if (nesting) {
                         auto nested = pb.createScope();
                         if (units_this_partition == 1 && !AdvanceBasis) {
-                            //  The body works at the next code unit: its If tests
-                            //  the test moved there, not the test itself.  (Tested
-                            //  where the test is, the body is skipped in a block
-                            //  whose first positions hold the next code units of a
-                            //  test at the end of the block before, unless a carry
-                            //  of the body makes it enter; and the movement into
-                            //  the body may be the same Advance outside the If.)
+                            //  The body works from the next code unit: its If tests
+                            //  the test moved there, and to the code units after
+                            //  it (see coverSequence).
                             PabloAST * const moved = adjustPosition(t, code_unit, code_unit + 1, pb);
                             EnclosingInfo movedInfo(partitionRange, moved, code_unit + 1);
-                            pb.createIf(moved, nested);
+                            pb.createIf(coverSequence(t, code_unit, code_unit + 1, lgth, pb), nested);
                             compileFromCodeUnit(k, movedInfo, movedInfo, code_unit + 1, nested);
                         } else {
-                            pb.createIf(t, nested);
+                            //  (The body works at this code unit and the ones after
+                            //  it: see coverSequence.)
+                            pb.createIf(coverSequence(t, code_unit, code_unit, lgth, pb), nested);
                             if (units_this_partition == 1) {
                                 compileFromCodeUnit(k, partitionInfo, partitionInfo, code_unit + 1, nested);
                             } else {

@@ -5,11 +5,12 @@
 
 //  utf8_classes: character classes computed on the UTF-8 bytes of a file
 //  (kernel::CharClassesKernel over the basis bits), for comparison with a
-//  reference (utf8_classes_test.py).  The classes (at most 8) are read from the
-//  file given by -classes, one class per line as hexadecimal codepoint ranges
-//  ("4E00-4E2F 7ED9").  The output has one byte for each byte of the input: bit
-//  i is set where class i is marked, at the last byte of each character
-//  (-mode=advance) or at its first byte (-mode=lookahead).
+//  reference (utf8_classes_test.py).  The classes (at most 16, computed by one
+//  kernel) are read from the file given by -classes, one class per line as
+//  hexadecimal codepoint ranges ("4E00-4E2F 7ED9").  The output has one byte for
+//  each byte of the input: bit i is set where class 8 * group + i is marked
+//  (-group, 0 or 1), at the last byte of each character (-mode=advance) or at its
+//  first byte (-mode=lookahead).
 
 #include <kernel/basis/p2s_kernel.h>
 #include <kernel/basis/s2p_kernel.h>
@@ -36,6 +37,8 @@ static cl::OptionCategory utf8ClassesOptions("utf8_classes Options", "utf8_class
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(utf8ClassesOptions));
 static cl::opt<std::string> classesFile("classes", cl::desc("The classes, one per line, as hexadecimal codepoint ranges"),
                                         cl::Required, cl::cat(utf8ClassesOptions));
+static cl::opt<unsigned> group("group", cl::desc("The classes output: 8 * group to 8 * group + 7"), cl::init(0),
+                               cl::cat(utf8ClassesOptions));
 static cl::opt<std::string> movement("mode", cl::desc("advance (mark the last byte) or lookahead (the first byte)"),
                                      cl::init("advance"), cl::cat(utf8ClassesOptions));
 
@@ -60,8 +63,8 @@ int main(int argc, char * argv[]) {
         }
         ccs.push_back(cc);
     }
-    if (ccs.empty() || ccs.size() > 8) {
-        errs() << "utf8_classes: from 1 to 8 classes\n";
+    if (ccs.empty() || ccs.size() > 16 || group > 1) {
+        errs() << "utf8_classes: from 1 to 16 classes, -group 0 or 1\n";
         return 1;
     }
     pablo::BitMovementMode mode;
@@ -73,15 +76,23 @@ int main(int argc, char * argv[]) {
         errs() << "utf8_classes: -mode is advance or lookahead\n";
         return 1;
     }
-    while (ccs.size() < 8) ccs.push_back(re::makeCC(&cc::Unicode));
+    const unsigned n = ccs.size() > 8 ? 16 : 8;
+    while (ccs.size() < n) ccs.push_back(re::makeCC(&cc::Unicode));
     CPUDriver driver("utf8_classes");
     auto P = CreatePipeline(driver, Input<uint32_t>("fd"));
     StreamSet * const bytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<ReadSourceKernel>(P.getInputScalar("fd"), bytes);
     StreamSet * const basis = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(bytes, basis);
-    StreamSet * const classes = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<CharClassesKernel>(ccs, basis, classes, mode);
+    StreamSet * const all = P.CreateStreamSet(n, 1);
+    P.CreateKernelCall<CharClassesKernel>(ccs, basis, all, mode);
+    StreamSet * classes = all;
+    if (n > 8) {
+        classes = P.CreateStreamSet(8, 1);
+        std::vector<uint32_t> selected;
+        for (unsigned i = 0; i < 8; i++) selected.push_back(8 * group + i);
+        P.CreateKernelCall<StreamSelect>(classes, Select(all, selected));
+    }
     StreamSet * const out = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(classes, out);
     P.CreateKernelCall<StdOutKernel>(out);

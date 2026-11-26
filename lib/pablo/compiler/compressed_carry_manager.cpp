@@ -171,7 +171,21 @@ Value * CompressedCarryManager::readCarryInSummary(kernel::KernelBuilder & b) co
         Type * carryTy = mCurrentFrameType->getStructElementType(0)->getArrayElementType();
         summary = b.CreateLoad(carryTy, ptr);
         if (mNestedLoopCarryInMaskPhi) {
-            summary = b.CreateAnd(summary, mNestedLoopCarryInMaskPhi);
+            Value * mask = mNestedLoopCarryInMaskPhi;
+            if (mask->getType() == carryTy) {
+                summary = b.CreateAnd(summary, mask);
+            } else {
+                //  (The mask has the summary type of the outermost loop's scope,
+                //  and a scope nested in it may have another, e.g. i8 within i64.
+                //  The mask is all ones in the first iteration and all zeroes
+                //  thereafter, so it is applied as a select on its being nonzero.)
+                Type * const maskTy = mask->getType();
+                if (maskTy->isVectorTy()) {
+                    mask = b.CreateBitCast(mask, b.getIntNTy(getTypeBitWidth(maskTy)));
+                }
+                Value * const firstIteration = b.CreateICmpNE(mask, Constant::getNullValue(mask->getType()));
+                summary = b.CreateSelect(firstIteration, summary, Constant::getNullValue(carryTy));
+            }
         }
     }
     return summary;
